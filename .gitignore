@@ -18,3 +18,5 @@ apps/desktop/src-tauri/gen/schemas
 
 # Local notes / agent session artifacts (not published)
 notes/
+docs/superpowers/
+spikes/

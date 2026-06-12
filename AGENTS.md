@@ -52,6 +52,10 @@ direction. See docs/ARCHITECTURE.md.
   clippy warnings fail CI.
 - TypeScript: Biome is the style arbiter — no manual formatting debates.
 - Architectural decisions get a new ADR in `docs/adr/`; never rewrite old ones.
+- Working artifacts — design specs, implementation plans, session notes,
+  throwaway spikes (`docs/superpowers/`, `notes/`, `spikes/`) — stay local
+  and are never committed (gitignored). Durable outcomes belong in ADRs,
+  VISION.md, or ARCHITECTURE.md instead.
 - Releases bump the version in 4 places: root `package.json`,
   `apps/desktop/package.json`, `apps/desktop/src-tauri/tauri.conf.json`, and
   `[workspace.package]` in `Cargo.toml`.
