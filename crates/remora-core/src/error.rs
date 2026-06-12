@@ -5,7 +5,8 @@ use remora_protocol::{ProjectId, SessionId};
 /// Error returned by [`SessionSource`](crate::SessionSource) operations and
 /// [`SessionChannel`](crate::SessionChannel) sends.
 ///
-/// Small by design; real transport implementations extend it.
+/// Small by design; grows variants in core as real transports need them
+/// (backend-specific detail stays in [`Transport`](Self::Transport)).
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
     /// Spawn fails closed when the session already exists — tmux name

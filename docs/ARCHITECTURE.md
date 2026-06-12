@@ -66,7 +66,7 @@ a type or code path in core
 | Unit | Purpose | Depends on |
 | --- | --- | --- |
 | `crates/remora-protocol` | Wire types every client speaks (session ids, messages). Deliberately dependency-light — it is the contract third-party clients build against. | `serde` only |
-| `crates/remora-core` | Session model, the `SessionSource` trait, and its direct-mode implementations (ssh, kubectl exec). | `remora-protocol` |
+| `crates/remora-core` | Session model, the `SessionSource` trait, and its direct-mode implementations (ssh, kubectl exec). | `remora-protocol`, `tokio` |
 | `apps/desktop/src-tauri` | Tauri 2 shell: owns processes/PTYs, exposes commands to the frontend. | `remora-core` |
 | `apps/desktop/src` | React UI: tabs, embedded terminal, file/diff/PR panels. Talks only to the Tauri layer. | `@tauri-apps/api` |
 
