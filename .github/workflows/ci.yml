@@ -17,7 +17,7 @@ jobs:
     name: Frontend (biome, tsc, vitest)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: pnpm/action-setup@v6
 
@@ -42,7 +42,7 @@ jobs:
     name: Rust (fmt, clippy, test)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # src-tauri needs the Tauri Linux system libraries to compile.
       - name: Install Tauri system dependencies
@@ -74,7 +74,7 @@ jobs:
     name: Licenses and advisories (cargo-deny)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
