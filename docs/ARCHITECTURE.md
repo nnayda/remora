@@ -25,6 +25,26 @@ Persistence is borrowed, not invented: tmux already solves "process survives
 disconnect", so reconnect is *open a channel → `tmux attach` → repaint*. The
 sandbox needs only `tmux`, `git`, and the agent's CLI — no Remora daemon.
 
+## Hosts, projects, sessions
+
+Sessions are organized as **Host → Project → Session**
+([ADR-0004](adr/0004-local-config-live-session-discovery.md)). A *host* is a
+configured transport (ssh, kubectl exec; docker planned); a *project* is a
+directory on it with a workspace mode (`worktree` for git repos — fresh
+worktree + branch per session — or `shared` for plain directories) and a
+default agent, overridable per session.
+
+State splits along a hard line. Hosts and projects are **local declarative
+config** — one human-editable TOML file per device. Sessions are **never
+stored in any client**: they are discovered by listing tmux sessions named
+`remora_<project-id>_<session-id>` (ids are `[a-z0-9-]` slugs, so the name
+parses unambiguously; extra metadata rides in tmux session environment
+variables) and joining them back to config. That join is what the sidebar
+renders, and it is why a session launched on one device appears on every
+other device configured for that host. After a pod restart, a surviving
+worktree with no tmux session surfaces as *stopped*, with one-click
+respawn.
+
 ## The one rule
 
 **UI code never talks to ssh/kubectl directly.** Everything goes through the
@@ -57,6 +77,11 @@ A future `relay` binary will host `remora-core` behind a WebSocket and speak
 
 - The agent, the checked-out code, and all tool execution stay on the sandbox.
   The client sends keystrokes and paints pixels — nothing more.
+- Everything a client discovers from a sandbox (tmux session names,
+  environment metadata) is untrusted input: anyone with a shell there —
+  including the agent — can forge it. Discovered state informs display and
+  the config join only; spawn and respawn build commands exclusively from
+  local configuration ([ADR-0004](adr/0004-local-config-live-session-discovery.md)).
 - Clients hold no long-lived secrets beyond what the user already uses to
   reach their sandbox (kubeconfig / SSH). In relay mode the phone
   authenticates to the relay and never holds a key to the sandbox.

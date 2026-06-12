@@ -7,7 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Identifies one live session: one git worktree + one tmux session on the sandbox.
+/// Identifies one session on the sandbox: a workspace (git worktree, or the
+/// project directory in shared mode) that is live while its named tmux
+/// session exists and stopped when only the worktree survives.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub String);
 
