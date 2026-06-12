@@ -6,5 +6,7 @@
 //! it is the contract third-party clients build against.
 
 mod id;
+mod session;
 
 pub use id::{AgentId, InvalidIdError, ProjectId, SessionId};
+pub use session::{SessionMeta, SessionState, SpawnSpec};
