@@ -460,7 +460,7 @@ impl Config {
         }
 
         for (id, agent) in &raw.agents {
-            if agent.command.first().is_none_or(String::is_empty) {
+            if agent.command.is_empty() || agent.command.iter().any(String::is_empty) {
                 issues.push(ValidationIssue::EmptyAgentCommand { agent: id.clone() });
             }
         }
@@ -831,6 +831,10 @@ mod tests {
         assert!(issues[0].to_string().contains("claude"), "{issues:?}");
 
         let issues = issues_of("[agents.claude]\ncommand = [\"\"]\n");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+
+        // An empty element anywhere in the argv is a config mistake too.
+        let issues = issues_of("[agents.claude]\ncommand = [\"claude\", \"\", \"--continue\"]\n");
         assert_eq!(issues.len(), 1, "{issues:?}");
     }
 
