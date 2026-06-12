@@ -4,4 +4,8 @@
 //! talks to ssh/kubectl directly — it goes through a `SessionSource`
 //! implementation, which is what makes the relay an optional drop-in.
 
+mod error;
+
+pub use error::SourceError;
+
 pub use remora_protocol::{InvalidIdError, SessionId};
