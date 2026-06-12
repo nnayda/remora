@@ -23,6 +23,9 @@ use tokio::task::JoinHandle;
 use crate::{SessionChannel, SessionSource, SourceError};
 
 /// In-memory [`SessionSource`] double. One instance = one fake host.
+///
+/// Must be driven from a tokio runtime: spawn/attach start echo tasks via
+/// `tokio::spawn` and panic outside one.
 #[derive(Default)]
 pub struct FakeSessionSource {
     sessions: Mutex<HashMap<(ProjectId, SessionId), FakeSession>>,
@@ -55,7 +58,8 @@ impl FakeSessionSource {
     }
 
     /// Simulates a dropped connection: open channels die, the session
-    /// itself stays live and re-attachable.
+    /// itself stays live and re-attachable. Output already buffered in a
+    /// channel's queue is still delivered before `recv` reports death.
     pub fn kill_channels(&self, project_id: &ProjectId, session_id: &SessionId) {
         let mut sessions = self.sessions.lock().expect("sessions lock");
         if let Some(session) = sessions.get_mut(&(project_id.clone(), session_id.clone())) {
@@ -155,6 +159,9 @@ impl SessionSource for FakeSessionSource {
             Arc::clone(&session.resizes),
             Some(banner),
         ));
+        // Reap handles of echo tasks that already exited (caller dropped its
+        // channel) so repeated attaches don't grow the vec unboundedly.
+        session.channels.retain(|handle| !handle.is_finished());
         session.channels.push(task);
         Ok(channel)
     }
@@ -289,18 +296,19 @@ mod tests {
     #[tokio::test]
     async fn resizes_are_recorded_across_channels() {
         let source = FakeSessionSource::new();
-        let channel = source.spawn(spec("api", "fix-login")).await.expect("spawn");
+        let mut channel = source.spawn(spec("api", "fix-login")).await.expect("spawn");
         let first = TerminalSize::new(24, 80).expect("nonzero size");
         channel.resize(first).await.expect("resize");
+        // Echo tasks consume input asynchronously; round-trip a byte on each
+        // channel after its resize to know the resize was processed.
+        channel.send_bytes(b"sync".to_vec()).await.expect("send");
+        let _ = recv_bytes(&mut channel).await;
 
         let (project, session) = ids("api", "fix-login");
         let mut attached = source.attach(&project, &session).await.expect("attach");
         let _banner = recv_bytes(&mut attached).await;
         let second = TerminalSize::new(30, 100).expect("nonzero size");
         attached.resize(second).await.expect("resize");
-
-        // Echo tasks consume input asynchronously; round-trip a byte on the
-        // second channel to know its resize was processed.
         attached.send_bytes(b"sync".to_vec()).await.expect("send");
         let _ = recv_bytes(&mut attached).await;
         // Ordering between channels is not guaranteed; assert as a set.

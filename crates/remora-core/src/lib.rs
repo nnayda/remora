@@ -11,6 +11,7 @@ mod source;
 
 pub use channel::{SessionChannel, CHANNEL_CAPACITY};
 pub use error::SourceError;
+pub use fake::FakeSessionSource;
 pub use source::SessionSource;
 
 pub use remora_protocol::{
