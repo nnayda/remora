@@ -5,7 +5,7 @@ use remora_protocol::{ProjectId, SessionId, SessionMeta, SpawnSpec};
 
 use crate::{SessionChannel, SourceError};
 
-/// One implementation = one configured host (ssh, kubectl exec, or the
+/// One instance = one configured host (ssh, kubectl exec, or the
 /// in-process [`fake`](crate::fake)). UI code never talks to a transport
 /// directly — everything goes through this trait, which is what makes the
 /// relay an optional drop-in (ARCHITECTURE.md).
@@ -14,8 +14,8 @@ pub trait SessionSource: Send + Sync {
     /// Creates a new session per the spec and opens a channel to it.
     ///
     /// Fails closed with [`SourceError::SessionExists`] if the session
-    /// already exists in any state — name uniqueness is the lock
-    /// (ADR-0004). Respawning a *stopped* session is discovery-layer
+    /// already exists in any state; tmux-name uniqueness is the anti-race
+    /// lock (ADR-0004). Respawning a *stopped* session is discovery-layer
     /// logic, not a spawn variant.
     async fn spawn(&self, spec: SpawnSpec) -> Result<SessionChannel, SourceError>;
 
