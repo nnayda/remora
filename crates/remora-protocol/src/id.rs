@@ -8,6 +8,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Maximum length of an id slug, in characters.
+///
+/// Ids come from forgeable sandbox state (tmux session names), so the bound
+/// is enforced at every construction and deserialization path: without it, a
+/// hostile sandbox could mint arbitrarily large "valid" ids that clients
+/// clone into UI state, logs, and remote commands.
+pub const MAX_ID_LEN: usize = 64;
+
 /// Error returned when a string is not a valid Remora id slug.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvalidIdError {
@@ -15,7 +23,15 @@ pub struct InvalidIdError {
 }
 
 impl InvalidIdError {
-    /// The rejected input.
+    fn new(value: &str) -> Self {
+        // Keep at most one char past the limit: enough for Display to show
+        // the overflow without carrying a multi-megabyte forged value around.
+        Self {
+            value: value.chars().take(MAX_ID_LEN + 1).collect(),
+        }
+    }
+
+    /// The rejected input, truncated to [`MAX_ID_LEN`] + 1 characters.
     pub fn value(&self) -> &str {
         &self.value
     }
@@ -23,10 +39,24 @@ impl InvalidIdError {
 
 impl std::fmt::Display for InvalidIdError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The rejected value is untrusted and this message travels inside
+        // serde deserialization errors that callers routinely log: escape
+        // control bytes so a forged id cannot inject terminal escapes, and
+        // mark truncation so log lines stay bounded.
+        let shown: String = self
+            .value
+            .chars()
+            .take(MAX_ID_LEN)
+            .flat_map(char::escape_default)
+            .collect();
+        let truncated = if self.value.chars().nth(MAX_ID_LEN).is_some() {
+            "…"
+        } else {
+            ""
+        };
         write!(
             f,
-            "invalid id `{}`: must be a non-empty lower-case slug of [a-z0-9-]",
-            self.value
+            "invalid id `{shown}{truncated}`: must be a lower-case slug of [a-z0-9-], 1 to {MAX_ID_LEN} chars"
         )
     }
 }
@@ -34,16 +64,17 @@ impl std::fmt::Display for InvalidIdError {
 impl std::error::Error for InvalidIdError {}
 
 fn validate_slug(value: &str) -> Result<(), InvalidIdError> {
+    // Length first: ids are ASCII, so the byte length bounds the char count
+    // and a forged multi-megabyte value is rejected without a full scan.
     let valid = !value.is_empty()
+        && value.len() <= MAX_ID_LEN
         && value
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
     if valid {
         Ok(())
     } else {
-        Err(InvalidIdError {
-            value: value.to_string(),
-        })
+        Err(InvalidIdError::new(value))
     }
 }
 
@@ -60,8 +91,8 @@ macro_rules! slug_id {
             /// Validates and wraps `value`.
             ///
             /// Valid ids are non-empty lower-case slugs of `[a-z0-9-]`
-            /// (ADR-0004); anything else is rejected, including on
-            /// deserialization.
+            /// (ADR-0004), at most [`MAX_ID_LEN`] characters; anything else
+            /// is rejected, including on deserialization.
             pub fn new(value: impl Into<String>) -> Result<Self, InvalidIdError> {
                 let value = value.into();
                 validate_slug(&value)?;
@@ -181,5 +212,36 @@ mod tests {
         let err = SessionId::new("Fix_Login").expect_err("invalid slug");
         assert!(err.to_string().contains("Fix_Login"));
         let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn enforces_length_cap() {
+        let at_cap = "a".repeat(MAX_ID_LEN);
+        assert!(SessionId::new(at_cap).is_ok());
+
+        let over_cap = "a".repeat(MAX_ID_LEN + 1);
+        assert!(SessionId::new(&over_cap).is_err());
+
+        let json = format!("\"{over_cap}\"");
+        assert!(serde_json::from_str::<SessionId>(&json).is_err());
+    }
+
+    #[test]
+    fn error_message_escapes_and_truncates_untrusted_input() {
+        // Forged ids can carry terminal escapes and be arbitrarily large;
+        // the error message must neutralize both, because it also rides
+        // inside serde deserialization errors that callers log.
+        let err = SessionId::new("evil\x1b[2J\nx").expect_err("invalid slug");
+        let msg = err.to_string();
+        assert!(!msg.contains('\x1b'), "raw ESC byte leaked: {msg:?}");
+        assert!(!msg.contains('\n'), "raw newline leaked: {msg:?}");
+        assert!(msg.contains("\\u{1b}"));
+
+        let huge = "A".repeat(1_000_000);
+        let err = SessionId::new(&huge).expect_err("invalid slug");
+        let msg = err.to_string();
+        assert!(msg.len() < 256, "message not bounded: {} bytes", msg.len());
+        assert!(msg.contains('…'));
+        assert!(err.value().chars().count() <= MAX_ID_LEN + 1);
     }
 }

@@ -8,9 +8,13 @@ use crate::{AgentId, ProjectId, SessionId};
 ///
 /// `Live` means the named tmux session exists; `Stopped` means only the
 /// workspace (worktree) survives — e.g. after a pod restart — and the
-/// session can be respawned.
+/// session can be respawned. The set is closed by construction (a tmux
+/// session either exists or it doesn't); adding a state is a breaking
+/// protocol change requiring a [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION)
+/// bump, since older clients reject unknown variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SessionState {
     Live,
     Stopped,
@@ -24,6 +28,13 @@ pub enum SessionState {
 /// with a shell on the sandbox can forge them, so they are plain optional
 /// strings — a forged value must never make the message undeserializable,
 /// and nothing may build commands from them.
+///
+/// Constructors (discovery, the future relay) own that invariant for the
+/// typed fields too: ids and `created_at` validate during deserialization,
+/// so senders must *drop* sessions whose discovered names don't parse and
+/// map unparseable metadata to `None` — one forged element forwarded as-is
+/// would make the entire enclosing message undeserializable for every
+/// client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub project_id: ProjectId,
@@ -33,7 +44,9 @@ pub struct SessionMeta {
     /// sandbox. Untrusted; display only.
     pub agent: Option<String>,
     /// Creation time in unix epoch seconds, as advertised by the sandbox.
-    /// Untrusted; display only.
+    /// Untrusted; display only. Senders must map unparseable or
+    /// out-of-range discovered values to `None` rather than forwarding
+    /// them — a non-numeric forged value would fail the whole message.
     pub created_at: Option<u64>,
     /// Workspace (worktree) path, as advertised by the sandbox. Untrusted;
     /// display only.
@@ -58,7 +71,6 @@ pub struct SpawnSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentId, ProjectId, SessionId};
 
     fn meta() -> SessionMeta {
         SessionMeta {
@@ -94,6 +106,31 @@ mod tests {
         let m: SessionMeta = serde_json::from_str(json).expect("deserialize");
         assert_eq!(m.state, SessionState::Stopped);
         assert_eq!(m.agent, None);
+    }
+
+    #[test]
+    fn discovered_metadata_tolerates_absent_keys() {
+        // Senders may omit absent fields entirely rather than sending null.
+        let json = r#"{"project_id":"api","session_id":"fix-login","state":"live"}"#;
+        let m: SessionMeta = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(m.agent, None);
+        assert_eq!(m.created_at, None);
+        assert_eq!(m.workspace_path, None);
+    }
+
+    #[test]
+    fn unknown_fields_are_ignored_for_forward_compat() {
+        // A newer peer may add fields; older clients must keep parsing.
+        let json = r#"{"project_id":"api","session_id":"fix-login","state":"live","agent":null,"created_at":null,"workspace_path":null,"future_field":true}"#;
+        let m: SessionMeta = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(m.state, SessionState::Live);
+    }
+
+    #[test]
+    fn spawn_spec_tolerates_absent_agent_key() {
+        let json = r#"{"project_id":"api","session_id":"fix-login"}"#;
+        let spec: SpawnSpec = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(spec.agent, None);
     }
 
     #[test]
