@@ -5,29 +5,18 @@
 //! WebSocket (relay mode). Keeping this crate dependency-light is deliberate:
 //! it is the contract third-party clients build against.
 
-use serde::{Deserialize, Serialize};
+mod channel;
+mod id;
+mod session;
 
-/// Identifies one session on the sandbox: a workspace (git worktree, or the
-/// project directory in shared mode) that is live while its named tmux
-/// session exists and stopped when only the worktree survives.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SessionId(pub String);
+pub use channel::{ChannelInput, ChannelOutput, InvalidTerminalSizeError, TerminalSize};
+pub use id::{AgentId, InvalidIdError, ProjectId, SessionId, MAX_ID_LEN};
+pub use session::{SessionMeta, SessionState, SpawnSpec};
 
-impl std::fmt::Display for SessionId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn session_id_round_trips_through_json() {
-        let id = SessionId("remora-feature-x".to_string());
-        let json = serde_json::to_string(&id).expect("serialize");
-        let back: SessionId = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(id, back);
-    }
-}
+/// Version of the wire format defined by this crate.
+///
+/// Externally tagged serde enums reject unknown variants, so growing any
+/// message enum (or changing a representation) is a breaking change: bump
+/// this constant and gate compatibility on it. The tmux naming and worktree
+/// conventions of ADR-0004 version alongside it.
+pub const PROTOCOL_VERSION: u32 = 0;

@@ -1,0 +1,29 @@
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+language: "en-US"
+
+reviews:
+  profile: "chill"
+  high_level_summary: true
+  poem: false
+  auto_review:
+    enabled: true
+  path_filters:
+    - "!**/pnpm-lock.yaml"
+    - "!**/Cargo.lock"
+  path_instructions:
+    - path: "crates/**"
+      instructions: |
+        Rust workspace shared by all clients and the future relay.
+        CI already enforces rustfmt and clippy with warnings-as-errors, and
+        unsafe_code is denied workspace-wide — skip style nits and focus on
+        logic, API design, and wire-format compatibility.
+        remora-core and remora-protocol must stay agent-agnostic: the coding
+        agent is an opaque interactive CLI in a PTY. Flag anything that bakes
+        Claude-specific (or any agent-specific) knowledge into these crates.
+    - path: "apps/desktop/**"
+      instructions: |
+        Tauri 2 app (React + TypeScript frontend, Rust shell). Biome enforces
+        formatting and lint — skip style nits.
+        UI code must never talk to ssh/kubectl or any transport directly;
+        everything goes through the SessionSource trait in remora-core. Flag
+        any change that makes the UI transport-aware.
