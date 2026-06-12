@@ -18,15 +18,21 @@ pub const CHANNEL_CAPACITY: usize = 256;
 /// [`SourceError::ChannelClosed`] and [`recv`](Self::recv) returns `None`.
 /// There is no close or detach call (spine spike: channel death is only
 /// observable locally).
+#[derive(Debug)]
 pub struct SessionChannel {
+    /// Caller → PTY. `Sender` is `Clone`: a kept clone holds the input side
+    /// open past this struct's drop.
     pub input: mpsc::Sender<ChannelInput>,
+    /// PTY → caller.
     pub output: mpsc::Receiver<ChannelOutput>,
 }
 
 impl SessionChannel {
     /// Creates a connected pair: the caller-facing channel plus the
     /// transport-facing ends (input receiver, output sender). Transports
-    /// keep the latter two and drop them to signal death.
+    /// keep the latter two and must drop *both* together to signal death —
+    /// dropping only one leaves a half-dead channel (sends succeed into a
+    /// queue nobody drains, or `recv` ends while input lingers).
     pub fn pair() -> (
         Self,
         mpsc::Receiver<ChannelInput>,
@@ -69,22 +75,27 @@ impl SessionChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use remora_protocol::{ChannelInput, ChannelOutput, TerminalSize};
 
     #[tokio::test]
     async fn helpers_wrap_protocol_messages() {
-        let (channel, mut transport_input, transport_output) = SessionChannel::pair();
+        let (mut channel, mut transport_input, transport_output) = SessionChannel::pair();
+        assert_eq!(channel.input.max_capacity(), CHANNEL_CAPACITY);
+        assert_eq!(transport_output.max_capacity(), CHANNEL_CAPACITY);
 
-        channel.send_bytes(b"hi".to_vec()).await.expect("send bytes");
+        // Bytes then resize back-to-back: resize rides the input queue, so
+        // the transport must see them in send order.
+        let size = TerminalSize::new(30, 100).expect("nonzero size");
+        channel
+            .send_bytes(b"hi".to_vec())
+            .await
+            .expect("send bytes");
+        channel.resize(size).await.expect("send resize");
         let Some(ChannelInput::Bytes(bytes)) = transport_input.recv().await else {
-            panic!("expected bytes input");
+            panic!("expected bytes input first");
         };
         assert_eq!(bytes, b"hi");
-
-        let size = TerminalSize::new(30, 100).expect("nonzero size");
-        channel.resize(size).await.expect("send resize");
         let Some(ChannelInput::Resize(got)) = transport_input.recv().await else {
-            panic!("expected resize input");
+            panic!("expected resize input second");
         };
         assert_eq!(got, size);
 
@@ -92,7 +103,6 @@ mod tests {
             .send(ChannelOutput::Bytes(b"out".to_vec()))
             .await
             .expect("transport send");
-        let mut channel = channel;
         let Some(ChannelOutput::Bytes(bytes)) = channel.recv().await else {
             panic!("expected bytes output");
         };
