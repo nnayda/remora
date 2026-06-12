@@ -1,0 +1,16 @@
+[package]
+name = "remora-core"
+description = "Session model and transport seam (SessionSource) for Remora"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+remora-protocol = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

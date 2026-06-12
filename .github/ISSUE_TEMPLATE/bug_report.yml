@@ -1,0 +1,52 @@
+name: Bug report
+description: Something doesn't work the way it should.
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: |
+        1. Opened a session against my sandbox
+        2. Closed the laptop lid, reopened
+        3. Expected the session to re-attach; instead got …
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Desktop app (UI)
+        - Session / transport (ssh, kubectl exec)
+        - Protocol
+        - Build / CI
+        - Docs
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform and version
+      description: OS + Remora version (or commit hash if built from source).
+      placeholder: macOS 15.5, Remora 0.1.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: sandbox
+    attributes:
+      label: Sandbox setup
+      description: How do you reach your sandbox? (ssh / kubectl exec, anything unusual about the environment)
+      placeholder: kubectl exec into a long-lived pod; tmux 3.4; claude 1.x
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      description: Any relevant logs or error output. Redact hostnames and credentials.
+      render: text

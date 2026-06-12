@@ -1,0 +1,15 @@
+[package]
+name = "remora-protocol"
+description = "Wire protocol types shared by Remora clients, the direct transport, and the optional relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

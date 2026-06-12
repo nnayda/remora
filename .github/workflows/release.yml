@@ -1,0 +1,62 @@
+name: Release
+
+# Builds desktop bundles on a version tag and attaches them to a draft
+# GitHub Release. Publishing the release is a manual step after checking
+# the artifacts.
+#
+# Code signing and notarization are not wired up yet (pre-alpha — no
+# certificates). When they are, the signing secrets get added here; see
+# https://v2.tauri.app/distribute/ for the macOS/Windows specifics.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest # arm64 (Apple Silicon)
+            args: --target aarch64-apple-darwin
+          - platform: macos-latest # x86_64 (Intel)
+            args: --target x86_64-apple-darwin
+          - platform: windows-latest
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: Remora ${{ github.ref_name }}
+          releaseDraft: true
+          prerelease: true
+          args: ${{ matrix.args }}
