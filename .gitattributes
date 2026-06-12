@@ -1,0 +1,14 @@
+# Normalize all text files to LF in the repository and on checkout, so
+# Windows contributors and the windows-latest release runner produce the
+# same bytes as everyone else.
+* text=auto eol=lf
+
+# Tauri app icons and other images are binary — never diff or normalize.
+*.png binary
+*.ico binary
+*.icns binary
+
+# Lockfiles are machine-generated: hide them by default in PR diffs.
+# (Leave merge as text — pnpm and cargo can both repair conflicted lockfiles.)
+pnpm-lock.yaml linguist-generated
+Cargo.lock linguist-generated

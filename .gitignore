@@ -1,0 +1,20 @@
+# Node
+node_modules/
+dist/
+
+# Rust
+/target/
+
+# Tauri
+apps/desktop/src-tauri/gen/schemas
+
+# Editors / OS
+.DS_Store
+*.swp
+.idea/
+
+# Logs
+*.log
+
+# Local notes / agent session artifacts (not published)
+notes/

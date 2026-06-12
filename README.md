@@ -1,0 +1,76 @@
+# Remora
+
+**Persistent remote coding-agent sessions, from any device.**
+
+Remora is a cross-platform client for native coding-agent CLIs — Claude Code
+first, Codex and others by design — running on a remote sandbox. Each coding
+session is a tab; each tab is a git worktree plus a tmux session on your
+sandbox. Close the laptop mid-task, reopen it — or open your phone — and the
+agent is still running, exactly where you left it.
+
+> **Status: pre-alpha.** The scaffold is in place; the app is not yet usable.
+> See [docs/VISION.md](docs/VISION.md) for where this is going.
+
+## Why
+
+- **The agent never runs on your device.** The agent, the checked-out code, and
+  every tool call live in a disposable remote sandbox (Kubernetes pod, VPS,
+  container). If the agent goes off the rails, the blast radius is a container —
+  not the machine holding your SSH keys and browser cookies.
+- **Persistence is borrowed, not invented.** The agent runs under tmux on the
+  sandbox. Reconnect is "open a channel → `tmux attach` → repaint". No custom
+  daemon to install on your infrastructure.
+- **Your agent, not our agent.** Remora drives the agent's native interactive
+  TUI through a real PTY — no SDK, no API keys, no reimplemented UI. Claude
+  Code is the first supported agent; nothing in the core assumes it.
+- **One codebase, every platform.** Tauri 2 targets macOS, Windows, iOS, and
+  Android from a single UI.
+
+## How it works
+
+```
+DIRECT MODE (default, zero infra)
+  App ──ssh / kubectl exec──► sandbox (tmux: one session per worktree)
+
+RELAY MODE (opt-in, enables phone-from-anywhere + push notifications)
+  App   ──WS──► relay ──ssh / kubectl exec──► sandbox (tmux)
+  Phone ──WS──┘
+```
+
+The UI always talks to a `SessionSource` — in direct mode it drives
+`ssh`/`kubectl exec` in-process; in relay mode the same interface is hosted
+behind a WebSocket. Your sandbox only needs `tmux`, `git`, and your agent's
+CLI.
+
+## Repository layout
+
+| Path | What it is |
+| --- | --- |
+| `apps/desktop` | Tauri 2 desktop app (React + TypeScript frontend, Rust shell) |
+| `crates/remora-core` | Session model and the `SessionSource` transport seam |
+| `crates/remora-protocol` | Wire protocol types shared by clients and the future relay |
+| `docs/` | Vision, architecture notes, ADRs |
+
+## Developing
+
+See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for prerequisites and the full
+workflow. Short version:
+
+```sh
+pnpm install
+pnpm dev        # tauri dev (desktop app)
+pnpm test       # frontend tests
+cargo test      # rust tests
+pnpm lint       # biome
+cargo clippy --workspace --all-targets
+```
+
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Security
+issues go through [SECURITY.md](SECURITY.md), please don't open public issues
+for those.
+
+## License
+
+[AGPL-3.0-only](LICENSE).
