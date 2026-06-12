@@ -77,6 +77,8 @@ with reconnect as the headline.
 ## Feature surface (v1)
 
 - Tabbed window, one tab per session.
+- Sidebar organizing configured hosts and their projects, with live session
+  state ([ADR-0004](adr/0004-local-config-live-session-discovery.md)).
 - One-click session spawn (worktree + tmux + agent on the sandbox).
 - Embedded terminal rendering the agent's native TUI via PTY.
 - Seamless reconnect from the same or any reachable machine (direct mode).
@@ -145,8 +147,9 @@ project from day one:
   signal from the agent itself? Whatever the mechanism, the heuristics are
   per-agent adapter data, not core code
   ([ADR-0003](adr/0003-agent-agnostic-sessions.md)).
-- **Worktree/branch hygiene:** naming, cleanup of stale worktrees and tmux
-  sessions, and what happens when the pod restarts (tmux dies with it —
-  surface clearly and offer respawn).
+- **Worktree/branch hygiene:** naming and cleanup of stale worktrees and
+  tmux sessions. (The pod-restart half is decided: surviving worktrees
+  surface as *stopped* with one-click respawn —
+  [ADR-0004](adr/0004-local-config-live-session-discovery.md).)
 - **Relay auth:** simplest secure pairing for desktop ⇄ phone ⇄ relay —
   pairing code, OIDC, or shared token?
