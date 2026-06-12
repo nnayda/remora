@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **Node.js** ≥ 20.19 and **pnpm** 10 (`corepack enable` will pick up the
+- **Node.js** ≥ 24 and **pnpm** 11 (`corepack enable` will pick up the
   pinned version from `package.json`).
 - **Rust** stable via [rustup](https://rustup.rs) — the exact toolchain and
   components (`rustfmt`, `clippy`) come from `rust-toolchain.toml`
