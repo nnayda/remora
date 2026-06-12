@@ -13,10 +13,18 @@ use crate::{SessionChannel, SourceError};
 pub trait SessionSource: Send + Sync {
     /// Creates a new session per the spec and opens a channel to it.
     ///
-    /// Fails closed with [`SourceError::SessionExists`] if the session
-    /// already exists in any state; tmux-name uniqueness is the anti-race
-    /// lock (ADR-0004). Respawning a *stopped* session is discovery-layer
-    /// logic, not a spawn variant.
+    /// Fails closed with [`SourceError::SessionExists`] if a *live* session
+    /// already holds the name — tmux-name uniqueness is the anti-race lock
+    /// (ADR-0004). Whether a *stopped* session (surviving worktree, no tmux
+    /// session) also blocks spawn is implementation-defined: the in-process
+    /// fake reports `SessionExists` for it, but a real transport can only
+    /// detect it with a separate, non-atomic worktree check. Respawning a
+    /// stopped session is discovery-layer logic (roadmap stage 6), not a
+    /// spawn variant.
+    ///
+    /// Not cancellation-safe: dropping the returned future mid-flight may
+    /// leave the session created without the caller learning of it —
+    /// recover via [`list`](Self::list).
     async fn spawn(&self, spec: SpawnSpec) -> Result<SessionChannel, SourceError>;
 
     /// Opens a channel to an existing *live* session.
@@ -33,6 +41,8 @@ pub trait SessionSource: Send + Sync {
     /// Discovers sessions and their liveness without attaching.
     ///
     /// Never inferred from PTY bytes — listing is a separate control plane
-    /// (spine spike).
+    /// (spine spike). Order is unspecified; callers that render a stable
+    /// list must sort. (The fake sorts by `(project_id, session_id)` for
+    /// test determinism, but transports need not.)
     async fn list(&self) -> Result<Vec<SessionMeta>, SourceError>;
 }

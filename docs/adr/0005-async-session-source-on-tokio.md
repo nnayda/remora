@@ -30,6 +30,9 @@ pairs of `remora-protocol` messages** rather than a trait:
   caller observes send errors / `recv() == None`. No close, detach, or
   state-change notification exists, matching the spike's finding that
   disconnect semantics are per-transport and never remotely observable.
+- The queue bound counts *messages*, not bytes; capping each `Bytes`
+  payload is the sending transport's framing obligation. The bound is only
+  meaningful when both hold.
 - Transports own their internal blocking I/O threads and bridge them to
   the mpsc pair; nothing in core blocks the runtime.
 - `remora-core` takes tokio with the `sync` and `rt` features only.
@@ -68,3 +71,10 @@ What becomes harder, and what we are committed to:
 - Transports must never block the runtime; their blocking I/O lives on
   dedicated threads they own and reap. CI cannot see a violation — review
   must.
+- "Backpressure" does not extend to the PTY itself: a PTY cannot be paused.
+  When the output queue fills (a stalled or backgrounded consumer), a
+  transport must decide its own overflow policy — block its reader (and
+  risk stalling the remote agent) or drop output (tmux repaint-on-reattach
+  recovers screen state). The seam does not mandate one; each transport
+  documents its choice. The fake parks on `output.send` (the blocking
+  variant), which is the simplest, not the recommended, policy.

@@ -10,7 +10,7 @@
 //! observed geometry.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use remora_protocol::{
@@ -28,8 +28,10 @@ use crate::{SessionChannel, SessionSource, SourceError};
 /// `tokio::spawn` and panic outside one.
 #[derive(Default)]
 pub struct FakeSessionSource {
-    sessions: Mutex<HashMap<(ProjectId, SessionId), FakeSession>>,
+    sessions: Mutex<Registry>,
 }
+
+type Registry = HashMap<(ProjectId, SessionId), FakeSession>;
 
 struct FakeSession {
     state: SessionState,
@@ -40,20 +42,34 @@ struct FakeSession {
     channels: Vec<JoinHandle<()>>,
 }
 
+impl FakeSession {
+    /// Aborts every open channel task, dropping their transport ends.
+    fn kill_channels(&mut self) {
+        for task in self.channels.drain(..) {
+            task.abort();
+        }
+    }
+}
+
 impl FakeSessionSource {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Locks the registry, recovering from poisoning: the fake backs UI
+    /// dev sessions, so one panicked accessor must not wedge every later
+    /// call, and no invariant spans the lock.
+    fn lock_sessions(&self) -> MutexGuard<'_, Registry> {
+        self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Simulates a sandbox restart: tmux dies (open channels die with it),
     /// the workspace survives, the session surfaces as *stopped*.
     pub fn stop_session(&self, project_id: &ProjectId, session_id: &SessionId) {
-        let mut sessions = self.sessions.lock().expect("sessions lock");
+        let mut sessions = self.lock_sessions();
         if let Some(session) = sessions.get_mut(&(project_id.clone(), session_id.clone())) {
             session.state = SessionState::Stopped;
-            for task in session.channels.drain(..) {
-                task.abort();
-            }
+            session.kill_channels();
         }
     }
 
@@ -61,21 +77,27 @@ impl FakeSessionSource {
     /// itself stays live and re-attachable. Output already buffered in a
     /// channel's queue is still delivered before `recv` reports death.
     pub fn kill_channels(&self, project_id: &ProjectId, session_id: &SessionId) {
-        let mut sessions = self.sessions.lock().expect("sessions lock");
+        let mut sessions = self.lock_sessions();
         if let Some(session) = sessions.get_mut(&(project_id.clone(), session_id.clone())) {
-            for task in session.channels.drain(..) {
-                task.abort();
-            }
+            session.kill_channels();
         }
     }
 
     /// Resize messages the session has observed, across all its channels.
-    /// Order between concurrent channels is not guaranteed.
+    /// Order between concurrent channels is not guaranteed. Grows for the
+    /// session's lifetime — a test-scoped observation surface, not a model
+    /// of real transport state.
     pub fn resizes(&self, project_id: &ProjectId, session_id: &SessionId) -> Vec<TerminalSize> {
-        let sessions = self.sessions.lock().expect("sessions lock");
+        let sessions = self.lock_sessions();
         sessions
             .get(&(project_id.clone(), session_id.clone()))
-            .map(|session| session.resizes.lock().expect("resizes lock").clone())
+            .map(|session| {
+                session
+                    .resizes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+            })
             .unwrap_or_default()
     }
 }
@@ -102,7 +124,10 @@ async fn run_echo(
                 }
             }
             ChannelInput::Resize(size) => {
-                resizes.lock().expect("resizes lock").push(size);
+                resizes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(size);
             }
             // ChannelInput is #[non_exhaustive]; ignore unknown messages.
             _ => {}
@@ -114,7 +139,7 @@ async fn run_echo(
 impl SessionSource for FakeSessionSource {
     async fn spawn(&self, spec: SpawnSpec) -> Result<SessionChannel, SourceError> {
         let key = (spec.project_id, spec.session_id);
-        let mut sessions = self.sessions.lock().expect("sessions lock");
+        let mut sessions = self.lock_sessions();
         if sessions.contains_key(&key) {
             return Err(SourceError::SessionExists {
                 project_id: key.0,
@@ -142,7 +167,7 @@ impl SessionSource for FakeSessionSource {
         session_id: &SessionId,
     ) -> Result<SessionChannel, SourceError> {
         let key = (project_id.clone(), session_id.clone());
-        let mut sessions = self.sessions.lock().expect("sessions lock");
+        let mut sessions = self.lock_sessions();
         let not_found = || SourceError::SessionNotFound {
             project_id: project_id.clone(),
             session_id: session_id.clone(),
@@ -167,7 +192,7 @@ impl SessionSource for FakeSessionSource {
     }
 
     async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
-        let sessions = self.sessions.lock().expect("sessions lock");
+        let sessions = self.lock_sessions();
         let mut metas: Vec<SessionMeta> = sessions
             .iter()
             .map(|((project_id, session_id), session)| SessionMeta {
@@ -364,5 +389,98 @@ mod tests {
         channel.send_bytes(b"via dyn".to_vec()).await.expect("send");
         assert_eq!(recv_bytes(&mut channel).await, b"via dyn");
         assert_eq!(source.list().await.expect("list").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn spawn_fails_closed_on_stopped_session() {
+        let source = FakeSessionSource::new();
+        source.spawn(spec("api", "fix-login")).await.expect("spawn");
+        let (project, session) = ids("api", "fix-login");
+        source.stop_session(&project, &session);
+        // A stopped session still occupies the name (ADR-0004 fail-closed).
+        let err = source
+            .spawn(spec("api", "fix-login"))
+            .await
+            .expect_err("stopped session still occupies the name");
+        assert!(matches!(err, SourceError::SessionExists { .. }));
+    }
+
+    #[tokio::test]
+    async fn list_orders_sessions_deterministically() {
+        let source = FakeSessionSource::new();
+        source.spawn(spec("web", "zeta")).await.expect("spawn");
+        source.spawn(spec("api", "fix-login")).await.expect("spawn");
+        source.spawn(spec("api", "add-tests")).await.expect("spawn");
+        let listed = source.list().await.expect("list");
+        let keys: Vec<(&str, &str)> = listed
+            .iter()
+            .map(|m| (m.project_id.as_str(), m.session_id.as_str()))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![("api", "add-tests"), ("api", "fix-login"), ("web", "zeta")]
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_session_kills_open_channels() {
+        let source = FakeSessionSource::new();
+        let mut channel = source.spawn(spec("api", "fix-login")).await.expect("spawn");
+        let (project, session) = ids("api", "fix-login");
+
+        source.stop_session(&project, &session);
+        assert!(channel.recv().await.is_none());
+        let err = channel
+            .send_bytes(b"x".to_vec())
+            .await
+            .expect_err("dead channel");
+        assert!(matches!(err, SourceError::ChannelClosed));
+    }
+
+    #[tokio::test]
+    async fn kill_channels_delivers_buffered_output_before_death() {
+        let source = FakeSessionSource::new();
+        let mut channel = source.spawn(spec("api", "fix-login")).await.expect("spawn");
+        let (project, session) = ids("api", "fix-login");
+
+        // Round-trip so the echo of the payload is queued in the output
+        // channel before we kill it; the buffered bytes survive the abort.
+        channel
+            .send_bytes(b"buffered".to_vec())
+            .await
+            .expect("send");
+        tokio::task::yield_now().await;
+        source.kill_channels(&project, &session);
+        assert_eq!(recv_bytes(&mut channel).await, b"buffered");
+        assert!(channel.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn inherent_helpers_are_noops_for_unknown_sessions() {
+        let source = FakeSessionSource::new();
+        let (project, session) = ids("api", "ghost");
+        source.stop_session(&project, &session);
+        source.kill_channels(&project, &session);
+        assert!(source.resizes(&project, &session).is_empty());
+        assert!(source.list().await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_input_queue_exerts_backpressure() {
+        use remora_protocol::ChannelInput;
+
+        // No echo task drains this pair, so the input queue fills and the
+        // (CAPACITY + 1)th try_send is rejected — the bound counts messages.
+        let (channel, _input_rx, _output_tx) = crate::SessionChannel::pair();
+        for _ in 0..crate::CHANNEL_CAPACITY {
+            channel
+                .input
+                .try_send(ChannelInput::Bytes(vec![0]))
+                .expect("queue not yet full");
+        }
+        assert!(matches!(
+            channel.input.try_send(ChannelInput::Bytes(vec![0])),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+        ));
     }
 }

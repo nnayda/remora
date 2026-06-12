@@ -8,6 +8,10 @@ use crate::SourceError;
 /// Queue depth for each direction of a [`SessionChannel`].
 ///
 /// Bounded so a PTY firehose exerts backpressure instead of growing memory.
+/// The bound counts *messages*, not bytes — capping the size of each
+/// `Bytes` payload is the sending transport's framing obligation (see the
+/// `remora-protocol` channel docs), so memory is bounded only when both
+/// hold.
 pub const CHANNEL_CAPACITY: usize = 256;
 
 /// A live two-way pipe to one session's PTY: protocol messages in, raw PTY
@@ -23,7 +27,9 @@ pub struct SessionChannel {
     /// Caller → PTY. `Sender` is `Clone`: a kept clone holds the input side
     /// open past this struct's drop.
     pub input: mpsc::Sender<ChannelInput>,
-    /// PTY → caller.
+    /// PTY → caller. The bytes are untrusted remote output destined for a
+    /// terminal emulator only — never log or render them as text without
+    /// escaping (terminal-escape injection).
     pub output: mpsc::Receiver<ChannelOutput>,
 }
 
@@ -51,6 +57,11 @@ impl SessionChannel {
     }
 
     /// Sends raw input bytes (keystrokes, pastes) to the session's PTY.
+    ///
+    /// Waits for queue space when the channel is full; a transport that
+    /// stalls without dropping its ends parks this future indefinitely.
+    /// Cancellation-unsafe: dropping the future before it completes loses
+    /// the bytes (tokio mpsc does not buffer a cancelled send).
     pub async fn send_bytes(&self, bytes: Vec<u8>) -> Result<(), SourceError> {
         self.input
             .send(ChannelInput::Bytes(bytes))
