@@ -153,3 +153,10 @@ project from day one:
   [ADR-0004](adr/0004-local-config-live-session-discovery.md).)
 - **Relay auth:** simplest secure pairing for desktop ⇄ phone ⇄ relay —
   pairing code, OIDC, or shared token?
+- **Relay configuration source:** host/project config is per-device
+  ([ADR-0004](adr/0004-local-config-live-session-discovery.md)) and the
+  phone never holds a sandbox key — so where does the relay's copy of host
+  config and credentials come from, and how is it authorized?
+- **Session display names:** sessions are never stored client-side and
+  sandbox-side metadata is untrusted — where could a user-assigned session
+  label durably live?

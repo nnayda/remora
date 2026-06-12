@@ -37,16 +37,37 @@ along the line above:
   with metadata that doesn't fit in the name (agent, creation time,
   worktree path) kept in tmux session environment variables. Config `id`s
   are therefore stable join keys: immutable once created.
+- **Ids are lower-case slugs matching `[a-z0-9-]+`.** The underscore is
+  reserved as the name separator, so `remora_<project-id>_<session-id>`
+  parses unambiguously. Session ids are minted client-side at spawn
+  (short random slugs); creation fails closed if the tmux name already
+  exists. Ids and names are never interpolated into shell strings —
+  remote commands are built as argument arrays.
+- **Everything discovered from the sandbox is untrusted input.** Anyone
+  with a shell on the sandbox — including the agent itself — can forge
+  session names and environment metadata, so discovered state drives
+  display and the config join only. Spawn and respawn take the working
+  directory and agent command exclusively from local config, validated
+  against the local project; nothing read from the sandbox is ever used
+  to construct a command.
 - **Projects declare a workspace mode.** `worktree` (git repos: each
-  session gets a fresh worktree + branch; surviving worktrees with no tmux
-  session surface as *stopped*, with one-click respawn after a pod
-  restart) or `shared` (plain directories: sessions share the path, no
-  isolation).
+  session gets a fresh worktree + branch at
+  `~/.remora/worktrees/<project-id>/<session-id>`, branch
+  `remora/<session-id>` — this path/branch convention is versioned wire
+  format alongside the tmux names, because stopped-session detection
+  depends on it; surviving worktrees with no tmux session surface as
+  *stopped*, with one-click respawn after a pod restart — respawn claims
+  a stopped worktree by creating its named tmux session first, so tmux
+  name uniqueness is the lock and a concurrent respawner attaches instead
+  of double-spawning) or `shared` (plain directories: sessions share the
+  path and the git index, so shared projects are effectively
+  single-writer — concurrent sessions can clobber each other).
 
 The sidebar renders this join — config tree × live discovery — with
-host/session state at a glance. The full design (config schema, launch
-sequence, states, UX) lives in the working spec; the durable parts are
-reflected in [ARCHITECTURE.md](../ARCHITECTURE.md).
+host/session state at a glance. Finer-grained design (config schema, launch
+sequence, UX) was worked out in a local working spec, which stays
+uncommitted per the repo's working-artifacts convention; everything durable
+lives in this ADR and [ARCHITECTURE.md](../ARCHITECTURE.md).
 
 ## Alternatives considered
 
@@ -81,9 +102,13 @@ What becomes easier:
 
 What becomes harder, and what we are committed to:
 
-- The tmux naming convention and session-environment metadata are now wire
-  format: versioned conventions, round-trip tested in `remora-core`, and
-  changed only compatibly (old sessions must still be recognized).
+- The tmux naming convention, the worktree path/branch convention, and
+  session-environment metadata are now wire format: versioned conventions,
+  round-trip tested in `remora-core`, and changed only compatibly (old
+  sessions must still be recognized).
+- Surfacing stopped worktrees creates a cleanup obligation: orphaned
+  worktrees and branches accumulate until reaped. Hygiene remains an open
+  question in VISION.md.
 - Config ids are immutable once created; the app must never offer id
   editing (renames touch only display names).
 - Discovery cost scales with configured hosts (a `tmux ls` per host on
