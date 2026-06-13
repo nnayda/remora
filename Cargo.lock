@@ -2722,8 +2722,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "remora-protocol",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
 ]
 
 [[package]]

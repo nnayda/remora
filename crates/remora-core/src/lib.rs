@@ -4,6 +4,8 @@
 //! talks to ssh/kubectl directly — it goes through a `SessionSource`
 //! implementation, which is what makes the relay an optional drop-in.
 
+pub mod config;
+
 mod channel;
 mod error;
 pub mod fake;
