@@ -443,8 +443,15 @@ mod tests {
         let mut channel = source.spawn(spec("api", "fix-login")).await.expect("spawn");
         let (project, session) = ids("api", "fix-login");
 
-        // Round-trip so the echo of the payload is queued in the output
-        // channel before we kill it; the buffered bytes survive the abort.
+        // Queue output before killing, so we exercise the buffered bytes
+        // surviving the abort. On the current-thread runtime `#[tokio::test]`
+        // uses (the crate enables no `rt-multi-thread` feature), a single
+        // `yield_now` deterministically runs the woken echo task through one
+        // recv→send cycle to its next `recv().await`, so the echo of
+        // "buffered" is in the output queue before `kill_channels` aborts the
+        // task. (Under a multi-thread runtime this would need a stronger
+        // barrier, but the property — queued output is not lost when the
+        // sender is dropped — can only be observed by leaving it unread.)
         channel
             .send_bytes(b"buffered".to_vec())
             .await
