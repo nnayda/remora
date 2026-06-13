@@ -8,9 +8,13 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 remora-protocol = { workspace = true }
-serde = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 
 [lints]
 workspace = true

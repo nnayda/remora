@@ -15,6 +15,7 @@ the old one rather than editing history (see
 | [0002](0002-tauri-single-codebase-optional-relay.md) | Build one Tauri codebase for all platforms, with an optional relay | Accepted |
 | [0003](0003-agent-agnostic-sessions.md) | Treat the agent as a pluggable interactive CLI | Accepted |
 | [0004](0004-local-config-live-session-discovery.md) | Configure hosts and projects locally, discover sessions from the sandbox | Accepted |
+| [0005](0005-async-session-source-on-tokio.md) | SessionSource is async on tokio; channels are message pipes | Accepted |
 
 ## Statuses
 
