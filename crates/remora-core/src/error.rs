@@ -1,0 +1,100 @@
+//! Errors crossing the `SessionSource` seam.
+
+use remora_protocol::{ProjectId, SessionId};
+
+/// Cap on backend detail rendered into a [`SourceError::Transport`]
+/// message, so one error cannot flood a log line.
+const MAX_TRANSPORT_DETAIL_LEN: usize = 256;
+
+/// Escapes and bounds transport detail for display. Real transports fill
+/// it from backend output (ssh/kubectl stderr), which carries
+/// remote-influenced bytes — escape control characters inside `Display`
+/// itself so no render path can leak terminal escapes (same rule as
+/// `InvalidIdError` in `remora-protocol`).
+fn escape_detail(detail: &str) -> String {
+    let mut shown: String = detail
+        .chars()
+        .take(MAX_TRANSPORT_DETAIL_LEN)
+        .flat_map(char::escape_default)
+        .collect();
+    if detail.chars().nth(MAX_TRANSPORT_DETAIL_LEN).is_some() {
+        shown.push('…');
+    }
+    shown
+}
+
+/// Error returned by [`SessionSource`](crate::SessionSource) operations and
+/// [`SessionChannel`](crate::SessionChannel) sends.
+///
+/// Small by design; grows variants in core as real transports need them
+/// (backend-specific detail stays in [`Transport`](Self::Transport)) —
+/// `#[non_exhaustive]` so downstream crates match with a wildcard arm.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SourceError {
+    /// Spawn fails closed when the session already exists — tmux name
+    /// uniqueness is the lock (ADR-0004).
+    #[error("session `{project_id}_{session_id}` already exists")]
+    SessionExists {
+        project_id: ProjectId,
+        session_id: SessionId,
+    },
+    /// The attach target does not exist or is not live.
+    #[error("session `{project_id}_{session_id}` not found")]
+    SessionNotFound {
+        project_id: ProjectId,
+        session_id: SessionId,
+    },
+    /// The channel's other end is gone. Channel death is only observable
+    /// locally (spine spike); there is no remote "detached" state.
+    #[error("channel closed")]
+    ChannelClosed,
+    /// Backend-specific failure, rendered for display. A string rather than
+    /// a nested error type so the seam stays backend-agnostic. The detail
+    /// may carry remote-influenced bytes; `Display` escapes and truncates
+    /// it, so rendering this error anywhere is safe.
+    #[error("transport error: {}", escape_detail(.0))]
+    Transport(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_messages_name_the_session() {
+        let err = SourceError::SessionExists {
+            project_id: ProjectId::new("api").expect("valid slug"),
+            session_id: SessionId::new("fix-login").expect("valid slug"),
+        };
+        assert_eq!(err.to_string(), "session `api_fix-login` already exists");
+
+        let err = SourceError::SessionNotFound {
+            project_id: ProjectId::new("api").expect("valid slug"),
+            session_id: SessionId::new("gone").expect("valid slug"),
+        };
+        assert_eq!(err.to_string(), "session `api_gone` not found");
+
+        assert_eq!(SourceError::ChannelClosed.to_string(), "channel closed");
+        assert_eq!(
+            SourceError::Transport("ssh exited".to_string()).to_string(),
+            "transport error: ssh exited"
+        );
+        let _: &dyn std::error::Error = &SourceError::ChannelClosed;
+    }
+
+    #[test]
+    fn transport_detail_is_escaped_and_truncated() {
+        // Remote-influenced control bytes must not pass through Display.
+        let err = SourceError::Transport("\x1b]0;pwn\x07x".to_string());
+        assert_eq!(err.to_string(), r"transport error: \u{1b}]0;pwn\u{7}x");
+
+        let long = "a".repeat(MAX_TRANSPORT_DETAIL_LEN + 1);
+        let shown = SourceError::Transport(long).to_string();
+        assert!(shown.ends_with('…'));
+        assert_eq!(
+            shown.len(),
+            "transport error: ".len() + MAX_TRANSPORT_DETAIL_LEN + '…'.len_utf8()
+        );
+    }
+}

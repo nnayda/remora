@@ -6,4 +6,17 @@
 
 pub mod config;
 
-pub use remora_protocol::{InvalidIdError, SessionId};
+mod channel;
+mod error;
+pub mod fake;
+mod source;
+
+pub use channel::{SessionChannel, CHANNEL_CAPACITY};
+pub use error::SourceError;
+pub use fake::FakeSessionSource;
+pub use source::SessionSource;
+
+pub use remora_protocol::{
+    AgentId, ChannelInput, ChannelOutput, InvalidIdError, InvalidTerminalSizeError, ProjectId,
+    SessionId, SessionMeta, SessionState, SpawnSpec, TerminalSize, PROTOCOL_VERSION,
+};
