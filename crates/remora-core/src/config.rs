@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub use remora_protocol::{AgentId, InvalidIdError, ProjectId};
 
@@ -18,8 +18,8 @@ pub use remora_protocol::{AgentId, InvalidIdError, ProjectId};
 /// client-side (ADR-0004) — so unlike `ProjectId`/`AgentId` this type lives
 /// in `remora-core`, not the protocol crate. Same slug grammar as every
 /// other id: lower-case `[a-z0-9-]+`, bounded length.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
-#[serde(try_from = "String")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct HostId(String);
 
 impl HostId {
@@ -152,7 +152,11 @@ pub struct Agent {
 }
 
 /// Why a config failed to load.
+///
+/// `#[non_exhaustive]`: later stages add validation rules and load-time
+/// failure modes, so downstream `match`es must keep a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     #[error("cannot read config file `{path}`: {source}")]
     Io {
@@ -171,7 +175,15 @@ pub enum ConfigError {
 }
 
 /// One semantic problem in an otherwise well-formed config file.
+///
+/// Free-form config strings carried here (`transport`, `path`) are stored
+/// pre-sanitized via [`sanitized`]: these messages are logged, so they must
+/// not relay terminal escapes or unbounded lengths from a pasted config.
+///
+/// `#[non_exhaustive]`: stages 4-6 add new validation rules, so downstream
+/// `match`es must keep a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ValidationIssue {
     #[error("host `{host}`: unknown transport `{transport}` (expected `ssh` or `kubectl`)")]
     UnknownTransport { host: HostId, transport: String },
@@ -195,6 +207,12 @@ pub enum ValidationIssue {
     },
     #[error("project `{project}`: `path` must start with `/` or `~` (got `{path}`)")]
     RelativeProjectPath { project: ProjectId, path: String },
+    #[error("project `{project}`: `{field}` {reason}")]
+    InvalidProjectField {
+        project: ProjectId,
+        field: &'static str,
+        reason: &'static str,
+    },
     #[error("project `{project}`: unknown host `{host}` (configured hosts: {known})")]
     UnknownHost {
         project: ProjectId,
@@ -207,8 +225,27 @@ pub enum ValidationIssue {
         agent: AgentId,
         known: String,
     },
-    #[error("agent `{agent}`: `command` must be a non-empty argv array")]
-    EmptyAgentCommand { agent: AgentId },
+    #[error("agent `{agent}`: `command` {reason}")]
+    InvalidAgentCommand {
+        agent: AgentId,
+        reason: &'static str,
+    },
+}
+
+/// Escapes control bytes and bounds the length of a config value echoed in
+/// an error message — the same hygiene as the protocol's `InvalidIdError`
+/// Display, because these messages end up in logs.
+fn sanitized(value: &str) -> String {
+    const MAX_ECHOED_CHARS: usize = 64;
+    let mut out: String = value
+        .chars()
+        .take(MAX_ECHOED_CHARS)
+        .flat_map(char::escape_default)
+        .collect();
+    if value.chars().nth(MAX_ECHOED_CHARS).is_some() {
+        out.push('…');
+    }
+    out
 }
 
 /// Renders configured ids for "unknown reference" messages, e.g.
@@ -224,14 +261,20 @@ fn known_list<'a>(ids: impl Iterator<Item = &'a str>) -> String {
 }
 
 fn display_issues(issues: &[ValidationIssue]) -> String {
+    // A generated config can carry thousands of issues; keep the rendered
+    // error bounded for whatever logs or displays it.
+    const MAX_DISPLAYED_ISSUES: usize = 20;
     let n = issues.len();
     let mut out = format!(
         "invalid config ({n} problem{})",
         if n == 1 { "" } else { "s" }
     );
-    for issue in issues {
+    for issue in issues.iter().take(MAX_DISPLAYED_ISSUES) {
         out.push_str("\n  - ");
         out.push_str(&issue.to_string());
+    }
+    if n > MAX_DISPLAYED_ISSUES {
+        out.push_str(&format!("\n  … and {} more", n - MAX_DISPLAYED_ISSUES));
     }
     out
 }
@@ -268,6 +311,20 @@ struct RawConfig {
     projects: BTreeMap<ProjectId, Project>,
     #[serde(default)]
     agents: BTreeMap<AgentId, Agent>,
+}
+
+/// Validates an optional display name (hosts and projects), returning the
+/// problem if there is one. Names render verbatim in the sidebar, so blank
+/// or control-character names fail at config time like every other field.
+fn check_display_name(name: Option<&str>) -> Option<&'static str> {
+    let name = name?;
+    if name.trim().is_empty() {
+        Some("must not be empty")
+    } else if name.chars().any(char::is_control) {
+        Some("must not contain control characters")
+    } else {
+        None
+    }
 }
 
 /// Records an issue for every field that is present but doesn't belong to
@@ -311,10 +368,12 @@ fn require_field(
 
 impl RawHost {
     /// Validates every *present* field's value, independent of transport:
-    /// blank strings fail loudly at config time instead of cryptically at
-    /// connect time, and a leading `-` would be parsed as a flag by
-    /// ssh/kubectl when the transport builds its argv (commands are built
-    /// from config as argument arrays, ADR-0004).
+    /// blank strings, control characters, and edge whitespace fail loudly
+    /// at config time instead of cryptically at connect time, and a leading
+    /// `-` would be parsed as a flag by ssh/kubectl when the transport
+    /// builds its argv (commands are built from config as argument arrays,
+    /// ADR-0004). Whitespace is checked before the dash so a value like
+    /// `" -oproxycommand=…"` cannot dodge the flag guard.
     fn check_field_values(&self, id: &HostId, issues: &mut Vec<ValidationIssue>) {
         let string_fields = [
             ("host", self.host.as_deref()),
@@ -328,6 +387,10 @@ impl RawHost {
             let Some(value) = value else { continue };
             let reason = if value.trim().is_empty() {
                 "must not be empty"
+            } else if value.chars().any(char::is_control) {
+                "must not contain control characters"
+            } else if value != value.trim() {
+                "must not have leading or trailing whitespace"
             } else if value.starts_with('-') {
                 "must not start with `-`"
             } else {
@@ -339,11 +402,11 @@ impl RawHost {
                 reason,
             });
         }
-        if self.port == Some(0) {
+        if let Some(reason) = check_display_name(self.name.as_deref()) {
             issues.push(ValidationIssue::InvalidHostField {
                 host: id.clone(),
-                field: "port",
-                reason: "must be between 1 and 65535",
+                field: "name",
+                reason,
             });
         }
     }
@@ -366,6 +429,16 @@ impl RawHost {
                     ],
                     issues,
                 );
+                // Range-checked only here, where `port` belongs: on other
+                // transports it is already reported as foreign, and a
+                // second "pick a valid port" message would contradict it.
+                if self.port == Some(0) {
+                    issues.push(ValidationIssue::InvalidHostField {
+                        host: id.clone(),
+                        field: "port",
+                        reason: "must be between 1 and 65535",
+                    });
+                }
                 require_field(id, "ssh", "host", self.host, issues).map(|host| {
                     Transport::Ssh(SshHost {
                         host,
@@ -397,7 +470,7 @@ impl RawHost {
             other => {
                 issues.push(ValidationIssue::UnknownTransport {
                     host: id.clone(),
-                    transport: other.to_string(),
+                    transport: sanitized(other),
                 });
                 None
             }
@@ -451,17 +524,56 @@ impl Config {
                     known: known_agents.clone(),
                 });
             }
-            if !(project.path.starts_with('/') || project.path.starts_with('~')) {
+            let path = project.path.as_str();
+            if !(path.starts_with('/') || path.starts_with('~')) {
                 issues.push(ValidationIssue::RelativeProjectPath {
                     project: id.clone(),
-                    path: project.path.clone(),
+                    path: sanitized(path),
+                });
+            } else if path.chars().any(char::is_control) {
+                issues.push(ValidationIssue::InvalidProjectField {
+                    project: id.clone(),
+                    field: "path",
+                    reason: "must not contain control characters",
+                });
+            } else if path != "~" && path.starts_with('~') && !path.starts_with("~/") {
+                // Transports only promise `~/` expansion (ADR-0004); a
+                // `~user` form would be silently mangled, so fail closed
+                // until a transport actually supports it.
+                issues.push(ValidationIssue::InvalidProjectField {
+                    project: id.clone(),
+                    field: "path",
+                    reason: "must start with `/`, `~`, or `~/` (`~user` paths are not supported)",
+                });
+            }
+            if let Some(reason) = check_display_name(project.name.as_deref()) {
+                issues.push(ValidationIssue::InvalidProjectField {
+                    project: id.clone(),
+                    field: "name",
+                    reason,
                 });
             }
         }
 
         for (id, agent) in &raw.agents {
-            if agent.command.is_empty() || agent.command.iter().any(String::is_empty) {
-                issues.push(ValidationIssue::EmptyAgentCommand { agent: id.clone() });
+            let reason = if agent.command.is_empty()
+                || agent.command.iter().any(|arg| arg.trim().is_empty())
+            {
+                Some("must be a non-empty argv array without blank elements")
+            } else if agent
+                .command
+                .iter()
+                .any(|arg| arg.chars().any(char::is_control))
+            {
+                Some("must not contain control characters")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                issues.push(ValidationIssue::InvalidAgentCommand {
+                    agent: id.clone(),
+                    reason,
+                });
             }
         }
 
@@ -478,12 +590,36 @@ impl Config {
     }
 
     /// Reads and parses the config file at `path`.
+    ///
+    /// Refuses non-regular files (a FIFO at the config path would block a
+    /// desktop app forever) and files over [`MAX_CONFIG_BYTES`] — a config
+    /// is hand-written; anything that size is the wrong file.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        /// Upper bound on a plausible hand-edited config file.
+        const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
         let path = path.as_ref();
-        let input = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        let io_err = |source: std::io::Error| ConfigError::Io {
             path: path.to_path_buf(),
             source,
-        })?;
+        };
+        let meta = std::fs::metadata(path).map_err(io_err)?;
+        if !meta.is_file() {
+            return Err(io_err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file",
+            )));
+        }
+        if meta.len() > MAX_CONFIG_BYTES {
+            return Err(io_err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "file is {} bytes; refusing to read more than {MAX_CONFIG_BYTES}",
+                    meta.len()
+                ),
+            )));
+        }
+        let input = std::fs::read_to_string(path).map_err(io_err)?;
         Self::from_toml_str(&input)
     }
 }
@@ -915,11 +1051,207 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("remora-config-test-{}.toml", std::process::id()));
         std::fs::write(&path, FULL).expect("write temp config");
-        let config = Config::load(&path).expect("load temp config");
+        // Hold the result so the temp file is removed even when the
+        // assertions below panic.
+        let result = Config::load(&path);
         std::fs::remove_file(&path).ok();
+        let config = result.expect("load temp config");
         assert_eq!(config.hosts.len(), 2);
         assert_eq!(config.projects.len(), 1);
         assert_eq!(config.agents.len(), 1);
+    }
+
+    #[test]
+    fn load_caps_config_file_size() {
+        let path = std::env::temp_dir().join(format!(
+            "remora-config-test-huge-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "#".repeat(2 * 1024 * 1024)).expect("write huge file");
+        let result = Config::load(&path);
+        std::fs::remove_file(&path).ok();
+        let err = result.expect_err("oversized config");
+        assert!(matches!(err, ConfigError::Io { .. }), "{err}");
+        assert!(err.to_string().contains("remora-config-test-huge"), "{err}");
+    }
+
+    #[test]
+    fn rejects_blank_agent_command_elements() {
+        // Whitespace-only argv elements are as broken as empty ones.
+        let issues = issues_of("[agents.claude]\ncommand = [\"   \"]\n");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+
+        // Control characters are never legitimate in a launch command.
+        let issues = issues_of("[agents.claude]\ncommand = [\"claude\\n--evil\"]\n");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].to_string().contains("control"), "{issues:?}");
+    }
+
+    #[test]
+    fn kubectl_optional_fields_default_to_none() {
+        let config = Config::from_toml_str(
+            "[hosts.staging]\ntransport = \"kubectl\"\npod = \"sandbox-0\"\n",
+        )
+        .expect("minimal kubectl host parses");
+        let Transport::Kubectl(k8s) = &config.hosts[&host_id("staging")].transport else {
+            panic!("staging should be kubectl");
+        };
+        assert_eq!(k8s.pod, "sandbox-0");
+        assert_eq!(k8s.namespace, None);
+        assert_eq!(k8s.context, None);
+        assert_eq!(k8s.container, None);
+    }
+
+    #[test]
+    fn rejects_port_above_65535() {
+        // Out-of-range ports fail u16 deserialization — a shape error with
+        // location info, unlike the semantic port-zero check.
+        let err = Config::from_toml_str(
+            "[hosts.devbox]\ntransport = \"ssh\"\nhost = \"devbox\"\nport = 65536\n",
+        )
+        .expect_err("out-of-range port");
+        assert!(matches!(err, ConfigError::Parse(_)), "{err}");
+        assert!(err.to_string().contains("line"), "{err}");
+    }
+
+    #[test]
+    fn host_id_enforces_length_bound() {
+        assert!(HostId::new("a".repeat(64)).is_ok());
+        assert!(HostId::new("a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn port_zero_on_kubectl_is_reported_once_as_foreign() {
+        // The port-range check must not also fire for a transport that
+        // doesn't accept `port` — one contradiction-free diagnostic.
+        let issues =
+            issues_of("[hosts.staging]\ntransport = \"kubectl\"\npod = \"sandbox-0\"\nport = 0\n");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(
+            issues[0].to_string().contains("does not apply"),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn validation_issue_display_is_escaped_and_bounded() {
+        // Config strings echoed in error messages get logged; a pasted
+        // config must not inject terminal escapes or megabytes into the
+        // log line (same hygiene as the protocol's InvalidIdError).
+        let issues = issues_of("[hosts.devbox]\ntransport = \"tel\\u001Bnet\"\n");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        let msg = issues[0].to_string();
+        assert!(!msg.contains('\u{1b}'), "raw ESC leaked: {msg:?}");
+        assert!(msg.contains("\\u{1b}"), "{msg}");
+
+        let huge_path = "a".repeat(100_000);
+        let issues = issues_of(&format!(
+            "[hosts.devbox]\ntransport = \"ssh\"\nhost = \"devbox\"\n\
+             [projects.api]\nhost = \"devbox\"\npath = \"{huge_path}\"\n\
+             workspace = \"worktree\"\nagent = \"claude\"\n\
+             [agents.claude]\ncommand = [\"claude\"]\n"
+        ));
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        let msg = issues[0].to_string();
+        assert!(
+            msg.len() < 1_000,
+            "message not bounded: {} bytes",
+            msg.len()
+        );
+        assert!(msg.contains('…'), "{msg}");
+    }
+
+    #[test]
+    fn rejects_control_characters_in_string_fields() {
+        // A newline in an ssh destination splits log lines and metadata
+        // records; never legitimate.
+        let issues = issues_of("[hosts.devbox]\ntransport = \"ssh\"\nhost = \"dev\\nbox\"\n");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].to_string().contains("control"), "{issues:?}");
+
+        let issues = issues_of(
+            "[hosts.devbox]\ntransport = \"ssh\"\nhost = \"devbox\"\n\
+             [projects.api]\nhost = \"devbox\"\npath = \"/tmp/\\u001Bevil\"\n\
+             workspace = \"worktree\"\nagent = \"claude\"\n\
+             [agents.claude]\ncommand = [\"claude\"]\n",
+        );
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].to_string().contains("control"), "{issues:?}");
+    }
+
+    #[test]
+    fn rejects_leading_or_trailing_whitespace_in_host_fields() {
+        // " -oproxycommand=..." would dodge the leading-dash guard and can
+        // become a flag the moment any layer trims or word-splits.
+        let issues =
+            issues_of("[hosts.devbox]\ntransport = \"ssh\"\nhost = \" -oproxycommand=evil\"\n");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].to_string().contains("whitespace"), "{issues:?}");
+
+        let issues = issues_of("[hosts.devbox]\ntransport = \"ssh\"\nhost = \"devbox \"\n");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+    }
+
+    #[test]
+    fn rejects_blank_or_control_display_names() {
+        let issues =
+            issues_of("[hosts.devbox]\nname = \"\"\ntransport = \"ssh\"\nhost = \"devbox\"\n");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].to_string().contains("name"), "{issues:?}");
+
+        let issues = issues_of(
+            "[hosts.devbox]\ntransport = \"ssh\"\nhost = \"devbox\"\n\
+             [projects.api]\nname = \"api\\u0007\"\nhost = \"devbox\"\npath = \"/api\"\n\
+             workspace = \"worktree\"\nagent = \"claude\"\n\
+             [agents.claude]\ncommand = [\"claude\"]\n",
+        );
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].to_string().contains("control"), "{issues:?}");
+    }
+
+    #[test]
+    fn rejects_tilde_user_paths() {
+        // Transports only promise `~/` expansion (ADR-0004 worktrees live
+        // under `~/.remora`); `~user` forms would be silently mangled.
+        let issues = issues_of(
+            "[hosts.devbox]\ntransport = \"ssh\"\nhost = \"devbox\"\n\
+             [projects.api]\nhost = \"devbox\"\npath = \"~bob/code\"\n\
+             workspace = \"worktree\"\nagent = \"claude\"\n\
+             [agents.claude]\ncommand = [\"claude\"]\n",
+        );
+        assert_eq!(issues.len(), 1, "{issues:?}");
+
+        for ok_path in ["~", "~/code", "/code"] {
+            let config = Config::from_toml_str(&format!(
+                "[hosts.devbox]\ntransport = \"ssh\"\nhost = \"devbox\"\n\
+                 [projects.api]\nhost = \"devbox\"\npath = \"{ok_path}\"\n\
+                 workspace = \"worktree\"\nagent = \"claude\"\n\
+                 [agents.claude]\ncommand = [\"claude\"]\n"
+            ))
+            .unwrap_or_else(|e| panic!("path {ok_path:?} should be valid: {e}"));
+            assert_eq!(config.projects.len(), 1);
+        }
+    }
+
+    #[test]
+    fn display_caps_the_issue_list() {
+        let mut toml = String::new();
+        for i in 0..25 {
+            toml.push_str(&format!("[hosts.h{i}]\ntransport = \"nope\"\n"));
+        }
+        let err = Config::from_toml_str(&toml).expect_err("25 broken hosts");
+        let msg = err.to_string();
+        assert!(msg.contains("25 problems"), "{msg}");
+        assert!(msg.contains("and 5 more"), "should cap listing: {msg}");
+    }
+
+    #[test]
+    fn host_id_serializes_as_plain_string() {
+        let id = HostId::new("devbox").expect("valid slug");
+        assert_eq!(
+            serde_json::to_string(&id).expect("serialize"),
+            r#""devbox""#
+        );
     }
 
     #[test]
