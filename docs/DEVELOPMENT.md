@@ -47,6 +47,29 @@ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 > `crates/`, you can iterate faster with
 > `cargo test -p remora-core -p remora-protocol`.
 
+## End-to-end ssh attach test
+
+`crates/remora-core/tests/ssh_e2e.rs` exercises a real attach against a live
+sshd + tmux. It is `#[ignore]`d so the default suite stays hermetic.
+
+To run it, create a tmux session on a reachable host and point the test at it:
+
+```sh
+# on the host:
+tmux new-session -d -s remora_demo_one
+# locally:
+REMORA_E2E_SSH_HOST=<host> REMORA_E2E_PROJECT=demo REMORA_E2E_SESSION=one \
+  cargo test -p remora-core --test ssh_e2e -- --ignored --nocapture
+```
+
+Optional environment variables (prepend to the command if needed):
+
+- `REMORA_E2E_SSH_USER=<user>`
+- `REMORA_E2E_SSH_PORT=<port>`
+
+It attaches, resizes, runs `echo remora-e2e-ok`, and asserts the marker shows
+up in the PTY stream.
+
 ## Repository layout
 
 | Path | What it is |

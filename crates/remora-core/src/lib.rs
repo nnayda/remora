@@ -5,6 +5,8 @@
 //! implementation, which is what makes the relay an optional drop-in.
 
 pub mod config;
+pub mod naming;
+pub mod transport;
 
 mod channel;
 mod error;
@@ -15,6 +17,7 @@ pub use channel::{SessionChannel, CHANNEL_CAPACITY};
 pub use error::SourceError;
 pub use fake::FakeSessionSource;
 pub use source::SessionSource;
+pub use transport::SshSource;
 
 pub use remora_protocol::{
     AgentId, ChannelInput, ChannelOutput, InvalidIdError, InvalidTerminalSizeError, ProjectId,

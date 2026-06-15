@@ -16,6 +16,7 @@ authors = ["Remora contributors"]
 
 [workspace.dependencies]
 async-trait = "0.1"
+portable-pty = "0.9"
 remora-core = { path = "crates/remora-core" }
 remora-protocol = { path = "crates/remora-protocol" }
 serde = { version = "1", features = ["derive"] }
