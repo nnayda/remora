@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod naming;
+pub mod spawn_plan;
 pub mod transport;
 
 mod channel;
@@ -17,6 +18,7 @@ pub use channel::{SessionChannel, CHANNEL_CAPACITY};
 pub use error::SourceError;
 pub use fake::FakeSessionSource;
 pub use source::SessionSource;
+pub use spawn_plan::{plan_spawn, PlanError, SpawnPlan};
 pub use transport::SshSource;
 
 pub use remora_protocol::{

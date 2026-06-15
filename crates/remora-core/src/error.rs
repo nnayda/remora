@@ -1,5 +1,6 @@
 //! Errors crossing the `SessionSource` seam.
 
+use crate::spawn_plan::PlanError;
 use remora_protocol::{ProjectId, SessionId};
 
 /// Cap on backend detail rendered into a [`SourceError::Transport`]
@@ -45,6 +46,11 @@ pub enum SourceError {
         project_id: ProjectId,
         session_id: SessionId,
     },
+    /// Spawn could not be planned from local config (unknown project or
+    /// agent). Carries the typed [`PlanError`] so the offending id survives
+    /// for display.
+    #[error("spawn could not be planned: {0}")]
+    Plan(#[from] PlanError),
     /// The channel's other end is gone. Channel death is only observable
     /// locally (spine spike); there is no remote "detached" state.
     #[error("channel closed")]
@@ -81,6 +87,14 @@ mod tests {
             "transport error: ssh exited"
         );
         let _: &dyn std::error::Error = &SourceError::ChannelClosed;
+    }
+
+    #[test]
+    fn plan_error_converts_into_source_error() {
+        let plan = PlanError::UnknownProject(ProjectId::new("ghost").expect("slug"));
+        let err: SourceError = plan.into();
+        assert!(matches!(err, SourceError::Plan(_)));
+        assert!(err.to_string().contains("ghost"));
     }
 
     #[test]
