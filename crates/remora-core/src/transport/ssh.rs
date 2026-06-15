@@ -108,6 +108,11 @@ fn ssh_base_argv(host: &SshHost, interactive: bool) -> Vec<String> {
     argv.push("ServerAliveInterval=15".into());
     argv.push("-o".into());
     argv.push("ServerAliveCountMax=3".into());
+    // Bound the connect phase so an unreachable/slow host fails fast instead
+    // of parking a spawn_blocking thread. Execution-phase hangs (a wedged
+    // remote git/tmux) are not covered — see TODOS.md (execution watchdog).
+    argv.push("-o".into());
+    argv.push("ConnectTimeout=10".into());
     if let Some(port) = host.port {
         argv.push("-p".into());
         argv.push(port.to_string());
@@ -153,15 +158,42 @@ fn worktree_add_argv(host: &SshHost, plan: &SpawnPlan) -> Vec<String> {
     argv.push("worktree".into());
     argv.push("add".into());
     argv.push("-b".into());
-    argv.push(branch.to_string());
+    argv.push(shell_quote(branch));
     argv.push(quote_remote_path(&plan.dir));
     argv
 }
 
+/// `git -C <project> worktree remove --force <worktree>` — best-effort
+/// cleanup of an orphaned worktree after a non-duplicate `new-session`
+/// failure (no live session owns it), so the project/session slot stays
+/// retryable. `--force` because the fresh worktree may have a checked-out
+/// branch and no commits yet.
+fn worktree_remove_argv(host: &SshHost, plan: &SpawnPlan) -> Vec<String> {
+    let mut argv = ssh_base_argv(host, false);
+    argv.push("git".into());
+    argv.push("-C".into());
+    argv.push(quote_remote_path(&plan.project_path));
+    argv.push("worktree".into());
+    argv.push("remove".into());
+    argv.push("--force".into());
+    argv.push(quote_remote_path(&plan.dir));
+    argv
+}
+
+/// Joins the agent argv into a single shell command line (one sh-safe
+/// string). `tmux new-session` re-runs its shell-command argument through
+/// `sh -c` — a *second* shell parse — so per-token quoting alone would be
+/// stripped before tmux sees it. Joining here (minimal per-token quoting)
+/// produces a string that `sh -c` re-parses back into the original argv.
+/// Config bans control/nul characters, so `try_join` cannot error.
+fn join_agent_command(argv: &[String]) -> String {
+    shlex::try_join(argv.iter().map(String::as_str)).expect("config bans control/nul characters")
+}
+
 /// `tmux new-session -d -s <name> -c <dir> <agent…>` — the atomic creation
 /// lock. No metadata trailer (set-environment runs separately so a metadata
-/// failure can't falsely fail a live session). Agent tokens are shell-quoted
-/// for the remote shell.
+/// failure can't falsely fail a live session). The agent command is joined
+/// and quoted as a single arg (see `join_agent_command`).
 fn new_session_argv(host: &SshHost, plan: &SpawnPlan) -> Vec<String> {
     let mut argv = ssh_base_argv(host, false);
     argv.push("tmux".into());
@@ -171,9 +203,10 @@ fn new_session_argv(host: &SshHost, plan: &SpawnPlan) -> Vec<String> {
     argv.push(plan.tmux_name.clone());
     argv.push("-c".into());
     argv.push(quote_remote_path(&plan.dir));
-    for token in &plan.agent_argv {
-        argv.push(shell_quote(token));
-    }
+    // The agent command is ONE shell-quoted arg, not one per token: the login
+    // shell strips this outer layer, then tmux's `sh -c` re-parses the inner
+    // joined string back into the intended argv (the double-shell hazard).
+    argv.push(shell_quote(&join_agent_command(&plan.agent_argv)));
     argv
 }
 
@@ -213,7 +246,7 @@ fn classify_new_session_failure(
     project_id: &ProjectId,
     session_id: &SessionId,
 ) -> SourceError {
-    if stderr.to_ascii_lowercase().contains("duplicate") {
+    if stderr.to_ascii_lowercase().contains("duplicate session") {
         SourceError::SessionExists {
             project_id: project_id.clone(),
             session_id: session_id.clone(),
@@ -278,11 +311,16 @@ fn run_spawn(
 
     let out = exec.run(&new_session_argv(host, plan))?;
     if !out.success {
-        return Err(classify_new_session_failure(
-            &out.stderr,
-            &plan.project_id,
-            &plan.session_id,
-        ));
+        let err = classify_new_session_failure(&out.stderr, &plan.project_id, &plan.session_id);
+        // A non-duplicate failure means NO session was created, so the
+        // worktree we just made is orphaned — best-effort remove it so the
+        // slot stays retryable instead of bricking until stage-6 reclaim. A
+        // duplicate (`SessionExists`) means a *live* session owns that
+        // worktree; never touch it.
+        if plan.branch.is_some() && !matches!(err, SourceError::SessionExists { .. }) {
+            let _ = exec.run(&worktree_remove_argv(host, plan));
+        }
+        return Err(err);
     }
 
     for (key, value) in &plan.env {
@@ -434,6 +472,8 @@ mod tests {
                 "ServerAliveInterval=15",
                 "-o",
                 "ServerAliveCountMax=3",
+                "-o",
+                "ConnectTimeout=10",
                 "devbox",
                 "tmux",
                 "attach-session",
@@ -577,9 +617,36 @@ mod tests {
         assert_eq!(argv[n + 3], "remora_api_fix-login");
         assert_eq!(argv[n + 4], "-c");
         assert_eq!(argv[n + 5], "\"$HOME\"/.remora/worktrees/api/fix-login");
-        assert_eq!(argv[n + 6], "claude");
-        assert_eq!(argv[n + 7], "--continue");
+        // Agent command joined into ONE shell-quoted arg (double-shell safe).
+        assert_eq!(argv[n + 6], "'claude --continue'");
+        assert!(argv.get(n + 7).is_none(), "agent command is a single arg");
         assert!(!argv.iter().any(|a| a == "set-environment" || a == ";"));
+    }
+
+    #[test]
+    fn agent_command_survives_the_double_shell() {
+        // An agent arg containing a space must survive BOTH the ssh login
+        // shell and tmux's `sh -c` re-parse of new-session's shell-command.
+        let plan = SpawnPlan {
+            agent_argv: vec![
+                "claude".into(),
+                "--append-system-prompt".into(),
+                "Be concise".into(),
+            ],
+            ..worktree_plan()
+        };
+        let argv = new_session_argv(&host("devbox", None, None), &plan);
+        let n = argv
+            .iter()
+            .position(|a| a == "new-session")
+            .expect("new-session");
+        // Exactly one agent-command arg after `-c <dir>` (joined, not per-token).
+        assert_eq!(argv.len(), n + 7);
+        // The inner joined string re-parses (via tmux's sh -c) back to the argv.
+        let inner = join_agent_command(&plan.agent_argv);
+        assert_eq!(shlex::split(&inner), Some(plan.agent_argv.clone()));
+        // The outer layer is what ssh's login shell strips to yield `inner`.
+        assert_eq!(argv[n + 6], shell_quote(&inner));
     }
 
     #[test]
@@ -807,5 +874,28 @@ mod tests {
         let err = run_spawn(&fake, &host("devbox", None, None), &plan).expect_err("should fail");
         assert!(matches!(err, SourceError::Transport(_)));
         assert!(fake.opened.lock().expect("lock").is_empty());
+        // The orphaned worktree is cleaned up so the slot stays retryable.
+        let calls = fake.calls.lock().expect("lock");
+        assert!(
+            calls.last().expect("a call").iter().any(|a| a == "remove"),
+            "non-duplicate failure removes the orphaned worktree"
+        );
+    }
+
+    #[test]
+    fn duplicate_session_does_not_remove_the_worktree() {
+        // A duplicate means a LIVE session owns the worktree — never remove it.
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()), // worktree add
+            Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
+        ]);
+        let err = run_spawn(&fake, &host("devbox", None, None), &plan).expect_err("dup");
+        assert!(matches!(err, SourceError::SessionExists { .. }));
+        let calls = fake.calls.lock().expect("lock");
+        assert!(
+            !calls.iter().any(|c| c.iter().any(|a| a == "remove")),
+            "must not remove a live session's worktree"
+        );
     }
 }
