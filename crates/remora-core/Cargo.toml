@@ -12,6 +12,7 @@ async-trait = { workspace = true }
 portable-pty = { workspace = true }
 remora-protocol = { workspace = true }
 serde = { workspace = true }
+shlex = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
 toml = { workspace = true }
