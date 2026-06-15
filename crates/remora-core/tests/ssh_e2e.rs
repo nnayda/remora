@@ -13,6 +13,8 @@
 
 use std::time::Duration;
 
+use tokio::time::Instant;
+
 use remora_core::config::SshHost;
 use remora_core::{ChannelOutput, ProjectId, SessionId, SessionSource, SshSource, TerminalSize};
 
@@ -53,9 +55,17 @@ async fn attaches_to_a_live_remote_tmux_session() {
         .await
         .expect("send");
 
+    // Total deadline across all recvs, not a per-recv timeout — otherwise a
+    // steady byte stream that never carries the marker resets the clock every
+    // iteration and the loop could run far past 10s.
     let mut acc = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
     let found = loop {
-        match tokio::time::timeout(Duration::from_secs(10), channel.recv()).await {
+        let now = Instant::now();
+        if now >= deadline {
+            break false;
+        }
+        match tokio::time::timeout(deadline - now, channel.recv()).await {
             Ok(Some(ChannelOutput::Bytes(b))) => {
                 acc.extend_from_slice(&b);
                 if acc.windows(13).any(|w| w == b"remora-e2e-ok") {

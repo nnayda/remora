@@ -58,10 +58,14 @@ To run it, create a tmux session on a reachable host and point the test at it:
 # on the host:
 tmux new-session -d -s remora_demo_one
 # locally:
-REMORA_E2E_SSH_HOST=<host> [REMORA_E2E_SSH_USER=<user>] [REMORA_E2E_SSH_PORT=<port>] \
-REMORA_E2E_PROJECT=demo REMORA_E2E_SESSION=one \
+REMORA_E2E_SSH_HOST=<host> REMORA_E2E_PROJECT=demo REMORA_E2E_SESSION=one \
   cargo test -p remora-core --test ssh_e2e -- --ignored --nocapture
 ```
+
+Optional environment variables (prepend to the command if needed):
+
+- `REMORA_E2E_SSH_USER=<user>`
+- `REMORA_E2E_SSH_PORT=<port>`
 
 It attaches, resizes, runs `echo remora-e2e-ok`, and asserts the marker shows
 up in the PTY stream.
