@@ -49,6 +49,31 @@ impl SshSource {
     }
 }
 
+/// The ssh program + connection flags shared by every command this transport
+/// runs. `interactive` adds `-tt` (force a remote PTY) for the attach; the
+/// blocking setup commands (git, tmux create) don't need it. Keepalive lets
+/// a half-open link (laptop sleep) surface as channel death in ~45s.
+fn ssh_base_argv(host: &SshHost, interactive: bool) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["ssh".into()];
+    if interactive {
+        argv.push("-tt".into());
+    }
+    argv.push("-o".into());
+    argv.push("ServerAliveInterval=15".into());
+    argv.push("-o".into());
+    argv.push("ServerAliveCountMax=3".into());
+    if let Some(port) = host.port {
+        argv.push("-p".into());
+        argv.push(port.to_string());
+    }
+    if let Some(user) = &host.user {
+        argv.push("-l".into());
+        argv.push(user.clone());
+    }
+    argv.push(host.host.clone());
+    argv
+}
+
 /// Builds the ssh argv (program + args) for attaching to `tmux_name`, as a
 /// pure `Vec<String>` so it is unit-testable without spawning anything.
 ///
@@ -60,27 +85,8 @@ impl SshSource {
 /// terminator (a trailing `--` breaks on ssh clients that don't re-parse
 /// options after the destination, e.g. Dropbear).
 fn attach_argv(host: &SshHost, tmux_name: &str) -> Vec<String> {
-    let mut argv: Vec<String> = vec![
-        "ssh".into(),
-        "-tt".into(),
-        // Detect a half-open connection (laptop sleep / wifi drop) in ~45s
-        // so the local ssh exits and the channel reports death promptly.
-        "-o".into(),
-        "ServerAliveInterval=15".into(),
-        "-o".into(),
-        "ServerAliveCountMax=3".into(),
-    ];
-    if let Some(port) = host.port {
-        argv.push("-p".into());
-        argv.push(port.to_string());
-    }
-    if let Some(user) = &host.user {
-        argv.push("-l".into());
-        argv.push(user.clone());
-    }
-    argv.push(host.host.clone());
-    // `-d` evicts every other client on attach (sequential-handoff model;
-    // co-view is a post-MVP non-goal — see the design spec).
+    let mut argv = ssh_base_argv(host, true);
+    // `-d` evicts every other client on attach (sequential-handoff model).
     argv.push("tmux".into());
     argv.push("attach-session".into());
     argv.push("-d".into());
