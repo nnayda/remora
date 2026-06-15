@@ -336,8 +336,6 @@ impl SessionSource for SshSource {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
     use crate::config::WorkspaceMode;
     use crate::spawn_plan::SpawnPlan;
@@ -376,46 +374,42 @@ mod tests {
         Arc::new(Config::from_toml_str(toml).expect("config"))
     }
 
-    /// A fake `SshExec` that records calls and returns preconfigured results.
+    /// Scripted executor: returns queued `run` results in order, records every
+    /// argv, and hands back a dead `SessionChannel` for `open_channel`.
     struct FakeExec {
-        /// Queued results for `run()` calls. Each `run()` pops from the front;
-        /// once exhausted, further calls return success with empty stderr.
-        run_results: Mutex<Vec<RemoteOutput>>,
-        /// Every argv passed to `open_channel` is recorded here.
-        pub opened: Mutex<Vec<Vec<String>>>,
+        results: std::sync::Mutex<std::collections::VecDeque<Result<RemoteOutput, SourceError>>>,
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+        opened: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
     impl FakeExec {
-        fn new(run_results: Vec<RemoteOutput>) -> Self {
+        fn new(results: Vec<Result<RemoteOutput, SourceError>>) -> Self {
             Self {
-                run_results: Mutex::new(run_results),
-                opened: Mutex::new(vec![]),
+                results: std::sync::Mutex::new(results.into_iter().collect()),
+                calls: std::sync::Mutex::new(Vec::new()),
+                opened: std::sync::Mutex::new(Vec::new()),
             }
+        }
+        fn ok() -> RemoteOutput {
+            RemoteOutput { success: true, stderr: String::new() }
+        }
+        fn fail(stderr: &str) -> RemoteOutput {
+            RemoteOutput { success: false, stderr: stderr.into() }
         }
     }
 
     impl SshExec for FakeExec {
-        fn run(&self, _argv: &[String]) -> Result<RemoteOutput, SourceError> {
-            let mut results = self.run_results.lock().expect("lock");
-            if results.is_empty() {
-                Ok(RemoteOutput {
-                    success: true,
-                    stderr: String::new(),
-                })
-            } else {
-                Ok(results.remove(0))
-            }
+        fn run(&self, argv: &[String]) -> Result<RemoteOutput, SourceError> {
+            self.calls.lock().expect("lock").push(argv.to_vec());
+            self.results
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .unwrap_or_else(|| Ok(FakeExec::ok()))
         }
-
         fn open_channel(&self, argv: &[String]) -> Result<SessionChannel, SourceError> {
             self.opened.lock().expect("lock").push(argv.to_vec());
-            // Build a disconnected channel pair and return the caller-facing
-            // SessionChannel. Dropping the transport ends makes the channel
-            // appear closed to readers, but Ok with a valid struct satisfies
-            // the type.
-            let (channel, _input_rx, _output_tx) = SessionChannel::pair();
-            drop(_input_rx);
-            drop(_output_tx);
+            let (channel, _rx, _tx) = SessionChannel::pair();
             Ok(channel)
         }
     }
@@ -640,7 +634,7 @@ mod tests {
     // --- run_spawn orchestration tests ---
 
     #[test]
-    fn run_spawn_skips_worktree_add_when_branch_is_none() {
+    fn shared_spawn_skips_worktree_add() {
         let plan = SpawnPlan {
             branch: None,
             workspace: WorkspaceMode::Shared,
@@ -649,40 +643,42 @@ mod tests {
         };
         let fake = FakeExec::new(vec![
             // Only new-session should fire; all other run() calls succeed by default.
-            RemoteOutput { success: true, stderr: String::new() },
+            Ok(FakeExec::ok()),
         ]);
         let result = run_spawn(&fake, &host("devbox", None, None), &plan);
         assert!(result.is_ok(), "{result:?}");
+        // First call must be new-session (no worktree-add).
+        let calls = fake.calls.lock().expect("lock");
+        assert!(calls[0].iter().any(|a| a == "new-session"), "first call is new-session");
+        assert!(!calls[0].iter().any(|a| a == "worktree"), "no worktree-add");
         assert_eq!(fake.opened.lock().expect("lock").len(), 1);
     }
 
     #[test]
-    fn run_spawn_returns_session_exists_when_worktree_add_fails_already_exists() {
+    fn existing_worktree_aborts_before_create() {
         let plan = worktree_plan();
-        let fake = FakeExec::new(vec![RemoteOutput {
-            success: false,
-            stderr: "fatal: '<path>' already exists".into(),
-        }]);
+        let fake = FakeExec::new(vec![Ok(FakeExec::fail("fatal: '<path>' already exists"))]);
         let err = run_spawn(&fake, &host("devbox", None, None), &plan)
             .expect_err("worktree already exists");
         assert!(matches!(err, SourceError::SessionExists { .. }), "{err}");
+        // Exactly 1 call (worktree-add), no channel opened.
+        assert_eq!(fake.calls.lock().expect("lock").len(), 1);
+        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
     }
 
     #[test]
-    fn run_spawn_returns_session_exists_when_new_session_says_duplicate() {
+    fn duplicate_session_does_not_open_a_channel() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
             // worktree add succeeds
-            RemoteOutput { success: true, stderr: String::new() },
+            Ok(FakeExec::ok()),
             // new-session fails with duplicate
-            RemoteOutput {
-                success: false,
-                stderr: "duplicate session: remora_api_fix-login".into(),
-            },
+            Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
         ]);
         let err = run_spawn(&fake, &host("devbox", None, None), &plan)
             .expect_err("duplicate session");
         assert!(matches!(err, SourceError::SessionExists { .. }), "{err}");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
     }
 
     #[test]
@@ -705,6 +701,41 @@ mod tests {
             attach_argv.last().map(String::as_str),
             Some("remora_api_fix-login")
         );
+    }
+
+    #[test]
+    fn worktree_spawn_runs_add_create_metadata_then_attaches_in_order() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()), Ok(FakeExec::ok()), Ok(FakeExec::ok()),
+            Ok(FakeExec::ok()), Ok(FakeExec::ok()), Ok(FakeExec::ok()),
+        ]);
+        let result = run_spawn(&fake, &host("devbox", None, None), &plan);
+        assert!(result.is_ok());
+        let calls = fake.calls.lock().expect("lock");
+        // worktree add, new-session, 3x set-environment, set-option = 6 blocking cmds.
+        assert_eq!(calls.len(), 6);
+        assert!(calls[0].iter().any(|a| a == "worktree"));
+        assert!(calls[1].iter().any(|a| a == "new-session"));
+        assert!(calls[2].iter().any(|a| a == "set-environment"));
+        assert!(calls[5].iter().any(|a| a == "set-option"));
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
+    #[test]
+    fn metadata_failure_is_tolerated_and_still_attaches() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                          // worktree add
+            Ok(FakeExec::ok()),                          // new-session (live!)
+            Ok(FakeExec::fail("set-env boom")),          // REMORA_AGENT — tolerated
+            Err(SourceError::Transport("net".into())),   // REMORA_WORKSPACE — tolerated
+            Ok(FakeExec::ok()),                          // REMORA_CREATED_AT
+            Ok(FakeExec::fail("opt boom")),              // remain-on-exit — tolerated
+        ]);
+        let result = run_spawn(&fake, &host("devbox", None, None), &plan);
+        assert!(result.is_ok(), "metadata failures must not fail a live session");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
     }
 
     #[tokio::test]
