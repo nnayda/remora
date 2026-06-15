@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod naming;
+pub mod transport;
 
 mod channel;
 mod error;
