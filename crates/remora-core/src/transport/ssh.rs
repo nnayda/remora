@@ -246,8 +246,9 @@ fn classify_worktree_add_failure(
 
 /// Turns a pure argv into a `CommandBuilder` (program = argv[0]).
 ///
-/// Precondition: `argv` is non-empty. The only caller feeds it
-/// [`attach_argv`], which always yields the `ssh` program plus its args.
+/// Precondition: `argv` is non-empty. Callers feed it [`attach_argv`]
+/// (via [`RealSshExec::open_channel`]), which always yields the `ssh`
+/// program plus its args.
 fn command_from_argv(argv: &[String]) -> CommandBuilder {
     debug_assert!(!argv.is_empty(), "argv must contain at least the program");
     let mut cmd = CommandBuilder::new(&argv[0]);
@@ -522,6 +523,9 @@ mod tests {
         assert_eq!(quote_remote_path("/home/dev/api"), "/home/dev/api");
         // a space in a path WOULD force quoting (defensive, not expected for slugs).
         assert_eq!(quote_remote_path("/a b"), "'/a b'");
+        // `~/` + a space: $HOME stays unquoted, the remainder is quoted, and
+        // the remote shell concatenates the two adjacent segments into one word.
+        assert_eq!(quote_remote_path("~/a b"), "\"$HOME\"'/a b'");
     }
 
     fn worktree_plan() -> SpawnPlan {
