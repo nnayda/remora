@@ -6,6 +6,18 @@
 //! two mpsc ends, so it cannot hold the child, the PTY master, or the thread
 //! handles. Dropping the channel SIGNALS teardown; the child is reaped
 //! *eventually* by the writer thread, not synchronously on drop.
+//!
+//! Teardown is asymmetric by caller activity. The caller's `recv()` returns
+//! `None` promptly when the child exits — that is driven by the *reader*
+//! thread hitting EOF, independent of caller activity. Reaping the child is
+//! the *writer* thread's job, and the writer only checks the reader's death
+//! signal before each `blocking_recv` and after each write. So an **active**
+//! caller (sending input) gets a prompt reap, while an **idle** caller's
+//! writer stays parked in `blocking_recv` until the caller sends or drops the
+//! channel (or, for ssh, until `ServerAlive*` keepalive trips). In the local
+//! case the child has already exited so nothing leaks; the lingering writer
+//! just reaps later. A `tokio::select!`-style writer is the future option if
+//! prompt idle-reap is ever required.
 
 use std::io::{Read, Write};
 use std::sync::mpsc as std_mpsc;
@@ -319,5 +331,28 @@ mod tests {
             .await
             .expect("resize accepted while live");
         drop(channel);
+    }
+
+    #[tokio::test]
+    async fn idle_caller_sees_close_on_child_exit() {
+        // The optimistic-attach scenario: a viewer attaches, the remote
+        // session is already gone, and the user types nothing. The channel
+        // must still close (recv -> None) on its own. This path is driven by
+        // the reader hitting EOF, independent of whether the caller ever
+        // sends input — so this test never calls send_bytes.
+        let mut cmd = CommandBuilder::new("printf");
+        cmd.arg("remora-bye");
+        let mut channel = spawn_pty_channel(cmd).expect("spawn");
+
+        let mut acc = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), channel.recv()).await {
+                Ok(Some(ChannelOutput::Bytes(b))) => acc.extend_from_slice(&b),
+                Ok(Some(_)) => {} // ChannelOutput is #[non_exhaustive]
+                Ok(None) => break,
+                Err(_) => panic!("idle caller never saw the channel close; got {acc:?}"),
+            }
+        }
+        assert!(acc.windows(10).any(|w| w == b"remora-bye"), "got {acc:?}");
     }
 }
