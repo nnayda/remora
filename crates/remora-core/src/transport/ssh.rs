@@ -159,6 +159,46 @@ fn set_option_remain_on_exit_argv(host: &SshHost, tmux_name: &str) -> Vec<String
     argv
 }
 
+/// Maps a failed `tmux new-session` to a `SourceError`. tmux prints
+/// `duplicate session: NAME` and exits non-zero when the name is taken; the
+/// match is case-insensitive on `duplicate` so a non-English `LC_MESSAGES`
+/// still trips the fail-closed lock. Called only on non-success.
+fn classify_new_session_failure(
+    stderr: &str,
+    project_id: &ProjectId,
+    session_id: &SessionId,
+) -> SourceError {
+    if stderr.to_ascii_lowercase().contains("duplicate") {
+        SourceError::SessionExists {
+            project_id: project_id.clone(),
+            session_id: session_id.clone(),
+        }
+    } else {
+        SourceError::Transport(stderr.to_string())
+    }
+}
+
+/// Maps a failed `git worktree add` to a `SourceError`. A leftover worktree
+/// dir or branch (from a prior stopped session) surfaces as `SessionExists`
+/// — an actionable "already exists" rather than raw git stderr — keeping ssh
+/// consistent with the fake. Reclaim/respawn is stage 6. Called only on
+/// non-success.
+fn classify_worktree_add_failure(
+    stderr: &str,
+    project_id: &ProjectId,
+    session_id: &SessionId,
+) -> SourceError {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("already exists") || lower.contains("already checked out") {
+        SourceError::SessionExists {
+            project_id: project_id.clone(),
+            session_id: session_id.clone(),
+        }
+    } else {
+        SourceError::Transport(stderr.to_string())
+    }
+}
+
 /// Turns a pure argv into a `CommandBuilder` (program = argv[0]).
 ///
 /// Precondition: `argv` is non-empty. The only caller feeds it
@@ -410,5 +450,48 @@ mod tests {
         assert_eq!(argv[o + 2], "remora_api_x");
         assert_eq!(argv[o + 3], "remain-on-exit");
         assert_eq!(argv[o + 4], "on");
+    }
+
+    fn ids() -> (ProjectId, SessionId) {
+        (
+            ProjectId::new("api").expect("slug"),
+            SessionId::new("fix-login").expect("slug"),
+        )
+    }
+
+    #[test]
+    fn dup_new_session_maps_to_session_exists_case_insensitive() {
+        let (p, s) = ids();
+        let err = classify_new_session_failure("duplicate session: remora_api_fix-login\n", &p, &s);
+        assert!(matches!(err, SourceError::SessionExists { .. }));
+        let err = classify_new_session_failure("DUPLICATE SESSION", &p, &s);
+        assert!(matches!(err, SourceError::SessionExists { .. }));
+    }
+
+    #[test]
+    fn other_new_session_failure_is_transport() {
+        let (p, s) = ids();
+        let err = classify_new_session_failure("no server running on /tmp/tmux", &p, &s);
+        assert!(matches!(err, SourceError::Transport(_)));
+    }
+
+    #[test]
+    fn existing_worktree_maps_to_session_exists() {
+        let (p, s) = ids();
+        let err = classify_worktree_add_failure("fatal: '<path>' already exists", &p, &s);
+        assert!(matches!(err, SourceError::SessionExists { .. }));
+        let err = classify_worktree_add_failure(
+            "fatal: 'remora/fix-login' is already checked out at '<path>'",
+            &p,
+            &s,
+        );
+        assert!(matches!(err, SourceError::SessionExists { .. }));
+    }
+
+    #[test]
+    fn other_worktree_failure_is_transport() {
+        let (p, s) = ids();
+        let err = classify_worktree_add_failure("fatal: not a git repository", &p, &s);
+        assert!(matches!(err, SourceError::Transport(_)));
     }
 }
