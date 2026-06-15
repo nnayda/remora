@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use remora_core::config::SshHost;
+use std::sync::Arc;
+
+use remora_core::config::{Config, SshHost};
 use remora_core::{ChannelOutput, ProjectId, SessionId, SessionSource, SshSource, TerminalSize};
 
 #[tokio::test]
@@ -41,7 +43,7 @@ async fn attaches_to_a_live_remote_tmux_session() {
     )
     .expect("valid session slug");
 
-    let source = SshSource::new(host);
+    let source = SshSource::new(host, Arc::new(Config::default()));
     let mut channel = source.attach(&project, &session).await.expect("attach");
 
     // Drive a resize, then a shell command, and expect to see its marker in

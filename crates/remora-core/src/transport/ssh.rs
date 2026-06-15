@@ -1,14 +1,16 @@
 //! `SshSource` — the first real transport. Builds the ssh argv from a
 //! validated `SshHost` and delegates to the PTY-process bridge.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use portable_pty::CommandBuilder;
 use remora_protocol::{ProjectId, SessionId, SessionMeta, SpawnSpec};
 
 use super::pty_process::spawn_pty_channel;
-use crate::config::SshHost;
+use crate::config::{Config, SshHost};
 use crate::naming::tmux_session_name;
-use crate::spawn_plan::SpawnPlan;
+use crate::spawn_plan::{plan_spawn, SpawnPlan};
 use crate::{SessionChannel, SessionSource, SourceError};
 
 /// Single-token shell quoting for the remote login shell, via `shlex`.
@@ -37,16 +39,58 @@ fn quote_remote_path(path: &str) -> String {
     }
 }
 
+/// Result of a blocking remote command: did it succeed, and its stderr.
+pub(crate) struct RemoteOutput {
+    pub success: bool,
+    pub stderr: String,
+}
+
+/// The executor seam every spawn/attach step crosses.
+pub(crate) trait SshExec: Send + Sync {
+    fn run(&self, argv: &[String]) -> Result<RemoteOutput, SourceError>;
+    fn open_channel(&self, argv: &[String]) -> Result<SessionChannel, SourceError>;
+}
+
+struct RealSshExec;
+
+impl SshExec for RealSshExec {
+    fn run(&self, argv: &[String]) -> Result<RemoteOutput, SourceError> {
+        let output = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .map_err(|e| SourceError::Transport(format!("ssh exec: {e}")))?;
+        Ok(RemoteOutput {
+            success: output.status.success(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    fn open_channel(&self, argv: &[String]) -> Result<SessionChannel, SourceError> {
+        spawn_pty_channel(command_from_argv(argv))
+    }
+}
+
 /// One instance = one configured ssh host (matches the `SessionSource`
 /// trait doc).
 pub struct SshSource {
     host: SshHost,
+    config: Arc<Config>,
+    exec: Arc<dyn SshExec>,
 }
 
 impl SshSource {
     /// Wraps a configured ssh host as a transport.
-    pub fn new(host: SshHost) -> Self {
-        Self { host }
+    pub fn new(host: SshHost, config: Arc<Config>) -> Self {
+        Self {
+            host,
+            config,
+            exec: Arc::new(RealSshExec),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_exec(host: SshHost, config: Arc<Config>, exec: Arc<dyn SshExec>) -> Self {
+        Self { host, config, exec }
     }
 }
 
@@ -210,15 +254,55 @@ fn command_from_argv(argv: &[String]) -> CommandBuilder {
     cmd
 }
 
+/// Orchestrates the full spawn sequence: optional worktree creation, tmux
+/// new-session (the atomic lock), metadata env vars, remain-on-exit option,
+/// then attach. Each step crosses the `SshExec` seam so tests can inject a
+/// `FakeExec` without touching the network.
+fn run_spawn(
+    exec: &dyn SshExec,
+    host: &SshHost,
+    plan: &SpawnPlan,
+) -> Result<SessionChannel, SourceError> {
+    if plan.branch.is_some() {
+        let out = exec.run(&worktree_add_argv(host, plan))?;
+        if !out.success {
+            return Err(classify_worktree_add_failure(
+                &out.stderr,
+                &plan.project_id,
+                &plan.session_id,
+            ));
+        }
+    }
+
+    let out = exec.run(&new_session_argv(host, plan))?;
+    if !out.success {
+        return Err(classify_new_session_failure(
+            &out.stderr,
+            &plan.project_id,
+            &plan.session_id,
+        ));
+    }
+
+    for (key, value) in &plan.env {
+        let _ = exec.run(&set_environment_argv(host, &plan.tmux_name, key, value));
+    }
+    let _ = exec.run(&set_option_remain_on_exit_argv(host, &plan.tmux_name));
+
+    exec.open_channel(&attach_argv(host, &plan.tmux_name))
+}
+
 #[async_trait]
 impl SessionSource for SshSource {
-    /// Not implemented until stage 5 (worktree + branch + tmux new-session +
-    /// agent launch). Stubbed rather than `unimplemented!` so a caller gets
-    /// a clean error, not a panic.
-    async fn spawn(&self, _spec: SpawnSpec) -> Result<SessionChannel, SourceError> {
-        Err(SourceError::Transport(
-            "ssh spawn: not implemented (stage 5)".into(),
-        ))
+    /// Resolves the spawn plan from config, then runs the full spawn
+    /// orchestration (worktree add → tmux new-session → env metadata →
+    /// attach) via the injectable `SshExec` seam.
+    async fn spawn(&self, spec: SpawnSpec) -> Result<SessionChannel, SourceError> {
+        let plan = plan_spawn(&self.config, &spec)?;
+        let exec = Arc::clone(&self.exec);
+        let host = self.host.clone();
+        tokio::task::spawn_blocking(move || run_spawn(exec.as_ref(), &host, &plan))
+            .await
+            .map_err(|e| SourceError::Transport(format!("spawn task: {e}")))?
     }
 
     /// Opens a channel to an existing tmux session over ssh.
@@ -234,11 +318,9 @@ impl SessionSource for SshSource {
         session_id: &SessionId,
     ) -> Result<SessionChannel, SourceError> {
         let tmux_name = tmux_session_name(project_id, session_id);
-        let argv = attach_argv(&self.host, &tmux_name);
-        let cmd = command_from_argv(&argv);
-        // Run the blocking PTY setup (openpty + ssh fork/exec) off the
-        // runtime (ADR-0005: nothing in core blocks the runtime).
-        tokio::task::spawn_blocking(move || spawn_pty_channel(cmd))
+        let exec = Arc::clone(&self.exec);
+        let host = self.host.clone();
+        tokio::task::spawn_blocking(move || exec.open_channel(&attach_argv(&host, &tmux_name)))
             .await
             .map_err(|e| SourceError::Transport(format!("pty setup task: {e}")))?
     }
@@ -254,6 +336,8 @@ impl SessionSource for SshSource {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use crate::config::WorkspaceMode;
     use crate::spawn_plan::SpawnPlan;
@@ -273,6 +357,66 @@ mod tests {
             project_id: ProjectId::new("api").expect("slug"),
             session_id: SessionId::new("fix-login").expect("slug"),
             agent: Some(AgentId::new("claude").expect("slug")),
+        }
+    }
+
+    fn test_config() -> Arc<Config> {
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.api]
+            host = "devbox"
+            path = "/home/dev/api"
+            workspace = "worktree"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+        "#;
+        Arc::new(Config::from_toml_str(toml).expect("config"))
+    }
+
+    /// A fake `SshExec` that records calls and returns preconfigured results.
+    struct FakeExec {
+        /// Queued results for `run()` calls. Each `run()` pops from the front;
+        /// once exhausted, further calls return success with empty stderr.
+        run_results: Mutex<Vec<RemoteOutput>>,
+        /// Every argv passed to `open_channel` is recorded here.
+        pub opened: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl FakeExec {
+        fn new(run_results: Vec<RemoteOutput>) -> Self {
+            Self {
+                run_results: Mutex::new(run_results),
+                opened: Mutex::new(vec![]),
+            }
+        }
+    }
+
+    impl SshExec for FakeExec {
+        fn run(&self, _argv: &[String]) -> Result<RemoteOutput, SourceError> {
+            let mut results = self.run_results.lock().expect("lock");
+            if results.is_empty() {
+                Ok(RemoteOutput {
+                    success: true,
+                    stderr: String::new(),
+                })
+            } else {
+                Ok(results.remove(0))
+            }
+        }
+
+        fn open_channel(&self, argv: &[String]) -> Result<SessionChannel, SourceError> {
+            self.opened.lock().expect("lock").push(argv.to_vec());
+            // Build a disconnected channel pair and return the caller-facing
+            // SessionChannel. Dropping the transport ends makes the channel
+            // appear closed to readers, but Ok with a valid struct satisfies
+            // the type.
+            let (channel, _input_rx, _output_tx) = SessionChannel::pair();
+            drop(_input_rx);
+            drop(_output_tx);
+            Ok(channel)
         }
     }
 
@@ -336,16 +480,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_is_stubbed_with_its_stage() {
-        let source = SshSource::new(host("devbox", None, None));
-        let err = source.spawn(spec()).await.expect_err("stubbed");
-        assert!(matches!(err, SourceError::Transport(_)));
-        assert!(err.to_string().contains("stage 5"), "{err}");
+    async fn spawn_unknown_project_is_a_plan_error() {
+        let source = SshSource::new(host("devbox", None, None), Arc::new(Config::default()));
+        let err = source.spawn(spec()).await.expect_err("no such project");
+        assert!(matches!(err, SourceError::Plan(_)), "{err}");
     }
 
     #[tokio::test]
     async fn list_is_stubbed_with_its_stage() {
-        let source = SshSource::new(host("devbox", None, None));
+        let source = SshSource::new(host("devbox", None, None), Arc::new(Config::default()));
         let err = source.list().await.expect_err("stubbed");
         assert!(matches!(err, SourceError::Transport(_)));
         assert!(err.to_string().contains("stage 6"), "{err}");
@@ -353,9 +496,8 @@ mod tests {
 
     #[tokio::test]
     async fn usable_through_dyn_session_source() {
-        let source: Box<dyn SessionSource> = Box::new(SshSource::new(host("devbox", None, None)));
-        // spawn is stubbed, but the call must dispatch through the trait
-        // object — this pins object-safety for the relay seam.
+        let source: Box<dyn SessionSource> =
+            Box::new(SshSource::new(host("devbox", None, None), Arc::new(Config::default())));
         assert!(source.spawn(spec()).await.is_err());
     }
 
@@ -493,5 +635,85 @@ mod tests {
         let (p, s) = ids();
         let err = classify_worktree_add_failure("fatal: not a git repository", &p, &s);
         assert!(matches!(err, SourceError::Transport(_)));
+    }
+
+    // --- run_spawn orchestration tests ---
+
+    #[test]
+    fn run_spawn_skips_worktree_add_when_branch_is_none() {
+        let plan = SpawnPlan {
+            branch: None,
+            workspace: WorkspaceMode::Shared,
+            dir: "/home/dev/api".into(),
+            ..worktree_plan()
+        };
+        let fake = FakeExec::new(vec![
+            // Only new-session should fire; all other run() calls succeed by default.
+            RemoteOutput { success: true, stderr: String::new() },
+        ]);
+        let result = run_spawn(&fake, &host("devbox", None, None), &plan);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
+    #[test]
+    fn run_spawn_returns_session_exists_when_worktree_add_fails_already_exists() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![RemoteOutput {
+            success: false,
+            stderr: "fatal: '<path>' already exists".into(),
+        }]);
+        let err = run_spawn(&fake, &host("devbox", None, None), &plan)
+            .expect_err("worktree already exists");
+        assert!(matches!(err, SourceError::SessionExists { .. }), "{err}");
+    }
+
+    #[test]
+    fn run_spawn_returns_session_exists_when_new_session_says_duplicate() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            // worktree add succeeds
+            RemoteOutput { success: true, stderr: String::new() },
+            // new-session fails with duplicate
+            RemoteOutput {
+                success: false,
+                stderr: "duplicate session: remora_api_fix-login".into(),
+            },
+        ]);
+        let err = run_spawn(&fake, &host("devbox", None, None), &plan)
+            .expect_err("duplicate session");
+        assert!(matches!(err, SourceError::SessionExists { .. }), "{err}");
+    }
+
+    #[test]
+    fn run_spawn_opens_exactly_one_channel_on_success() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![]);
+        let result = run_spawn(&fake, &host("devbox", None, None), &plan);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
+    #[test]
+    fn run_spawn_attach_argv_ends_with_tmux_name() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![]);
+        let _ = run_spawn(&fake, &host("devbox", None, None), &plan);
+        let opened = fake.opened.lock().expect("lock");
+        let attach_argv = &opened[0];
+        assert_eq!(
+            attach_argv.last().map(String::as_str),
+            Some("remora_api_fix-login")
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_through_fake_exec_attaches() {
+        let config = test_config();
+        let fake = Arc::new(FakeExec::new(vec![]));
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        let result = source.spawn(spec()).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
     }
 }
