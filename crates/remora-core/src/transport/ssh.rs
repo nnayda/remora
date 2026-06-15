@@ -8,6 +8,7 @@ use remora_protocol::{ProjectId, SessionId, SessionMeta, SpawnSpec};
 use super::pty_process::spawn_pty_channel;
 use crate::config::SshHost;
 use crate::naming::tmux_session_name;
+use crate::spawn_plan::SpawnPlan;
 use crate::{SessionChannel, SessionSource, SourceError};
 
 /// Single-token shell quoting for the remote login shell, via `shlex`.
@@ -95,6 +96,69 @@ fn attach_argv(host: &SshHost, tmux_name: &str) -> Vec<String> {
     argv
 }
 
+/// `git -C <project> worktree add -b <branch> <worktree>` over ssh.
+/// Precondition: `plan.branch` is `Some` (worktree mode); the only caller
+/// checks. `git worktree add` creates leading directories.
+fn worktree_add_argv(host: &SshHost, plan: &SpawnPlan) -> Vec<String> {
+    let branch = plan.branch.as_deref().unwrap_or_default();
+    let mut argv = ssh_base_argv(host, false);
+    argv.push("git".into());
+    argv.push("-C".into());
+    argv.push(quote_remote_path(&plan.project_path));
+    argv.push("worktree".into());
+    argv.push("add".into());
+    argv.push("-b".into());
+    argv.push(branch.to_string());
+    argv.push(quote_remote_path(&plan.dir));
+    argv
+}
+
+/// `tmux new-session -d -s <name> -c <dir> <agent…>` — the atomic creation
+/// lock. No metadata trailer (set-environment runs separately so a metadata
+/// failure can't falsely fail a live session). Agent tokens are shell-quoted
+/// for the remote shell.
+fn new_session_argv(host: &SshHost, plan: &SpawnPlan) -> Vec<String> {
+    let mut argv = ssh_base_argv(host, false);
+    argv.push("tmux".into());
+    argv.push("new-session".into());
+    argv.push("-d".into());
+    argv.push("-s".into());
+    argv.push(plan.tmux_name.clone());
+    argv.push("-c".into());
+    argv.push(quote_remote_path(&plan.dir));
+    for token in &plan.agent_argv {
+        argv.push(shell_quote(token));
+    }
+    argv
+}
+
+/// `tmux set-environment -t <name> <key> <value>`. The value is the logical
+/// metadata string, single-quoted as a literal (no tilde expansion — the
+/// stored value must round-trip via stage-6 `show-environment`).
+fn set_environment_argv(host: &SshHost, tmux_name: &str, key: &str, value: &str) -> Vec<String> {
+    let mut argv = ssh_base_argv(host, false);
+    argv.push("tmux".into());
+    argv.push("set-environment".into());
+    argv.push("-t".into());
+    argv.push(tmux_name.into());
+    argv.push(key.into());
+    argv.push(shell_quote(value));
+    argv
+}
+
+/// `tmux set-option -t <name> remain-on-exit on` — keeps an exited agent's
+/// pane inspectable instead of destroying the session.
+fn set_option_remain_on_exit_argv(host: &SshHost, tmux_name: &str) -> Vec<String> {
+    let mut argv = ssh_base_argv(host, false);
+    argv.push("tmux".into());
+    argv.push("set-option".into());
+    argv.push("-t".into());
+    argv.push(tmux_name.into());
+    argv.push("remain-on-exit".into());
+    argv.push("on".into());
+    argv
+}
+
 /// Turns a pure argv into a `CommandBuilder` (program = argv[0]).
 ///
 /// Precondition: `argv` is non-empty. The only caller feeds it
@@ -151,6 +215,8 @@ impl SessionSource for SshSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::WorkspaceMode;
+    use crate::spawn_plan::SpawnPlan;
     use crate::SessionSource;
 
     fn host(host: &str, user: Option<&str>, port: Option<u16>) -> SshHost {
@@ -271,5 +337,78 @@ mod tests {
         assert_eq!(quote_remote_path("/home/dev/api"), "/home/dev/api");
         // a space in a path WOULD force quoting (defensive, not expected for slugs).
         assert_eq!(quote_remote_path("/a b"), "'/a b'");
+    }
+
+    fn worktree_plan() -> SpawnPlan {
+        SpawnPlan {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("fix-login").expect("slug"),
+            tmux_name: "remora_api_fix-login".into(),
+            workspace: WorkspaceMode::Worktree,
+            project_path: "/home/dev/api".into(),
+            dir: "~/.remora/worktrees/api/fix-login".into(),
+            branch: Some("remora/fix-login".into()),
+            env: vec![
+                ("REMORA_AGENT".into(), "claude".into()),
+                ("REMORA_WORKSPACE".into(), "~/.remora/worktrees/api/fix-login".into()),
+                ("REMORA_CREATED_AT".into(), "1700000000".into()),
+            ],
+            agent_argv: vec!["claude".into(), "--continue".into()],
+        }
+    }
+
+    #[test]
+    fn worktree_add_argv_builds_git_command() {
+        let plan = worktree_plan();
+        let argv = worktree_add_argv(&host("devbox", None, None), &plan);
+        let g = argv.iter().position(|a| a == "git").expect("git");
+        assert_eq!(argv[g + 1], "-C");
+        assert_eq!(argv[g + 2], "/home/dev/api");
+        assert_eq!(argv[g + 3], "worktree");
+        assert_eq!(argv[g + 4], "add");
+        assert_eq!(argv[g + 5], "-b");
+        assert_eq!(argv[g + 6], "remora/fix-login");
+        assert_eq!(argv[g + 7], "\"$HOME\"/.remora/worktrees/api/fix-login");
+        assert!(!argv.iter().any(|a| a == "-tt"), "setup is non-interactive");
+    }
+
+    #[test]
+    fn new_session_argv_is_the_lock_with_no_metadata_trailer() {
+        let plan = worktree_plan();
+        let argv = new_session_argv(&host("devbox", None, None), &plan);
+        let n = argv.iter().position(|a| a == "new-session").expect("new-session");
+        assert_eq!(argv[n + 1], "-d");
+        assert_eq!(argv[n + 2], "-s");
+        assert_eq!(argv[n + 3], "remora_api_fix-login");
+        assert_eq!(argv[n + 4], "-c");
+        assert_eq!(argv[n + 5], "\"$HOME\"/.remora/worktrees/api/fix-login");
+        assert_eq!(argv[n + 6], "claude");
+        assert_eq!(argv[n + 7], "--continue");
+        assert!(!argv.iter().any(|a| a == "set-environment" || a == ";"));
+    }
+
+    #[test]
+    fn set_environment_argv_quotes_logical_value() {
+        let argv = set_environment_argv(
+            &host("devbox", None, None),
+            "remora_api_fix-login",
+            "REMORA_WORKSPACE",
+            "~/.remora/worktrees/api/fix-login",
+        );
+        let s = argv.iter().position(|a| a == "set-environment").expect("set-env");
+        assert_eq!(argv[s + 1], "-t");
+        assert_eq!(argv[s + 2], "remora_api_fix-login");
+        assert_eq!(argv[s + 3], "REMORA_WORKSPACE");
+        assert_eq!(argv[s + 4], "'~/.remora/worktrees/api/fix-login'");
+    }
+
+    #[test]
+    fn set_option_argv_sets_remain_on_exit() {
+        let argv = set_option_remain_on_exit_argv(&host("devbox", None, None), "remora_api_x");
+        let o = argv.iter().position(|a| a == "set-option").expect("set-option");
+        assert_eq!(argv[o + 1], "-t");
+        assert_eq!(argv[o + 2], "remora_api_x");
+        assert_eq!(argv[o + 3], "remain-on-exit");
+        assert_eq!(argv[o + 4], "on");
     }
 }
