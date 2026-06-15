@@ -64,7 +64,11 @@ fn attach_argv(host: &SshHost, tmux_name: &str) -> Vec<String> {
 }
 
 /// Turns a pure argv into a `CommandBuilder` (program = argv[0]).
+///
+/// Precondition: `argv` is non-empty. The only caller feeds it
+/// [`attach_argv`], which always yields the `ssh` program plus its args.
 fn command_from_argv(argv: &[String]) -> CommandBuilder {
+    debug_assert!(!argv.is_empty(), "argv must contain at least the program");
     let mut cmd = CommandBuilder::new(&argv[0]);
     cmd.args(&argv[1..]);
     cmd
