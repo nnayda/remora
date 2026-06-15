@@ -161,7 +161,10 @@ mod tests {
     fn argv_inserts_port_then_user_before_host() {
         let argv = attach_argv(&host("devbox", Some("dev"), Some(2222)), "remora_api_s");
         // Order: ...keepalive, -p <port>, -l <user>, <host>, remote cmd.
-        let host_idx = argv.iter().position(|a| a == "devbox").expect("host present");
+        let host_idx = argv
+            .iter()
+            .position(|a| a == "devbox")
+            .expect("host present");
         let p = argv.iter().position(|a| a == "-p").expect("-p present");
         let l = argv.iter().position(|a| a == "-l").expect("-l present");
         assert_eq!(argv[p + 1], "2222");
@@ -183,7 +186,10 @@ mod tests {
         assert_eq!(argv.last().map(String::as_str), Some("remora_web_zeta"));
         assert!(argv.iter().any(|a| a == "-tt"), "forces remote PTY");
         // `-d` is the tmux eviction flag, positioned after attach-session.
-        let attach = argv.iter().position(|a| a == "attach-session").expect("attach");
+        let attach = argv
+            .iter()
+            .position(|a| a == "attach-session")
+            .expect("attach");
         assert_eq!(argv[attach + 1], "-d");
     }
 

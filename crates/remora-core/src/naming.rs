@@ -19,7 +19,10 @@ mod tests {
     fn formats_as_remora_project_session() {
         let project = ProjectId::new("api").expect("valid slug");
         let session = SessionId::new("fix-login").expect("valid slug");
-        assert_eq!(tmux_session_name(&project, &session), "remora_api_fix-login");
+        assert_eq!(
+            tmux_session_name(&project, &session),
+            "remora_api_fix-login"
+        );
 
         // Hyphenated slugs are unambiguous because `_` is the only separator.
         let project = ProjectId::new("web-app").expect("valid slug");
