@@ -10,6 +10,32 @@ use crate::config::SshHost;
 use crate::naming::tmux_session_name;
 use crate::{SessionChannel, SessionSource, SourceError};
 
+/// Single-token shell quoting for the remote login shell, via `shlex`.
+/// Config validation bans control/nul characters (stage 3), so `try_quote`
+/// cannot hit its nul-byte error path here.
+fn shell_quote(token: &str) -> String {
+    shlex::try_quote(token)
+        .expect("config bans control/nul characters")
+        .into_owned()
+}
+
+/// Renders a logical remote path (`/…`, `~/…`, or `~`) into one shell token
+/// that the remote shell resolves to the intended directory. Quoting
+/// disables tilde expansion, so a leading `~` is emitted as a double-quoted
+/// `$HOME` with the remainder passed through `shell_quote` (bare for normal
+/// slug/path chars, quoted only if it contains shell-special bytes):
+/// `~/api` -> `"$HOME"/api`. Config rejects `~user` and control chars
+/// (stage 3), so these three cases are exhaustive.
+fn quote_remote_path(path: &str) -> String {
+    if path == "~" {
+        "\"$HOME\"".to_string()
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        format!("\"$HOME\"{}", shell_quote(&format!("/{rest}")))
+    } else {
+        shell_quote(path)
+    }
+}
+
 /// One instance = one configured ssh host (matches the `SessionSource`
 /// trait doc).
 pub struct SshSource {
@@ -219,5 +245,25 @@ mod tests {
         // spawn is stubbed, but the call must dispatch through the trait
         // object — this pins object-safety for the relay seam.
         assert!(source.spawn(spec()).await.is_err());
+    }
+
+    #[test]
+    fn shell_quote_leaves_simple_tokens_and_quotes_spaces() {
+        assert_eq!(shell_quote("claude"), "claude");
+        assert_eq!(shell_quote("--continue"), "--continue");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn quote_remote_path_expands_tilde_via_home() {
+        // `~/x` -> $HOME stays expandable; the remainder has no shell-special
+        // chars so shlex returns it bare (slug/path chars are safe).
+        assert_eq!(quote_remote_path("~/api"), "\"$HOME\"/api");
+        assert_eq!(quote_remote_path("~"), "\"$HOME\"");
+        // absolute path: all safe chars, returned bare (no quoting needed).
+        assert_eq!(quote_remote_path("/home/dev/api"), "/home/dev/api");
+        // a space in a path WOULD force quoting (defensive, not expected for slugs).
+        assert_eq!(quote_remote_path("/a b"), "'/a b'");
     }
 }
