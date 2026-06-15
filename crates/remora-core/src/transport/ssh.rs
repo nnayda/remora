@@ -55,6 +55,7 @@ struct RealSshExec;
 
 impl SshExec for RealSshExec {
     fn run(&self, argv: &[String]) -> Result<RemoteOutput, SourceError> {
+        debug_assert!(!argv.is_empty(), "argv must contain at least the program");
         let output = std::process::Command::new(&argv[0])
             .args(&argv[1..])
             .output()
@@ -746,5 +747,29 @@ mod tests {
         let result = source.spawn(spec()).await;
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+        // The plan's tmux name and env reached the recorded argv (not just
+        // that the wiring dispatched).
+        let calls = fake.calls.lock().expect("lock");
+        assert!(
+            calls.iter().any(|c| c.iter().any(|a| a == "new-session"))
+                && calls.iter().any(|c| c.iter().any(|a| a == "remora_api_fix-login")),
+            "new-session argv carries the planned tmux name"
+        );
+        assert!(
+            calls.iter().any(|c| c.iter().any(|a| a == "REMORA_AGENT")),
+            "metadata was written via set-environment"
+        );
+    }
+
+    #[test]
+    fn new_session_generic_failure_is_transport_and_opens_no_channel() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                       // worktree add
+            Ok(FakeExec::fail("no server running")),  // new-session: generic failure
+        ]);
+        let err = run_spawn(&fake, &host("devbox", None, None), &plan).expect_err("should fail");
+        assert!(matches!(err, SourceError::Transport(_)));
+        assert!(fake.opened.lock().expect("lock").is_empty());
     }
 }
