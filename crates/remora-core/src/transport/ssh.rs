@@ -392,10 +392,16 @@ mod tests {
             }
         }
         fn ok() -> RemoteOutput {
-            RemoteOutput { success: true, stderr: String::new() }
+            RemoteOutput {
+                success: true,
+                stderr: String::new(),
+            }
         }
         fn fail(stderr: &str) -> RemoteOutput {
-            RemoteOutput { success: false, stderr: stderr.into() }
+            RemoteOutput {
+                success: false,
+                stderr: stderr.into(),
+            }
         }
     }
 
@@ -491,8 +497,10 @@ mod tests {
 
     #[tokio::test]
     async fn usable_through_dyn_session_source() {
-        let source: Box<dyn SessionSource> =
-            Box::new(SshSource::new(host("devbox", None, None), Arc::new(Config::default())));
+        let source: Box<dyn SessionSource> = Box::new(SshSource::new(
+            host("devbox", None, None),
+            Arc::new(Config::default()),
+        ));
         assert!(source.spawn(spec()).await.is_err());
     }
 
@@ -527,7 +535,10 @@ mod tests {
             branch: Some("remora/fix-login".into()),
             env: vec![
                 ("REMORA_AGENT".into(), "claude".into()),
-                ("REMORA_WORKSPACE".into(), "~/.remora/worktrees/api/fix-login".into()),
+                (
+                    "REMORA_WORKSPACE".into(),
+                    "~/.remora/worktrees/api/fix-login".into(),
+                ),
                 ("REMORA_CREATED_AT".into(), "1700000000".into()),
             ],
             agent_argv: vec!["claude".into(), "--continue".into()],
@@ -553,7 +564,10 @@ mod tests {
     fn new_session_argv_is_the_lock_with_no_metadata_trailer() {
         let plan = worktree_plan();
         let argv = new_session_argv(&host("devbox", None, None), &plan);
-        let n = argv.iter().position(|a| a == "new-session").expect("new-session");
+        let n = argv
+            .iter()
+            .position(|a| a == "new-session")
+            .expect("new-session");
         assert_eq!(argv[n + 1], "-d");
         assert_eq!(argv[n + 2], "-s");
         assert_eq!(argv[n + 3], "remora_api_fix-login");
@@ -572,7 +586,10 @@ mod tests {
             "REMORA_WORKSPACE",
             "~/.remora/worktrees/api/fix-login",
         );
-        let s = argv.iter().position(|a| a == "set-environment").expect("set-env");
+        let s = argv
+            .iter()
+            .position(|a| a == "set-environment")
+            .expect("set-env");
         assert_eq!(argv[s + 1], "-t");
         assert_eq!(argv[s + 2], "remora_api_fix-login");
         assert_eq!(argv[s + 3], "REMORA_WORKSPACE");
@@ -582,7 +599,10 @@ mod tests {
     #[test]
     fn set_option_argv_sets_remain_on_exit() {
         let argv = set_option_remain_on_exit_argv(&host("devbox", None, None), "remora_api_x");
-        let o = argv.iter().position(|a| a == "set-option").expect("set-option");
+        let o = argv
+            .iter()
+            .position(|a| a == "set-option")
+            .expect("set-option");
         assert_eq!(argv[o + 1], "-t");
         assert_eq!(argv[o + 2], "remora_api_x");
         assert_eq!(argv[o + 3], "remain-on-exit");
@@ -650,7 +670,10 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         // First call must be new-session (no worktree-add).
         let calls = fake.calls.lock().expect("lock");
-        assert!(calls[0].iter().any(|a| a == "new-session"), "first call is new-session");
+        assert!(
+            calls[0].iter().any(|a| a == "new-session"),
+            "first call is new-session"
+        );
         assert!(!calls[0].iter().any(|a| a == "worktree"), "no worktree-add");
         assert_eq!(fake.opened.lock().expect("lock").len(), 1);
     }
@@ -676,8 +699,8 @@ mod tests {
             // new-session fails with duplicate
             Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
         ]);
-        let err = run_spawn(&fake, &host("devbox", None, None), &plan)
-            .expect_err("duplicate session");
+        let err =
+            run_spawn(&fake, &host("devbox", None, None), &plan).expect_err("duplicate session");
         assert!(matches!(err, SourceError::SessionExists { .. }), "{err}");
         assert_eq!(fake.opened.lock().expect("lock").len(), 0);
     }
@@ -708,8 +731,12 @@ mod tests {
     fn worktree_spawn_runs_add_create_metadata_then_attaches_in_order() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()), Ok(FakeExec::ok()), Ok(FakeExec::ok()),
-            Ok(FakeExec::ok()), Ok(FakeExec::ok()), Ok(FakeExec::ok()),
+            Ok(FakeExec::ok()),
+            Ok(FakeExec::ok()),
+            Ok(FakeExec::ok()),
+            Ok(FakeExec::ok()),
+            Ok(FakeExec::ok()),
+            Ok(FakeExec::ok()),
         ]);
         let result = run_spawn(&fake, &host("devbox", None, None), &plan);
         assert!(result.is_ok());
@@ -727,15 +754,18 @@ mod tests {
     fn metadata_failure_is_tolerated_and_still_attaches() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                          // worktree add
-            Ok(FakeExec::ok()),                          // new-session (live!)
-            Ok(FakeExec::fail("set-env boom")),          // REMORA_AGENT — tolerated
-            Err(SourceError::Transport("net".into())),   // REMORA_WORKSPACE — tolerated
-            Ok(FakeExec::ok()),                          // REMORA_CREATED_AT
-            Ok(FakeExec::fail("opt boom")),              // remain-on-exit — tolerated
+            Ok(FakeExec::ok()),                        // worktree add
+            Ok(FakeExec::ok()),                        // new-session (live!)
+            Ok(FakeExec::fail("set-env boom")),        // REMORA_AGENT — tolerated
+            Err(SourceError::Transport("net".into())), // REMORA_WORKSPACE — tolerated
+            Ok(FakeExec::ok()),                        // REMORA_CREATED_AT
+            Ok(FakeExec::fail("opt boom")),            // remain-on-exit — tolerated
         ]);
         let result = run_spawn(&fake, &host("devbox", None, None), &plan);
-        assert!(result.is_ok(), "metadata failures must not fail a live session");
+        assert!(
+            result.is_ok(),
+            "metadata failures must not fail a live session"
+        );
         assert_eq!(fake.opened.lock().expect("lock").len(), 1);
     }
 
@@ -752,7 +782,9 @@ mod tests {
         let calls = fake.calls.lock().expect("lock");
         assert!(
             calls.iter().any(|c| c.iter().any(|a| a == "new-session"))
-                && calls.iter().any(|c| c.iter().any(|a| a == "remora_api_fix-login")),
+                && calls
+                    .iter()
+                    .any(|c| c.iter().any(|a| a == "remora_api_fix-login")),
             "new-session argv carries the planned tmux name"
         );
         assert!(
@@ -765,8 +797,8 @@ mod tests {
     fn new_session_generic_failure_is_transport_and_opens_no_channel() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                       // worktree add
-            Ok(FakeExec::fail("no server running")),  // new-session: generic failure
+            Ok(FakeExec::ok()),                      // worktree add
+            Ok(FakeExec::fail("no server running")), // new-session: generic failure
         ]);
         let err = run_spawn(&fake, &host("devbox", None, None), &plan).expect_err("should fail");
         assert!(matches!(err, SourceError::Transport(_)));

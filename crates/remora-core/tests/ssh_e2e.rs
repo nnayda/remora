@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use remora_core::config::{Config, SshHost};
 use remora_core::{
-    ChannelOutput, ProjectId, SessionId, SessionChannel, SessionSource, SshSource, TerminalSize,
+    ChannelOutput, ProjectId, SessionChannel, SessionId, SessionSource, SshSource, TerminalSize,
 };
 
 #[tokio::test]
@@ -105,10 +105,7 @@ async fn recv_until_contains(channel: &mut SessionChannel, needle: &str) {
         match tokio::time::timeout(deadline - now, channel.recv()).await {
             Ok(Some(ChannelOutput::Bytes(b))) => {
                 acc.extend_from_slice(&b);
-                if acc
-                    .windows(needle.len())
-                    .any(|w| w == needle.as_bytes())
-                {
+                if acc.windows(needle.len()).any(|w| w == needle.as_bytes()) {
                     return;
                 }
             }

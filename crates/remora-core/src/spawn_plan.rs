@@ -7,7 +7,9 @@
 use remora_protocol::{AgentId, ProjectId, SessionId, SpawnSpec};
 
 use crate::config::{Config, WorkspaceMode};
-use crate::naming::{branch_name, tmux_session_name, worktree_path, ENV_AGENT, ENV_CREATED_AT, ENV_WORKSPACE};
+use crate::naming::{
+    branch_name, tmux_session_name, worktree_path, ENV_AGENT, ENV_CREATED_AT, ENV_WORKSPACE,
+};
 
 /// Why a spawn could not be planned from local config. Typed (not a string)
 /// so the UI keeps the offending id; stays off the transport error enum
@@ -161,8 +163,11 @@ mod tests {
     #[test]
     fn env_carries_agent_workspace_and_parseable_created_at() {
         let plan = plan_spawn(&config(), &spec("api", "s1", None)).expect("plan");
-        let env: std::collections::HashMap<_, _> =
-            plan.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let env: std::collections::HashMap<_, _> = plan
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         assert_eq!(env[ENV_AGENT], "claude");
         assert_eq!(env[ENV_WORKSPACE], "~/.remora/worktrees/api/s1");
         assert!(env[ENV_CREATED_AT].chars().all(|c| c.is_ascii_digit()));
