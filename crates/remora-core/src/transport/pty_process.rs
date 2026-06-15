@@ -27,7 +27,6 @@ const INITIAL_COLS: u16 = 80;
 
 /// Spawns `cmd` against a fresh local PTY and bridges it to a
 /// `SessionChannel`. See the module docs for the teardown model.
-#[allow(dead_code)] // used by ssh transport in Task 4
 pub fn spawn_pty_channel(cmd: CommandBuilder) -> Result<SessionChannel, SourceError> {
     Ok(spawn_pty_channel_inner(cmd)?.0)
 }
@@ -35,7 +34,6 @@ pub fn spawn_pty_channel(cmd: CommandBuilder) -> Result<SessionChannel, SourceEr
 /// Like [`spawn_pty_channel`] but also returns the child's OS pid (when the
 /// platform exposes one) so tests can assert the no-leaked-process
 /// guarantee. Internal: the public bridge contract is just the channel.
-#[allow(dead_code)] // used in tests and by ssh transport in Task 4
 fn spawn_pty_channel_inner(
     cmd: CommandBuilder,
 ) -> Result<(SessionChannel, Option<u32>), SourceError> {
