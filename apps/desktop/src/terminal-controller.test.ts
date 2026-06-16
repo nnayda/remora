@@ -91,6 +91,12 @@ function fakeConn() {
 
 const el = {} as HTMLElement;
 
+function term(): NonNullable<typeof xt.state.term> {
+  const t = xt.state.term;
+  if (!t) throw new Error("terminal not constructed");
+  return t;
+}
+
 describe("TerminalController", () => {
   it("writes incoming bytes to the terminal as a Uint8Array (not a string)", () => {
     const conn = fakeConn();
@@ -118,8 +124,8 @@ describe("TerminalController", () => {
     const conn = fakeConn();
     new TerminalController(el, conn as unknown as SessionConnection);
     conn.resize.mockClear();
-    xt.state.term!.rows = 30;
-    xt.state.term!.cols = 100;
+    term().rows = 30;
+    term().cols = 100;
     roCb?.();
     rafCb?.(); // flush debounce
     expect(conn.resize).toHaveBeenCalledWith(30, 100);
@@ -129,7 +135,7 @@ describe("TerminalController", () => {
     const conn = fakeConn();
     new TerminalController(el, conn as unknown as SessionConnection);
     conn.resize.mockClear();
-    xt.state.term!.rows = 0;
+    term().rows = 0;
     roCb?.();
     rafCb?.();
     expect(xt.state.fit?.fit).toHaveBeenCalled();
@@ -145,12 +151,24 @@ describe("TerminalController", () => {
     expect(conn.resize).not.toHaveBeenCalled();
   });
 
+  it("does not call resize after the session is closed", () => {
+    const conn = fakeConn();
+    new TerminalController(el, conn as unknown as SessionConnection);
+    conn.emit({ event: "closed" });
+    conn.resize.mockClear();
+    term().rows = 30;
+    term().cols = 100;
+    roCb?.();
+    rafCb?.(); // flush debounce
+    expect(conn.resize).not.toHaveBeenCalled();
+  });
+
   it("on closed: shows a notice and stops forwarding input", () => {
     const conn = fakeConn();
     new TerminalController(el, conn as unknown as SessionConnection);
     conn.emit({ event: "closed" });
-    const text = xt.state
-      .term!.written.filter((w): w is string => typeof w === "string")
+    const text = term()
+      .written.filter((w): w is string => typeof w === "string")
       .join("");
     expect(text).toContain("[session closed]");
     conn.write.mockClear();

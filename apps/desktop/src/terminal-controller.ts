@@ -64,6 +64,7 @@ export class TerminalController {
   }
 
   private syncSize(): void {
+    if (this.closed) return;
     this.fit.fit();
     const { rows, cols } = this.term;
     if (rows === 0 || cols === 0) return; // unlaid-out/hidden element: skip (bridge rejects 0)
