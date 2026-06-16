@@ -39,9 +39,11 @@ fn quote_remote_path(path: &str) -> String {
     }
 }
 
-/// Result of a blocking remote command: did it succeed, and its stderr.
+/// Result of a blocking remote command: success, captured stdout, and stderr.
 pub(crate) struct RemoteOutput {
     pub success: bool,
+    #[allow(dead_code)] // consumed by later discovery task
+    pub stdout: String,
     pub stderr: String,
 }
 
@@ -62,6 +64,7 @@ impl SshExec for RealSshExec {
             .map_err(|e| SourceError::Transport(format!("ssh exec: {e}")))?;
         Ok(RemoteOutput {
             success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     }
@@ -433,12 +436,23 @@ mod tests {
         fn ok() -> RemoteOutput {
             RemoteOutput {
                 success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        }
+        // Used by a later task (discovery); silenced here to keep clippy clean.
+        #[allow(dead_code)]
+        fn out(stdout: &str) -> RemoteOutput {
+            RemoteOutput {
+                success: true,
+                stdout: stdout.into(),
                 stderr: String::new(),
             }
         }
         fn fail(stderr: &str) -> RemoteOutput {
             RemoteOutput {
                 success: false,
+                stdout: String::new(),
                 stderr: stderr.into(),
             }
         }
