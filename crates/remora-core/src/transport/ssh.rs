@@ -366,6 +366,16 @@ fn write_metadata(exec: &dyn SshExec, host: &SshHost, plan: &SpawnPlan) {
     let _ = exec.run(&set_option_remain_on_exit_argv(host, &plan.tmux_name));
 }
 
+/// `tmux has-session -t <name>` — the liveness preflight for `attach`.
+fn has_session_argv(host: &SshHost, tmux_name: &str) -> Vec<String> {
+    let mut argv = ssh_base_argv(host, false);
+    argv.push("tmux".into());
+    argv.push("has-session".into());
+    argv.push("-t".into());
+    argv.push(tmux_name.into());
+    argv
+}
+
 /// Opens the PTY attach channel to an existing session (no liveness
 /// preflight — callers that need one do it first; see `SshSource::attach`).
 fn attach_channel(
@@ -482,13 +492,12 @@ impl SessionSource for SshSource {
             .map_err(|e| SourceError::Transport(format!("spawn task: {e}")))?
     }
 
-    /// Opens a channel to an existing tmux session over ssh.
+    /// Opens a channel to an existing *live* session over ssh.
     ///
-    /// NOTE: stage-4 optimistic attach. Unlike the `SessionSource::attach`
-    /// contract, a missing/stopped session is NOT reported as
-    /// `SessionNotFound` — it surfaces as tmux error bytes then channel
-    /// death. Liveness-checked `SessionNotFound` lands with discovery.
-    // TODO(stage 6): preflight liveness -> SessionNotFound.
+    /// A `tmux has-session` preflight returns `SessionNotFound` for a missing
+    /// or stopped session (honoring the trait contract stage 4 deferred); a
+    /// dead-pane session still exists and is attachable. The TOCTOU window
+    /// (session dies between preflight and attach) degrades to channel death.
     async fn attach(
         &self,
         project_id: &ProjectId,
@@ -497,9 +506,20 @@ impl SessionSource for SshSource {
         let tmux_name = tmux_session_name(project_id, session_id);
         let exec = Arc::clone(&self.exec);
         let host = self.host.clone();
-        tokio::task::spawn_blocking(move || exec.open_channel(&attach_argv(&host, &tmux_name)))
-            .await
-            .map_err(|e| SourceError::Transport(format!("pty setup task: {e}")))?
+        let project_id = project_id.clone();
+        let session_id = session_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let out = exec.run(&has_session_argv(&host, &tmux_name))?;
+            if !out.success {
+                return Err(SourceError::SessionNotFound {
+                    project_id,
+                    session_id,
+                });
+            }
+            attach_channel(exec.as_ref(), &host, &tmux_name)
+        })
+        .await
+        .map_err(|e| SourceError::Transport(format!("attach task: {e}")))?
     }
 
     /// Discovers sessions on the host and joins them to local config.
@@ -1122,6 +1142,49 @@ mod tests {
             classify_list_sessions(&boom),
             Err(SourceError::Transport(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn attach_returns_not_found_when_session_is_absent() {
+        let config = test_config();
+        // has-session preflight fails (no such session) -> SessionNotFound,
+        // and NO channel is opened.
+        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::fail(
+            "can't find session",
+        ))]));
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        let (project, session) = (
+            ProjectId::new("api").expect("slug"),
+            SessionId::new("fix-login").expect("slug"),
+        );
+        let err = source.attach(&project, &session).await.expect_err("absent");
+        assert!(matches!(err, SourceError::SessionNotFound { .. }), "{err}");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn attach_opens_channel_when_session_is_live() {
+        let config = test_config();
+        // has-session succeeds -> channel opened.
+        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::ok())]));
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        let (project, session) = (
+            ProjectId::new("api").expect("slug"),
+            SessionId::new("fix-login").expect("slug"),
+        );
+        source.attach(&project, &session).await.expect("attach");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
+    #[test]
+    fn has_session_argv_targets_the_name() {
+        let argv = has_session_argv(&host("devbox", None, None), "remora_api_fix-login");
+        let h = argv
+            .iter()
+            .position(|a| a == "has-session")
+            .expect("has-session");
+        assert_eq!(argv[h + 1], "-t");
+        assert_eq!(argv[h + 2], "remora_api_fix-login");
     }
 
     #[test]
