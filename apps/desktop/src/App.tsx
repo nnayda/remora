@@ -1,47 +1,73 @@
-import { useEffect, useState } from "react";
+// apps/desktop/src/App.tsx
+import { useEffect, useRef, useState } from "react";
 import "./App.css";
-import { connectSession, type SessionConnection } from "./connection";
+import { NewSessionDialog } from "./NewSessionDialog";
+import { TabBar } from "./TabBar";
 import { Terminal } from "./Terminal";
+import { sessionStore, useSessions } from "./useSessions";
 
 export const APP_NAME = "Remora";
 
-// Stage-8 dev harness: one hardcoded session against the fake source. The first
-// dev mount spawns; StrictMode's remount and every reload attach (banner
-// replays). Tabs and a real spawn picker are stage 9.
 function App() {
-  const [connection, setConnection] = useState<SessionConnection | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const { tabs, activeKey, openSession, closeTab, focusTab } = useSessions();
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const newButtonRef = useRef<HTMLButtonElement>(null);
 
-  useEffect(() => {
-    let conn: SessionConnection | undefined;
-    let cancelled = false;
-    const logClose = (e: unknown) => console.error("session close failed", e);
-    connectSession("demo", "scratch", null)
-      .then((c) => {
-        if (cancelled) void c.close().catch(logClose);
-        else {
-          conn = c;
-          setConnection(c);
-        }
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setError(e instanceof Error ? e.message : String(e));
-      });
-    return () => {
-      cancelled = true;
-      void conn?.close().catch(logClose);
-    };
-  }, []);
+  // App teardown closes every live session (window close). The store is a
+  // module singleton, so this is the one place that ends connections.
+  useEffect(() => () => sessionStore.dispose(), []);
+
+  function handleOpened(attached: boolean) {
+    setDialogOpen(false);
+    setNotice(attached ? "Attached to an existing session." : null);
+    newButtonRef.current?.focus();
+  }
 
   return (
     <main className="app">
-      {error ? (
-        <p className="status">Failed to connect: {error}</p>
-      ) : connection ? (
-        <Terminal connection={connection} />
-      ) : (
-        <p className="status">Connecting…</p>
+      <TabBar
+        tabs={tabs}
+        activeKey={activeKey}
+        onFocus={focusTab}
+        onClose={closeTab}
+        onNew={() => {
+          setNotice(null);
+          setDialogOpen(true);
+        }}
+        newButtonRef={newButtonRef}
+      />
+      {notice && (
+        <div className="notice" role="status">
+          {notice}
+        </div>
+      )}
+      <div className="panes">
+        {tabs.length === 0 ? (
+          <p className="status">
+            No sessions. Click "+ New session" to start one.
+          </p>
+        ) : (
+          tabs.map((t) => (
+            <div
+              key={t.key}
+              className="pane"
+              style={t.key === activeKey ? undefined : { display: "none" }}
+            >
+              <Terminal connection={t.connection} />
+            </div>
+          ))
+        )}
+      </div>
+      {dialogOpen && (
+        <NewSessionDialog
+          openSession={openSession}
+          onOpened={handleOpened}
+          onClose={() => {
+            setDialogOpen(false);
+            newButtonRef.current?.focus();
+          }}
+        />
       )}
     </main>
   );
