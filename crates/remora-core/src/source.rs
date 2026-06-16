@@ -45,4 +45,24 @@ pub trait SessionSource: Send + Sync {
     /// list must sort. (The fake sorts by `(project_id, session_id)` for
     /// test determinism, but transports need not.)
     async fn list(&self) -> Result<Vec<SessionMeta>, SourceError>;
+
+    /// Re-creates the tmux session for a *stopped* worktree and attaches.
+    ///
+    /// The worktree already survives, so this never runs `git worktree add`;
+    /// the agent and working directory come exclusively from local config
+    /// (the original metadata died with the tmux session). Requires the
+    /// resolved project to be worktree-mode — a shared-mode project returns
+    /// [`PlanError::NotWorktreeProject`](crate::PlanError) rather than
+    /// spawning into the project root. A concurrent respawner that already won
+    /// the race leaves a *live* session of this name, in which case this
+    /// attaches to it instead of double-spawning (ADR-0004). A vanished
+    /// worktree (its directory removed out from under a surviving session
+    /// record) surfaces as [`SourceError::SessionNotFound`] — there is nothing
+    /// left to respawn; a transport that cannot even probe surfaces as
+    /// [`SourceError::Transport`].
+    async fn respawn(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<SessionChannel, SourceError>;
 }

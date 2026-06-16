@@ -47,12 +47,23 @@ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 > `crates/`, you can iterate faster with
 > `cargo test -p remora-core -p remora-protocol`.
 
-## End-to-end ssh attach test
+## End-to-end ssh tests
 
-`crates/remora-core/tests/ssh_e2e.rs` exercises a real attach against a live
-sshd + tmux. It is `#[ignore]`d so the default suite stays hermetic.
+`crates/remora-core/tests/ssh_e2e.rs` exercises the ssh transport against a
+live sshd + tmux. Every test is `#[ignore]`d so the default suite stays
+hermetic. They cover the full lifecycle:
 
-To run it, create a tmux session on a reachable host and point the test at it:
+- **attach** — attaches to a pre-existing tmux session, resizes, runs
+  `echo remora-e2e-ok`, and asserts the marker shows up in the PTY stream.
+- **spawn** — a shared-workspace spawn (and a duplicate-session block) and a
+  worktree-mode cold start that creates a fresh worktree.
+- **discovery + respawn** — stops a session, discovers it as *stopped* via
+  `list`, respawns it (reusing the surviving worktree, no `git worktree add`),
+  and checks that respawning a vanished worktree fails closed as
+  `SessionNotFound`.
+
+To run them, point the tests at a reachable host. The attach test needs a tmux
+session created up front:
 
 ```sh
 # on the host:
@@ -62,13 +73,21 @@ REMORA_E2E_SSH_HOST=<host> REMORA_E2E_PROJECT=demo REMORA_E2E_SESSION=one \
   cargo test -p remora-core --test ssh_e2e -- --ignored --nocapture
 ```
 
-Optional environment variables (prepend to the command if needed):
+Environment variables:
 
-- `REMORA_E2E_SSH_USER=<user>`
-- `REMORA_E2E_SSH_PORT=<port>`
-
-It attaches, resizes, runs `echo remora-e2e-ok`, and asserts the marker shows
-up in the PTY stream.
+- `REMORA_E2E_SSH_HOST=<host>` — required; the ssh destination.
+- `REMORA_E2E_SSH_USER=<user>` — optional.
+- `REMORA_E2E_SSH_PORT=<port>` — optional.
+- `REMORA_E2E_PROJECT=<slug>` — optional (default `demo`); the attach test's
+  project id. With `REMORA_E2E_SESSION` it selects which tmux session to attach
+  to (`remora_<project>_<session>`), so it must match the session created on
+  the host.
+- `REMORA_E2E_SESSION=<slug>` — optional (default `one`); the attach test's
+  session id (see above).
+- `REMORA_E2E_PATH=<dir>` — working dir on the host for the shared-workspace
+  spawn test (defaults to `~/e2e`).
+- `REMORA_E2E_GIT_PATH=<repo>` — path to an existing git repo on the host;
+  required for the worktree spawn, discovery, and respawn tests.
 
 ## Repository layout
 

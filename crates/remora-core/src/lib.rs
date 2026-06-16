@@ -5,6 +5,7 @@
 //! implementation, which is what makes the relay an optional drop-in.
 
 pub mod config;
+pub mod discovery;
 pub mod naming;
 pub mod spawn_plan;
 pub mod transport;

@@ -21,6 +21,8 @@ pub enum PlanError {
     UnknownProject(ProjectId),
     #[error("unknown agent `{0}`")]
     UnknownAgent(AgentId),
+    #[error("project `{0}` is not a worktree project; cannot respawn")]
+    NotWorktreeProject(ProjectId),
 }
 
 /// A resolved spawn, transport-agnostic. All paths are *logical* (raw `/…`
