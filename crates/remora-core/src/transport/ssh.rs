@@ -8,8 +8,9 @@ use portable_pty::CommandBuilder;
 use remora_protocol::{ProjectId, SessionId, SessionMeta, SpawnSpec};
 
 use super::pty_process::spawn_pty_channel;
-use crate::config::{Config, SshHost};
-use crate::naming::tmux_session_name;
+use crate::config::{Config, SshHost, WorkspaceMode};
+use crate::discovery::{self, DiscoveredEnv};
+use crate::naming::{parse_tmux_session_name, tmux_session_name};
 use crate::spawn_plan::{plan_spawn, SpawnPlan};
 use crate::{SessionChannel, SessionSource, SourceError};
 
@@ -42,7 +43,6 @@ fn quote_remote_path(path: &str) -> String {
 /// Result of a blocking remote command: success, captured stdout, and stderr.
 pub(crate) struct RemoteOutput {
     pub success: bool,
-    #[allow(dead_code)] // consumed by later discovery task
     pub stdout: String,
     pub stderr: String,
 }
@@ -240,6 +240,54 @@ fn set_option_remain_on_exit_argv(host: &SshHost, tmux_name: &str) -> Vec<String
     argv
 }
 
+/// `tmux list-sessions -F '#{session_name}'`. The format string is
+/// shell-quoted: a bare `#` would start a comment in the remote login shell.
+fn list_sessions_argv(host: &SshHost) -> Vec<String> {
+    let mut argv = ssh_base_argv(host, false);
+    argv.push("tmux".into());
+    argv.push("list-sessions".into());
+    argv.push("-F".into());
+    argv.push(shell_quote("#{session_name}"));
+    argv
+}
+
+/// `tmux show-environment -t <name>` — reads one session's env metadata.
+fn show_environment_query_argv(host: &SshHost, tmux_name: &str) -> Vec<String> {
+    let mut argv = ssh_base_argv(host, false);
+    argv.push("tmux".into());
+    argv.push("show-environment".into());
+    argv.push("-t".into());
+    argv.push(tmux_name.into());
+    argv
+}
+
+/// `git -C <project-path> worktree list --porcelain`.
+fn worktree_list_argv(host: &SshHost, project_path: &str) -> Vec<String> {
+    let mut argv = ssh_base_argv(host, false);
+    argv.push("git".into());
+    argv.push("-C".into());
+    argv.push(quote_remote_path(project_path));
+    argv.push("worktree".into());
+    argv.push("list".into());
+    argv.push("--porcelain".into());
+    argv
+}
+
+/// Classifies `tmux list-sessions`: success → session-name lines; a
+/// no-server / no-sessions stderr → empty (the normal cold state, decision 9,
+/// matched case-insensitively); any other failure → `Transport`.
+fn classify_list_sessions(out: &RemoteOutput) -> Result<Vec<String>, SourceError> {
+    if out.success {
+        return Ok(out.stdout.lines().map(str::to_string).collect());
+    }
+    let lower = out.stderr.to_ascii_lowercase();
+    if lower.contains("no server running") || lower.contains("no sessions") {
+        Ok(Vec::new())
+    } else {
+        Err(SourceError::Transport(out.stderr.clone()))
+    }
+}
+
 /// Maps a failed `tmux new-session` to a `SourceError`. tmux prints
 /// `duplicate session: NAME` and exits non-zero when the name is taken; the
 /// match is case-insensitive on `duplicate` so a non-English `LC_MESSAGES`
@@ -362,6 +410,64 @@ fn run_spawn(
     attach_channel(exec, host, &plan.tmux_name)
 }
 
+/// Reads a live session's metadata; a failed `show-environment` (race: the
+/// session died after `list-sessions`) yields empty metadata — the session is
+/// still listed `Live` (don't downgrade a known-live session on a metadata
+/// read flake). The target name is rebuilt from validated ids.
+fn read_environment(
+    exec: &dyn SshExec,
+    host: &SshHost,
+    project: &ProjectId,
+    session: &SessionId,
+) -> DiscoveredEnv {
+    let tmux_name = tmux_session_name(project, session);
+    match exec.run(&show_environment_query_argv(host, &tmux_name)) {
+        Ok(out) if out.success => discovery::parse_session_environment(&out.stdout),
+        _ => DiscoveredEnv::default(),
+    }
+}
+
+/// Discovers sessions on the host and joins them to local config. Config-
+/// scoped throughout (R1): the live set keeps only configured projects, and
+/// the stopped scan runs only for configured worktree-mode projects.
+fn run_list(
+    exec: &dyn SshExec,
+    host: &SshHost,
+    config: &Config,
+) -> Result<Vec<SessionMeta>, SourceError> {
+    let names = classify_list_sessions(&exec.run(&list_sessions_argv(host))?)?;
+
+    let mut live = Vec::new();
+    for name in &names {
+        let Some((project, session)) = parse_tmux_session_name(name) else {
+            continue; // forged / non-remora name dropped
+        };
+        if !config.projects.contains_key(&project) {
+            continue; // R1: configured projects only
+        }
+        let env = read_environment(exec, host, &project, &session);
+        live.push((project, session, env));
+    }
+
+    let mut stopped = Vec::new();
+    for (project_id, project) in &config.projects {
+        if project.workspace != WorkspaceMode::Worktree {
+            continue; // shared projects have no surviving worktree
+        }
+        // A failure for one project (bad path, not a repo) yields empty for
+        // that project, never a failed discovery (decision 8).
+        if let Ok(out) = exec.run(&worktree_list_argv(host, &project.path)) {
+            if out.success {
+                for (session, path) in discovery::parse_worktree_list(&out.stdout, project_id) {
+                    stopped.push((project_id.clone(), session, path));
+                }
+            }
+        }
+    }
+
+    Ok(discovery::join(live, stopped))
+}
+
 #[async_trait]
 impl SessionSource for SshSource {
     /// Resolves the spawn plan from config, then runs the full spawn
@@ -396,12 +502,14 @@ impl SessionSource for SshSource {
             .map_err(|e| SourceError::Transport(format!("pty setup task: {e}")))?
     }
 
-    /// Not implemented until stage 6 (discovery lists tmux sessions and
-    /// parses the `remora_<p>_<s>` names back to ids).
+    /// Discovers sessions on the host and joins them to local config.
     async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
-        Err(SourceError::Transport(
-            "ssh discovery: not implemented (stage 6)".into(),
-        ))
+        let exec = Arc::clone(&self.exec);
+        let host = self.host.clone();
+        let config = Arc::clone(&self.config);
+        tokio::task::spawn_blocking(move || run_list(exec.as_ref(), &host, &config))
+            .await
+            .map_err(|e| SourceError::Transport(format!("list task: {e}")))?
     }
 }
 
@@ -411,6 +519,7 @@ mod tests {
     use crate::config::WorkspaceMode;
     use crate::spawn_plan::SpawnPlan;
     use crate::SessionSource;
+    use remora_protocol::SessionState;
 
     fn host(host: &str, user: Option<&str>, port: Option<u16>) -> SshHost {
         SshHost {
@@ -468,8 +577,6 @@ mod tests {
                 stderr: String::new(),
             }
         }
-        // Used by a later task (discovery); silenced here to keep clippy clean.
-        #[allow(dead_code)]
         fn out(stdout: &str) -> RemoteOutput {
             RemoteOutput {
                 success: true,
@@ -568,14 +675,6 @@ mod tests {
         let source = SshSource::new(host("devbox", None, None), Arc::new(Config::default()));
         let err = source.spawn(spec()).await.expect_err("no such project");
         assert!(matches!(err, SourceError::Plan(_)), "{err}");
-    }
-
-    #[tokio::test]
-    async fn list_is_stubbed_with_its_stage() {
-        let source = SshSource::new(host("devbox", None, None), Arc::new(Config::default()));
-        let err = source.list().await.expect_err("stubbed");
-        assert!(matches!(err, SourceError::Transport(_)));
-        assert!(err.to_string().contains("stage 6"), "{err}");
     }
 
     #[tokio::test]
@@ -939,5 +1038,102 @@ mod tests {
             !calls.iter().any(|c| c.iter().any(|a| a == "remove")),
             "must not remove a live session's worktree"
         );
+    }
+
+    #[tokio::test]
+    async fn list_joins_live_metadata_stopped_and_filters_unconfigured() {
+        // Config has project `api` (worktree). `ghost` is NOT configured.
+        let config = test_config();
+        // Scripted exec, in call order:
+        //  1) list-sessions -> api (configured) + ghost (unconfigured) +
+        //     `main` & `remora__bad` (unparseable) — only api survives.
+        //  2) show-environment for api/fix-login -> metadata
+        //  3) git worktree list for api -> fix-login (live) + add-tests (stopped)
+        let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::out("remora_api_fix-login\nremora_ghost_x\nmain\nremora__bad\n")),
+            Ok(FakeExec::out("REMORA_AGENT=claude\nREMORA_CREATED_AT=1765500000\n")),
+            Ok(FakeExec::out(
+                "worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n\n\
+                 worktree /home/dev/.remora/worktrees/api/add-tests\nbranch refs/heads/remora/add-tests\n",
+            )),
+        ]));
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        let metas = source.list().await.expect("list");
+
+        // ghost filtered out (R1). api/add-tests is Stopped; api/fix-login is Live.
+        let keys: Vec<(&str, &str, SessionState)> = metas
+            .iter()
+            .map(|m| (m.project_id.as_str(), m.session_id.as_str(), m.state))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("api", "add-tests", SessionState::Stopped),
+                ("api", "fix-login", SessionState::Live),
+            ]
+        );
+        let live = &metas[1];
+        assert_eq!(live.agent.as_deref(), Some("claude"));
+        // Stopped carries the real discovered worktree path (R6).
+        assert_eq!(
+            metas[0].workspace_path.as_deref(),
+            Some("/home/dev/.remora/worktrees/api/add-tests")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_treats_no_server_as_empty() {
+        let config = test_config();
+        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::fail(
+            "no server running on /tmp/tmux-1000/default",
+        ))]));
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        assert!(source.list().await.expect("list").is_empty());
+    }
+
+    #[test]
+    fn classify_list_sessions_maps_no_server_to_empty() {
+        let empty = RemoteOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "no server running on /tmp/tmux".into(),
+        };
+        assert_eq!(
+            classify_list_sessions(&empty).expect("ok"),
+            Vec::<String>::new()
+        );
+
+        let ok = RemoteOutput {
+            success: true,
+            stdout: "remora_api_x\nremora_api_y\n".into(),
+            stderr: String::new(),
+        };
+        assert_eq!(
+            classify_list_sessions(&ok).expect("ok"),
+            vec!["remora_api_x", "remora_api_y"]
+        );
+
+        let boom = RemoteOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "permission denied".into(),
+        };
+        assert!(matches!(
+            classify_list_sessions(&boom),
+            Err(SourceError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn list_sessions_argv_quotes_the_format_string() {
+        let argv = list_sessions_argv(&host("devbox", None, None));
+        // `#{session_name}` MUST be shell-quoted: a bare `#` starts a comment
+        // in the remote login shell and would swallow the format argument.
+        assert_eq!(argv.last().map(String::as_str), Some("'#{session_name}'"));
+        let l = argv
+            .iter()
+            .position(|a| a == "list-sessions")
+            .expect("list-sessions");
+        assert_eq!(argv[l + 1], "-F");
     }
 }
