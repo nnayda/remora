@@ -1,9 +1,12 @@
 import {
+  attachSession,
+  type BridgeError,
   type BridgeOutput,
   type ChannelHandle,
   closeSession,
   type OnOutput,
   resizeSession,
+  spawnSession,
   writeSession,
 } from "./bridge";
 
@@ -62,4 +65,42 @@ export async function openConnection(open: Opener): Promise<SessionConnection> {
       return closeSession(handle);
     },
   };
+}
+
+function isBridgeError(e: unknown): e is BridgeError {
+  return typeof e === "object" && e !== null && "kind" in e;
+}
+
+export function isSessionNotFound(e: unknown): boolean {
+  return isBridgeError(e) && e.kind === "sessionNotFound";
+}
+
+export function isSessionExists(e: unknown): boolean {
+  return isBridgeError(e) && e.kind === "sessionExists";
+}
+
+/**
+ * Get a connection to (projectId, sessionId): attach if it exists, spawn if
+ * not, and if a concurrent spawn beat us (sessionExists) attach instead.
+ * Survives React StrictMode's mount/unmount/mount in either order and page
+ * reloads (which re-attach the surviving session and replay its banner).
+ */
+export async function connectSession(
+  projectId: string,
+  sessionId: string,
+  agent: string | null,
+): Promise<SessionConnection> {
+  try {
+    return await openConnection((o) => attachSession(projectId, sessionId, o));
+  } catch (e) {
+    if (!isSessionNotFound(e)) throw e;
+  }
+  try {
+    return await openConnection((o) =>
+      spawnSession(projectId, sessionId, agent, o),
+    );
+  } catch (e) {
+    if (!isSessionExists(e)) throw e;
+    return await openConnection((o) => attachSession(projectId, sessionId, o));
+  }
 }

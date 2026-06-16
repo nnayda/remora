@@ -17,7 +17,12 @@ vi.mock("./bridge", () => ({
 }));
 
 import type { BridgeOutput, OnOutput } from "./bridge";
-import { openConnection } from "./connection";
+import {
+  connectSession,
+  isSessionExists,
+  isSessionNotFound,
+  openConnection,
+} from "./connection";
 
 beforeEach(() => {
   for (const f of Object.values(b)) f.mockReset();
@@ -88,5 +93,58 @@ describe("connection.ts — openConnection", () => {
     conn.subscribe((m) => second.push(m));
     expect(first).toEqual([{ event: "bytes", bytes: [1] }]);
     expect(second).toEqual([{ event: "bytes", bytes: [2] }]);
+  });
+});
+
+describe("connection.ts — connectSession ladder", () => {
+  it("attaches when the session already exists", async () => {
+    b.attachSession.mockResolvedValue(1);
+    await connectSession("p", "s", null);
+    expect(b.attachSession).toHaveBeenCalledTimes(1);
+    expect(b.spawnSession).not.toHaveBeenCalled();
+  });
+
+  it("spawns when attach reports the session is not found", async () => {
+    b.attachSession.mockRejectedValueOnce({
+      kind: "sessionNotFound",
+      message: "x",
+    });
+    b.spawnSession.mockResolvedValue(2);
+    await connectSession("p", "s", "claude");
+    expect(b.attachSession).toHaveBeenCalledTimes(1);
+    expect(b.spawnSession).toHaveBeenCalledTimes(1);
+    expect(b.spawnSession).toHaveBeenCalledWith(
+      "p",
+      "s",
+      "claude",
+      expect.anything(),
+    );
+  });
+
+  it("falls back to attach when a racing spawn reports the session exists", async () => {
+    b.attachSession
+      .mockRejectedValueOnce({ kind: "sessionNotFound" }) // first attach: not there yet
+      .mockResolvedValueOnce(3); // fallback attach succeeds
+    b.spawnSession.mockRejectedValueOnce({ kind: "sessionExists" });
+    await connectSession("p", "s", null);
+    expect(b.spawnSession).toHaveBeenCalledTimes(1);
+    expect(b.attachSession).toHaveBeenCalledTimes(2);
+  });
+
+  it("rethrows unexpected bridge errors", async () => {
+    b.attachSession.mockRejectedValueOnce({
+      kind: "transport",
+      message: "boom",
+    });
+    await expect(connectSession("p", "s", null)).rejects.toMatchObject({
+      kind: "transport",
+    });
+  });
+
+  it("error guards match the BridgeError kinds", () => {
+    expect(isSessionNotFound({ kind: "sessionNotFound" })).toBe(true);
+    expect(isSessionExists({ kind: "sessionExists" })).toBe(true);
+    expect(isSessionNotFound({ kind: "sessionExists" })).toBe(false);
+    expect(isSessionExists(new Error("x"))).toBe(false);
   });
 });
