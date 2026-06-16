@@ -44,12 +44,14 @@ import { TerminalController } from "./terminal-controller";
 
 let roCb: (() => void) | null = null;
 let rafCb: (() => void) | null = null;
+let disconnectSpy = vi.fn();
 
 beforeEach(() => {
   xt.state.term = null;
   xt.state.fit = null;
   roCb = null;
   rafCb = null;
+  disconnectSpy = vi.fn();
   vi.stubGlobal(
     "ResizeObserver",
     class {
@@ -57,7 +59,9 @@ beforeEach(() => {
         roCb = cb;
       }
       observe() {}
-      disconnect() {}
+      disconnect() {
+        disconnectSpy();
+      }
     },
   );
   // Capture the rAF callback so the test flushes the debounce explicitly.
@@ -65,7 +69,10 @@ beforeEach(() => {
     rafCb = cb;
     return 1;
   });
-  vi.stubGlobal("cancelAnimationFrame", () => {});
+  // Simulate real cancellation: a cancelled frame's callback never fires.
+  vi.stubGlobal("cancelAnimationFrame", () => {
+    rafCb = null;
+  });
 });
 
 afterEach(() => vi.unstubAllGlobals());
@@ -180,8 +187,33 @@ describe("TerminalController", () => {
     const conn = fakeConn();
     const c = new TerminalController(el, conn as unknown as SessionConnection);
     c.dispose();
+    expect(disconnectSpy).toHaveBeenCalled();
     expect(conn.unsubscribe).toHaveBeenCalled();
     expect(xt.state.term?.dataDispose).toHaveBeenCalled();
     expect(xt.state.term?.dispose).toHaveBeenCalled();
+  });
+
+  it("writes the closed notice only once when closed arrives repeatedly", () => {
+    const conn = fakeConn();
+    new TerminalController(el, conn as unknown as SessionConnection);
+    conn.emit({ event: "closed" });
+    conn.emit({ event: "closed" });
+    const notices = term().written.filter(
+      (w): w is string =>
+        typeof w === "string" && w.includes("[session closed]"),
+    );
+    expect(notices).toHaveLength(1);
+  });
+
+  it("cancels a pending resize on dispose so resize is not sent after teardown", () => {
+    const conn = fakeConn();
+    const c = new TerminalController(el, conn as unknown as SessionConnection);
+    conn.resize.mockClear();
+    term().rows = 30;
+    term().cols = 100;
+    roCb?.(); // queues a rAF via scheduleFit
+    c.dispose(); // cancelAnimationFrame clears the queued callback
+    rafCb?.(); // no-op after cancellation
+    expect(conn.resize).not.toHaveBeenCalled();
   });
 });

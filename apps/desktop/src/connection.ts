@@ -30,6 +30,12 @@ type Opener = (onOutput: OnOutput) => Promise<ChannelHandle>;
  * Open one channel and wrap it. Output produced before `subscribe` is buffered
  * and replayed on the first subscribe, so nothing is lost in the window between
  * the channel opening and the terminal mounting (e.g. an attach banner).
+ *
+ * The caller is expected to `subscribe` within a render tick (the terminal
+ * mounts immediately): the buffer is a short-lived handoff, not a durable
+ * store, so it is intentionally uncapped — a terminal stream cannot drop bytes
+ * mid-escape-sequence, so a ring buffer would corrupt the screen. Durable
+ * backpressure for detach/reattach is a transport concern (stage 11).
  */
 export async function openConnection(open: Opener): Promise<SessionConnection> {
   let subscriber: OnOutput | null = null;

@@ -94,6 +94,15 @@ describe("connection.ts — openConnection", () => {
     expect(first).toEqual([{ event: "bytes", bytes: [1] }]);
     expect(second).toEqual([{ event: "bytes", bytes: [2] }]);
   });
+
+  it("reports closed=true when the closed event arrives before subscribe", async () => {
+    const { conn, emit } = await open();
+    emit({ event: "closed" });
+    expect(conn.closed).toBe(true);
+    const seen: BridgeOutput[] = [];
+    conn.subscribe((m) => seen.push(m));
+    expect(seen).toContainEqual({ event: "closed" });
+  });
 });
 
 describe("connection.ts — connectSession ladder", () => {
@@ -139,6 +148,16 @@ describe("connection.ts — connectSession ladder", () => {
     await expect(connectSession("p", "s", null)).rejects.toMatchObject({
       kind: "transport",
     });
+  });
+
+  it("rethrows an unexpected error from the spawn leg", async () => {
+    b.attachSession.mockRejectedValueOnce({ kind: "sessionNotFound" });
+    b.spawnSession.mockRejectedValueOnce({ kind: "transport", message: "net" });
+    await expect(connectSession("p", "s", null)).rejects.toMatchObject({
+      kind: "transport",
+    });
+    expect(b.spawnSession).toHaveBeenCalledTimes(1);
+    expect(b.attachSession).toHaveBeenCalledTimes(1);
   });
 
   it("error guards match the BridgeError kinds", () => {

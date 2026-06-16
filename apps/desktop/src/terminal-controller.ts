@@ -35,7 +35,9 @@ export class TerminalController {
 
     this.unsubscribe = connection.subscribe((msg) => {
       if (msg.event === "bytes") this.term.write(new Uint8Array(msg.bytes));
-      else this.handleClosed();
+      else if (msg.event === "closed") this.handleClosed();
+      // A future BridgeOutput variant falls through here and is ignored, rather
+      // than being mislabeled as a closed session.
     });
 
     this.onDataDisposable = this.term.onData((data) => {
