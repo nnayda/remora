@@ -52,6 +52,41 @@ describe("bridge.ts", () => {
     ]);
   });
 
+  it("attachSession passes ids + wired channel and returns the handle", async () => {
+    c.sessionAttach.mockImplementation(
+      async (
+        _p: unknown,
+        _s: unknown,
+        ch: { onmessage: ((m: unknown) => void) | null },
+      ) => {
+        ch.onmessage?.({ event: "bytes", bytes: [120] });
+        return { status: "ok", data: 7 };
+      },
+    );
+    const seen: unknown[] = [];
+    const h = await bridge.attachSession("api", "x", (m) => seen.push(m));
+    expect(h).toBe(7);
+    expect(c.sessionAttach).toHaveBeenCalledWith("api", "x", expect.anything());
+    expect(seen).toEqual([{ event: "bytes", bytes: [120] }]);
+  });
+
+  it("respawnSession passes ids and returns the handle", async () => {
+    c.sessionRespawn.mockResolvedValue({ status: "ok", data: 3 });
+    const h = await bridge.respawnSession("api", "x", () => {});
+    expect(h).toBe(3);
+    expect(c.sessionRespawn).toHaveBeenCalledWith(
+      "api",
+      "x",
+      expect.anything(),
+    );
+  });
+
+  it("resizeSession forwards rows and cols", async () => {
+    c.sessionResize.mockResolvedValue({ status: "ok", data: null });
+    await bridge.resizeSession(5 as never, 30, 100);
+    expect(c.sessionResize).toHaveBeenCalledWith(5, 30, 100);
+  });
+
   it("listSessions returns data on ok", async () => {
     c.sessionList.mockResolvedValue({ status: "ok", data: [] });
     expect(await bridge.listSessions()).toEqual([]);

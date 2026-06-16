@@ -118,6 +118,9 @@ mod bindings_test {
         let tmp = std::env::temp_dir().join("remora-bindings-gen.ts");
         builder()
             .export(
+                // u64 (ChannelHandle, SessionMetaDto.created_at) -> TS `number`.
+                // number is exact only to 2^53; a monotonic handle counter won't
+                // approach that in a process lifetime, so this is safe here.
                 specta_typescript::Typescript::default()
                     .bigint(specta_typescript::BigIntExportBehavior::Number),
                 &tmp,
@@ -134,9 +137,20 @@ mod bindings_test {
             .collect::<Vec<_>>()
             .join("\n");
         let current = std::fs::read_to_string(&committed).unwrap_or_default();
-        if current.trim() != generated.trim() {
+        let stale = current.trim() != generated.trim();
+        // Default (incl. CI): compare only — NEVER mutate the source tree, or a
+        // stale checkout would surface as phantom diffs / cache churn. To
+        // regenerate locally after changing a command, opt in explicitly:
+        //   REMORA_UPDATE_BINDINGS=1 cargo test -p remora-desktop bindings_are_up_to_date
+        if stale && std::env::var_os("REMORA_UPDATE_BINDINGS").is_some() {
             std::fs::write(&committed, format!("{generated}\n")).expect("write bindings");
-            panic!("src/bindings.ts was stale and has been regenerated — commit it and re-run.");
+        } else {
+            assert!(
+                !stale,
+                "src/bindings.ts is stale. Regenerate with \
+                 `REMORA_UPDATE_BINDINGS=1 cargo test -p remora-desktop bindings_are_up_to_date`, \
+                 then commit src/bindings.ts."
+            );
         }
     }
 }

@@ -203,10 +203,9 @@ async fn forward(
             // `recv() -> None` can race on one tick; without bias we could emit
             // a spurious Closed after a close() that is contracted to be silent.
             biased;
-            _ = &mut cancel => {      // close(): entry already removed; stay silent
-                deregister(&registry, handle);
-                return;
-            }
+            // close() already removed the registry entry before signalling
+            // cancel, so there is nothing to deregister here — just stop silently.
+            _ = &mut cancel => return,
             msg = output.recv() => match msg {
                 Some(ChannelOutput::Bytes(bytes)) => {
                     if sink.send(BridgeOutput::Bytes { bytes }).is_err() {
@@ -315,6 +314,9 @@ mod tests {
         // After the forward task ends it drops the sink, so the receiver is
         // Disconnected rather than Empty — both mean "nothing was delivered";
         // only an Ok(_) would prove a (forbidden) message was sent.
+        // One yield_now is deterministic on the current-thread runtime
+        // `#[tokio::test]` uses: it runs the woken forward task through the
+        // cancel arm to completion before control returns here.
         tokio::task::yield_now().await;
         assert!(rx.try_recv().is_err(), "close() must not emit any output");
     }
