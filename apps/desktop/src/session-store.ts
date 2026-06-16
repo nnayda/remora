@@ -1,4 +1,3 @@
-// apps/desktop/src/session-store.ts
 import type { SessionConnection } from "./connection";
 
 /** Identity + dedupe key for a tab. */

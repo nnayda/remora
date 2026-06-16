@@ -1,4 +1,3 @@
-// apps/desktop/src/NewSessionDialog.tsx
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import type { OpenResult, SpawnInput } from "./session-store";
 import { OPEN_CANCELLED } from "./session-store";

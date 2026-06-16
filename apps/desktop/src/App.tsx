@@ -1,4 +1,3 @@
-// apps/desktop/src/App.tsx
 import { useEffect, useRef, useState } from "react";
 import "./App.css";
 import { NewSessionDialog } from "./NewSessionDialog";
