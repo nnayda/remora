@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Embedded terminal (desktop, roadmap stage 8): xterm.js wired to the Tauri
+  bridge. A `SessionConnection` seam (`connection.ts`) buffers PTY output until
+  the terminal subscribes, then streams it and delegates write/resize/close to
+  the bridge handle; `connectSession` attaches an existing session or spawns a
+  new one (attach→spawn→attach), surviving React StrictMode's double-mount and
+  page reloads. A framework-agnostic `TerminalController` owns the xterm
+  `Terminal` + `FitAddon`: raw bytes go to `term.write` (the emulator owns
+  screen state — bytes are never parsed), keystrokes are UTF-8 encoded back, and
+  DOM-driven resize is debounced and zero/unchanged-guarded, with a
+  `[session closed]` notice on transport death. A thin `<Terminal>` React
+  wrapper plus a one-session dev harness make the loop interactive against the
+  fake `SessionSource`. Adds `@xterm/xterm` + `@xterm/addon-fit`.
 - Tauri bridge (desktop, roadmap stage 7): the `src-tauri` layer now owns a
   `SessionSource` and exposes `session_{list,spawn,attach,respawn,write,resize,
   close}` Tauri commands, streaming PTY output to the React frontend over
