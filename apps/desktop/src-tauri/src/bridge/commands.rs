@@ -103,3 +103,40 @@ pub fn builder() -> Builder<tauri::Wry> {
         session_close
     ])
 }
+
+#[cfg(test)]
+mod bindings_test {
+    use super::builder;
+
+    /// Generates the committed TS bindings and fails if they drift (no-drift guard).
+    /// Post-processes the tauri-specta rc.21 output: drop the stray
+    /// `export type TAURI_CHANNEL<TSend> = null` (collides with the Channel import
+    /// -> TS2440) and prepend `// @ts-nocheck` (silences TS6133 on generated decls).
+    #[test]
+    fn bindings_are_up_to_date() {
+        let committed = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/bindings.ts");
+        let tmp = std::env::temp_dir().join("remora-bindings-gen.ts");
+        builder()
+            .export(
+                specta_typescript::Typescript::default()
+                    .bigint(specta_typescript::BigIntExportBehavior::Number),
+                &tmp,
+            )
+            .expect("specta export");
+        let raw = std::fs::read_to_string(&tmp).expect("read generated bindings");
+        std::fs::remove_file(&tmp).ok();
+        let generated: String = std::iter::once("// @ts-nocheck".to_string())
+            .chain(
+                raw.lines()
+                    .filter(|l| !l.trim_start().starts_with("export type TAURI_CHANNEL"))
+                    .map(str::to_string),
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
+        let current = std::fs::read_to_string(&committed).unwrap_or_default();
+        if current.trim() != generated.trim() {
+            std::fs::write(&committed, format!("{generated}\n")).expect("write bindings");
+            panic!("src/bindings.ts was stale and has been regenerated — commit it and re-run.");
+        }
+    }
+}

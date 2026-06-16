@@ -6,7 +6,14 @@
     "useIgnoreFile": true
   },
   "files": {
-    "includes": ["**", "!**/dist", "!**/target", "!**/gen", "!pnpm-lock.yaml"]
+    "includes": [
+      "**",
+      "!**/dist",
+      "!**/target",
+      "!**/gen",
+      "!pnpm-lock.yaml",
+      "!apps/desktop/src/bindings.ts"
+    ]
   },
   "formatter": {
     "enabled": true,
