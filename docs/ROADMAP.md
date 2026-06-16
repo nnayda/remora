@@ -9,8 +9,8 @@ Status markers: ✅ done · ☐ open.
 
 Already done: repo scaffold (#1–#10) and the spine spike (roadmap step 1 in
 [VISION.md](VISION.md)). **Phase 1 is complete** (#14–#19); the Tauri bridge
-(stage 7) is also complete; the next open stage is the Embedded terminal
-component (stage 8).
+(stage 7) and the Embedded terminal component (stage 8) are also complete;
+the next open stage is Tabs + one-click session spawn (stage 9).
 
 ## Phase 1 — Protocol & core (the seam) — ✅ complete
 
@@ -52,7 +52,7 @@ component (stage 8).
    spawn/attach/list/write/resize as Tauri commands, stream PTY output to
    the frontend as events. The UI talks only to this layer.
 
-8. ☐ **Embedded terminal component**
+8. ✅ **Embedded terminal component**
    xterm.js wired to the bridge: render the byte stream, send keystrokes,
    drive resize from the DOM. Never parse bytes — the emulator owns screen
    state (spike lesson).
@@ -120,7 +120,7 @@ Hard dependencies per stage (a stage needs these merged first):
 | ✅ 5 ssh spawn | 3, 4 |
 | ✅ 6 Discovery & join | 3, 4 |
 | ✅ 7 Tauri bridge | 2 (runs on the test double) |
-| ☐ 8 Terminal component | 7 |
+| ✅ 8 Terminal component | 7 |
 | ☐ 9 Tabs + spawn | 5, 8 |
 | ☐ 10 Sidebar | 6, 9 |
 | ☐ 11 Reconnect & respawn | 6, 10 |
