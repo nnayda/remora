@@ -186,3 +186,26 @@ up cold.
 - **Context:** Stage-7 eng review (outside-voice finding / D8-8A). Same
   `fake-as-contract-overspecification` shape as the list-ordering call.
 - **Depends on:** stage 9 (spawn UI) / stage 10 (sidebar attach).
+
+## Per-webview handle ownership (stage 8+ multi-window)
+
+- **What:** Scope `ChannelHandle`s to the webview/window that opened them, so
+  one window cannot drive (`session_write`/`session_resize`/`session_close`)
+  another window's channel. Today the bridge registry is process-global and a
+  handle is just a `u64`; any caller that knows (or guesses) an integer hits the
+  same registry. As part of this, tighten `ChannelHandle`'s inner field from
+  `pub` to `pub(crate)` (serde/specta derive don't need the field public) so
+  handles can't be forged outside the bridge crate.
+- **Why:** Harmless while the app is single-window/single-user (stage 7), but
+  once stage 8 (terminal) and a tabbed/multi-window UI land, cross-window handle
+  access is a real trust-boundary slip: window A could write keystrokes into or
+  close window B's session. Handles are sequential `AtomicU64` values, so they
+  are trivially guessable.
+- **Pros:** Closes a multi-window trust boundary before it can be exploited;
+  the field-visibility tightening is free. **Cons:** needs a per-webview
+  identity to key on (Tauri `WebviewWindow` label or similar), which only exists
+  once there's a real window/tab model — premature to build now.
+- **Context:** Stage-7 `/review` (adversarial pass, INFORMATIONAL — not
+  exploitable at single-window stage 7). Flagged as the one forward-looking item
+  worth tracking; the `pub`-field tightening can be done anytime.
+- **Depends on:** stage 8 (terminal) / a multi-window or tabbed UI model.
