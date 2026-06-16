@@ -216,4 +216,20 @@ describe("TerminalController", () => {
     rafCb?.(); // no-op after cancellation
     expect(conn.resize).not.toHaveBeenCalled();
   });
+
+  it("logs a write failure instead of swallowing it, and stays open", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const conn = fakeConn();
+    conn.write.mockRejectedValueOnce(new Error("dead channel"));
+    new TerminalController(el, conn as unknown as SessionConnection);
+    term().dataCb?.("x");
+    await Promise.resolve(); // let the rejected write's catch run
+    await Promise.resolve();
+    expect(errSpy).toHaveBeenCalled();
+    // A single rejection must NOT force-close: a later keystroke still writes.
+    conn.write.mockResolvedValueOnce(undefined);
+    term().dataCb?.("y");
+    expect(conn.write).toHaveBeenCalledTimes(2);
+    errSpy.mockRestore();
+  });
 });

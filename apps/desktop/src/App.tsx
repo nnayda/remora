@@ -15,20 +15,22 @@ function App() {
   useEffect(() => {
     let conn: SessionConnection | undefined;
     let cancelled = false;
+    const logClose = (e: unknown) => console.error("session close failed", e);
     connectSession("demo", "scratch", null)
       .then((c) => {
-        if (cancelled) void c.close();
+        if (cancelled) void c.close().catch(logClose);
         else {
           conn = c;
           setConnection(c);
         }
       })
-      .catch((e: unknown) =>
-        setError(e instanceof Error ? e.message : String(e)),
-      );
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : String(e));
+      });
     return () => {
       cancelled = true;
-      void conn?.close();
+      void conn?.close().catch(logClose);
     };
   }, []);
 

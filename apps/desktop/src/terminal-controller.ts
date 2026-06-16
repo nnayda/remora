@@ -42,7 +42,9 @@ export class TerminalController {
 
     this.onDataDisposable = this.term.onData((data) => {
       if (this.closed) return;
-      void this.connection.write(encoder.encode(data)).catch(() => {});
+      void this.connection
+        .write(encoder.encode(data))
+        .catch((e) => this.logTransportError("write", e));
     });
 
     this.observer = new ResizeObserver(() => this.scheduleFit());
@@ -55,6 +57,13 @@ export class TerminalController {
     this.closed = true;
     // Dim grey notice so a dead session reads clearly, not as a frozen bug.
     this.term.write("\r\n\x1b[90m[session closed]\x1b[0m\r\n");
+  }
+
+  // Surface (don't swallow) a fire-and-forget write/resize rejection. Log only:
+  // the bridge's `closed` event is the authoritative death signal, so a single
+  // transient rejection must not force-close an otherwise live session.
+  private logTransportError(op: "write" | "resize", error: unknown): void {
+    console.error(`terminal ${op} failed`, error);
   }
 
   private scheduleFit(): void {
@@ -73,7 +82,9 @@ export class TerminalController {
     if (rows === this.lastRows && cols === this.lastCols) return; // nothing changed
     this.lastRows = rows;
     this.lastCols = cols;
-    void this.connection.resize(rows, cols).catch(() => {});
+    void this.connection
+      .resize(rows, cols)
+      .catch((e) => this.logTransportError("resize", e));
   }
 
   dispose(): void {
