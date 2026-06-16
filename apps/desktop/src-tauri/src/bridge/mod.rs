@@ -150,9 +150,9 @@ impl Bridge {
         }
     }
 
-    /// Local teardown (no protocol counterpart): drop this client's ends. The
-    /// `Ok` return is the authoritative teardown signal — the frontend must NOT
-    /// wait for a `closed` event after calling this. Idempotent.
+    /// Local teardown (no protocol counterpart): drop this client's ends.
+    /// Returning is the authoritative local-teardown signal — the frontend must
+    /// NOT wait for a `closed` event after `session_close`. Idempotent.
     pub fn close(&self, handle: ChannelHandle) {
         if let Some(ch) = self.lock().remove(&handle.0) {
             let _ = ch.cancel.send(());
@@ -186,9 +186,10 @@ fn parse_ids(p: String, s: String) -> Result<(ProjectId, SessionId), BridgeError
     Ok((parse_id(ProjectId::new(p))?, parse_id(SessionId::new(s))?))
 }
 
-/// Pumps PTY output to the sink. Ends on transport death (emit Closed),
-/// frontend-gone (sink err -> stop), or cancel (close(): silent). Always
-/// self-deregisters by handle.
+/// Pumps PTY output to the sink. On transport death OR frontend-gone (sink
+/// error) it attempts to emit `Closed` (unless `close()` raced in after the
+/// loop exited — see cancel guard below). On cancel (`close()`) it is always
+/// silent. Always self-deregisters by handle.
 async fn forward(
     mut output: mpsc::Receiver<ChannelOutput>,
     sink: Arc<dyn OutputSink>,
@@ -217,7 +218,16 @@ async fn forward(
             }
         }
     }
-    let _ = sink.send(BridgeOutput::Closed);
+    // The loop exited via the output arm (transport death or frontend-gone).
+    // If close() fired the cancel meanwhile (death raced close() OUTSIDE the
+    // select), stay silent — close() is contracted to emit nothing. Otherwise
+    // this is a genuine death: tell the frontend.
+    match cancel.try_recv() {
+        Ok(()) => {}
+        Err(_) => {
+            let _ = sink.send(BridgeOutput::Closed);
+        }
+    }
     deregister(&registry, handle);
 }
 
@@ -254,6 +264,21 @@ mod tests {
             }),
         )
     }
+    /// Polls up to ~500ms for the forward task to self-deregister `h`
+    /// (write then returns UnknownHandle). Panics with `ctx` on timeout.
+    async fn wait_for_deregister(b: &Bridge, h: ChannelHandle, ctx: &str) {
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if matches!(
+                b.write(h, b"probe".to_vec()).await,
+                Err(BridgeError::UnknownHandle)
+            ) {
+                return;
+            }
+        }
+        panic!("{ctx}");
+    }
+
     async fn next_bytes(rx: &mut mpsc::UnboundedReceiver<BridgeOutput>) -> Vec<u8> {
         match rx.recv().await {
             Some(BridgeOutput::Bytes { bytes }) => bytes,
@@ -333,16 +358,7 @@ mod tests {
                   // Trigger output so the forward task attempts a send that fails.
         let _ = b.write(h, b"x".to_vec()).await;
         // Let the forward task observe the failed send and self-deregister.
-        for _ in 0..50 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            if matches!(
-                b.write(h, b"y".to_vec()).await,
-                Err(BridgeError::UnknownHandle)
-            ) {
-                return;
-            }
-        }
-        panic!("forward task did not deregister after sink failure");
+        wait_for_deregister(&b, h, "forward task did not deregister after sink failure").await;
     }
 
     #[tokio::test]
@@ -471,6 +487,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resize_unknown_handle() {
+        let b = bridge(Arc::new(FakeSessionSource::new()));
+        assert!(matches!(
+            b.resize(ChannelHandle(999), 24, 80).await,
+            Err(BridgeError::UnknownHandle)
+        ));
+    }
+
+    #[tokio::test]
+    async fn attach_and_respawn_reject_invalid_ids() {
+        let b = bridge(Arc::new(FakeSessionSource::new()));
+        let (s1, _r1) = sink();
+        assert!(matches!(
+            b.attach("API".into(), "x".into(), s1).await,
+            Err(BridgeError::InvalidId { .. })
+        ));
+        let (s2, _r2) = sink();
+        assert!(matches!(
+            b.respawn("API".into(), "x".into(), s2).await,
+            Err(BridgeError::InvalidId { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn attach_unknown_session_is_not_found() {
+        let b = bridge(Arc::new(FakeSessionSource::new()));
+        let (s, _rx) = sink();
+        assert!(matches!(
+            b.attach("api".into(), "ghost".into(), s).await,
+            Err(BridgeError::SessionNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn natural_death_emits_closed_and_deregisters() {
         let src = Arc::new(FakeSessionSource::new());
         let (s, mut rx) = sink();
@@ -487,15 +537,6 @@ mod tests {
                 None => panic!("no Closed emitted"),
             }
         }
-        for _ in 0..50 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            if matches!(
-                b.write(h, b"x".to_vec()).await,
-                Err(BridgeError::UnknownHandle)
-            ) {
-                return;
-            }
-        }
-        panic!("forward task did not deregister after natural death");
+        wait_for_deregister(&b, h, "forward task did not deregister after natural death").await;
     }
 }

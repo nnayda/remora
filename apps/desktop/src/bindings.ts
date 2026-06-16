@@ -85,7 +85,18 @@ export type BridgeOutput = { event: "bytes"; bytes: number[] } | { event: "close
  * Opaque handle the frontend uses to address one open channel (write/resize/close).
  */
 export type ChannelHandle = number
-export type SessionMetaDto = { projectId: string; sessionId: string; state: SessionStateDto; agent: string | null; createdAt: number | null; workspacePath: string | null }
+export type SessionMetaDto = { projectId: string; sessionId: string; state: SessionStateDto; 
+/**
+ * Agent id the sandbox advertises for this session. Untrusted,
+ * display-only: the discovery layer sanitizes it; never build a command
+ * or path from it.
+ */
+agent: string | null; createdAt: number | null; 
+/**
+ * Workspace path the sandbox advertises. Untrusted, display-only (same
+ * rule as `agent`).
+ */
+workspacePath: string | null }
 export type SessionStateDto = "live" | "stopped"
 
 /** tauri-specta globals **/

@@ -53,8 +53,13 @@ pub struct SessionMetaDto {
     pub project_id: String,
     pub session_id: String,
     pub state: SessionStateDto,
+    /// Agent id the sandbox advertises for this session. Untrusted,
+    /// display-only: the discovery layer sanitizes it; never build a command
+    /// or path from it.
     pub agent: Option<String>,
     pub created_at: Option<u64>,
+    /// Workspace path the sandbox advertises. Untrusted, display-only (same
+    /// rule as `agent`).
     pub workspace_path: Option<String>,
 }
 
@@ -94,6 +99,19 @@ mod tests {
         assert!(matches!(
             BridgeError::from(SourceError::Transport("x".into())),
             BridgeError::Transport { .. }
+        ));
+        assert!(matches!(
+            BridgeError::from(SourceError::SessionExists {
+                project_id: ProjectId::new("api").expect("slug"),
+                session_id: SessionId::new("x").expect("slug"),
+            }),
+            BridgeError::SessionExists { .. }
+        ));
+        assert!(matches!(
+            BridgeError::from(SourceError::Plan(remora_core::PlanError::UnknownProject(
+                ProjectId::new("ghost").expect("slug")
+            ))),
+            BridgeError::Plan { .. }
         ));
     }
 
