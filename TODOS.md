@@ -147,3 +147,65 @@ up cold.
   honest that the original metadata is unrecoverable; this tracks closing the
   UX gap once a client/UI exists to carry the last-known agent.
 - **Depends on:** a client/UI that retains pre-stop discovery state.
+
+## Coalesce bridge output + binary byte codec (PTY firehose backpressure)
+
+- **What:** In the Tauri bridge's PTY→frontend forward task, batch bytes per
+  render tick before sending, and/or swap the JSON-number-array byte encoding
+  for a binary codec. Today the forward task pushes each `ChannelOutput` chunk
+  through `ipc::Channel::send` 1:1.
+- **Why:** Past the bridge's 256-message core mpsc, `ipc::Channel::send` is
+  fire-and-forget — no webview backpressure. A real PTY firehose (a big build
+  log, `yes`) can pile messages into the IPC/webview layer unbounded and spike
+  memory. The number-array encoding also bloats each chunk ~3-4x over the wire.
+  Neither matters on the stage-7 fake (echo, hand-driven); both bite once a
+  real terminal (stage 8) and real transports (stage 9) land.
+- **Pros:** Firehose-safe; smaller, faster output payloads. **Cons:** can't be
+  exercised or tuned without a real transport + xterm, so it's premature now.
+- **Context:** Stage-7 eng review (Architecture finding 2 / D3-2A). Deliberately
+  deferred to keep the fake-only bridge small; lands with its first real
+  firehose consumer.
+- **Depends on:** stage 8 (xterm terminal) + stage 9 (real transports) so it
+  can be measured.
+
+## Define multiple-attach / one-channel-per-session policy (stage 9-10 UI)
+
+- **What:** Decide and implement what happens when the UI opens more than one
+  output channel to the same live session. The bridge is deliberately a dumb
+  multiplexer (it permits N handles per session); the *policy* (one tab per
+  session? surface eviction?) belongs to the spawn/sidebar UI.
+- **Why:** Behavior diverges by transport and the fake hides it: the
+  `FakeSessionSource` gives each attach an independent echo channel, but real
+  ssh evicts the prior client (`tmux attach -d`, per the `SessionSource::attach`
+  doc). Without a defined policy the stage-9/10 UI can ship two tabs fighting
+  over one session, or rediscover the fake-vs-ssh divergence cold.
+- **Pros:** Avoids a confusing multi-attach UX bug; pins down the fake-vs-ssh
+  divergence in one place. **Cons:** none beyond a backlog entry; enforcing it
+  in the bridge now would be premature (eviction is already the transport's
+  job, so bridge-side policy could fight it).
+- **Context:** Stage-7 eng review (outside-voice finding / D8-8A). Same
+  `fake-as-contract-overspecification` shape as the list-ordering call.
+- **Depends on:** stage 9 (spawn UI) / stage 10 (sidebar attach).
+
+## Per-webview handle ownership (stage 8+ multi-window)
+
+- **What:** Scope `ChannelHandle`s to the webview/window that opened them, so
+  one window cannot drive (`session_write`/`session_resize`/`session_close`)
+  another window's channel. Today the bridge registry is process-global and a
+  handle is just a `u64`; any caller that knows (or guesses) an integer hits the
+  same registry. As part of this, tighten `ChannelHandle`'s inner field from
+  `pub` to `pub(crate)` (serde/specta derive don't need the field public) so
+  handles can't be forged outside the bridge crate.
+- **Why:** Harmless while the app is single-window/single-user (stage 7), but
+  once stage 8 (terminal) and a tabbed/multi-window UI land, cross-window handle
+  access is a real trust-boundary slip: window A could write keystrokes into or
+  close window B's session. Handles are sequential `AtomicU64` values, so they
+  are trivially guessable.
+- **Pros:** Closes a multi-window trust boundary before it can be exploited;
+  the field-visibility tightening is free. **Cons:** needs a per-webview
+  identity to key on (Tauri `WebviewWindow` label or similar), which only exists
+  once there's a real window/tab model — premature to build now.
+- **Context:** Stage-7 `/review` (adversarial pass, INFORMATIONAL — not
+  exploitable at single-window stage 7). Flagged as the one forward-looking item
+  worth tracking; the `pub`-field tightening can be done anytime.
+- **Depends on:** stage 8 (terminal) / a multi-window or tabbed UI model.
