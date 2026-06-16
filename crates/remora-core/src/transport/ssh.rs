@@ -11,7 +11,7 @@ use super::pty_process::spawn_pty_channel;
 use crate::config::{Config, SshHost, WorkspaceMode};
 use crate::discovery::{self, DiscoveredEnv};
 use crate::naming::{parse_tmux_session_name, tmux_session_name};
-use crate::spawn_plan::{plan_spawn, SpawnPlan};
+use crate::spawn_plan::{plan_spawn, PlanError, SpawnPlan};
 use crate::{SessionChannel, SessionSource, SourceError};
 
 /// Single-token shell quoting for the remote login shell, via `shlex`.
@@ -420,6 +420,30 @@ fn run_spawn(
     attach_channel(exec, host, &plan.tmux_name)
 }
 
+/// Re-creates a stopped session's tmux session and attaches. Unlike spawn:
+/// no `worktree add` (the worktree survives), and a duplicate name means a
+/// concurrent respawner already won — attach to the live session instead of
+/// erroring (ADR-0004). Requires worktree mode (R5): a shared-mode plan can't
+/// claim a worktree, so it errors before any remote command.
+fn run_respawn(
+    exec: &dyn SshExec,
+    host: &SshHost,
+    plan: &SpawnPlan,
+) -> Result<SessionChannel, SourceError> {
+    if plan.branch.is_none() {
+        return Err(PlanError::NotWorktreeProject(plan.project_id.clone()).into());
+    }
+    match create_session(exec, host, plan) {
+        Ok(()) => {
+            write_metadata(exec, host, plan);
+            attach_channel(exec, host, &plan.tmux_name)
+        }
+        // Concurrent respawner already created it: attach to the live session.
+        Err(SourceError::SessionExists { .. }) => attach_channel(exec, host, &plan.tmux_name),
+        Err(err) => Err(err),
+    }
+}
+
 /// Reads a live session's metadata; a failed `show-environment` (race: the
 /// session died after `list-sessions`) yields empty metadata — the session is
 /// still listed `Live` (don't downgrade a known-live session on a metadata
@@ -530,6 +554,27 @@ impl SessionSource for SshSource {
         tokio::task::spawn_blocking(move || run_list(exec.as_ref(), &host, &config))
             .await
             .map_err(|e| SourceError::Transport(format!("list task: {e}")))?
+    }
+
+    async fn respawn(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<SessionChannel, SourceError> {
+        // Agent = project default; the original is unrecoverable (env died
+        // with the tmux session). REMORA_CREATED_AT is re-stamped by spawn's
+        // metadata write.
+        let spec = SpawnSpec {
+            project_id: project_id.clone(),
+            session_id: session_id.clone(),
+            agent: None,
+        };
+        let plan = plan_spawn(&self.config, &spec)?;
+        let exec = Arc::clone(&self.exec);
+        let host = self.host.clone();
+        tokio::task::spawn_blocking(move || run_respawn(exec.as_ref(), &host, &plan))
+            .await
+            .map_err(|e| SourceError::Transport(format!("respawn task: {e}")))?
     }
 }
 
@@ -1198,5 +1243,78 @@ mod tests {
             .position(|a| a == "list-sessions")
             .expect("list-sessions");
         assert_eq!(argv[l + 1], "-F");
+    }
+
+    #[tokio::test]
+    async fn respawn_creates_without_worktree_add_and_attaches() {
+        let config = test_config(); // api is worktree-mode
+        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::ok())])); // new-session ok
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        let (project, session) = (
+            ProjectId::new("api").expect("slug"),
+            SessionId::new("fix-login").expect("slug"),
+        );
+        source.respawn(&project, &session).await.expect("respawn");
+        let calls = fake.calls.lock().expect("lock");
+        // No worktree-add; first remote call is new-session.
+        assert!(calls[0].iter().any(|a| a == "new-session"));
+        assert!(!calls.iter().any(|c| c.iter().any(|a| a == "worktree")));
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn respawn_duplicate_attaches_to_live_session() {
+        let config = test_config();
+        // new-session reports duplicate -> respawn attaches instead of erroring.
+        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::fail(
+            "duplicate session: remora_api_fix-login",
+        ))]));
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        let (project, session) = (
+            ProjectId::new("api").expect("slug"),
+            SessionId::new("fix-login").expect("slug"),
+        );
+        source
+            .respawn(&project, &session)
+            .await
+            .expect("respawn attaches");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn respawn_of_shared_project_errors_before_any_remote_call() {
+        // A shared-mode project resolves to branch=None -> NotWorktreeProject,
+        // and no remote command runs.
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.scratch]
+            host = "devbox"
+            path = "~/scratch"
+            workspace = "shared"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+        "#;
+        let config = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let fake = Arc::new(FakeExec::new(vec![]));
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        let (project, session) = (
+            ProjectId::new("scratch").expect("slug"),
+            SessionId::new("s1").expect("slug"),
+        );
+        let err = source
+            .respawn(&project, &session)
+            .await
+            .expect_err("shared");
+        assert!(
+            matches!(err, SourceError::Plan(PlanError::NotWorktreeProject(_))),
+            "{err}"
+        );
+        assert!(
+            fake.calls.lock().expect("lock").is_empty(),
+            "no remote call"
+        );
     }
 }

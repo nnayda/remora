@@ -191,6 +191,39 @@ impl SessionSource for FakeSessionSource {
         Ok(channel)
     }
 
+    async fn respawn(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<SessionChannel, SourceError> {
+        let key = (project_id.clone(), session_id.clone());
+        let mut sessions = self.lock_sessions();
+        let Some(session) = sessions.get_mut(&key) else {
+            return Err(SourceError::SessionNotFound {
+                project_id: project_id.clone(),
+                session_id: session_id.clone(),
+            });
+        };
+        // Already live -> a concurrent respawner won; attach (banner). Stopped
+        // -> bring it back live with a fresh spawn-style channel (no banner).
+        let banner = if session.state == SessionState::Live {
+            Some(format!("[fake attach {project_id}_{session_id}]\r\n").into_bytes())
+        } else {
+            session.state = SessionState::Live;
+            None
+        };
+        let (channel, input_rx, output_tx) = SessionChannel::pair();
+        let task = tokio::spawn(run_echo(
+            input_rx,
+            output_tx,
+            Arc::clone(&session.resizes),
+            banner,
+        ));
+        session.channels.retain(|handle| !handle.is_finished());
+        session.channels.push(task);
+        Ok(channel)
+    }
+
     async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
         let sessions = self.lock_sessions();
         let mut metas: Vec<SessionMeta> = sessions
@@ -460,6 +493,46 @@ mod tests {
         source.kill_channels(&project, &session);
         assert_eq!(recv_bytes(&mut channel).await, b"buffered");
         assert!(channel.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn respawn_revives_a_stopped_session() {
+        let source = FakeSessionSource::new();
+        source.spawn(spec("api", "fix-login")).await.expect("spawn");
+        let (project, session) = ids("api", "fix-login");
+        source.stop_session(&project, &session);
+
+        let mut channel = source.respawn(&project, &session).await.expect("respawn");
+        channel.send_bytes(b"alive".to_vec()).await.expect("send");
+        assert_eq!(recv_bytes(&mut channel).await, b"alive");
+
+        // Now Live again.
+        let listed = source.list().await.expect("list");
+        assert_eq!(listed[0].state, SessionState::Live);
+    }
+
+    #[tokio::test]
+    async fn respawn_of_live_session_attaches() {
+        let source = FakeSessionSource::new();
+        source.spawn(spec("api", "fix-login")).await.expect("spawn");
+        let (project, session) = ids("api", "fix-login");
+        // Already live -> concurrent respawner attaches (banner).
+        let mut channel = source.respawn(&project, &session).await.expect("respawn");
+        assert_eq!(
+            recv_bytes(&mut channel).await,
+            b"[fake attach api_fix-login]\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn respawn_of_unknown_session_is_not_found() {
+        let source = FakeSessionSource::new();
+        let (project, session) = ids("api", "ghost");
+        let err = source
+            .respawn(&project, &session)
+            .await
+            .expect_err("unknown");
+        assert!(matches!(err, SourceError::SessionNotFound { .. }));
     }
 
     #[tokio::test]
