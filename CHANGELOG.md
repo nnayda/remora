@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Tauri bridge (desktop, roadmap stage 7): the `src-tauri` layer now owns a
+  `SessionSource` and exposes `session_{list,spawn,attach,respawn,write,resize,
+  close}` Tauri commands, streaming PTY output to the React frontend over
+  `tauri::ipc::Channel`. Runs on the in-process fake `SessionSource` this stage
+  (real ssh/kubectl wiring is stage 9). The forward-task lifecycle is
+  register-before-spawn with a `oneshot` cancel and a biased `select!`, so
+  `close()` is strictly silent; the handle-keyed registry recovers from mutex
+  poisoning. Command-arg ids cross the IPC boundary as strings and are
+  validated by constructing the protocol newtype (fail-closed on forged ids);
+  frontend-facing error/metadata values stay display-only. TypeScript bindings
+  are generated from Rust by tauri-specta (`apps/desktop/src/bindings.ts`,
+  guarded by a drift test) and wrapped by a typed `bridge.ts` client. The UI
+  talks only to this layer (ARCHITECTURE.md "one rule").
 - ssh session discovery + respawn: `SshSource::list` discovers sessions on a
   host by joining live tmux sessions (`list-sessions` + per-session
   `show-environment` metadata) with stopped worktrees (`git worktree list`),
