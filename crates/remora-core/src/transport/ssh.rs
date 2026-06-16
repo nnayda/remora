@@ -292,6 +292,42 @@ fn command_from_argv(argv: &[String]) -> CommandBuilder {
     cmd
 }
 
+/// `tmux new-session -d` — the atomic creation lock. `Ok` on success;
+/// `Err(SessionExists)` on a duplicate name (case-insensitive); otherwise
+/// `Err(Transport)`. Opens no channel.
+fn create_session(exec: &dyn SshExec, host: &SshHost, plan: &SpawnPlan) -> Result<(), SourceError> {
+    let out = exec.run(&new_session_argv(host, plan))?;
+    if out.success {
+        Ok(())
+    } else {
+        Err(classify_new_session_failure(
+            &out.stderr,
+            &plan.project_id,
+            &plan.session_id,
+        ))
+    }
+}
+
+/// Writes the `REMORA_*` env metadata and `remain-on-exit`. Every call is
+/// tolerated: a metadata failure must never fail an already-live session
+/// (env is untrusted/display-only — ADR-0004).
+fn write_metadata(exec: &dyn SshExec, host: &SshHost, plan: &SpawnPlan) {
+    for (key, value) in &plan.env {
+        let _ = exec.run(&set_environment_argv(host, &plan.tmux_name, key, value));
+    }
+    let _ = exec.run(&set_option_remain_on_exit_argv(host, &plan.tmux_name));
+}
+
+/// Opens the PTY attach channel to an existing session (no liveness
+/// preflight — callers that need one do it first; see `SshSource::attach`).
+fn attach_channel(
+    exec: &dyn SshExec,
+    host: &SshHost,
+    tmux_name: &str,
+) -> Result<SessionChannel, SourceError> {
+    exec.open_channel(&attach_argv(host, tmux_name))
+}
+
 /// Orchestrates the full spawn sequence: optional worktree creation, tmux
 /// new-session (the atomic lock), metadata env vars, remain-on-exit option,
 /// then attach. Each step crosses the `SshExec` seam so tests can inject a
@@ -312,26 +348,18 @@ fn run_spawn(
         }
     }
 
-    let out = exec.run(&new_session_argv(host, plan))?;
-    if !out.success {
-        let err = classify_new_session_failure(&out.stderr, &plan.project_id, &plan.session_id);
-        // A non-duplicate failure means NO session was created, so the
+    if let Err(err) = create_session(exec, host, plan) {
+        // A non-duplicate failure means no session was created, so the
         // worktree we just made is orphaned — best-effort remove it so the
-        // slot stays retryable instead of bricking until stage-6 reclaim. A
-        // duplicate (`SessionExists`) means a *live* session owns that
-        // worktree; never touch it.
+        // slot stays retryable. A duplicate means a live session owns it.
         if plan.branch.is_some() && !matches!(err, SourceError::SessionExists { .. }) {
             let _ = exec.run(&worktree_remove_argv(host, plan));
         }
         return Err(err);
     }
 
-    for (key, value) in &plan.env {
-        let _ = exec.run(&set_environment_argv(host, &plan.tmux_name, key, value));
-    }
-    let _ = exec.run(&set_option_remain_on_exit_argv(host, &plan.tmux_name));
-
-    exec.open_channel(&attach_argv(host, &plan.tmux_name))
+    write_metadata(exec, host, plan);
+    attach_channel(exec, host, &plan.tmux_name)
 }
 
 #[async_trait]
