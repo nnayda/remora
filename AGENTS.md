@@ -33,7 +33,8 @@ touched `crates/`, iterate with `cargo test -p remora-core -p remora-protocol`.
 - `apps/desktop` — Tauri 2 app: frontend in `src/`, Rust shell in `src-tauri/`
 - `crates/remora-core` — session model + the `SessionSource` transport trait
 - `crates/remora-protocol` — wire types shared by clients and the future relay
-- `docs/` — VISION.md (direction), ARCHITECTURE.md (system map), adr/ (decisions)
+- `docs/` — VISION.md (direction), ARCHITECTURE.md (system map),
+  ROADMAP.md (MVP build order + stage status), adr/ (decisions)
 
 ## The one rule
 
