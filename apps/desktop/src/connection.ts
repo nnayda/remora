@@ -112,3 +112,28 @@ export async function connectSession(
     return await openConnection((o) => attachSession(projectId, sessionId, o));
   }
 }
+
+/**
+ * Open a *new* session: spawn first, and on `sessionExists` attach the running
+ * one instead. Returns `attached: true` when it attached an existing session so
+ * the UI can say so rather than silently opening old state. (Contrast
+ * `connectSession`, which is attach-first for reconnect callers.)
+ */
+export async function openSession(
+  projectId: string,
+  sessionId: string,
+  agent: string | null,
+): Promise<{ connection: SessionConnection; attached: boolean }> {
+  try {
+    const connection = await openConnection((o) =>
+      spawnSession(projectId, sessionId, agent, o),
+    );
+    return { connection, attached: false };
+  } catch (e) {
+    if (!isSessionExists(e)) throw e;
+    const connection = await openConnection((o) =>
+      attachSession(projectId, sessionId, o),
+    );
+    return { connection, attached: true };
+  }
+}
