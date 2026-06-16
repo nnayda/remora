@@ -1,0 +1,115 @@
+//! Frontend-facing error + the session-metadata DTO (keeps remora-protocol serde-only).
+use remora_core::SourceError;
+use remora_protocol::{SessionMeta, SessionState};
+
+#[derive(Debug, serde::Serialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum BridgeError {
+    SessionExists { message: String },
+    SessionNotFound { message: String },
+    ChannelClosed,
+    Transport { message: String },
+    Plan { message: String },
+    InvalidId { message: String },
+    UnknownHandle,
+    InvalidSize { message: String },
+}
+
+impl From<SourceError> for BridgeError {
+    fn from(e: SourceError) -> Self {
+        // message comes ONLY from Display (already escapes/bounds untrusted bytes).
+        let message = e.to_string();
+        match e {
+            SourceError::SessionExists { .. } => BridgeError::SessionExists { message },
+            SourceError::SessionNotFound { .. } => BridgeError::SessionNotFound { message },
+            SourceError::ChannelClosed => BridgeError::ChannelClosed,
+            SourceError::Plan(_) => BridgeError::Plan { message },
+            // #[non_exhaustive]: unknown future variants degrade to Transport.
+            _ => BridgeError::Transport { message },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, specta::Type)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStateDto {
+    Live,
+    Stopped,
+}
+
+impl From<SessionState> for SessionStateDto {
+    fn from(s: SessionState) -> Self {
+        match s {
+            SessionState::Live => SessionStateDto::Live,
+            SessionState::Stopped => SessionStateDto::Stopped,
+            _ => SessionStateDto::Stopped, // #[non_exhaustive] guard
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMetaDto {
+    pub project_id: String,
+    pub session_id: String,
+    pub state: SessionStateDto,
+    pub agent: Option<String>,
+    pub created_at: Option<u64>,
+    pub workspace_path: Option<String>,
+}
+
+impl From<SessionMeta> for SessionMetaDto {
+    fn from(m: SessionMeta) -> Self {
+        SessionMetaDto {
+            project_id: m.project_id.to_string(),
+            session_id: m.session_id.to_string(),
+            state: m.state.into(),
+            agent: m.agent,
+            created_at: m.created_at,
+            workspace_path: m.workspace_path,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use remora_core::SourceError;
+    use remora_protocol::{ProjectId, SessionId, SessionMeta, SessionState};
+
+    #[test]
+    fn maps_source_errors_to_kinds() {
+        let e = SourceError::SessionNotFound {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("x").expect("slug"),
+        };
+        assert!(matches!(
+            BridgeError::from(e),
+            BridgeError::SessionNotFound { .. }
+        ));
+        assert!(matches!(
+            BridgeError::from(SourceError::ChannelClosed),
+            BridgeError::ChannelClosed
+        ));
+        assert!(matches!(
+            BridgeError::from(SourceError::Transport("x".into())),
+            BridgeError::Transport { .. }
+        ));
+    }
+
+    #[test]
+    fn dto_round_trips_camelcase() {
+        let meta = SessionMeta {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("fix-login").expect("slug"),
+            state: SessionState::Stopped,
+            agent: Some("claude".into()),
+            created_at: Some(1_765_500_000),
+            workspace_path: None,
+        };
+        let dto = SessionMetaDto::from(meta);
+        let json = serde_json::to_string(&dto).expect("serialize");
+        assert!(json.contains(r#""projectId":"api""#));
+        assert!(json.contains(r#""state":"stopped""#));
+    }
+}
