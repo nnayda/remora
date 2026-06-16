@@ -10,6 +10,8 @@ import {
   writeSession,
 } from "./bridge";
 
+export type { BridgeOutput, OnOutput };
+
 /** One open bridge channel: a buffered output stream plus input controls. */
 export interface SessionConnection {
   /** Replay buffered output to `onMessage`, then stream live. Returns an unsubscribe. */
