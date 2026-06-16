@@ -78,6 +78,12 @@ Environment variables:
 - `REMORA_E2E_SSH_HOST=<host>` — required; the ssh destination.
 - `REMORA_E2E_SSH_USER=<user>` — optional.
 - `REMORA_E2E_SSH_PORT=<port>` — optional.
+- `REMORA_E2E_PROJECT=<slug>` — optional (default `demo`); the attach test's
+  project id. With `REMORA_E2E_SESSION` it selects which tmux session to attach
+  to (`remora_<project>_<session>`), so it must match the session created on
+  the host.
+- `REMORA_E2E_SESSION=<slug>` — optional (default `one`); the attach test's
+  session id (see above).
 - `REMORA_E2E_PATH=<dir>` — working dir on the host for the shared-workspace
   spawn test (defaults to `~/e2e`).
 - `REMORA_E2E_GIT_PATH=<repo>` — path to an existing git repo on the host;

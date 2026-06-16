@@ -32,6 +32,13 @@ pub fn parse_tmux_session_name(name: &str) -> Option<(ProjectId, SessionId)> {
 /// valid slug. Matched on the path so a detached-HEAD worktree still resolves
 /// (decision 3); only `<session>` comes from discovered bytes.
 pub fn parse_worktree_path(abs_path: &str, project: &ProjectId) -> Option<SessionId> {
+    // Discovery input is untrusted (ADR-0004) and this matches on *trailing*
+    // segments, so require a real absolute (`/…`) or `~/…` path first —
+    // otherwise a forged relative path whose tail happens to match the
+    // convention (e.g. `tmp/.remora/worktrees/api/s1`) would parse.
+    if !(abs_path.starts_with('/') || abs_path.starts_with("~/")) {
+        return None;
+    }
     let segments: Vec<&str> = abs_path.split('/').filter(|s| !s.is_empty()).collect();
     match segments.as_slice() {
         [.., dot_remora, worktrees, proj, session]
@@ -174,6 +181,8 @@ mod tests {
             "/home/dev/.remora/worktrees/other/x",      // wrong project
             "/home/dev/.config/worktrees/api/x",        // not `.remora`
             "/home/dev/.remora/worktrees/api/Bad_Slug", // session not a slug
+            "tmp/.remora/worktrees/api/s1",             // relative, not absolute
+            "~user/.remora/worktrees/api/s1",           // `~user`, not `~/`
         ] {
             assert_eq!(
                 parse_worktree_path(bad, &api),
