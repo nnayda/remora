@@ -54,9 +54,11 @@ export function NewSessionDialog({
       onOpened(result.attached);
       return; // App closes the dialog
     }
+    setSubmitting(false);
+    // OPEN_CANCELLED means the open was cancelled externally (e.g. app teardown,
+    // which unmounts this dialog anyway). Show nothing for it; surface real errors.
     if (result.error !== OPEN_CANCELLED) {
       setError(errorMessage(result.error));
-      setSubmitting(false);
     }
   }
 
@@ -69,7 +71,7 @@ export function NewSessionDialog({
     }
     if (e.key !== "Tab") return;
     const focusable = dialogRef.current?.querySelectorAll<HTMLElement>(
-      'button, input, [tabindex]:not([tabindex="-1"])',
+      'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])',
     );
     if (!focusable || focusable.length === 0) return;
     const first = focusable[0];
