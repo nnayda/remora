@@ -115,7 +115,10 @@ mod bindings_test {
     #[test]
     fn bindings_are_up_to_date() {
         let committed = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/bindings.ts");
-        let tmp = std::env::temp_dir().join("remora-bindings-gen.ts");
+        // Unique per process so concurrent `cargo test` runs can't collide on
+        // the temp path (matches the `remora-config-test-{pid}` convention).
+        let tmp =
+            std::env::temp_dir().join(format!("remora-bindings-gen-{}.ts", std::process::id()));
         builder()
             .export(
                 // u64 (ChannelHandle, SessionMetaDto.created_at) -> TS `number`.

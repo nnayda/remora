@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SessionSource` and exposes `session_{list,spawn,attach,respawn,write,resize,
   close}` Tauri commands, streaming PTY output to the React frontend over
   `tauri::ipc::Channel`. Runs on the in-process fake `SessionSource` this stage
-  (real ssh/kubectl wiring is stage 9). The forward-task lifecycle is
+  (real ssh/kubectl transports wire in at later roadmap stages). The forward-task lifecycle is
   register-before-spawn with a `oneshot` cancel and a biased `select!`, so
   `close()` is strictly silent; the handle-keyed registry recovers from mutex
   poisoning. Command-arg ids cross the IPC boundary as strings and are
