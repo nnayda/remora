@@ -146,6 +146,24 @@ mod tests {
         assert_eq!(env.created_at, Some(1_765_500_000));
     }
 
+    /// The reader matches env keys as string literals; the writer
+    /// (`spawn_plan`) emits them via the `naming::ENV_*` constants. Nothing in
+    /// the type system couples the two, so a rename on the write side would
+    /// silently break discovery. This test links them: it builds the env block
+    /// from the constants the writer uses and asserts the reader recognizes
+    /// every field — fail here if the literals in `parse_session_environment`
+    /// ever drift from `naming::ENV_*`.
+    #[test]
+    fn reads_exactly_the_keys_the_writer_emits() {
+        use crate::naming::{ENV_AGENT, ENV_CREATED_AT, ENV_WORKSPACE};
+        let out =
+            format!("{ENV_AGENT}=claude\n{ENV_WORKSPACE}=/wt/api/x\n{ENV_CREATED_AT}=1765500000\n");
+        let env = parse_session_environment(&out);
+        assert_eq!(env.agent.as_deref(), Some("claude"));
+        assert_eq!(env.workspace_path.as_deref(), Some("/wt/api/x"));
+        assert_eq!(env.created_at, Some(1_765_500_000));
+    }
+
     #[test]
     fn env_duplicate_key_last_wins() {
         let env = parse_session_environment("REMORA_AGENT=first\nREMORA_AGENT=second\n");

@@ -5,8 +5,8 @@ use remora_protocol::{ProjectId, SessionId};
 
 /// Builds the tmux session name for a session (ADR-0004):
 /// `remora_<project-id>_<session-id>`. Ids are validated `[a-z0-9-]+`
-/// slugs, so the `_`-separated name parses unambiguously. The inverse
-/// (parsing) lands with discovery in stage 6.
+/// slugs, so the `_`-separated name parses unambiguously. The inverse is
+/// [`parse_tmux_session_name`].
 pub fn tmux_session_name(project: &ProjectId, session: &SessionId) -> String {
     format!("remora_{}_{}", project.as_str(), session.as_str())
 }

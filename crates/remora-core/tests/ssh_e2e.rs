@@ -319,3 +319,82 @@ async fn e2e_discovery_stopped_then_respawn_reuses_worktree() {
         "should be live again"
     );
 }
+
+#[tokio::test]
+#[ignore = "needs REMORA_E2E_SSH_HOST + REMORA_E2E_GIT_PATH (a git repo on the host)"]
+async fn e2e_respawn_of_vanished_worktree_is_not_found() {
+    let (host_dest, git_path) = match (
+        std::env::var("REMORA_E2E_SSH_HOST"),
+        std::env::var("REMORA_E2E_GIT_PATH"),
+    ) {
+        (Ok(h), Ok(g)) => (h, g),
+        _ => return,
+    };
+    let session = format!("vanish-{}", std::process::id());
+
+    let toml = format!(
+        r#"
+        [hosts.e2e]
+        transport = "ssh"
+        host = "{host_dest}"
+        [projects.gitproj]
+        host = "e2e"
+        path = "{git_path}"
+        workspace = "worktree"
+        agent = "sh"
+        [agents.sh]
+        command = ["sh"]
+    "#
+    );
+    let config = Arc::new(Config::from_toml_str(&toml).expect("e2e config"));
+    let source = SshSource::new(e2e_host(&host_dest), config);
+    let project = ProjectId::new("gitproj").expect("slug");
+    let session_id = SessionId::new(&session).expect("slug");
+
+    // Spawn a worktree session, then sync so the worktree has landed.
+    let spec = remora_core::SpawnSpec {
+        project_id: project.clone(),
+        session_id: session_id.clone(),
+        agent: None,
+    };
+    let mut channel = source.spawn(spec).await.expect("spawn");
+    channel
+        .send_bytes(b"echo SYNC_$((2+2))\n".to_vec())
+        .await
+        .expect("send");
+    recv_until_contains(&mut channel, "SYNC_4").await;
+    drop(channel);
+
+    // Kill the tmux session AND remove the worktree directory (the dangerous
+    // case: the git admin entry survives a bare `rm -rf`, so discovery still
+    // lists it, but the directory is gone). Respawn must fail closed with
+    // SessionNotFound rather than spawning into a vanished dir.
+    std::process::Command::new("ssh")
+        .args([
+            host_dest.as_str(),
+            "tmux",
+            "kill-session",
+            "-t",
+            &format!("remora_gitproj_{session}"),
+        ])
+        .output()
+        .expect("kill-session");
+    std::process::Command::new("ssh")
+        .args([
+            host_dest.as_str(),
+            "rm",
+            "-rf",
+            &format!("$HOME/.remora/worktrees/gitproj/{session}"),
+        ])
+        .output()
+        .expect("rm worktree");
+
+    let err = source
+        .respawn(&project, &session_id)
+        .await
+        .expect_err("vanished worktree");
+    assert!(
+        matches!(err, remora_core::SourceError::SessionNotFound { .. }),
+        "vanished worktree must be SessionNotFound, got {err}"
+    );
+}

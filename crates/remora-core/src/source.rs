@@ -56,7 +56,10 @@ pub trait SessionSource: Send + Sync {
     /// spawning into the project root. A concurrent respawner that already won
     /// the race leaves a *live* session of this name, in which case this
     /// attaches to it instead of double-spawning (ADR-0004). A vanished
-    /// worktree surfaces as [`SourceError::Transport`].
+    /// worktree (its directory removed out from under a surviving session
+    /// record) surfaces as [`SourceError::SessionNotFound`] — there is nothing
+    /// left to respawn; a transport that cannot even probe surfaces as
+    /// [`SourceError::Transport`].
     async fn respawn(
         &self,
         project_id: &ProjectId,
