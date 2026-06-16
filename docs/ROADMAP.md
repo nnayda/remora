@@ -8,8 +8,9 @@ no relay, no mobile.
 Status markers: ✅ done · ☐ open.
 
 Already done: repo scaffold (#1–#10) and the spine spike (roadmap step 1 in
-[VISION.md](VISION.md)). **Phase 1 is complete** (#14–#19); the next open
-stage is the Tauri bridge (stage 7).
+[VISION.md](VISION.md)). **Phase 1 is complete** (#14–#19); the Tauri bridge
+(stage 7) is also complete; the next open stage is the Embedded terminal
+component (stage 8).
 
 ## Phase 1 — Protocol & core (the seam) — ✅ complete
 
@@ -46,7 +47,7 @@ stage is the Tauri bridge (stage 7).
 
 ## Phase 2 — Desktop shell (the hero scenario) — ☐ open
 
-7. ☐ **Tauri bridge**
+7. ✅ **Tauri bridge**
    The src-tauri layer: own `SessionSource` instances, expose
    spawn/attach/list/write/resize as Tauri commands, stream PTY output to
    the frontend as events. The UI talks only to this layer.
@@ -118,7 +119,7 @@ Hard dependencies per stage (a stage needs these merged first):
 | ✅ 4 ssh attach + channel | 2, 3 |
 | ✅ 5 ssh spawn | 3, 4 |
 | ✅ 6 Discovery & join | 3, 4 |
-| ☐ 7 Tauri bridge | 2 (runs on the test double) |
+| ✅ 7 Tauri bridge | 2 (runs on the test double) |
 | ☐ 8 Terminal component | 7 |
 | ☐ 9 Tabs + spawn | 5, 8 |
 | ☐ 10 Sidebar | 6, 9 |
