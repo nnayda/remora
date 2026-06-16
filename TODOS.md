@@ -186,6 +186,11 @@ up cold.
 - **Context:** Stage-7 eng review (outside-voice finding / D8-8A). Same
   `fake-as-contract-overspecification` shape as the list-ordering call.
 - **Depends on:** stage 9 (spawn UI) / stage 10 (sidebar attach).
+- **Update (stage-9 eng review):** stage 9 implements the *single-window*
+  slice — tabs are deduped by `project/session`, so one window cannot open two
+  tabs to the same session. What remains: the *cross-window* case (two app
+  windows attaching the same session) and surfacing ssh's `attach -d` eviction
+  to the user. Cross-window is gated on the per-webview handle work below.
 
 ## Per-webview handle ownership (stage 8+ multi-window)
 
@@ -209,3 +214,43 @@ up cold.
   exploitable at single-window stage 7). Flagged as the one forward-looking item
   worth tracking; the `pub`-field tightening can be done anytime.
 - **Depends on:** stage 8 (terminal) / a multi-window or tabbed UI model.
+
+## Terminal eviction / virtualization for large tab counts
+
+- **What:** Cap or virtualize the number of simultaneously mounted terminals.
+  Stage 9 keeps every open tab's xterm instance, `ResizeObserver`, and bridge
+  channel mounted for the tab's lifetime (so scrollback survives tab switches).
+- **Why:** Resource use grows linearly with open tabs. Fine at the expected
+  scale (a handful of live sessions), but unbounded — many tabs accumulate
+  xterm buffers + observers + open channels with no ceiling.
+- **How:** Cap mounted terminals (e.g. LRU); dispose the least-recently-used
+  terminal and reattach on focus. Note the snag: disposing loses xterm
+  scrollback, and the `connection.ts` buffer is a one-shot drain, not durable
+  history — so eviction needs a scrollback-handoff story (or accepts losing
+  scrollback for evicted tabs). Tie the decision to that.
+- **Pros:** Bounded memory/observer/channel footprint. **Cons:** disposal +
+  scrollback handoff complexity for a problem that doesn't exist at current
+  scale; premature now.
+- **Context:** Stage-9 eng review (Codex outside voice). Keep-all-mounted is the
+  deliberate stage-9 model (`docs/superpowers/specs/2026-06-16-stage-9-tabs-spawn-design.md`,
+  "Scaling assumption").
+- **Depends on:** real usage data on typical tab counts; not blocking.
+
+## Webview e2e for the hide/show terminal refit
+
+- **What:** A webview end-to-end test that spawns two session tabs, switches
+  between them, and asserts each terminal refits to the window and its
+  scrollback persists across the switch.
+- **Why:** This is the riskiest stage-9 UI behaviour, and it cannot be verified
+  by the unit tests: vitest runs in `environment: "node"` with xterm mocked, so
+  the real `ResizeObserver` + xterm fit path never executes. Stage 9 covers it
+  with (a) the already-tested `TerminalController` resize logic and (b) a manual
+  QA step; an e2e closes the gap.
+- **Pros:** Real verification of the hide/show refit + scrollback contract.
+  **Cons:** needs a webview e2e harness that doesn't exist yet; standing one up
+  is out of scope for a frontend-only stage.
+- **Context:** Stage-9 eng review (Codex outside voice — "the riskiest UI
+  behavior will not actually be verified by the proposed tests"). Manual QA is
+  the stage-9 stopgap; see the spec's "Known coverage gap".
+- **Depends on:** stage 16 (Desktop CI & packaging), which is the natural home
+  for an e2e harness.
