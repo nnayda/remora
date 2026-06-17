@@ -60,10 +60,16 @@ async fn session_respawn(
     bridge: tauri::State<'_, Bridge>,
     project_id: String,
     session_id: String,
+    agent: Option<String>,
     on_output: Channel<BridgeOutput>,
 ) -> Result<ChannelHandle, BridgeError> {
     bridge
-        .respawn(project_id, session_id, Arc::new(ChannelSink(on_output)))
+        .respawn(
+            project_id,
+            session_id,
+            agent,
+            Arc::new(ChannelSink(on_output)),
+        )
         .await
 }
 

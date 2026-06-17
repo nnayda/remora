@@ -131,11 +131,18 @@ impl Bridge {
         &self,
         project_id: String,
         session_id: String,
+        agent: Option<String>,
         sink: Arc<dyn OutputSink>,
     ) -> Result<ChannelHandle, BridgeError> {
         let (p, s) = parse_ids(project_id, session_id)?;
+        let agent = agent
+            .map(AgentId::new)
+            .transpose()
+            .map_err(|e| BridgeError::InvalidId {
+                message: e.to_string(),
+            })?;
         let source = self.resolve_for(&p)?;
-        let channel = source.respawn(&p, &s).await?;
+        let channel = source.respawn(&p, &s, agent).await?;
         Ok(self.open_channel(channel, sink))
     }
 
@@ -592,7 +599,7 @@ mod tests {
         let b = bridge(src);
         let (s, mut rx) = sink();
         let h = b
-            .respawn("api".into(), "x".into(), s)
+            .respawn("api".into(), "x".into(), None, s)
             .await
             .expect("respawn");
         b.write(h, b"alive".to_vec()).await.expect("write");
@@ -617,6 +624,7 @@ mod tests {
             &self,
             _: &ProjectId,
             _: &SessionId,
+            _: Option<AgentId>,
         ) -> Result<SessionChannel, SourceError> {
             unreachable!()
         }
@@ -670,7 +678,7 @@ mod tests {
         ));
         let (s2, _r2) = sink();
         assert!(matches!(
-            b.respawn("API".into(), "x".into(), s2).await,
+            b.respawn("API".into(), "x".into(), None, s2).await,
             Err(BridgeError::InvalidId { .. })
         ));
     }
@@ -774,6 +782,7 @@ mod tests {
             &self,
             _: &ProjectId,
             _: &SessionId,
+            _: Option<AgentId>,
         ) -> Result<SessionChannel, SourceError> {
             unreachable!()
         }

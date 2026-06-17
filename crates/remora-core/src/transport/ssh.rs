@@ -603,14 +603,15 @@ impl SessionSource for SshSource {
         &self,
         project_id: &ProjectId,
         session_id: &SessionId,
+        agent: Option<remora_protocol::AgentId>,
     ) -> Result<SessionChannel, SourceError> {
-        // Agent = project default; the original is unrecoverable (env died
-        // with the tmux session). REMORA_CREATED_AT is re-stamped by spawn's
-        // metadata write.
+        // REMORA_CREATED_AT is re-stamped by spawn's metadata write; the agent
+        // is carried by the client from pre-stop discovery (D6), else the
+        // project default resolves inside plan_spawn.
         let spec = SpawnSpec {
             project_id: project_id.clone(),
             session_id: session_id.clone(),
-            agent: None,
+            agent,
         };
         let plan = plan_spawn(&self.config, &spec)?;
         let exec = Arc::clone(&self.exec);
@@ -637,6 +638,14 @@ mod tests {
         }
     }
 
+    fn pid(s: &str) -> ProjectId {
+        ProjectId::new(s).expect("slug")
+    }
+
+    fn sid(s: &str) -> SessionId {
+        SessionId::new(s).expect("slug")
+    }
+
     fn spec() -> SpawnSpec {
         use remora_protocol::AgentId;
         SpawnSpec {
@@ -658,6 +667,26 @@ mod tests {
             agent = "claude"
             [agents.claude]
             command = ["claude"]
+        "#;
+        Arc::new(Config::from_toml_str(toml).expect("config"))
+    }
+
+    /// Config with two agents: default "claude" for the api project, and a
+    /// second "codex" agent — used to prove respawn can override the default.
+    fn two_agent_config() -> Arc<Config> {
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.api]
+            host = "devbox"
+            path = "/home/dev/api"
+            workspace = "worktree"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+            [agents.codex]
+            command = ["codex"]
         "#;
         Arc::new(Config::from_toml_str(toml).expect("config"))
     }
@@ -698,6 +727,18 @@ mod tests {
                 stdout: String::new(),
                 stderr: stderr.into(),
             }
+        }
+
+        /// Returns the first recorded argv that contains the given substring.
+        /// Panics if no call contains the substring.
+        fn recorded_argv_containing(&self, needle: &str) -> Vec<String> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .iter()
+                .find(|argv| argv.iter().any(|a| a.contains(needle)))
+                .cloned()
+                .unwrap_or_else(|| panic!("no recorded argv contains {needle:?}"))
         }
     }
 
@@ -1361,7 +1402,10 @@ mod tests {
             ProjectId::new("api").expect("slug"),
             SessionId::new("fix-login").expect("slug"),
         );
-        source.respawn(&project, &session).await.expect("respawn");
+        source
+            .respawn(&project, &session, None)
+            .await
+            .expect("respawn");
         let calls = fake.calls.lock().expect("lock");
         // First call is the `test -d` preflight; then new-session; never a
         // `git worktree add` (the worktree survives).
@@ -1386,7 +1430,7 @@ mod tests {
             SessionId::new("fix-login").expect("slug"),
         );
         source
-            .respawn(&project, &session)
+            .respawn(&project, &session, None)
             .await
             .expect("respawn attaches");
         assert_eq!(fake.opened.lock().expect("lock").len(), 1);
@@ -1405,7 +1449,7 @@ mod tests {
             SessionId::new("fix-login").expect("slug"),
         );
         let err = source
-            .respawn(&project, &session)
+            .respawn(&project, &session, None)
             .await
             .expect_err("vanished");
         assert!(matches!(err, SourceError::SessionNotFound { .. }), "{err}");
@@ -1429,7 +1473,7 @@ mod tests {
             SessionId::new("fix-login").expect("slug"),
         );
         let err = source
-            .respawn(&project, &session)
+            .respawn(&project, &session, None)
             .await
             .expect_err("probe failed");
         assert!(matches!(err, SourceError::Transport(_)), "{err}");
@@ -1451,7 +1495,7 @@ mod tests {
             SessionId::new("fix-login").expect("slug"),
         );
         let err = source
-            .respawn(&project, &session)
+            .respawn(&project, &session, None)
             .await
             .expect_err("generic");
         assert!(matches!(err, SourceError::Transport(_)), "{err}");
@@ -1482,7 +1526,7 @@ mod tests {
             SessionId::new("s1").expect("slug"),
         );
         let err = source
-            .respawn(&project, &session)
+            .respawn(&project, &session, None)
             .await
             .expect_err("shared");
         assert!(
@@ -1492,6 +1536,31 @@ mod tests {
         assert!(
             fake.calls.lock().expect("lock").is_empty(),
             "no remote call"
+        );
+    }
+
+    #[tokio::test]
+    async fn respawn_uses_the_supplied_agent_not_the_project_default() {
+        use remora_protocol::AgentId;
+        // Project default is "claude"; respawn with "codex" must launch codex.
+        let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::ok()), // test -d preflight: dir exists
+            Ok(FakeExec::ok()), // new-session ok
+        ]));
+        let src =
+            SshSource::with_exec(host("devbox", None, None), two_agent_config(), fake.clone());
+        let _ = src
+            .respawn(
+                &pid("api"),
+                &sid("fix"),
+                Some(AgentId::new("codex").expect("slug")),
+            )
+            .await;
+        // The new-session argv carries the codex launch command.
+        let new_session = fake.recorded_argv_containing("new-session");
+        assert!(
+            new_session.iter().any(|a| a.contains("codex")),
+            "respawn should launch the supplied agent, got: {new_session:?}"
         );
     }
 }

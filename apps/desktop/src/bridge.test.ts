@@ -70,11 +70,12 @@ describe("bridge.ts", () => {
     expect(seen).toEqual([{ event: "bytes", bytes: [120] }]);
   });
 
-  it("respawnSession passes ids + wired channel and returns the handle", async () => {
+  it("respawnSession passes ids + agent + wired channel and returns the handle", async () => {
     c.sessionRespawn.mockImplementation(
       async (
         _p: unknown,
         _s: unknown,
+        _a: unknown,
         ch: { onmessage: ((m: unknown) => void) | null },
       ) => {
         ch.onmessage?.({ event: "bytes", bytes: [42] });
@@ -82,11 +83,14 @@ describe("bridge.ts", () => {
       },
     );
     const seen: unknown[] = [];
-    const h = await bridge.respawnSession("api", "x", (m) => seen.push(m));
+    const h = await bridge.respawnSession("api", "x", "codex", (m) =>
+      seen.push(m),
+    );
     expect(h).toBe(3);
     expect(c.sessionRespawn).toHaveBeenCalledWith(
       "api",
       "x",
+      "codex",
       expect.anything(),
     );
     expect(seen).toEqual([{ event: "bytes", bytes: [42] }]);

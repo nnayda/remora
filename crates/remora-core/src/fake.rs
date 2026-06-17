@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use remora_protocol::{
-    ChannelInput, ChannelOutput, ProjectId, SessionId, SessionMeta, SessionState, SpawnSpec,
-    TerminalSize,
+    AgentId, ChannelInput, ChannelOutput, ProjectId, SessionId, SessionMeta, SessionState,
+    SpawnSpec, TerminalSize,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -195,6 +195,7 @@ impl SessionSource for FakeSessionSource {
         &self,
         project_id: &ProjectId,
         session_id: &SessionId,
+        agent: Option<AgentId>,
     ) -> Result<SessionChannel, SourceError> {
         let key = (project_id.clone(), session_id.clone());
         let mut sessions = self.lock_sessions();
@@ -204,6 +205,11 @@ impl SessionSource for FakeSessionSource {
                 session_id: session_id.clone(),
             });
         };
+        // Record the requested agent so tests can assert D6 plumbing; the fake
+        // has no real agent process, so this only affects the reported meta.
+        if let Some(a) = agent {
+            session.agent = Some(a.as_str().to_string());
+        }
         // Already live -> a concurrent respawner won; attach (banner). Stopped
         // -> bring it back live with a fresh spawn-style channel (no banner).
         let banner = if session.state == SessionState::Live {
@@ -502,7 +508,10 @@ mod tests {
         let (project, session) = ids("api", "fix-login");
         source.stop_session(&project, &session);
 
-        let mut channel = source.respawn(&project, &session).await.expect("respawn");
+        let mut channel = source
+            .respawn(&project, &session, None)
+            .await
+            .expect("respawn");
         channel.send_bytes(b"alive".to_vec()).await.expect("send");
         assert_eq!(recv_bytes(&mut channel).await, b"alive");
 
@@ -517,7 +526,10 @@ mod tests {
         source.spawn(spec("api", "fix-login")).await.expect("spawn");
         let (project, session) = ids("api", "fix-login");
         // Already live -> concurrent respawner attaches (banner).
-        let mut channel = source.respawn(&project, &session).await.expect("respawn");
+        let mut channel = source
+            .respawn(&project, &session, None)
+            .await
+            .expect("respawn");
         assert_eq!(
             recv_bytes(&mut channel).await,
             b"[fake attach api_fix-login]\r\n"
@@ -529,7 +541,7 @@ mod tests {
         let source = FakeSessionSource::new();
         let (project, session) = ids("api", "ghost");
         let err = source
-            .respawn(&project, &session)
+            .respawn(&project, &session, None)
             .await
             .expect_err("unknown");
         assert!(matches!(err, SourceError::SessionNotFound { .. }));

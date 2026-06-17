@@ -1,7 +1,7 @@
 //! The transport seam every client drives (ADR-0005).
 
 use async_trait::async_trait;
-use remora_protocol::{ProjectId, SessionId, SessionMeta, SpawnSpec};
+use remora_protocol::{AgentId, ProjectId, SessionId, SessionMeta, SpawnSpec};
 
 use crate::{SessionChannel, SourceError};
 
@@ -49,9 +49,8 @@ pub trait SessionSource: Send + Sync {
     /// Re-creates the tmux session for a *stopped* worktree and attaches.
     ///
     /// The worktree already survives, so this never runs `git worktree add`;
-    /// the agent and working directory come exclusively from local config
-    /// (the original metadata died with the tmux session). Requires the
-    /// resolved project to be worktree-mode — a shared-mode project returns
+    /// The agent is the caller-supplied `agent` (the client carries the pre-stop `REMORA_AGENT` from discovery, D6), else the project default.
+    /// Requires the resolved project to be worktree-mode — a shared-mode project returns
     /// [`PlanError::NotWorktreeProject`](crate::PlanError) rather than
     /// spawning into the project root. A concurrent respawner that already won
     /// the race leaves a *live* session of this name, in which case this
@@ -64,5 +63,6 @@ pub trait SessionSource: Send + Sync {
         &self,
         project_id: &ProjectId,
         session_id: &SessionId,
+        agent: Option<AgentId>,
     ) -> Result<SessionChannel, SourceError>;
 }
