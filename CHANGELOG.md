@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Real ssh transport wiring (desktop, roadmap stage 11 precursor): the Tauri
+  bridge now drives real ssh sessions instead of the in-process fake. It
+  resolves the transport per call from the per-device config — a new
+  `SourceResolver` trait + `ConfigResolver` (`bridge/resolve.rs`) map a
+  project's host to an `SshSource`, and the bridge looks up
+  `project → host → transport` on each `spawn`/`attach`/`respawn`/`list` (no
+  command-signature change; `SshSource::new` opens no connection until used, so
+  building one per call is free). `list()` aggregates across all configured ssh
+  hosts, tolerates one host being unreachable (partial result), and errors only
+  when every host fails — carrying the failing host's cause. A `kubectl` host
+  surfaces a clear "unsupported (stage 12)" config error. The fake
+  `SessionSource` is now test-only; an empty config shows the empty-state
+  sidebar. `docs/DEVELOPMENT.md` documents the per-device `config.toml` for
+  pointing the app at a real host.
 - Sidebar with live session state (desktop, roadmap stage 10): a left sidebar
   renders the Host → Project → Session tree from the config-and-discovery join,
   refreshed live; clicking a live session attaches it as a tab. A new

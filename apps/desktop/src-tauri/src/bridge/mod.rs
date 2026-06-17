@@ -2,6 +2,7 @@ pub mod commands;
 pub mod dto;
 pub mod error;
 pub mod output;
+pub mod resolve;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -11,10 +12,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use remora_core::config::{Config, ConfigError};
-use remora_core::{SessionChannel, SessionSource};
+use remora_core::{SessionChannel, SessionSource, SourceError};
+
 use remora_protocol::{
     AgentId, ChannelInput, ChannelOutput, ProjectId, SessionId, SpawnSpec, TerminalSize,
 };
+use resolve::SourceResolver;
 use tokio::sync::{mpsc, oneshot};
 
 use dto::ConfigDto;
@@ -31,7 +34,7 @@ struct OpenChannel {
 
 /// Owns the transport(s) and the open-channel registry. UI talks only to this.
 pub struct Bridge {
-    source: Arc<dyn SessionSource>,
+    resolver: Arc<dyn SourceResolver>,
     channels: Registry,
     next_handle: AtomicU64,
     spawn_task: Spawner,
@@ -42,9 +45,9 @@ pub struct Bridge {
 
 impl Bridge {
     /// Production: forward tasks run on Tauri's async runtime.
-    pub fn new(source: Arc<dyn SessionSource>, config_path: PathBuf) -> Self {
+    pub fn new(resolver: Arc<dyn SourceResolver>, config_path: PathBuf) -> Self {
         Self::with_spawner(
-            source,
+            resolver,
             config_path,
             Arc::new(|fut| {
                 tauri::async_runtime::spawn(fut);
@@ -53,12 +56,12 @@ impl Bridge {
     }
 
     fn with_spawner(
-        source: Arc<dyn SessionSource>,
+        resolver: Arc<dyn SourceResolver>,
         config_path: PathBuf,
         spawn_task: Spawner,
     ) -> Self {
         Self {
-            source,
+            resolver,
             channels: Arc::new(Mutex::new(HashMap::new())),
             next_handle: AtomicU64::new(0),
             spawn_task,
@@ -107,7 +110,8 @@ impl Bridge {
                     message: e.to_string(),
                 })?,
         };
-        let channel = self.source.spawn(spec).await?;
+        let source = self.resolve_for(&spec.project_id)?;
+        let channel = source.spawn(spec).await?;
         Ok(self.open_channel(channel, sink))
     }
 
@@ -118,7 +122,8 @@ impl Bridge {
         sink: Arc<dyn OutputSink>,
     ) -> Result<ChannelHandle, BridgeError> {
         let (p, s) = parse_ids(project_id, session_id)?;
-        let channel = self.source.attach(&p, &s).await?;
+        let source = self.resolve_for(&p)?;
+        let channel = source.attach(&p, &s).await?;
         Ok(self.open_channel(channel, sink))
     }
 
@@ -129,7 +134,8 @@ impl Bridge {
         sink: Arc<dyn OutputSink>,
     ) -> Result<ChannelHandle, BridgeError> {
         let (p, s) = parse_ids(project_id, session_id)?;
-        let channel = self.source.respawn(&p, &s).await?;
+        let source = self.resolve_for(&p)?;
+        let channel = source.respawn(&p, &s).await?;
         Ok(self.open_channel(channel, sink))
     }
 
@@ -174,18 +180,62 @@ impl Bridge {
 
     /// Sorted by (project_id, session_id) for a transport-stable UI contract.
     pub async fn list(&self) -> Result<Vec<SessionMetaDto>, BridgeError> {
-        let mut metas: Vec<SessionMetaDto> = self
-            .source
-            .list()
-            .await?
-            .into_iter()
-            .map(Into::into)
-            .collect();
+        let config = Arc::new(self.load_config()?);
+        let sources = self.resolver.all(&config);
+        let total = sources.len();
+        let mut metas: Vec<SessionMetaDto> = Vec::new();
+        let mut failed = 0usize;
+        let mut last_err: Option<SourceError> = None;
+        for source in sources {
+            match source.list().await {
+                Ok(ms) => metas.extend(ms.into_iter().map(Into::into)),
+                // One host down must not blank the whole sidebar — skip it and
+                // carry the partial result. TODO(stage 11+): surface per-host
+                // availability instead of silently dropping a down host.
+                Err(e) => {
+                    failed += 1;
+                    last_err = Some(e);
+                }
+            }
+        }
+        if total > 0 && failed == total {
+            return Err(BridgeError::Transport {
+                message: match last_err {
+                    Some(e) => format!("all configured hosts are unreachable: {e}"),
+                    None => "all configured hosts are unreachable".into(),
+                },
+            });
+        }
         metas.sort_by(|a, b| {
             (a.project_id.as_str(), a.session_id.as_str())
                 .cmp(&(b.project_id.as_str(), b.session_id.as_str()))
         });
         Ok(metas)
+    }
+
+    /// Resolve the transport for a project: load config fresh, then pick the
+    /// project's host's source (per-call resolution, D1). Shared by
+    /// spawn/attach/respawn so the load-then-resolve step lives in one place.
+    fn resolve_for(&self, project_id: &ProjectId) -> Result<Arc<dyn SessionSource>, BridgeError> {
+        let config = Arc::new(self.load_config()?);
+        self.resolver.for_project(&config, project_id)
+    }
+
+    /// Load the per-device config fresh. A *missing* file is success → an
+    /// empty config (a fresh device is valid, ADR-0004). Every other failure
+    /// is a real `BridgeError::Config`.
+    fn load_config(&self) -> Result<Config, BridgeError> {
+        match Config::load(&self.config_path) {
+            Ok(config) => Ok(config),
+            Err(ConfigError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(Config::default())
+            }
+            Err(e) => Err(BridgeError::Config {
+                message: e.to_string(),
+            }),
+        }
     }
 
     /// Reads + projects the per-device config for the sidebar.
@@ -196,20 +246,7 @@ impl Bridge {
     /// is a real `BridgeError::Config` so the UI shows a banner rather than a
     /// silently-empty sidebar.
     pub fn config(&self) -> Result<ConfigDto, BridgeError> {
-        match Config::load(&self.config_path) {
-            Ok(config) => Ok(config.into()),
-            // Only a genuinely-absent file is "no config yet". Any other IO
-            // kind (PermissionDenied, the not-a-regular-file InvalidInput, the
-            // oversized InvalidData) is a real failure the user must see.
-            Err(ConfigError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                Ok(ConfigDto::default())
-            }
-            Err(e) => Err(BridgeError::Config {
-                message: e.to_string(),
-            }),
-        }
+        Ok(self.load_config()?.into())
     }
 }
 
@@ -279,8 +316,27 @@ fn deregister(registry: &Registry, handle: u64) {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use remora_core::{FakeSessionSource, SourceError};
+    use remora_core::{FakeSessionSource, SessionSource, SourceError};
     use remora_protocol::{SessionMeta, SessionState};
+
+    use super::resolve::SourceResolver;
+
+    /// Test resolver: returns one fixed source for every project, and as the
+    /// sole element of `all()`. Lets the existing single-source tests run
+    /// unchanged through the per-call resolution path.
+    struct FixedResolver(Arc<dyn SessionSource>);
+    impl SourceResolver for FixedResolver {
+        fn for_project(
+            &self,
+            _config: &Arc<Config>,
+            _project_id: &ProjectId,
+        ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+            Ok(Arc::clone(&self.0))
+        }
+        fn all(&self, _config: &Arc<Config>) -> Vec<Arc<dyn SessionSource>> {
+            vec![Arc::clone(&self.0)]
+        }
+    }
 
     // mpsc sink: collect output AND simulate frontend-gone (drop the receiver).
     struct ChanSink(mpsc::UnboundedSender<BridgeOutput>);
@@ -303,7 +359,7 @@ mod tests {
     }
     fn bridge_with_config(source: Arc<dyn SessionSource>, config_path: PathBuf) -> Bridge {
         Bridge::with_spawner(
-            source,
+            Arc::new(FixedResolver(source)),
             config_path,
             Arc::new(|fut| {
                 tokio::spawn(fut);
@@ -647,5 +703,169 @@ mod tests {
             }
         }
         wait_for_deregister(&b, h, "forward task did not deregister after natural death").await;
+    }
+
+    /// Records which project_id `for_project` was called with, and returns a
+    /// per-project source so a test can prove the bridge routed correctly.
+    struct RecordingResolver {
+        seen: Arc<Mutex<Vec<String>>>,
+        source: Arc<dyn SessionSource>,
+    }
+    impl super::resolve::SourceResolver for RecordingResolver {
+        fn for_project(
+            &self,
+            _c: &Arc<Config>,
+            project_id: &ProjectId,
+        ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(project_id.as_str().to_string());
+            Ok(Arc::clone(&self.source))
+        }
+        fn all(&self, _c: &Arc<Config>) -> Vec<Arc<dyn SessionSource>> {
+            vec![Arc::clone(&self.source)]
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_routes_through_for_project_with_the_project_id() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let b = Bridge::with_spawner(
+            Arc::new(RecordingResolver {
+                seen: Arc::clone(&seen),
+                source: Arc::new(FakeSessionSource::new()),
+            }),
+            temp_config_path("routing"),
+            Arc::new(|fut| {
+                tokio::spawn(fut);
+            }),
+        );
+        let (s, _rx) = sink();
+        b.spawn("api".into(), "x".into(), None, s)
+            .await
+            .expect("spawn");
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_slice(),
+            &["api".to_string()]
+        );
+    }
+
+    /// A resolver whose `all()` returns two sources: one live with a session,
+    /// one that always errors on list(). The bridge must return the live one's
+    /// sessions (partial), not error.
+    struct TwoHostResolver;
+    struct ErroringSource;
+    #[async_trait]
+    impl SessionSource for ErroringSource {
+        async fn spawn(&self, _: SpawnSpec) -> Result<SessionChannel, SourceError> {
+            unreachable!()
+        }
+        async fn attach(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+        ) -> Result<SessionChannel, SourceError> {
+            unreachable!()
+        }
+        async fn respawn(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+        ) -> Result<SessionChannel, SourceError> {
+            unreachable!()
+        }
+        async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
+            Err(SourceError::Transport("host down".into()))
+        }
+    }
+    impl super::resolve::SourceResolver for TwoHostResolver {
+        fn for_project(
+            &self,
+            _c: &Arc<Config>,
+            _p: &ProjectId,
+        ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+            unreachable!()
+        }
+        fn all(&self, _c: &Arc<Config>) -> Vec<Arc<dyn SessionSource>> {
+            vec![Arc::new(ReverseSource), Arc::new(ErroringSource)]
+        }
+    }
+
+    #[tokio::test]
+    async fn list_tolerates_one_host_down_and_returns_partial() {
+        let b = Bridge::with_spawner(
+            Arc::new(TwoHostResolver),
+            temp_config_path("twohost"),
+            Arc::new(|fut| {
+                tokio::spawn(fut);
+            }),
+        );
+        let listed = b.list().await.expect("partial result, not an error");
+        // ReverseSource contributes 2 sessions; ErroringSource contributes none.
+        assert_eq!(listed.len(), 2);
+    }
+
+    /// All hosts down → the sidebar should see discovery-unavailable, so the
+    /// bridge errors rather than reporting an empty (no-sessions) world.
+    struct AllDownResolver;
+    impl super::resolve::SourceResolver for AllDownResolver {
+        fn for_project(
+            &self,
+            _c: &Arc<Config>,
+            _p: &ProjectId,
+        ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+            unreachable!()
+        }
+        fn all(&self, _c: &Arc<Config>) -> Vec<Arc<dyn SessionSource>> {
+            vec![Arc::new(ErroringSource)]
+        }
+    }
+
+    #[tokio::test]
+    async fn list_errors_when_every_host_is_down() {
+        let b = Bridge::with_spawner(
+            Arc::new(AllDownResolver),
+            temp_config_path("alldown"),
+            Arc::new(|fut| {
+                tokio::spawn(fut);
+            }),
+        );
+        let err = b.list().await.expect_err("all hosts down should error");
+        match err {
+            BridgeError::Transport { message } => assert!(
+                message.contains("host down"),
+                "message should carry the host's cause, got: {message}"
+            ),
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
+
+    // End-to-end through the REAL ConfigResolver (the routing tests above use
+    // fakes): a spawn for a project absent from config surfaces as Config, not
+    // Transport — proving load_config → for_project is wired and classified.
+    #[tokio::test]
+    async fn spawn_unknown_project_is_config_error() {
+        let path = temp_config_path("unknown-project");
+        std::fs::write(
+            &path,
+            "[hosts.hermes]\ntransport = \"ssh\"\nhost = \"hermes\"\n\
+             [projects.api]\nhost = \"hermes\"\npath = \"/srv/api\"\nworkspace = \"worktree\"\nagent = \"claude\"\n\
+             [agents.claude]\ncommand = [\"claude\"]\n",
+        )
+        .expect("write");
+        let b = Bridge::with_spawner(
+            Arc::new(super::resolve::ConfigResolver),
+            path.clone(),
+            Arc::new(|fut| {
+                tokio::spawn(fut);
+            }),
+        );
+        let (s, _rx) = sink();
+        let result = b.spawn("ghost".into(), "x".into(), None, s).await;
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(result, Err(BridgeError::Config { .. })));
     }
 }
