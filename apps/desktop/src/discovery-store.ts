@@ -55,7 +55,10 @@ export class DiscoveryStore {
   };
 
   constructor(private readonly deps: DiscoveryDeps) {
-    this.intervalMs = deps.intervalMs ?? 4000;
+    // Guard against a 0/negative override turning the poll into a tight loop
+    // that hammers listSessions(); fall back to the 4s default.
+    const intervalMs = deps.intervalMs ?? 4000;
+    this.intervalMs = intervalMs > 0 ? intervalMs : 4000;
   }
 
   subscribe = (listener: () => void): (() => void) => {

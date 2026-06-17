@@ -2,6 +2,7 @@ import { useMemo, useRef, useState } from "react";
 import "./App.css";
 import { NewSessionDialog } from "./NewSessionDialog";
 import { Sidebar } from "./Sidebar";
+import { OPEN_CANCELLED } from "./session-store";
 import { buildTree, type SessionNode } from "./session-tree";
 import { TabBar } from "./TabBar";
 import { Terminal } from "./Terminal";
@@ -28,11 +29,22 @@ function App() {
   // server state (Codex #9); only the spawn path (handleOpened) refreshes.
   function openFromSidebar(node: SessionNode) {
     setNotice(null);
-    void openSession({
+    // openSession resolves (never rejects) with {ok:false} on failure — e.g. a
+    // session that died between the poll and the click. Surface that instead of
+    // dropping it silently; the .catch is a belt-and-braces guard.
+    openSession({
       projectId: node.projectId,
       sessionId: node.sessionId,
       agent: node.agent,
-    });
+    })
+      .then((result) => {
+        if (!result.ok && result.error !== OPEN_CANCELLED) {
+          setNotice("Could not open the session. It may have stopped.");
+        }
+      })
+      .catch(() => {
+        setNotice("Could not open the session. It may have stopped.");
+      });
   }
 
   // No teardown on React unmount: the store is a process-scoped singleton, and

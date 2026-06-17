@@ -60,6 +60,18 @@ describe("DiscoveryStore", () => {
     store.stop();
   });
 
+  it("clamps a non-positive intervalMs to the 4s default (no tight loop)", async () => {
+    const { store, listSessions } = makeStore({ intervalMs: 0 });
+    await store.start();
+    expect(listSessions).toHaveBeenCalledTimes(1);
+    // A 0ms interval would have fired many times here; the clamp holds it to 4s.
+    await vi.advanceTimersByTimeAsync(3999);
+    expect(listSessions).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(listSessions).toHaveBeenCalledTimes(2);
+    store.stop();
+  });
+
   it("re-lists sessions on each interval tick", async () => {
     const { store, listSessions } = makeStore();
     await store.start();
