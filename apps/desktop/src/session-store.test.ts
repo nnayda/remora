@@ -363,55 +363,65 @@ describe("SessionStore reconnect machine", () => {
     expect(store.getSnapshot().tabs[0].status).toBe("live");
   });
 
-  // RACE 1: respawnTab fires while a reconnect attach is pending.
-  // Only the respawn's connection should win; the reconnect's resolution must
-  // NOT additionally swap (no double remote open, no double swapConnection).
-  it("RACE: respawnTab while reconnect pending → exactly one swap, reconnect's connection is closed", async () => {
-    let attachResolve!: (c: SessionConnection) => void;
-    const attachConn = fakeConn();
-    const respawnConn = fakeConn();
+  // RACE 1: a second respawnTab fires while the first respawn is still pending.
+  // The second call bumps the token, so the first respawn is cancelled. When the
+  // first (cancelled) respawn resolves, its connection must NOT be installed —
+  // the tab must still hold the spawned connection until the second wins.
+  // This exercises the respawnTab post-await guard on the CANCELLATION side.
+  it("RACE: second respawnTab cancels first → cancelled respawn never installed as live connection", async () => {
+    let respawn1Resolve!: (c: SessionConnection) => void;
+    const respawnConn1 = fakeConn();
+    const respawnConn2 = fakeConn();
+    let call = 0;
 
     const { store, spawned } = makeStore({
-      // attach hangs until we manually resolve it
-      attach: () =>
-        new Promise<SessionConnection>((res) => {
-          attachResolve = res;
-        }),
-      respawn: () => Promise.resolve(respawnConn.conn),
+      respawn: () => {
+        call += 1;
+        if (call === 1)
+          return new Promise<SessionConnection>((res) => {
+            respawn1Resolve = res;
+          });
+        // Second respawn resolves immediately
+        return Promise.resolve(respawnConn2.conn);
+      },
     });
 
     await store.openSession({ projectId: "p", sessionId: "s", agent: null });
 
-    // Trigger death → store enters reconnecting, attach is in-flight
+    // Trigger death → store enters reconnecting
     spawned.die();
     expect(store.getSnapshot().tabs[0].status).toBe("reconnecting");
 
-    // While attach is still pending, trigger a respawn
-    const respawnPromise = store.respawnTab("p/s");
+    // First respawnTab — hangs
+    const p1 = store.respawnTab("p/s");
+    // Second respawnTab — resolves immediately, cancels first token
+    await store.respawnTab("p/s");
 
-    // Let the respawn resolve first
-    await respawnPromise;
-
-    // Tab should be live with the respawn connection
-    const tab = store.getSnapshot().tabs[0];
-    expect(tab.status).toBe("live");
-    expect(tab.connection).toBe(respawnConn.conn);
-
-    // Now resolve the stale attach — it must NOT swap again
-    attachResolve(attachConn.conn);
-    await Promise.resolve();
-    await Promise.resolve();
-
-    // Status must still be live and the reconnect's connection must have been closed
+    // Tab should now be live with conn2
     expect(store.getSnapshot().tabs[0].status).toBe("live");
-    expect(store.getSnapshot().tabs[0].connection).toBe(respawnConn.conn);
-    expect(attachConn.wasClosed()).toBe(true); // reconnect loser was cleaned up
+    expect(store.getSnapshot().tabs[0].connection).toBe(respawnConn2.conn);
+
+    // Now resolve the stale (cancelled) first respawn
+    respawn1Resolve(respawnConn1.conn);
+    await Promise.resolve();
+    await p1;
+
+    // KEY ASSERTION: the cancelled respawn must NOT replace the live connection
+    expect(store.getSnapshot().tabs[0].connection).not.toBe(respawnConn1.conn);
+    // cancelled respawn's connection must have been closed
+    expect(respawnConn1.wasClosed()).toBe(true);
+    // The winner conn2 is still live
+    expect(store.getSnapshot().tabs[0].connection).toBe(respawnConn2.conn);
+    expect(store.getSnapshot().tabs[0].status).toBe("live");
+    await p1;
   });
 
   // RACE 2: two concurrent respawnTab calls → only one swap survives.
-  // The second respawn to resolve must find its token cancelled and close its
-  // connection; the tab ends up live with exactly one of the two connections.
-  it("RACE: two concurrent respawnTab calls → exactly one swap, loser connection closed", async () => {
+  // The second respawnTab bumps the token, cancelling the first. When the first
+  // (cancelled) respawn resolves, it must NOT install conn1 as the live
+  // connection — the tab must still hold the original spawned connection.
+  // Only after the second resolves should the tab hold conn2.
+  it("RACE: two concurrent respawnTab calls → cancelled respawn never installed, winner is conn2", async () => {
     let respawn1Resolve!: (c: SessionConnection) => void;
     let respawn2Resolve!: (c: SessionConnection) => void;
     const conn1 = fakeConn();
@@ -441,11 +451,19 @@ describe("SessionStore reconnect machine", () => {
     // Second respawnTab call — also hangs; cancels the first token
     const p2 = store.respawnTab("p/s");
 
-    // Resolve the first (now-cancelled) respawn then the second (live) respawn
+    // Resolve the first (now-cancelled) respawn.
+    // KEY ASSERTION: a cancelled respawn must NEVER become the live connection.
+    // Before the fix, the unguarded swapConnection would install conn1 here.
     respawn1Resolve(conn1.conn);
     await Promise.resolve();
     await p1;
 
+    // conn1 must NOT be installed — the cancelled respawn was discarded
+    expect(store.getSnapshot().tabs[0].connection).not.toBe(conn1.conn);
+    // conn1 must have been closed (the cancelled respawn cleaned it up)
+    expect(conn1.wasClosed()).toBe(true);
+
+    // Now resolve the second (live) respawn
     respawn2Resolve(conn2.conn);
     await Promise.resolve();
     await p2;
@@ -454,7 +472,5 @@ describe("SessionStore reconnect machine", () => {
     const tab = store.getSnapshot().tabs[0];
     expect(tab.status).toBe("live");
     expect(tab.connection).toBe(conn2.conn);
-    // First respawn's connection was closed (it was the loser)
-    expect(conn1.wasClosed()).toBe(true);
   });
 });
