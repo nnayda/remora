@@ -1,4 +1,3 @@
-// apps/desktop/src/session-store.test.ts
 import { describe, expect, it, vi } from "vitest";
 import type { SessionConnection } from "./connection";
 import type { OpenSession } from "./session-store";
@@ -152,5 +151,55 @@ describe("SessionStore", () => {
     expect(listener).toHaveBeenCalled();
     unsub();
     expect(tabKey("a", "1")).toBe("a/1");
+  });
+
+  it("unsubscribed listener is not called on later changes", async () => {
+    const store = new SessionStore(instantOpener());
+    const listener = vi.fn();
+    const unsub = store.subscribe(listener);
+    await store.openSession(spec("a", "1"));
+    const callsBeforeUnsub = listener.mock.calls.length;
+    unsub();
+    await store.openSession(spec("b", "2"));
+    expect(listener).toHaveBeenCalledTimes(callsBeforeUnsub);
+  });
+
+  it("closeTab of a non-active tab leaves activeKey unchanged", async () => {
+    const store = new SessionStore(instantOpener());
+    await store.openSession(spec("a", "1"));
+    await store.openSession(spec("b", "2"));
+    await store.openSession(spec("c", "3"));
+    store.focusTab("a/1");
+    store.closeTab("b/2"); // not the active tab
+    const snap = store.getSnapshot();
+    expect(snap.activeKey).toBe("a/1");
+    expect(snap.tabs.map((t) => t.key)).toEqual(["a/1", "c/3"]);
+  });
+
+  // Isolates the `|| this.disposed` guard: dispose() runs BEFORE this open, so
+  // the open's own token is never marked cancelled — only `disposed` is true.
+  // A `&&`-for-`||` mutation would commit a tab here and fail this test.
+  it("an open started after dispose closes its orphan via the disposed guard", async () => {
+    let resolve!: (r: {
+      connection: SessionConnection;
+      attached: boolean;
+    }) => void;
+    const conn = makeConn();
+    const opener: OpenSession = vi.fn(
+      () =>
+        new Promise<{ connection: SessionConnection; attached: boolean }>(
+          (res) => {
+            resolve = res;
+          },
+        ),
+    );
+    const store = new SessionStore(opener);
+    store.dispose();
+    const pending = store.openSession(spec("a", "1"));
+    resolve({ connection: conn, attached: false });
+    const result = await pending;
+    expect(result).toEqual({ ok: false, error: OPEN_CANCELLED });
+    expect(conn.close).toHaveBeenCalledTimes(1);
+    expect(store.getSnapshot().tabs).toHaveLength(0);
   });
 });

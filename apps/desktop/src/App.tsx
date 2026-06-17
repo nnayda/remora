@@ -1,9 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import "./App.css";
 import { NewSessionDialog } from "./NewSessionDialog";
 import { TabBar } from "./TabBar";
 import { Terminal } from "./Terminal";
-import { sessionStore, useSessions } from "./useSessions";
+import { useSessions } from "./useSessions";
 
 export const APP_NAME = "Remora";
 
@@ -13,9 +13,10 @@ function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const newButtonRef = useRef<HTMLButtonElement>(null);
 
-  // App teardown closes every live session (window close). The store is a
-  // module singleton, so this is the one place that ends connections.
-  useEffect(() => () => sessionStore.dispose(), []);
+  // No teardown on React unmount: the store is a process-scoped singleton, and
+  // a StrictMode/HMR remount must NOT dispose it (decision 1). Process/window
+  // exit closes the OS-level PTY + bridge channels; a future window-close hook
+  // can call sessionStore.dispose() if explicit teardown is ever needed.
 
   function handleOpened(attached: boolean) {
     setDialogOpen(false);
@@ -28,8 +29,14 @@ function App() {
       <TabBar
         tabs={tabs}
         activeKey={activeKey}
-        onFocus={focusTab}
-        onClose={closeTab}
+        onFocus={(key) => {
+          setNotice(null);
+          focusTab(key);
+        }}
+        onClose={(key) => {
+          setNotice(null);
+          closeTab(key);
+        }}
         onNew={() => {
           setNotice(null);
           setDialogOpen(true);

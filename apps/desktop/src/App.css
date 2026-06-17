@@ -64,6 +64,16 @@ body {
   cursor: pointer;
 }
 
+/* Visible keyboard focus — the tab buttons are borderless on a dark bg, so the
+   UA default ring is easy to miss. */
+.tab-label:focus-visible,
+.tab-close:focus-visible,
+.tab-new:focus-visible,
+.dialog-actions button:focus-visible {
+  outline: 2px solid #8ab4f8;
+  outline-offset: -2px;
+}
+
 .panes {
   flex: 1;
   min-height: 0;

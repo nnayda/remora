@@ -71,8 +71,10 @@ export class SessionStore {
 
   private commit(): void {
     // New snapshot object every commit so useSyncExternalStore re-renders;
-    // unchanged between commits so it does not loop.
-    this.snapshot = { tabs: this.tabs, activeKey: this.activeKey };
+    // unchanged between commits so it does not loop. Copy tabs so the
+    // published snapshot is immutable (the hook's contract) and a consumer
+    // cannot mutate the store's live array.
+    this.snapshot = { tabs: [...this.tabs], activeKey: this.activeKey };
     for (const listener of this.listeners) listener();
   }
 
@@ -85,10 +87,12 @@ export class SessionStore {
       return { ok: true, attached: existing.attached };
     }
 
-    // Precondition: callers must not re-open a key whose open is still
-    // in flight. The dialog enforces this (submit is disabled while
-    // connecting, and committed tabs dedupe above), so a second pending
-    // token for the same key never races the first.
+    // A second open of a key whose open is still in flight would overwrite
+    // the pending token and could commit a duplicate tab. The dialog prevents
+    // it (submit disabled while connecting), but the store guards it too.
+    if (this.pending.has(key)) {
+      return { ok: false, error: OPEN_CANCELLED };
+    }
     const token = { cancelled: false };
     this.pending.set(key, token);
     let opened: { connection: SessionConnection; attached: boolean };

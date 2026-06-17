@@ -236,6 +236,31 @@ up cold.
   "Scaling assumption").
 - **Depends on:** real usage data on typical tab counts; not blocking.
 
+## Complete the WAI-ARIA tabs pattern (tab↔panel wiring + roving tabindex)
+
+- **What:** Finish the ARIA tabs pattern for the tab bar. Stage 9 ships the
+  basics (`role="tablist"`/`role="tab"`/`aria-selected`, `role="presentation"`
+  on the tab wrapper, labelled close buttons, visible focus ring). Still missing:
+  `aria-controls` on each tab → its pane `id`; `role="tabpanel"` +
+  `aria-labelledby` on each pane; and roving-tabindex + arrow-key navigation
+  between tabs (the standard tab keyboard model, vs the current Tab-key order).
+- **Why:** Screen-reader users currently can't jump tab→panel, and keyboard tab
+  switching uses Tab instead of arrow keys. Full compliance is the complete a11y
+  experience; the stage-9 basics are the floor, not the ceiling.
+- **How:** In `App.tsx` give each pane `id={`panel-${t.key}`}`, `role="tabpanel"`,
+  `aria-labelledby={`tab-${t.key}`}`; in `TabBar.tsx` give each tab button
+  `id={`tab-${t.key}`}`, `aria-controls={`panel-${t.key}`}`, and roving
+  `tabIndex` (0 on active, -1 otherwise) with an arrow-key handler on the
+  tablist. Do it as one coherent pass.
+- **Pros:** Complete keyboard + screen-reader tab UX. **Cons:** touches both
+  TabBar and App pane rendering; partial (controls-only) wiring is worse than
+  none, so do the whole pattern together.
+- **Context:** Stage-9 `/review` (design specialist + Codex adversarial both
+  flagged the tab↔panel gap). Deferred (decision 6 scoped "basic a11y", which
+  the stage-9 fixes satisfy). See
+  `docs/superpowers/specs/2026-06-16-stage-9-tabs-spawn-design.md`.
+- **Depends on:** none; pairs naturally with any future tab-reordering UX.
+
 ## Webview e2e for the hide/show terminal refit
 
 - **What:** A webview end-to-end test that spawns two session tabs, switches

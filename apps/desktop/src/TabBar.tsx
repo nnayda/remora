@@ -22,10 +22,14 @@ export function TabBar({
   return (
     <div className="tabbar" role="tablist" aria-label="Sessions">
       {tabs.map((t) => {
-        const label = `${t.projectId}/${t.sessionId}`;
+        const label = t.key; // `${projectId}/${sessionId}` — see tabKey()
         const active = t.key === activeKey;
         return (
-          <div key={t.key} className={active ? "tab tab--active" : "tab"}>
+          <div
+            key={t.key}
+            role="presentation"
+            className={active ? "tab tab--active" : "tab"}
+          >
             <button
               type="button"
               role="tab"

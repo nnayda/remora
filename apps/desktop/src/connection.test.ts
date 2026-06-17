@@ -201,4 +201,16 @@ describe("connection.ts — openSession (spawn-first)", () => {
     });
     expect(b.attachSession).not.toHaveBeenCalled();
   });
+
+  it("propagates an attach error when the fallback attach fails after sessionExists", async () => {
+    b.spawnSession.mockRejectedValueOnce({ kind: "sessionExists" });
+    b.attachSession.mockRejectedValueOnce({
+      kind: "transport",
+      message: "net",
+    });
+    await expect(openSession("p", "s", null)).rejects.toMatchObject({
+      kind: "transport",
+    });
+    expect(b.attachSession).toHaveBeenCalledTimes(1);
+  });
 });
