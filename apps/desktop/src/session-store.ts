@@ -289,6 +289,31 @@ export class SessionStore {
     this.commit();
   };
 
+  /** Focus kick: retry every reconnecting tab now (fresh token, attempt 0). */
+  reconnectStale = (): void => {
+    if (this.disposed) return;
+    for (const tab of this.tabs) {
+      if (tab.status === "reconnecting") void this.startReconnect(tab.key, 0);
+    }
+  };
+
+  /** Wake recovery (D2): re-attach every live/reconnecting tab. Serialized
+   * (N3) so a burst of tabs doesn't stampede ssh handshakes. Stopped and
+   * disconnected tabs are left for the explicit Respawn affordance. */
+  reconnectAll = async (): Promise<void> => {
+    if (this.disposed) return;
+    const keys = this.tabs
+      .filter((t) => t.status === "live" || t.status === "reconnecting")
+      .map((t) => t.key);
+    for (const key of keys) {
+      if (this.disposed) return;
+      const tab = this.tabs.find((t) => t.key === key);
+      if (!tab) continue;
+      this.setStatus(key, "reconnecting", null);
+      await this.startReconnect(key, 0); // one at a time
+    }
+  };
+
   respawnTab = async (key: string): Promise<void> => {
     const tab = this.tabs.find((t) => t.key === key);
     if (!tab || this.disposed) return;

@@ -474,3 +474,44 @@ describe("SessionStore reconnect machine", () => {
     expect(tab.connection).toBe(conn2.conn);
   });
 });
+
+describe("SessionStore reconnectAll/Stale", () => {
+  it("reconnectAll re-attaches a live tab serially and skips stopped tabs", async () => {
+    const fresh = fakeConn();
+    let attachCalls = 0;
+    const { store, spawned } = makeStore({
+      attach: () => {
+        attachCalls += 1;
+        return Promise.resolve(fresh.conn);
+      },
+    });
+    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store.reconnectAll();
+    expect(attachCalls).toBe(1);
+    expect(store.getSnapshot().tabs[0].connection).toBe(fresh.conn);
+    expect(spawned.wasClosed()).toBe(true);
+  });
+
+  it("reconnectStale kicks a reconnecting tab without touching a live one", async () => {
+    // a tab in transport-retry backoff is reconnecting; reconnectStale retries now
+    let attempts = 0;
+    const fresh = fakeConn();
+    const { store, spawned } = makeStore({
+      attach: () => {
+        attempts += 1;
+        return attempts < 2
+          ? Promise.reject({ kind: "transport", message: "down" })
+          : Promise.resolve(fresh.conn);
+      },
+    });
+    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    spawned.die();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.getSnapshot().tabs[0].status).toBe("reconnecting");
+    store.reconnectStale(); // retry immediately instead of waiting for the timer
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.getSnapshot().tabs[0].status).toBe("live");
+  });
+});
