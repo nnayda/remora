@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use remora_core::config::{Config, ConfigError};
-use remora_core::{SessionChannel, SourceError};
+use remora_core::{SessionChannel, SessionSource, SourceError};
 
 use remora_protocol::{
     AgentId, ChannelInput, ChannelOutput, ProjectId, SessionId, SpawnSpec, TerminalSize,
@@ -110,8 +110,7 @@ impl Bridge {
                     message: e.to_string(),
                 })?,
         };
-        let config = Arc::new(self.load_config()?);
-        let source = self.resolver.for_project(&config, &spec.project_id)?;
+        let source = self.resolve_for(&spec.project_id)?;
         let channel = source.spawn(spec).await?;
         Ok(self.open_channel(channel, sink))
     }
@@ -123,8 +122,7 @@ impl Bridge {
         sink: Arc<dyn OutputSink>,
     ) -> Result<ChannelHandle, BridgeError> {
         let (p, s) = parse_ids(project_id, session_id)?;
-        let config = Arc::new(self.load_config()?);
-        let source = self.resolver.for_project(&config, &p)?;
+        let source = self.resolve_for(&p)?;
         let channel = source.attach(&p, &s).await?;
         Ok(self.open_channel(channel, sink))
     }
@@ -136,8 +134,7 @@ impl Bridge {
         sink: Arc<dyn OutputSink>,
     ) -> Result<ChannelHandle, BridgeError> {
         let (p, s) = parse_ids(project_id, session_id)?;
-        let config = Arc::new(self.load_config()?);
-        let source = self.resolver.for_project(&config, &p)?;
+        let source = self.resolve_for(&p)?;
         let channel = source.respawn(&p, &s).await?;
         Ok(self.open_channel(channel, sink))
     }
@@ -214,6 +211,14 @@ impl Bridge {
                 .cmp(&(b.project_id.as_str(), b.session_id.as_str()))
         });
         Ok(metas)
+    }
+
+    /// Resolve the transport for a project: load config fresh, then pick the
+    /// project's host's source (per-call resolution, D1). Shared by
+    /// spawn/attach/respawn so the load-then-resolve step lives in one place.
+    fn resolve_for(&self, project_id: &ProjectId) -> Result<Arc<dyn SessionSource>, BridgeError> {
+        let config = Arc::new(self.load_config()?);
+        self.resolver.for_project(&config, project_id)
     }
 
     /// Load the per-device config fresh. A *missing* file is success → an
@@ -836,5 +841,31 @@ mod tests {
             ),
             other => panic!("expected Transport, got {other:?}"),
         }
+    }
+
+    // End-to-end through the REAL ConfigResolver (the routing tests above use
+    // fakes): a spawn for a project absent from config surfaces as Config, not
+    // Transport — proving load_config → for_project is wired and classified.
+    #[tokio::test]
+    async fn spawn_unknown_project_is_config_error() {
+        let path = temp_config_path("unknown-project");
+        std::fs::write(
+            &path,
+            "[hosts.hermes]\ntransport = \"ssh\"\nhost = \"hermes\"\n\
+             [projects.api]\nhost = \"hermes\"\npath = \"/srv/api\"\nworkspace = \"worktree\"\nagent = \"claude\"\n\
+             [agents.claude]\ncommand = [\"claude\"]\n",
+        )
+        .expect("write");
+        let b = Bridge::with_spawner(
+            Arc::new(super::resolve::ConfigResolver),
+            path.clone(),
+            Arc::new(|fut| {
+                tokio::spawn(fut);
+            }),
+        );
+        let (s, _rx) = sink();
+        let result = b.spawn("ghost".into(), "x".into(), None, s).await;
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(result, Err(BridgeError::Config { .. })));
     }
 }
