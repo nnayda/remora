@@ -176,30 +176,19 @@ describe("SessionStore", () => {
     expect(snap.tabs.map((t) => t.key)).toEqual(["a/1", "c/3"]);
   });
 
-  // Isolates the `|| this.disposed` guard: dispose() runs BEFORE this open, so
-  // the open's own token is never marked cancelled — only `disposed` is true.
-  // A `&&`-for-`||` mutation would commit a tab here and fail this test.
-  it("an open started after dispose closes its orphan via the disposed guard", async () => {
-    let resolve!: (r: {
-      connection: SessionConnection;
-      attached: boolean;
-    }) => void;
-    const conn = makeConn();
-    const opener: OpenSession = vi.fn(
-      () =>
-        new Promise<{ connection: SessionConnection; attached: boolean }>(
-          (res) => {
-            resolve = res;
-          },
-        ),
-    );
+  // A disposed store short-circuits openSession: it returns OPEN_CANCELLED
+  // immediately and never invokes the opener, so no spawn/attach side effect
+  // happens post-teardown. (dispose-DURING-flight is covered by the test above.)
+  it("an open started after dispose is cancelled without invoking the opener", async () => {
+    const opener: OpenSession = vi.fn(async () => ({
+      connection: makeConn(),
+      attached: false,
+    }));
     const store = new SessionStore(opener);
     store.dispose();
-    const pending = store.openSession(spec("a", "1"));
-    resolve({ connection: conn, attached: false });
-    const result = await pending;
+    const result = await store.openSession(spec("a", "1"));
     expect(result).toEqual({ ok: false, error: OPEN_CANCELLED });
-    expect(conn.close).toHaveBeenCalledTimes(1);
+    expect(opener).not.toHaveBeenCalled();
     expect(store.getSnapshot().tabs).toHaveLength(0);
   });
 });

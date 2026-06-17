@@ -44,20 +44,30 @@ export function NewSessionDialog({
     if (!valid || submitting) return;
     setSubmitting(true);
     setError(null);
-    const result = await openSession({
-      projectId,
-      sessionId,
-      agent: agent === "" ? null : agent,
-    });
-    if (result.ok) {
-      onOpened(result.attached);
-      return; // App closes the dialog
-    }
-    setSubmitting(false);
-    // OPEN_CANCELLED means the open was cancelled externally (e.g. app teardown,
-    // which unmounts this dialog anyway). Show nothing for it; surface real errors.
-    if (result.error !== OPEN_CANCELLED) {
-      setError(errorMessage(result.error));
+    try {
+      const result = await openSession({
+        projectId,
+        sessionId,
+        agent: agent === "" ? null : agent,
+      });
+      if (result.ok) {
+        onOpened(result.attached);
+        return; // App closes the dialog
+      }
+      // OPEN_CANCELLED means the open was cancelled externally (e.g. app
+      // teardown, which unmounts this dialog anyway). Show nothing for it;
+      // surface real errors.
+      if (result.error !== OPEN_CANCELLED) {
+        setError(errorMessage(result.error));
+      }
+    } catch (err) {
+      // openSession is contracted to resolve, not reject — this guards the
+      // unexpected (e.g. a subscriber throwing during commit) so the button
+      // never sticks on "Connecting…".
+      console.error("Failed to open session", err);
+      setError(errorMessage(err));
+    } finally {
+      setSubmitting(false);
     }
   }
 

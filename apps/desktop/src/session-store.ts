@@ -71,14 +71,23 @@ export class SessionStore {
 
   private commit(): void {
     // New snapshot object every commit so useSyncExternalStore re-renders;
-    // unchanged between commits so it does not loop. Copy tabs so the
-    // published snapshot is immutable (the hook's contract) and a consumer
-    // cannot mutate the store's live array.
-    this.snapshot = { tabs: [...this.tabs], activeKey: this.activeKey };
+    // unchanged between commits so it does not loop. Each tab is a fresh
+    // shallow copy so a consumer can't mutate the store's live state — the
+    // `connection` ref is intentionally shared (a live handle, not data).
+    this.snapshot = {
+      tabs: this.tabs.map((t) => ({ ...t })),
+      activeKey: this.activeKey,
+    };
     for (const listener of this.listeners) listener();
   }
 
   openSession = async (input: SpawnInput): Promise<OpenResult> => {
+    // After dispose() the store is dead — never start new work. The opener
+    // spawns/attaches a real session, a side effect we must not perform
+    // post-teardown (the post-await guard below only cancels locally).
+    if (this.disposed) {
+      return { ok: false, error: OPEN_CANCELLED };
+    }
     const key = tabKey(input.projectId, input.sessionId);
     const existing = this.tabs.find((t) => t.key === key);
     if (existing) {
