@@ -14,6 +14,14 @@ async sessionList() : Promise<Result<SessionMetaDto[], BridgeError>> {
     else return { status: "error", error: e  as any };
 }
 },
+async configGet() : Promise<Result<ConfigDto, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("config_get") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async sessionSpawn(projectId: string, sessionId: string, agent: string | null, onOutput: TAURI_CHANNEL<BridgeOutput>) : Promise<Result<ChannelHandle, BridgeError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("session_spawn", { projectId, sessionId, agent, onOutput }) };
@@ -74,7 +82,14 @@ async sessionClose(handle: ChannelHandle) : Promise<Result<null, BridgeError>> {
 
 /** user-defined types **/
 
-export type BridgeError = { kind: "sessionExists"; message: string } | { kind: "sessionNotFound"; message: string } | { kind: "channelClosed" } | { kind: "transport"; message: string } | { kind: "plan"; message: string } | { kind: "invalidId"; message: string } | { kind: "unknownHandle" } | { kind: "invalidSize"; message: string }
+export type BridgeError = { kind: "sessionExists"; message: string } | { kind: "sessionNotFound"; message: string } | { kind: "channelClosed" } | { kind: "transport"; message: string } | { kind: "plan"; message: string } | { kind: "invalidId"; message: string } | { kind: "unknownHandle" } | { kind: "invalidSize"; message: string } | 
+/**
+ * The config file exists but could not be read or parsed. A *missing*
+ * file is NOT this error — it maps to an empty config (a fresh device is
+ * valid). Permission/parse/validation failures surface here so the sidebar
+ * shows a banner instead of a silently-empty tree.
+ */
+{ kind: "config"; message: string }
 /**
  * Streamed from a session's PTY to the frontend. Internally tagged + camelCase
  * so the generated TS is a clean discriminated union. A local bridge<->frontend
@@ -85,6 +100,22 @@ export type BridgeOutput = { event: "bytes"; bytes: number[] } | { event: "close
  * Opaque handle the frontend uses to address one open channel (write/resize/close).
  */
 export type ChannelHandle = number
+/**
+ * The whole per-device config, projected for the sidebar. `Default` is the
+ * empty config a fresh device (no file yet) renders.
+ */
+export type ConfigDto = { hosts: HostDto[]; projects: ProjectDto[] }
+/**
+ * A configured host, label-only. The `transport` discriminant is all the UI
+ * needs (an icon/badge); the connection details never cross.
+ */
+export type HostDto = { id: string; name: string | null; transport: TransportKindDto }
+/**
+ * A configured project: its label, the host it lives on, and its default
+ * agent. The on-host `path` is intentionally omitted — it is not needed to
+ * render the tree and is closer to a connection detail than a label.
+ */
+export type ProjectDto = { id: string; name: string | null; hostId: string; agent: string }
 export type SessionMetaDto = { projectId: string; sessionId: string; state: SessionStateDto; 
 /**
  * Agent id the sandbox advertises for this session. Untrusted,
@@ -98,6 +129,10 @@ agent: string | null; createdAt: number | null;
  */
 workspacePath: string | null }
 export type SessionStateDto = "live" | "stopped"
+/**
+ * Which transport a host uses — the discriminant only, no connection fields.
+ */
+export type TransportKindDto = "ssh" | "kubectl"
 
 /** tauri-specta globals **/
 

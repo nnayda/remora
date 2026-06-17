@@ -12,6 +12,23 @@ use serde::{Deserialize, Serialize};
 
 pub use remora_protocol::{AgentId, InvalidIdError, ProjectId};
 
+/// Location of the per-device config file *relative to the OS config dir*
+/// (ADR-0004: one human-editable TOML per device). The subdir + filename are
+/// owned here so every client resolves the same `remora/config.toml` — the
+/// desktop shell supplies the platform base (e.g. `~/.config`), a future relay
+/// reuses this constant. Deliberately a predictable name, not a bundle id, so a
+/// human can find and edit it.
+pub const CONFIG_FILE_RELPATH: &str = "remora/config.toml";
+
+/// Joins `base` (an OS config dir) with [`CONFIG_FILE_RELPATH`].
+///
+/// The caller owns choosing `base` (the platform config dir is a
+/// runtime/shell concern); core owns only the suffix, so the path can't drift
+/// between clients.
+pub fn config_file_path(base: impl AsRef<Path>) -> PathBuf {
+    base.as_ref().join(CONFIG_FILE_RELPATH)
+}
+
 /// Identifies a host in local config.
 ///
 /// Hosts never cross the wire — how to *reach* a sandbox is inherently
@@ -1044,6 +1061,17 @@ mod tests {
         assert_eq!(issues.len(), 1, "{issues:?}");
         let msg = issues[0].to_string();
         assert!(msg.contains("port"), "{msg}");
+    }
+
+    #[test]
+    fn config_file_path_joins_base_with_relpath() {
+        let base = Path::new("/home/u/.config");
+        assert_eq!(
+            config_file_path(base),
+            PathBuf::from("/home/u/.config/remora/config.toml")
+        );
+        // The relpath is the documented, human-findable location.
+        assert_eq!(CONFIG_FILE_RELPATH, "remora/config.toml");
     }
 
     #[test]
