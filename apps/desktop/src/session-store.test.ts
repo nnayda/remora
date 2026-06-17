@@ -514,4 +514,61 @@ describe("SessionStore reconnectAll/Stale", () => {
     await Promise.resolve();
     expect(store.getSnapshot().tabs[0].status).toBe("live");
   });
+
+  // N3 anti-stampede: reconnectAll MUST process tabs one at a time (serial
+  // for...of/await), not launch all attaches concurrently (Promise.all).
+  // The discriminating assertion is the mid-flight check: with serial
+  // for...of/await, only ONE attach is in-flight at a time; with
+  // Promise.all, both start immediately and the assertion fails.
+  it("CRITICAL N3: reconnectAll serializes attaches — second attach waits for first to complete", async () => {
+    const deferred: Array<{ resolve: (c: SessionConnection) => void }> = [];
+    let started = 0;
+
+    const freshConns = [fakeConn(), fakeConn()];
+
+    const { store } = makeStore({
+      attach: () => {
+        const idx = started;
+        started += 1;
+        return new Promise<SessionConnection>((res) => {
+          deferred.push({ resolve: () => res(freshConns[idx].conn) });
+        });
+      },
+    });
+
+    // Open two live tabs with different keys.
+    await store.openSession({ projectId: "p", sessionId: "s1", agent: null });
+    await store.openSession({ projectId: "p", sessionId: "s2", agent: null });
+    expect(store.getSnapshot().tabs).toHaveLength(2);
+
+    // Start reconnectAll but do NOT await yet.
+    const reconnectPromise = store.reconnectAll();
+
+    // Yield to the microtask queue so the first attach call can start.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // KEY ASSERTION: only ONE attach must be in-flight.
+    // Serial for...of/await: started === 1 here.
+    // Parallel Promise.all: started === 2 — would fail this assertion.
+    expect(started).toBe(1);
+
+    // Resolve the first attach and drain microtasks so the loop advances.
+    deferred[0].resolve(freshConns[0].conn);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Now the second attach must have started.
+    expect(started).toBe(2);
+
+    // Resolve the second attach and let reconnectAll finish.
+    deferred[1].resolve(freshConns[1].conn);
+    await reconnectPromise;
+
+    // Both tabs should be live.
+    const snap = store.getSnapshot();
+    expect(snap.tabs.find((t) => t.key === "p/s1")?.status).toBe("live");
+    expect(snap.tabs.find((t) => t.key === "p/s2")?.status).toBe("live");
+  });
 });
