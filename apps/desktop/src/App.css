@@ -10,7 +10,80 @@ body {
 
 .app {
   display: flex;
+  flex-direction: column;
   height: 100vh;
+}
+
+.tabbar {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 4px;
+  background: #2a2a2a;
+  overflow-x: auto;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  background: #1e1e1e;
+  border-radius: 4px;
+}
+
+.tab--active {
+  background: #3a3a3a;
+}
+
+.tab-label {
+  border: none;
+  background: none;
+  color: #ddd;
+  padding: 6px 8px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.tab-close {
+  border: none;
+  background: none;
+  color: #999;
+  padding: 6px;
+  cursor: pointer;
+}
+
+.tab-close:hover {
+  color: #fff;
+}
+
+.tab-new {
+  border: none;
+  background: none;
+  color: #8ab4f8;
+  padding: 6px 8px;
+  font: inherit;
+  cursor: pointer;
+}
+
+/* Visible keyboard focus — the tab buttons are borderless on a dark bg, so the
+   UA default ring is easy to miss. */
+.tab-label:focus-visible,
+.tab-close:focus-visible,
+.tab-new:focus-visible,
+.dialog-actions button:focus-visible {
+  outline: 2px solid #8ab4f8;
+  outline-offset: -2px;
+}
+
+.panes {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.pane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
 }
 
 .terminal {
@@ -24,4 +97,82 @@ body {
   margin: auto;
   color: #888;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.notice {
+  padding: 6px 10px;
+  background: #1f3a5f;
+  color: #cfe3ff;
+  font-size: 0.85rem;
+}
+
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.dialog {
+  background: #252525;
+  color: #eee;
+  padding: 20px;
+  border-radius: 8px;
+  min-width: 320px;
+}
+
+.dialog h2 {
+  margin: 0 0 12px;
+  font-size: 1.1rem;
+}
+
+.dialog label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+  font-size: 0.85rem;
+}
+
+.dialog input {
+  padding: 6px;
+  background: #1a1a1a;
+  border: 1px solid #444;
+  border-radius: 4px;
+  color: #eee;
+  font: inherit;
+}
+
+.dialog .hint {
+  color: #888;
+  font-size: 0.75rem;
+}
+
+.dialog-error {
+  color: #ff8a8a;
+  font-size: 0.85rem;
+  margin: 0 0 12px;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.dialog-actions button {
+  padding: 6px 12px;
+  border-radius: 4px;
+  border: 1px solid #444;
+  background: #333;
+  color: #eee;
+  cursor: pointer;
+  font: inherit;
+}
+
+.dialog-actions button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }

@@ -22,6 +22,7 @@ import {
   isSessionExists,
   isSessionNotFound,
   openConnection,
+  openSession,
 } from "./connection";
 
 beforeEach(() => {
@@ -165,5 +166,51 @@ describe("connection.ts — connectSession ladder", () => {
     expect(isSessionExists({ kind: "sessionExists" })).toBe(true);
     expect(isSessionNotFound({ kind: "sessionExists" })).toBe(false);
     expect(isSessionExists(new Error("x"))).toBe(false);
+  });
+});
+
+describe("connection.ts — openSession (spawn-first)", () => {
+  it("spawns a fresh session and reports attached:false", async () => {
+    b.spawnSession.mockResolvedValue(5);
+    const { connection, attached } = await openSession("p", "s", "claude");
+    expect(attached).toBe(false);
+    expect(connection.closed).toBe(false);
+    expect(b.spawnSession).toHaveBeenCalledTimes(1);
+    expect(b.spawnSession).toHaveBeenCalledWith(
+      "p",
+      "s",
+      "claude",
+      expect.anything(),
+    );
+    expect(b.attachSession).not.toHaveBeenCalled();
+  });
+
+  it("attaches and reports attached:true when the session already exists", async () => {
+    b.spawnSession.mockRejectedValueOnce({ kind: "sessionExists" });
+    b.attachSession.mockResolvedValue(6);
+    const { attached } = await openSession("p", "s", null);
+    expect(attached).toBe(true);
+    expect(b.spawnSession).toHaveBeenCalledTimes(1);
+    expect(b.attachSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("propagates unexpected spawn errors", async () => {
+    b.spawnSession.mockRejectedValueOnce({ kind: "transport", message: "net" });
+    await expect(openSession("p", "s", null)).rejects.toMatchObject({
+      kind: "transport",
+    });
+    expect(b.attachSession).not.toHaveBeenCalled();
+  });
+
+  it("propagates an attach error when the fallback attach fails after sessionExists", async () => {
+    b.spawnSession.mockRejectedValueOnce({ kind: "sessionExists" });
+    b.attachSession.mockRejectedValueOnce({
+      kind: "transport",
+      message: "net",
+    });
+    await expect(openSession("p", "s", null)).rejects.toMatchObject({
+      kind: "transport",
+    });
+    expect(b.attachSession).toHaveBeenCalledTimes(1);
   });
 });

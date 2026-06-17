@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Tabs + one-click session spawn (desktop, roadmap stage 9): the app is usable
+  for the first time. A tabbed window runs one session per tab, and a free-form
+  "New session" dialog spawns sessions against the bridge. State and the
+  connection lifecycle live in a plain, node-tested `SessionStore`: tabs are
+  deduped by `project/session`, an in-flight-connect guard closes the orphaned
+  connection if a tab is closed (or the store torn down) before it resolves, and
+  a spawn-first `openSession` reports whether it spawned a fresh session or
+  attached an existing one. A thin `useSyncExternalStore` hook binds the store
+  to React; every terminal stays mounted (inactive panes hidden via inline
+  `display:none`) so scrollback survives tab switches. The dialog owns the
+  connecting/error UI (focus trap, Esc/Enter, restore-focus) and the tab bar
+  carries `tablist`/`tab` ARIA roles with a visible focus ring. Frontend-only,
+  on the in-process fake `SessionSource`.
 - Embedded terminal (desktop, roadmap stage 8): xterm.js wired to the Tauri
   bridge. A `SessionConnection` seam (`connection.ts`) buffers PTY output until
   the terminal subscribes, then streams it and delegates write/resize/close to
