@@ -352,6 +352,11 @@ fn command_from_argv(argv: &[String]) -> CommandBuilder {
     debug_assert!(!argv.is_empty(), "argv must contain at least the program");
     let mut cmd = CommandBuilder::new(&argv[0]);
     cmd.args(&argv[1..]);
+    // The terminal is xterm.js (xterm-256color). Pin it so the remote tmux
+    // resolves terminfo regardless of the launching shell's $TERM (#26);
+    // ssh forwards this to the remote PTY. .env() overrides only TERM, the
+    // rest of the environment is still inherited.
+    cmd.env("TERM", "xterm-256color");
     cmd
 }
 
@@ -1321,6 +1326,14 @@ mod tests {
             .expect("has-session");
         assert_eq!(argv[h + 1], "-t");
         assert_eq!(argv[h + 2], "remora_api_fix-login");
+    }
+
+    #[test]
+    fn interactive_command_pins_term_to_xterm_256color() {
+        // xterm.js (the app's emulator) speaks xterm-256color; the remote tmux
+        // must see that, not whatever TERM the app process inherited.
+        let cmd = command_from_argv(&["ssh".to_string(), "host".to_string()]);
+        assert_eq!(cmd.get_env("TERM"), Some("xterm-256color".as_ref()));
     }
 
     #[test]
