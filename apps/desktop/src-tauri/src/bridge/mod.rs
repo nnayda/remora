@@ -1,19 +1,23 @@
 pub mod commands;
+pub mod dto;
 pub mod error;
 pub mod output;
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use remora_core::config::{Config, ConfigError};
 use remora_core::{SessionChannel, SessionSource};
 use remora_protocol::{
     AgentId, ChannelInput, ChannelOutput, ProjectId, SessionId, SpawnSpec, TerminalSize,
 };
 use tokio::sync::{mpsc, oneshot};
 
+use dto::ConfigDto;
 use error::{BridgeError, SessionMetaDto};
 use output::{BridgeOutput, ChannelHandle, OutputSink};
 
@@ -31,25 +35,34 @@ pub struct Bridge {
     channels: Registry,
     next_handle: AtomicU64,
     spawn_task: Spawner,
+    /// Per-device config file (read-only). Resolved once at construction; read
+    /// fresh on every `config()` so an external edit shows on manual refresh.
+    config_path: PathBuf,
 }
 
 impl Bridge {
     /// Production: forward tasks run on Tauri's async runtime.
-    pub fn new(source: Arc<dyn SessionSource>) -> Self {
+    pub fn new(source: Arc<dyn SessionSource>, config_path: PathBuf) -> Self {
         Self::with_spawner(
             source,
+            config_path,
             Arc::new(|fut| {
                 tauri::async_runtime::spawn(fut);
             }),
         )
     }
 
-    fn with_spawner(source: Arc<dyn SessionSource>, spawn_task: Spawner) -> Self {
+    fn with_spawner(
+        source: Arc<dyn SessionSource>,
+        config_path: PathBuf,
+        spawn_task: Spawner,
+    ) -> Self {
         Self {
             source,
             channels: Arc::new(Mutex::new(HashMap::new())),
             next_handle: AtomicU64::new(0),
             spawn_task,
+            config_path,
         }
     }
 
@@ -174,6 +187,30 @@ impl Bridge {
         });
         Ok(metas)
     }
+
+    /// Reads + projects the per-device config for the sidebar.
+    ///
+    /// A *missing* file is success → an empty config (a fresh device is a
+    /// valid configuration, ADR-0004). Every other failure — permission
+    /// denied, not-a-regular-file, oversized, parse error, validation error —
+    /// is a real `BridgeError::Config` so the UI shows a banner rather than a
+    /// silently-empty sidebar.
+    pub fn config(&self) -> Result<ConfigDto, BridgeError> {
+        match Config::load(&self.config_path) {
+            Ok(config) => Ok(config.into()),
+            // Only a genuinely-absent file is "no config yet". Any other IO
+            // kind (PermissionDenied, the not-a-regular-file InvalidInput, the
+            // oversized InvalidData) is a real failure the user must see.
+            Err(ConfigError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(ConfigDto::default())
+            }
+            Err(e) => Err(BridgeError::Config {
+                message: e.to_string(),
+            }),
+        }
+    }
 }
 
 fn parse_id<T>(r: Result<T, remora_protocol::InvalidIdError>) -> Result<T, BridgeError> {
@@ -257,12 +294,84 @@ mod tests {
         (Arc::new(ChanSink(tx)), rx)
     }
     fn bridge(source: Arc<dyn SessionSource>) -> Bridge {
+        // Non-config tests don't touch config(); point at a path that does not
+        // exist so an accidental read would be an obvious empty config.
+        bridge_with_config(
+            source,
+            std::env::temp_dir().join("remora-no-such-config.toml"),
+        )
+    }
+    fn bridge_with_config(source: Arc<dyn SessionSource>, config_path: PathBuf) -> Bridge {
         Bridge::with_spawner(
             source,
+            config_path,
             Arc::new(|fut| {
                 tokio::spawn(fut);
             }),
         )
+    }
+    /// Unique temp path per process so concurrent `cargo test` runs don't
+    /// collide (matches the `remora-config-test-{pid}` convention in core).
+    fn temp_config_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "remora-bridge-cfg-{}-{}.toml",
+            tag,
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn config_missing_file_is_empty() {
+        let b = bridge_with_config(
+            Arc::new(FakeSessionSource::new()),
+            temp_config_path("missing").join("definitely-absent.toml"),
+        );
+        let dto = b
+            .config()
+            .expect("missing file is an empty config, not an error");
+        assert!(dto.hosts.is_empty() && dto.projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn config_unreadable_is_config_error() {
+        // A directory at the path: metadata succeeds but it is not a regular
+        // file → ConfigError::Io with kind != NotFound → must surface as Config.
+        let b = bridge_with_config(Arc::new(FakeSessionSource::new()), std::env::temp_dir());
+        assert!(matches!(b.config(), Err(BridgeError::Config { .. })));
+    }
+
+    #[tokio::test]
+    async fn config_malformed_is_config_error() {
+        let path = temp_config_path("malformed");
+        std::fs::write(&path, "this is not = valid = toml =").expect("write");
+        let result = b_config(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(result, Err(BridgeError::Config { .. })));
+    }
+
+    #[tokio::test]
+    async fn config_valid_returns_projected_dtos() {
+        let path = temp_config_path("valid");
+        std::fs::write(
+            &path,
+            "[hosts.devbox]\ntransport = \"ssh\"\nhost = \"h\"\n\
+             [projects.api]\nhost = \"devbox\"\npath = \"/srv/api\"\nworkspace = \"worktree\"\nagent = \"claude\"\n\
+             [agents.claude]\ncommand = [\"claude\"]\n",
+        )
+        .expect("write");
+        let result = b_config(&path);
+        std::fs::remove_file(&path).ok();
+        let dto = result.expect("valid config loads");
+        assert_eq!(dto.hosts.len(), 1);
+        assert_eq!(dto.hosts[0].id, "devbox");
+        assert_eq!(dto.projects.len(), 1);
+        assert_eq!(dto.projects[0].host_id, "devbox");
+    }
+
+    /// Loads config via a bridge pointed at `path` (keeps the temp-file cleanup
+    /// in the caller so a panic still removes the file).
+    fn b_config(path: &std::path::Path) -> Result<ConfigDto, BridgeError> {
+        bridge_with_config(Arc::new(FakeSessionSource::new()), path.to_path_buf()).config()
     }
     /// Polls up to ~500ms for the forward task to self-deregister `h`
     /// (write then returns UnknownHandle). Panics with `ctx` on timeout.

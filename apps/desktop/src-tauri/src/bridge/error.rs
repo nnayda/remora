@@ -5,14 +5,33 @@ use remora_protocol::{SessionMeta, SessionState};
 #[derive(Debug, serde::Serialize, specta::Type)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum BridgeError {
-    SessionExists { message: String },
-    SessionNotFound { message: String },
+    SessionExists {
+        message: String,
+    },
+    SessionNotFound {
+        message: String,
+    },
     ChannelClosed,
-    Transport { message: String },
-    Plan { message: String },
-    InvalidId { message: String },
+    Transport {
+        message: String,
+    },
+    Plan {
+        message: String,
+    },
+    InvalidId {
+        message: String,
+    },
     UnknownHandle,
-    InvalidSize { message: String },
+    InvalidSize {
+        message: String,
+    },
+    /// The config file exists but could not be read or parsed. A *missing*
+    /// file is NOT this error — it maps to an empty config (a fresh device is
+    /// valid). Permission/parse/validation failures surface here so the sidebar
+    /// shows a banner instead of a silently-empty tree.
+    Config {
+        message: String,
+    },
 }
 
 impl From<SourceError> for BridgeError {

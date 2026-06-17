@@ -261,21 +261,49 @@ up cold.
   `docs/superpowers/specs/2026-06-16-stage-9-tabs-spawn-design.md`.
 - **Depends on:** none; pairs naturally with any future tab-reordering UX.
 
-## Webview e2e for the hide/show terminal refit
+## Webview e2e for the hide/show terminal refit + sidebar click-to-attach
 
-- **What:** A webview end-to-end test that spawns two session tabs, switches
-  between them, and asserts each terminal refits to the window and its
-  scrollback persists across the switch.
-- **Why:** This is the riskiest stage-9 UI behaviour, and it cannot be verified
-  by the unit tests: vitest runs in `environment: "node"` with xterm mocked, so
-  the real `ResizeObserver` + xterm fit path never executes. Stage 9 covers it
-  with (a) the already-tested `TerminalController` resize logic and (b) a manual
-  QA step; an e2e closes the gap.
-- **Pros:** Real verification of the hide/show refit + scrollback contract.
+- **What:** A webview end-to-end test harness covering the UI behaviours that
+  vitest's node env can't: (a) spawn two session tabs, switch between them, and
+  assert each terminal refits to the window and scrollback persists; (b) **stage
+  10 sidebar** — click a live session row attaches/focuses the right tab, a
+  stopped row is inert (not clickable), and the active-tab highlight tracks the
+  selected row.
+- **Why:** vitest runs in `environment: "node"` with no jsdom/RTL, so neither
+  the real `ResizeObserver` + xterm fit path (stage 9) nor the sidebar's DOM
+  click-wiring / disabled-row / highlight behaviour (stage 10) executes under
+  unit tests. Both stages cover the logic in plain node-testable modules
+  (`TerminalController`/`DiscoveryStore`/`buildTree`) + manual QA; an e2e closes
+  the render-layer gap.
+- **Pros:** Real verification of the refit + scrollback contract and the
+  click-to-attach interaction (the exact bug class pure-logic tests miss:
+  stopped-row-still-clickable, wrong session opened, highlight mismatch).
   **Cons:** needs a webview e2e harness that doesn't exist yet; standing one up
-  is out of scope for a frontend-only stage.
-- **Context:** Stage-9 eng review (Codex outside voice — "the riskiest UI
-  behavior will not actually be verified by the proposed tests"). Manual QA is
-  the stage-9 stopgap; see the spec's "Known coverage gap".
-- **Depends on:** stage 16 (Desktop CI & packaging), which is the natural home
-  for an e2e harness.
+  is out of scope for a frontend-only stage. (Alternative considered for stage
+  10: add jsdom + @testing-library/react for one Sidebar test — declined to keep
+  the stage dep-free, consistent with stage 9.)
+- **Context:** Stage-9 eng review (Codex: riskiest UI behaviour unverified) +
+  stage-10 eng review T1 (Codex #12: click-to-attach coverage gap; user chose
+  defer-but-track). Manual QA is the stopgap for both; see each spec's
+  "Known coverage gap".
+- **Depends on:** stage 16 (Desktop CI & packaging), the natural home for an
+  e2e harness.
+
+## Config file watcher for live sidebar reload
+
+- **What:** Watch the per-device `config.toml` and auto-refresh the sidebar tree
+  when it changes on disk, instead of requiring the manual refresh button or an
+  app restart.
+- **Why:** Stage 10 fetches config once and re-reads it only on manual refresh.
+  An external edit (adding a host/project) won't appear until the user clicks
+  refresh. A watcher makes config edits feel live, matching the read-only
+  sidebar's "reflects your config" intent.
+- **Pros:** Better config-editing UX; natural pairing with the read-only tree.
+  **Cons:** file-watching has cross-platform nuance — editors save via
+  atomic-rename (watch the dir, not the inode), and events need debouncing;
+  pulls in a watcher dep or Tauri fs-watch plumbing + a `config_get` re-emit
+  path to the frontend.
+- **Context:** Stage-10 eng review (Codex outside voice #5). Manual refresh
+  already covers the explicit case; this is the live-reload polish, deferred to
+  its own focused change.
+- **Depends on:** stage 10 `config_get` merged.

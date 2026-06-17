@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tauri::ipc::Channel;
 use tauri_specta::{collect_commands, Builder};
 
+use crate::bridge::dto::ConfigDto;
 use crate::bridge::error::{BridgeError, SessionMetaDto};
 use crate::bridge::output::{BridgeOutput, ChannelHandle, ChannelSink};
 use crate::bridge::Bridge;
@@ -13,6 +14,12 @@ async fn session_list(
     bridge: tauri::State<'_, Bridge>,
 ) -> Result<Vec<SessionMetaDto>, BridgeError> {
     bridge.list().await
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn config_get(bridge: tauri::State<'_, Bridge>) -> Result<ConfigDto, BridgeError> {
+    bridge.config()
 }
 
 #[tauri::command]
@@ -95,6 +102,7 @@ async fn session_close(
 pub fn builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new().commands(collect_commands![
         session_list,
+        config_get,
         session_spawn,
         session_attach,
         session_respawn,

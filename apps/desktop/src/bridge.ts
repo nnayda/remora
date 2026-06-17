@@ -3,6 +3,7 @@ import {
   type BridgeError,
   type BridgeOutput,
   type ChannelHandle,
+  type ConfigDto,
   commands,
   type Result,
   type SessionMetaDto,
@@ -13,6 +14,7 @@ export type {
   BridgeError,
   BridgeOutput,
   ChannelHandle,
+  ConfigDto,
   SessionMetaDto,
   SessionStateDto,
 };
@@ -31,6 +33,10 @@ function unwrap<T>(r: Result<T, BridgeError>): T {
 
 export async function listSessions(): Promise<SessionMetaDto[]> {
   return unwrap(await commands.sessionList());
+}
+
+export async function getConfig(): Promise<ConfigDto> {
+  return unwrap(await commands.configGet());
 }
 
 export async function spawnSession(
