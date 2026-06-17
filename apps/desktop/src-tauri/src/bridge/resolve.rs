@@ -1,0 +1,132 @@
+use std::sync::Arc;
+
+use remora_core::config::{Config, Transport};
+use remora_core::{SessionSource, SshSource};
+use remora_protocol::ProjectId;
+
+use super::error::BridgeError;
+
+/// Selects the transport for a project's host from freshly-loaded config.
+/// The bridge loads config per call (per-call resolution, design D1) and
+/// hands an `Arc<Config>` here; `SshSource` is cheap and stateless, so
+/// building one per call is fine (no connection opens until attach/list).
+pub trait SourceResolver: Send + Sync {
+    /// Transport for `project_id`'s host. Errors if the project or its host
+    /// is unknown, or the host's transport is unsupported (kubectl, stage 12).
+    fn for_project(
+        &self,
+        config: &Arc<Config>,
+        project_id: &ProjectId,
+    ) -> Result<Arc<dyn SessionSource>, BridgeError>;
+
+    /// One transport per supported (ssh) host, for discovery aggregation.
+    /// Kubectl hosts are skipped until stage 12.
+    fn all(&self, config: &Arc<Config>) -> Vec<Arc<dyn SessionSource>>;
+}
+
+/// Production resolver: config is the source of truth.
+pub struct ConfigResolver;
+
+impl SourceResolver for ConfigResolver {
+    fn for_project(
+        &self,
+        config: &Arc<Config>,
+        project_id: &ProjectId,
+    ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+        let project = config
+            .projects
+            .get(project_id)
+            .ok_or_else(|| BridgeError::Config {
+                message: format!("unknown project `{}`", project_id.as_str()),
+            })?;
+        let host = config
+            .hosts
+            .get(&project.host)
+            .ok_or_else(|| BridgeError::Config {
+                message: format!(
+                    "project `{}` references unknown host `{}`",
+                    project_id.as_str(),
+                    project.host.as_str()
+                ),
+            })?;
+        match &host.transport {
+            Transport::Ssh(ssh) => Ok(Arc::new(SshSource::new(ssh.clone(), Arc::clone(config)))),
+            Transport::Kubectl(_) => Err(BridgeError::Config {
+                message: format!(
+                    "host `{}` uses the kubectl transport, not supported yet (stage 12)",
+                    project.host.as_str()
+                ),
+            }),
+        }
+    }
+
+    fn all(&self, config: &Arc<Config>) -> Vec<Arc<dyn SessionSource>> {
+        config
+            .hosts
+            .values()
+            .filter_map(|host| match &host.transport {
+                Transport::Ssh(ssh) => {
+                    Some(Arc::new(SshSource::new(ssh.clone(), Arc::clone(config)))
+                        as Arc<dyn SessionSource>)
+                }
+                Transport::Kubectl(_) => None,
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(toml: &str) -> Arc<Config> {
+        Arc::new(Config::from_toml_str(toml).expect("valid test config"))
+    }
+    fn pid(s: &str) -> ProjectId {
+        ProjectId::new(s).expect("slug")
+    }
+
+    const SSH_PROJECT: &str = "[hosts.hermes]\ntransport = \"ssh\"\nhost = \"hermes\"\n\
+        [projects.api]\nhost = \"hermes\"\npath = \"/srv/api\"\nworkspace = \"worktree\"\nagent = \"claude\"\n\
+        [agents.claude]\ncommand = [\"claude\"]\n";
+
+    #[test]
+    fn for_project_builds_ssh_source() {
+        let r = ConfigResolver;
+        assert!(r.for_project(&config(SSH_PROJECT), &pid("api")).is_ok());
+    }
+
+    #[test]
+    fn for_project_unknown_project_is_config_error() {
+        let r = ConfigResolver;
+        assert!(matches!(
+            r.for_project(&config(SSH_PROJECT), &pid("ghost")),
+            Err(BridgeError::Config { .. })
+        ));
+    }
+
+    #[test]
+    fn for_project_kubectl_host_is_unsupported_config_error() {
+        let toml = "[hosts.k8s]\ntransport = \"kubectl\"\npod = \"p\"\n\
+            [projects.api]\nhost = \"k8s\"\npath = \"/srv/api\"\nworkspace = \"worktree\"\nagent = \"claude\"\n\
+            [agents.claude]\ncommand = [\"claude\"]\n";
+        let r = ConfigResolver;
+        let err = r.for_project(&config(toml), &pid("api"));
+        assert!(matches!(err, Err(BridgeError::Config { .. })));
+    }
+
+    #[test]
+    fn all_skips_kubectl_and_counts_ssh_hosts() {
+        let toml = "[hosts.a]\ntransport = \"ssh\"\nhost = \"a\"\n\
+            [hosts.b]\ntransport = \"ssh\"\nhost = \"b\"\n\
+            [hosts.k]\ntransport = \"kubectl\"\npod = \"p\"\n";
+        let r = ConfigResolver;
+        assert_eq!(r.all(&config(toml)).len(), 2);
+    }
+
+    #[test]
+    fn all_empty_config_is_empty() {
+        let r = ConfigResolver;
+        assert!(r.all(&config("")).is_empty());
+    }
+}

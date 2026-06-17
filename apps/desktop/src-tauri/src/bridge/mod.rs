@@ -2,6 +2,7 @@ pub mod commands;
 pub mod dto;
 pub mod error;
 pub mod output;
+pub mod resolve;
 
 use std::collections::HashMap;
 use std::future::Future;
