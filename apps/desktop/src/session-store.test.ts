@@ -708,4 +708,366 @@ describe("SessionStore openViaRespawn", () => {
     // The store transitions synchronously to reconnecting
     expect(store.getSnapshot().tabs[0].status).toBe("reconnecting");
   });
+
+  // Fix B (F9): sidebar-clicking a STOPPED tab should respawn it, not just focus.
+  it("F9: openViaRespawn on a stopped tab focuses + triggers respawnTab", async () => {
+    const { store, spawned } = makeStore({
+      attach: () =>
+        Promise.reject({ kind: "sessionNotFound", message: "gone" }),
+    });
+    // Open a tab and drive it to stopped via death → sessionNotFound
+    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    spawned.die();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.getSnapshot().tabs[0].status).toBe("stopped");
+
+    // Now swap in a respawn opener that we can observe
+    const freshConn = fakeConn();
+    let respawnCalled = 0;
+    // Patch openers by replacing the store's openers reference is not directly
+    // possible, so we use a new store that starts from stopped state by calling
+    // respawnTab directly after driving stopped via makeStore, then verify
+    // openViaRespawn calls respawnTab by intercepting the respawn opener.
+    // Instead: build a store whose respawn we can track, drive stopped, then call openViaRespawn.
+    const openers2: StoreOpeners = {
+      spawn: vi.fn(async () => ({
+        connection: fakeConn().conn,
+        attached: false,
+      })),
+      attach: vi.fn(() =>
+        Promise.reject({ kind: "sessionNotFound", message: "gone" }),
+      ),
+      respawn: vi.fn(async () => {
+        respawnCalled += 1;
+        return freshConn.conn;
+      }),
+      schedule: vi.fn(),
+    };
+    const store2 = new SessionStore(openers2);
+    const { conn: spawnConn2, die: die2 } = fakeConn();
+    // Patch spawn to return our controlled conn
+    (openers2.spawn as ReturnType<typeof vi.fn>).mockResolvedValue({
+      connection: spawnConn2,
+      attached: false,
+    });
+    await store2.openSession({ projectId: "p", sessionId: "s", agent: null });
+    die2(); // trigger death
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store2.getSnapshot().tabs[0].status).toBe("stopped");
+
+    // Now call openViaRespawn for the already-open stopped tab
+    const result = await store2.openViaRespawn(spec("p", "s"));
+    expect(result).toEqual({ ok: true, attached: false });
+    // Focus should be on p/s
+    expect(store2.getSnapshot().activeKey).toBe("p/s");
+    // The respawn opener must have been invoked (via respawnTab)
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(respawnCalled).toBe(1);
+    // Tab should be live after respawnTab completes
+    expect(store2.getSnapshot().tabs[0].status).toBe("live");
+    expect(store2.getSnapshot().tabs[0].connection).toBe(freshConn.conn);
+  });
+});
+
+// ─── Fix D: additional coverage gaps ─────────────────────────────────────────
+
+describe("SessionStore Fix D coverage", () => {
+  // D1: reconnectAll skips stopped tabs
+  it("D1: reconnectAll re-attaches a live tab and skips a stopped tab", async () => {
+    const freshConn = fakeConn();
+    let attachCalls = 0;
+    const clock = fakeClock();
+
+    const spawnedLive = fakeConn();
+    const spawnedStopped = fakeConn();
+    let spawnCall = 0;
+
+    const openers: StoreOpeners = {
+      spawn: () => {
+        spawnCall += 1;
+        const c = spawnCall === 1 ? spawnedLive : spawnedStopped;
+        return Promise.resolve({ connection: c.conn, attached: false });
+      },
+      attach: (_p, sid) => {
+        attachCalls += 1;
+        if (sid === "stopped") {
+          return Promise.reject({ kind: "sessionNotFound", message: "gone" });
+        }
+        return Promise.resolve(freshConn.conn);
+      },
+      respawn: () => Promise.resolve(fakeConn().conn),
+      schedule: clock.schedule,
+    };
+    const store = new SessionStore(openers);
+    await store.openSession({ projectId: "p", sessionId: "live", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "stopped",
+      agent: null,
+    });
+
+    // Drive the second tab to stopped via death → sessionNotFound
+    spawnedStopped.die();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(
+      store.getSnapshot().tabs.find((t) => t.key === "p/stopped")?.status,
+    ).toBe("stopped");
+
+    // Reset attach call count so we only count reconnectAll's calls
+    attachCalls = 0;
+
+    await store.reconnectAll();
+
+    // Only the live tab should have been re-attached
+    expect(attachCalls).toBe(1);
+    expect(
+      store.getSnapshot().tabs.find((t) => t.key === "p/live")?.connection,
+    ).toBe(freshConn.conn);
+    // The stopped tab must remain stopped and its attach was NOT called
+    expect(
+      store.getSnapshot().tabs.find((t) => t.key === "p/stopped")?.status,
+    ).toBe("stopped");
+  });
+
+  // D2: reconnectStale doesn't touch live tabs
+  it("D2: reconnectStale retries a reconnecting tab and leaves a live tab untouched", async () => {
+    const freshForReconnecting = fakeConn();
+    const clock = fakeClock();
+    // Track which session ids were attached
+    const attachedIds: string[] = [];
+
+    const spawnedRecon = fakeConn();
+    const spawnedLive = fakeConn();
+    let spawnCall = 0;
+
+    // Fail on the first attach for "recon" (from the death handler), succeed on the second
+    let reconAttachCalls = 0;
+
+    const openers: StoreOpeners = {
+      spawn: () => {
+        spawnCall += 1;
+        const c = spawnCall === 1 ? spawnedRecon : spawnedLive;
+        return Promise.resolve({ connection: c.conn, attached: false });
+      },
+      attach: (_p, sid) => {
+        attachedIds.push(sid);
+        if (sid === "recon") {
+          reconAttachCalls += 1;
+          if (reconAttachCalls === 1)
+            return Promise.reject({ kind: "transport", message: "down" });
+          return Promise.resolve(freshForReconnecting.conn);
+        }
+        // Should never be called for the live tab
+        return Promise.resolve(fakeConn().conn);
+      },
+      respawn: () => Promise.resolve(fakeConn().conn),
+      schedule: clock.schedule,
+    };
+
+    const store = new SessionStore(openers);
+    // Open reconnecting tab and drive it to reconnecting (transport fail → backoff)
+    await store.openSession({
+      projectId: "p",
+      sessionId: "recon",
+      agent: null,
+    });
+    spawnedRecon.die();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(
+      store.getSnapshot().tabs.find((t) => t.key === "p/recon")?.status,
+    ).toBe("reconnecting");
+    expect(clock.count()).toBe(1); // parked on backoff
+
+    // Open a separate live tab
+    await store.openSession({
+      projectId: "p",
+      sessionId: "live",
+      agent: null,
+    });
+    expect(
+      store.getSnapshot().tabs.find((t) => t.key === "p/live")?.status,
+    ).toBe("live");
+
+    const liveConnBefore = store
+      .getSnapshot()
+      .tabs.find((t) => t.key === "p/live")?.connection;
+
+    // Clear the attach log before calling reconnectStale
+    attachedIds.length = 0;
+
+    // reconnectStale — should retry p/recon but NOT touch p/live
+    store.reconnectStale();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // p/recon should now be live
+    expect(
+      store.getSnapshot().tabs.find((t) => t.key === "p/recon")?.status,
+    ).toBe("live");
+    // p/live connection unchanged
+    expect(
+      store.getSnapshot().tabs.find((t) => t.key === "p/live")?.connection,
+    ).toBe(liveConnBefore);
+    // attach was only called for "recon", not "live"
+    expect(attachedIds).toEqual(["recon"]);
+  });
+
+  // D3: respawnTab happy path from stopped
+  it("D3: respawnTab drives a stopped tab to live and re-arms death", async () => {
+    const { store, spawned } = makeStore({
+      attach: () =>
+        Promise.reject({ kind: "sessionNotFound", message: "gone" }),
+    });
+    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    spawned.die();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.getSnapshot().tabs[0].status).toBe("stopped");
+
+    // Replace the respawn opener by creating a new store is not possible; instead
+    // use makeStore with respawn override from the start.
+    const respawnConn = fakeConn();
+    const openers2: StoreOpeners = {
+      spawn: vi.fn(async () => ({
+        connection: spawned.conn,
+        attached: false,
+      })),
+      attach: vi.fn(() =>
+        Promise.reject({ kind: "sessionNotFound", message: "gone" }),
+      ),
+      respawn: vi.fn(async () => respawnConn.conn),
+      schedule: vi.fn(),
+    };
+    const store2 = new SessionStore(openers2);
+    // Provide a fresh spawn conn
+    const initialConn = fakeConn();
+    (openers2.spawn as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      connection: initialConn.conn,
+      attached: false,
+    });
+    await store2.openSession({ projectId: "p", sessionId: "s", agent: null });
+    initialConn.die();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store2.getSnapshot().tabs[0].status).toBe("stopped");
+
+    await store2.respawnTab("p/s");
+
+    const tab = store2.getSnapshot().tabs[0];
+    expect(tab.status).toBe("live");
+    expect(tab.connection).toBe(respawnConn.conn);
+    expect(openers2.respawn).toHaveBeenCalledTimes(1);
+
+    // Death re-armed: firing the new conn's close → reconnecting
+    respawnConn.die();
+    expect(store2.getSnapshot().tabs[0].status).toBe("reconnecting");
+  });
+
+  // D4: respawnTab failure (uncancelled) → disconnected with error
+  it("D4: respawnTab failure sets status to disconnected with cause", async () => {
+    const openers: StoreOpeners = {
+      spawn: vi.fn(async () => ({
+        connection: fakeConn().conn,
+        attached: false,
+      })),
+      attach: vi.fn(() =>
+        Promise.reject({ kind: "sessionNotFound", message: "gone" }),
+      ),
+      respawn: vi.fn(async () => {
+        throw { kind: "transport", message: "refused" };
+      }),
+      schedule: vi.fn(),
+    };
+    const initialConn = fakeConn();
+    (openers.spawn as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      connection: initialConn.conn,
+      attached: false,
+    });
+    const store = new SessionStore(openers);
+    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    initialConn.die();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.getSnapshot().tabs[0].status).toBe("stopped");
+
+    await store.respawnTab("p/s");
+
+    const tab = store.getSnapshot().tabs[0];
+    expect(tab.status).toBe("disconnected");
+    expect(tab.error).toContain("refused");
+  });
+
+  // D5: backoff cap — delay for attempt >= 3 stays at BACKOFF_MS[3] = 8000
+  it("D5: backoff delays are capped at BACKOFF_MS[3] = 8000 ms", async () => {
+    const clock = fakeClock();
+    const delays: number[] = [];
+
+    const { store, spawned } = makeStore({
+      attach: () => Promise.reject({ kind: "transport", message: "down" }),
+      schedule: (fn, ms) => {
+        delays.push(ms);
+        clock.schedule(fn, ms);
+      },
+    });
+
+    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    spawned.die();
+
+    // Run 5 attempts (attempts 0–4): each fails with transport → schedules retry
+    for (let i = 0; i < 5; i++) {
+      await Promise.resolve();
+      await Promise.resolve();
+      clock.flush();
+    }
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // We should have at least 4 scheduled delays recorded
+    expect(delays.length).toBeGreaterThanOrEqual(4);
+    // The delay for attempt >= 3 must be capped at 8000
+    for (let i = 3; i < delays.length; i++) {
+      expect(delays[i]).toBe(8000);
+    }
+  });
+
+  // D6: closeTab during backoff — cancelled retry is a no-op
+  it("D6: closeTab during backoff cancels the scheduled retry", async () => {
+    let attachCalls = 0;
+    const clock = fakeClock();
+
+    const { store, spawned } = makeStore({
+      attach: () => {
+        attachCalls += 1;
+        return Promise.reject({ kind: "transport", message: "down" });
+      },
+      schedule: clock.schedule,
+    });
+
+    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    spawned.die();
+    await Promise.resolve();
+    await Promise.resolve();
+    // Tab is reconnecting, one retry parked on the clock
+    expect(store.getSnapshot().tabs[0].status).toBe("reconnecting");
+    expect(clock.count()).toBe(1);
+
+    // Close the tab while the retry is pending
+    store.closeTab("p/s");
+    expect(store.getSnapshot().tabs).toHaveLength(0);
+
+    // Flush the clock — the cancelled retry must be a no-op
+    const attachCallsBeforeFlush = attachCalls;
+    clock.flush();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // No additional attach attempt
+    expect(attachCalls).toBe(attachCallsBeforeFlush);
+    expect(store.getSnapshot().tabs).toHaveLength(0);
+  });
 });

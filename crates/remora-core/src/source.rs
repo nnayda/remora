@@ -48,7 +48,7 @@ pub trait SessionSource: Send + Sync {
 
     /// Re-creates the tmux session for a *stopped* worktree and attaches.
     ///
-    /// The worktree already survives, so this never runs `git worktree add`;
+    /// The worktree already survives, so this never runs `git worktree add`.
     /// The agent is the caller-supplied `agent` (the client carries the pre-stop `REMORA_AGENT` from discovery, D6), else the project default.
     /// Requires the resolved project to be worktree-mode — a shared-mode project returns
     /// [`PlanError::NotWorktreeProject`](crate::PlanError) rather than

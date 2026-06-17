@@ -47,13 +47,6 @@ export interface StoreOpeners {
   schedule(fn: () => void, ms: number): unknown;
 }
 
-/** The opener the store depends on; the real impl is `connection.openSession`. */
-export type OpenSession = (
-  projectId: string,
-  sessionId: string,
-  agent: string | null,
-) => Promise<{ connection: SessionConnection; attached: boolean }>;
-
 /** Returned by `openSession` when the open was cancelled (closed/disposed
  * mid-connect). The connection is closed by the store; callers ignore it. */
 export const OPEN_CANCELLED = Symbol("open-cancelled");
@@ -214,20 +207,21 @@ export class SessionStore {
     this.commit();
   }
 
-  openSession = async (input: SpawnInput): Promise<OpenResult> => {
-    // After dispose() the store is dead — never start new work. The opener
-    // spawns/attaches a real session, a side effect we must not perform
-    // post-teardown (the post-await guard below only cancels locally).
-    if (this.disposed) {
-      return { ok: false, error: OPEN_CANCELLED };
-    }
+  /**
+   * Shared open flow for `openSession` and `openViaRespawn` (non-existing path).
+   * Callers pass a concrete `open` function that returns `{connection, attached}`.
+   * Handles: pending guard → open → post-await cancel/dispose guard → commit tab
+   * (status "live", error null) → registerDeath → return {ok:true, attached}.
+   */
+  private async openTab(
+    input: SpawnInput,
+    open: (
+      p: string,
+      s: string,
+      a: string | null,
+    ) => Promise<{ connection: SessionConnection; attached: boolean }>,
+  ): Promise<OpenResult> {
     const key = tabKey(input.projectId, input.sessionId);
-    const existing = this.tabs.find((t) => t.key === key);
-    if (existing) {
-      this.activeKey = key;
-      this.commit();
-      return { ok: true, attached: existing.attached };
-    }
 
     // A second open of a key whose open is still in flight would overwrite
     // the pending token and could commit a duplicate tab. The dialog prevents
@@ -239,11 +233,7 @@ export class SessionStore {
     this.pending.set(key, token);
     let opened: { connection: SessionConnection; attached: boolean };
     try {
-      opened = await this.openers.spawn(
-        input.projectId,
-        input.sessionId,
-        input.agent,
-      );
+      opened = await open(input.projectId, input.sessionId, input.agent);
     } catch (error) {
       this.pending.delete(key);
       return { ok: false, error };
@@ -270,6 +260,24 @@ export class SessionStore {
     this.commit();
     this.registerDeath(tab);
     return { ok: true, attached: opened.attached };
+  }
+
+  openSession = async (input: SpawnInput): Promise<OpenResult> => {
+    // After dispose() the store is dead — never start new work. The opener
+    // spawns/attaches a real session, a side effect we must not perform
+    // post-teardown (the post-await guard below only cancels locally).
+    if (this.disposed) {
+      return { ok: false, error: OPEN_CANCELLED };
+    }
+    const key = tabKey(input.projectId, input.sessionId);
+    const existing = this.tabs.find((t) => t.key === key);
+    if (existing) {
+      this.activeKey = key;
+      this.commit();
+      return { ok: true, attached: existing.attached };
+    }
+
+    return this.openTab(input, (p, s, a) => this.openers.spawn(p, s, a));
   };
 
   closeTab = (key: string): void => {
@@ -333,6 +341,11 @@ export class SessionStore {
    *   • calls `openers.respawn` which returns `Promise<SessionConnection>` (not
    *     `{connection, attached}`)
    *   • always commits the tab with `attached: false, status: "live"`
+   *
+   * If the key already exists and its tab is stopped or disconnected, the tab is
+   * focused and `respawnTab` is triggered to re-create the session in-place
+   * (rather than silently focusing a dead tab). Live/reconnecting existing tabs
+   * are just focused, as before.
    */
   openViaRespawn = async (input: SpawnInput): Promise<OpenResult> => {
     if (this.disposed) {
@@ -343,46 +356,17 @@ export class SessionStore {
     if (existing) {
       this.activeKey = key;
       this.commit();
+      if (existing.status === "stopped" || existing.status === "disconnected") {
+        void this.respawnTab(key);
+      }
       return { ok: true, attached: false };
     }
-    if (this.pending.has(key)) {
-      return { ok: false, error: OPEN_CANCELLED };
-    }
-    const token = { cancelled: false };
-    this.pending.set(key, token);
-    let connection: SessionConnection;
-    try {
-      connection = await this.openers.respawn(
-        input.projectId,
-        input.sessionId,
-        input.agent,
-      );
-    } catch (error) {
-      this.pending.delete(key);
-      return { ok: false, error };
-    }
-    this.pending.delete(key);
 
-    if (token.cancelled || this.disposed) {
-      void connection.close().catch(() => {});
-      return { ok: false, error: OPEN_CANCELLED };
-    }
-
-    const tab: Tab = {
-      key,
-      projectId: input.projectId,
-      sessionId: input.sessionId,
-      agent: input.agent,
-      connection,
-      attached: false,
-      status: "live",
-      error: null,
-    };
-    this.tabs = [...this.tabs, tab];
-    this.activeKey = key;
-    this.commit();
-    this.registerDeath(tab);
-    return { ok: true, attached: false };
+    return this.openTab(input, (p, s, a) =>
+      this.openers
+        .respawn(p, s, a)
+        .then((connection) => ({ connection, attached: false })),
+    );
   };
 
   respawnTab = async (key: string): Promise<void> => {

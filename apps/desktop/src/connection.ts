@@ -125,7 +125,8 @@ export function errorMessage(e: unknown): string {
   if (isBridgeError(e) && "message" in e && typeof e.message === "string") {
     return e.message;
   }
-  return String(e);
+  if (typeof e === "string") return e;
+  return "unknown error";
 }
 
 /** Attach-only opener for reconnect / sidebar-live clicks. Unlike the removed
