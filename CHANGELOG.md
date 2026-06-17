@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Sidebar with live session state (desktop, roadmap stage 10): a left sidebar
+  renders the Host → Project → Session tree from the config-and-discovery join,
+  refreshed live; clicking a live session attaches it as a tab. A new
+  `config_get` Tauri command reads the per-device TOML (`remora-core` owns the
+  `remora/config.toml` suffix, the shell supplies the OS config dir) and
+  projects it through display-only DTOs in `bridge/dto.rs` — connection secrets
+  (ssh user/host/port, kube pod/namespace/context) never cross the boundary, and
+  a test enforces it. A missing config file is an empty sidebar (a fresh device
+  is valid); only a genuinely unreadable file (permissions, parse error)
+  surfaces as an error banner. The join itself is a pure, node-tested
+  `buildTree`: configured hosts render even when empty, and discovered sessions
+  whose project is not in config bucket under a synthetic "Unconfigured" host.
+  Live polling lives in a plain `DiscoveryStore` (poll + in-flight guard,
+  paused while the window is hidden and refreshed on focus, last-known tree
+  retained on a failed poll); a thin `useSyncExternalStore` hook binds it to
+  React. Frontend-only logic is node-tested; component rendering is covered by
+  manual QA + a tracked e2e TODO. Runs on the in-process fake `SessionSource`.
 - Tabs + one-click session spawn (desktop, roadmap stage 9): the app is usable
   for the first time. A tabbed window runs one session per tab, and a free-form
   "New session" dialog spawns sessions against the bridge. State and the
