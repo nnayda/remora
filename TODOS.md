@@ -21,6 +21,12 @@ up cold.
   `docs/superpowers/specs/2026-06-15-ssh-spawn-design.md` (Deferred section).
 - **Depends on:** none; best done after stage 6 (list) exists so all three
   ops adopt the shared base argv together.
+- **Priority note (stage-11 eng review):** the desktop app now drives real ssh
+  (PR A wires the bridge off the fake) under the sidebar's 4s discovery poll,
+  and stage-11 `reconnectAll` opens one ssh connection per open tab on wake.
+  Every one is a fresh TCP+auth handshake today. Bumps this up: real-transport
+  dogfooding will feel the churn immediately. See
+  `docs/superpowers/specs/2026-06-17-reconnect-respawn-design.md` (P1).
 
 ## ssh execution-phase timeout (watchdog)
 
@@ -147,6 +153,11 @@ up cold.
   honest that the original metadata is unrecoverable; this tracks closing the
   UX gap once a client/UI exists to carry the last-known agent.
 - **Depends on:** a client/UI that retains pre-stop discovery state.
+- **Status (stage-11 eng review, D6): being addressed in stage 11 (PR B).** The
+  sidebar carries the discovered `agent` (the pre-stop `REMORA_AGENT` surfaced
+  by `list()`); PR B adds an `agent` param to the `session_respawn` bridge
+  command + `SshSource::respawn` and passes it through. Remove this entry when
+  PR B lands. See `docs/superpowers/specs/2026-06-17-reconnect-respawn-design.md`.
 
 ## Coalesce bridge output + binary byte codec (PTY firehose backpressure)
 
@@ -288,6 +299,28 @@ up cold.
   "Known coverage gap".
 - **Depends on:** stage 16 (Desktop CI & packaging), the natural home for an
   e2e harness.
+
+## Session fingerprint on attach (don't trust the tmux name alone)
+
+- **What:** Before/while attaching, verify the target tmux session is the
+  Remora session we think it is — match a fingerprint (e.g. the `REMORA_*`
+  session-env metadata, or a created-at/worktree marker) rather than trusting
+  the `remora_<project>_<session>` name alone.
+- **Why:** Attach is name-based. If the tmux server restarted and a same-named
+  session was recreated by something else, or a name was manually reused,
+  attach (and stage-11 reconnect) could land on the wrong process. Discovered
+  state is untrusted input per ADR-0004, so the name is a hint, not proof.
+- **How:** On attach, read the session's `REMORA_*` env (already used by
+  discovery) and compare against expected; on mismatch, treat as
+  stopped/unknown rather than attaching. Pairs with the tmux `#{E:}` inline
+  metadata item (one round-trip already carries the fingerprint).
+- **Pros:** Closes a wrong-process attach hole that reconnect widens (it
+  re-attaches automatically). **Cons:** an extra check on the hot attach path;
+  needs a stable fingerprint definition; low likelihood at single-user scale.
+- **Context:** Stage-11 eng review, outside voice (Codex N4). Out of stage-11
+  scope (name-based attach is what stages 4–6 already ship); tracked as a
+  hardening. See `docs/superpowers/specs/2026-06-17-reconnect-respawn-design.md`.
+- **Depends on:** pairs with the tmux 3.0 `#{E:}` metadata item.
 
 ## Config file watcher for live sidebar reload
 

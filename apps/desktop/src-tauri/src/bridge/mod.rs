@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use remora_core::config::{Config, ConfigError};
-use remora_core::SessionChannel;
+use remora_core::{SessionChannel, SourceError};
 
 use remora_protocol::{
     AgentId, ChannelInput, ChannelOutput, ProjectId, SessionId, SpawnSpec, TerminalSize,
@@ -188,18 +188,25 @@ impl Bridge {
         let total = sources.len();
         let mut metas: Vec<SessionMetaDto> = Vec::new();
         let mut failed = 0usize;
+        let mut last_err: Option<SourceError> = None;
         for source in sources {
             match source.list().await {
                 Ok(ms) => metas.extend(ms.into_iter().map(Into::into)),
                 // One host down must not blank the whole sidebar — skip it and
                 // carry the partial result. TODO(stage 11+): surface per-host
                 // availability instead of silently dropping a down host.
-                Err(_) => failed += 1,
+                Err(e) => {
+                    failed += 1;
+                    last_err = Some(e);
+                }
             }
         }
         if total > 0 && failed == total {
             return Err(BridgeError::Transport {
-                message: "all configured hosts are unreachable".into(),
+                message: match last_err {
+                    Some(e) => format!("all configured hosts are unreachable: {e}"),
+                    None => "all configured hosts are unreachable".into(),
+                },
             });
         }
         metas.sort_by(|a, b| {
@@ -821,6 +828,13 @@ mod tests {
                 tokio::spawn(fut);
             }),
         );
-        assert!(matches!(b.list().await, Err(BridgeError::Transport { .. })));
+        let err = b.list().await.expect_err("all hosts down should error");
+        match err {
+            BridgeError::Transport { message } => assert!(
+                message.contains("host down"),
+                "message should carry the host's cause, got: {message}"
+            ),
+            other => panic!("expected Transport, got {other:?}"),
+        }
     }
 }
