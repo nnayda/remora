@@ -117,6 +117,34 @@ PR titles must follow Conventional Commits (enforced by
 Pushing a `v*` tag builds desktop bundles and attaches them to a draft GitHub
 Release (`.github/workflows/release.yml`).
 
+## Connecting to a real host (dogfooding)
+
+The app reads a per-device config from the OS config dir (not the repo):
+`~/.config/remora/config.toml` on Linux, `~/Library/Application Support/
+remora/config.toml` on macOS. It is never committed. To drive a real ssh host
+(here, an alias `hermes` defined in your `~/.ssh/config`):
+
+```toml
+[hosts.hermes]
+transport = "ssh"
+host = "hermes"            # any ssh destination, including a ~/.ssh/config alias
+
+[agents.claude]
+command = ["claude"]
+[agents.codex]
+command = ["codex"]
+
+[projects.<id>]
+host = "hermes"
+path = "~/<repo>"          # a git repo for worktree mode
+workspace = "worktree"     # fresh worktree + branch per session
+agent = "claude"           # overridable per session
+```
+
+The host needs only `tmux`, `git`, and the agent CLI on `PATH`. With no hosts
+configured the sidebar shows the empty state — there is no in-app fake at
+runtime (the fake is test-only).
+
 ## Releases
 
 1. Update `CHANGELOG.md` (move entries from *Unreleased* to a new version
