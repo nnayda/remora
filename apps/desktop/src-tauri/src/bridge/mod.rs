@@ -736,7 +736,7 @@ mod tests {
                 seen: Arc::clone(&seen),
                 source: Arc::new(FakeSessionSource::new()),
             }),
-            std::env::temp_dir().join("remora-routing.toml"),
+            temp_config_path("routing"),
             Arc::new(|fut| {
                 tokio::spawn(fut);
             }),
@@ -798,7 +798,7 @@ mod tests {
     async fn list_tolerates_one_host_down_and_returns_partial() {
         let b = Bridge::with_spawner(
             Arc::new(TwoHostResolver),
-            std::env::temp_dir().join("remora-twohost.toml"),
+            temp_config_path("twohost"),
             Arc::new(|fut| {
                 tokio::spawn(fut);
             }),
@@ -828,7 +828,7 @@ mod tests {
     async fn list_errors_when_every_host_is_down() {
         let b = Bridge::with_spawner(
             Arc::new(AllDownResolver),
-            std::env::temp_dir().join("remora-alldown.toml"),
+            temp_config_path("alldown"),
             Arc::new(|fut| {
                 tokio::spawn(fut);
             }),
