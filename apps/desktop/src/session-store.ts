@@ -64,6 +64,12 @@ export type OpenResult =
 
 const BACKOFF_MS = [1000, 2000, 4000, 8000] as const;
 
+/** Cancellation handle for one reconnect loop. A newer trigger flips the prior
+ * token's `cancelled`, so the stale loop bails. Depth is the `attempt` param. */
+interface ReconnectToken {
+  cancelled: boolean;
+}
+
 /**
  * App-scoped owner of the open tabs and their connections. Plain class (no
  * React) so it is node-testable and survives React remounts. Exposes a
@@ -79,10 +85,7 @@ export class SessionStore {
   private activeKey: string | null = null;
   private pending = new Map<string, { cancelled: boolean }>();
   // One token per tab key; bumped to cancel an in-flight reconnect.
-  private reconnectTokens = new Map<
-    string,
-    { cancelled: boolean; attempt: number }
-  >();
+  private reconnectTokens = new Map<string, ReconnectToken>();
   private disposed = false;
   private listeners = new Set<() => void>();
   private snapshot: Snapshot = { tabs: [], activeKey: null };
@@ -133,44 +136,54 @@ export class SessionStore {
     void this.startReconnect(key, 0);
   }
 
-  private newReconnectToken(key: string): {
-    cancelled: boolean;
-    attempt: number;
-  } {
+  private newReconnectToken(key: string): ReconnectToken {
     const prev = this.reconnectTokens.get(key);
     if (prev) prev.cancelled = true; // cancel any older loop
-    const token = { cancelled: false, attempt: 0 };
+    const token: ReconnectToken = { cancelled: false };
     this.reconnectTokens.set(key, token);
     return token;
   }
 
-  /** Attach-only reconnect with classification + capped backoff. */
-  private async startReconnect(key: string, attempt: number): Promise<void> {
-    const token =
-      attempt === 0
-        ? this.newReconnectToken(key)
-        : this.reconnectTokens.get(key);
-    if (!token || token.cancelled || this.disposed) return;
-    const tab = this.tabs.find((t) => t.key === key);
+  /**
+   * Attach-only reconnect with classification + capped backoff.
+   *
+   * The token is threaded through the whole loop (captured once, passed into the
+   * scheduled retry) rather than re-fetched by key each attempt. A concurrent
+   * trigger (`reconnectStale`/`reconnectAll`/another `onDeath`) calls
+   * `newReconnectToken(key)` during a backoff window, which flips THIS token's
+   * `cancelled` and installs a fresh one. The stale scheduled retry then carries
+   * the old (now-cancelled) `t` and bails, so only the newest loop proceeds —
+   * no double attach / orphaned connection.
+   */
+  private async startReconnect(
+    key: string,
+    attempt: number,
+    token?: ReconnectToken,
+  ): Promise<void> {
+    // attempt-0 callers pass no token → fresh; retries pass the captured one.
+    const t = token ?? this.newReconnectToken(key);
+    if (t.cancelled || this.disposed) return;
+    const tab = this.tabs.find((tb) => tb.key === key);
     if (!tab) return;
     let next: SessionConnection;
     try {
       next = await this.openers.attach(tab.projectId, tab.sessionId);
     } catch (e) {
-      if (token.cancelled || this.disposed) return;
+      if (t.cancelled || this.disposed) return;
       const fate = reconnectFate(e);
       if (fate === "stopped") return this.setStatus(key, "stopped", null);
       if (fate === "terminal")
         return this.setStatus(key, "disconnected", errorMessage(e));
-      // retry: schedule next attempt with capped backoff
+      // retry: schedule next attempt with capped backoff, threading the SAME
+      // token so a concurrent trigger can cancel this loop.
       const ms = BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)];
       this.openers.schedule(
-        () => void this.startReconnect(key, attempt + 1),
+        () => void this.startReconnect(key, attempt + 1, t),
         ms,
       );
       return;
     }
-    if (token.cancelled || this.disposed) {
+    if (t.cancelled || this.disposed) {
       void next.close().catch(() => {});
       return;
     }

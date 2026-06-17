@@ -48,9 +48,16 @@ export async function openConnection(open: Opener): Promise<SessionConnection> {
   const closeListeners = new Set<() => void>();
 
   const onOutput: OnOutput = (msg) => {
-    if (msg.event === "closed") {
+    if (msg.event === "closed" && !closed) {
+      // First close TRANSITION: fire death listeners exactly once, then clear
+      // so a second `closed` event (or a lingering listener) can't re-trigger
+      // the death path.
       closed = true;
-      for (const l of closeListeners) l();
+      const listeners = [...closeListeners];
+      closeListeners.clear();
+      for (const l of listeners) l();
+    } else if (msg.event === "closed") {
+      closed = true; // already closed; do not re-fire
     }
     if (subscriber) subscriber(msg);
     else buffer.push(msg);

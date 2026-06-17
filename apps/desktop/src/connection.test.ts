@@ -50,6 +50,17 @@ describe("connection.onClose", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it("fires the onClose listener exactly ONCE across two closed events", async () => {
+    const f = fakeOpener();
+    const conn = await openConnection(f.open);
+    const onClose = vi.fn();
+    conn.onClose(onClose);
+    f.emit({ event: "closed" });
+    f.emit({ event: "closed" }); // a second close must NOT re-trigger death
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(conn.closed).toBe(true);
+  });
+
   it("does not fire on our own close()", async () => {
     const f = fakeOpener();
     const conn = await openConnection(f.open);

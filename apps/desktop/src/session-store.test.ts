@@ -475,6 +475,63 @@ describe("SessionStore reconnect machine", () => {
   });
 });
 
+describe("SessionStore reconnect token-refetch race", () => {
+  // The scheduled retry must carry the SAME token it was created with, not
+  // re-fetch the current token by key. Otherwise a concurrent trigger
+  // (reconnectStale) that installs a fresh token during the backoff window
+  // leaves the stale scheduled retry alive: it re-fetches the NEW token, sees
+  // it un-cancelled, and runs a SECOND attach/swap loop — double attach/orphan.
+  it("CRITICAL: a stale scheduled retry bails on its captured token after a concurrent reconnectStale wins", async () => {
+    // attach behaviour, driven by a phase counter:
+    //   call 1 (loop A, attempt 0): FAIL transport → loop A schedules a retry
+    //   call 2 (loop B from reconnectStale): SUCCEED → tab goes live
+    //   call 3+ (the STALE loop-A retry, if it wrongly runs): must NOT happen
+    let attachCalls = 0;
+    const fresh = fakeConn();
+    const { store, spawned, clock } = makeStore({
+      attach: () => {
+        attachCalls += 1;
+        if (attachCalls === 1) {
+          return Promise.reject({ kind: "transport", message: "down" });
+        }
+        return Promise.resolve(fresh.conn);
+      },
+    });
+
+    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+
+    // Death → loop A (token A): attach call 1 fails → a retry is scheduled.
+    spawned.die();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.getSnapshot().tabs[0].status).toBe("reconnecting");
+    expect(attachCalls).toBe(1);
+    expect(clock.count()).toBe(1); // loop A's retry is parked on the clock
+
+    // Concurrent trigger: reconnectStale starts a FRESH loop B (token B), which
+    // cancels token A. Loop B's attach (call 2) succeeds → tab is live.
+    store.reconnectStale();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.getSnapshot().tabs[0].status).toBe("live");
+    expect(store.getSnapshot().tabs[0].connection).toBe(fresh.conn);
+    expect(attachCalls).toBe(2);
+
+    // Now fire the STALE loop-A retry parked on the clock. With the token
+    // threaded, it carries the cancelled token A and bails: NO extra attach,
+    // NO swap. (With the bug, it re-fetches token B, runs attach a 3rd time,
+    // and swaps in an orphan.)
+    clock.flush();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(attachCalls).toBe(2); // stale retry was a no-op
+    const tab = store.getSnapshot().tabs[0];
+    expect(tab.status).toBe("live");
+    expect(tab.connection).toBe(fresh.conn); // no orphan swapped in
+  });
+});
+
 describe("SessionStore reconnectAll/Stale", () => {
   it("reconnectAll re-attaches a live tab serially and skips stopped tabs", async () => {
     const fresh = fakeConn();
