@@ -99,6 +99,28 @@ export function isSessionExists(e: unknown): boolean {
   return isBridgeError(e) && e.kind === "sessionExists";
 }
 
+export type ReconnectFate = "retry" | "stopped" | "terminal";
+
+/** Classify an attach failure for the reconnect machine (D5):
+ *  - sessionNotFound → the tmux session is gone → `stopped` (respawnable)
+ *  - config/invalidId → permanent (bad config/auth) → `terminal` (show cause)
+ *  - everything else (transport/network) → `retry` with backoff */
+export function reconnectFate(e: unknown): ReconnectFate {
+  if (isSessionNotFound(e)) return "stopped";
+  if (isBridgeError(e) && (e.kind === "config" || e.kind === "invalidId")) {
+    return "terminal";
+  }
+  return "retry";
+}
+
+/** Human-readable cause for a terminal disconnect. */
+export function errorMessage(e: unknown): string {
+  if (isBridgeError(e) && "message" in e && typeof e.message === "string") {
+    return e.message;
+  }
+  return String(e);
+}
+
 /** Attach-only opener for reconnect / sidebar-live clicks. Unlike the removed
  * `connectSession`, it never spawns on not-found — the caller decides whether a
  * vanished session becomes `stopped` (respawnable). */

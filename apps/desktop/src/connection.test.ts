@@ -25,6 +25,7 @@ import {
   isSessionNotFound,
   openConnection,
   openSession,
+  reconnectFate,
   respawnConnection,
 } from "./connection";
 
@@ -165,6 +166,20 @@ describe("connection.ts — attachConnection / respawnConnection", () => {
     expect(isSessionExists({ kind: "sessionExists" })).toBe(true);
     expect(isSessionNotFound({ kind: "sessionExists" })).toBe(false);
     expect(isSessionExists(new Error("x"))).toBe(false);
+  });
+});
+
+describe("reconnectFate", () => {
+  it("maps error kinds to fates", () => {
+    expect(reconnectFate({ kind: "sessionNotFound", message: "x" })).toBe(
+      "stopped",
+    );
+    expect(reconnectFate({ kind: "config", message: "bad host" })).toBe(
+      "terminal",
+    );
+    expect(reconnectFate({ kind: "invalidId", message: "x" })).toBe("terminal");
+    expect(reconnectFate({ kind: "transport", message: "down" })).toBe("retry");
+    expect(reconnectFate(new Error("boom"))).toBe("retry");
   });
 });
 

@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import { openSession } from "./connection";
+import { attachConnection, openSession, respawnConnection } from "./connection";
 import { SessionStore } from "./session-store";
 
 /**
@@ -7,7 +7,12 @@ import { SessionStore } from "./session-store";
  * cannot tear down live connections. Teardown is explicit via `dispose()`
  * (called from App's unmount effect).
  */
-export const sessionStore = new SessionStore(openSession);
+export const sessionStore = new SessionStore({
+  spawn: (p, s, a) => openSession(p, s, a),
+  attach: (p, s) => attachConnection(p, s),
+  respawn: (p, s, a) => respawnConnection(p, s, a),
+  schedule: (fn, ms) => setTimeout(fn, ms),
+});
 
 export function useSessions() {
   const snapshot = useSyncExternalStore(
@@ -20,5 +25,6 @@ export function useSessions() {
     openSession: sessionStore.openSession,
     closeTab: sessionStore.closeTab,
     focusTab: sessionStore.focusTab,
+    respawnTab: sessionStore.respawnTab,
   };
 }
