@@ -692,4 +692,135 @@ mod tests {
         }
         wait_for_deregister(&b, h, "forward task did not deregister after natural death").await;
     }
+
+    /// Records which project_id `for_project` was called with, and returns a
+    /// per-project source so a test can prove the bridge routed correctly.
+    struct RecordingResolver {
+        seen: Arc<Mutex<Vec<String>>>,
+        source: Arc<dyn SessionSource>,
+    }
+    impl super::resolve::SourceResolver for RecordingResolver {
+        fn for_project(
+            &self,
+            _c: &Arc<Config>,
+            project_id: &ProjectId,
+        ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(project_id.as_str().to_string());
+            Ok(Arc::clone(&self.source))
+        }
+        fn all(&self, _c: &Arc<Config>) -> Vec<Arc<dyn SessionSource>> {
+            vec![Arc::clone(&self.source)]
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_routes_through_for_project_with_the_project_id() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let b = Bridge::with_spawner(
+            Arc::new(RecordingResolver {
+                seen: Arc::clone(&seen),
+                source: Arc::new(FakeSessionSource::new()),
+            }),
+            std::env::temp_dir().join("remora-routing.toml"),
+            Arc::new(|fut| {
+                tokio::spawn(fut);
+            }),
+        );
+        let (s, _rx) = sink();
+        b.spawn("api".into(), "x".into(), None, s)
+            .await
+            .expect("spawn");
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_slice(),
+            &["api".to_string()]
+        );
+    }
+
+    /// A resolver whose `all()` returns two sources: one live with a session,
+    /// one that always errors on list(). The bridge must return the live one's
+    /// sessions (partial), not error.
+    struct TwoHostResolver;
+    struct ErroringSource;
+    #[async_trait]
+    impl SessionSource for ErroringSource {
+        async fn spawn(&self, _: SpawnSpec) -> Result<SessionChannel, SourceError> {
+            unreachable!()
+        }
+        async fn attach(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+        ) -> Result<SessionChannel, SourceError> {
+            unreachable!()
+        }
+        async fn respawn(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+        ) -> Result<SessionChannel, SourceError> {
+            unreachable!()
+        }
+        async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
+            Err(SourceError::Transport("host down".into()))
+        }
+    }
+    impl super::resolve::SourceResolver for TwoHostResolver {
+        fn for_project(
+            &self,
+            _c: &Arc<Config>,
+            _p: &ProjectId,
+        ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+            unreachable!()
+        }
+        fn all(&self, _c: &Arc<Config>) -> Vec<Arc<dyn SessionSource>> {
+            vec![Arc::new(ReverseSource), Arc::new(ErroringSource)]
+        }
+    }
+
+    #[tokio::test]
+    async fn list_tolerates_one_host_down_and_returns_partial() {
+        let b = Bridge::with_spawner(
+            Arc::new(TwoHostResolver),
+            std::env::temp_dir().join("remora-twohost.toml"),
+            Arc::new(|fut| {
+                tokio::spawn(fut);
+            }),
+        );
+        let listed = b.list().await.expect("partial result, not an error");
+        // ReverseSource contributes 2 sessions; ErroringSource contributes none.
+        assert_eq!(listed.len(), 2);
+    }
+
+    /// All hosts down → the sidebar should see discovery-unavailable, so the
+    /// bridge errors rather than reporting an empty (no-sessions) world.
+    struct AllDownResolver;
+    impl super::resolve::SourceResolver for AllDownResolver {
+        fn for_project(
+            &self,
+            _c: &Arc<Config>,
+            _p: &ProjectId,
+        ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+            unreachable!()
+        }
+        fn all(&self, _c: &Arc<Config>) -> Vec<Arc<dyn SessionSource>> {
+            vec![Arc::new(ErroringSource)]
+        }
+    }
+
+    #[tokio::test]
+    async fn list_errors_when_every_host_is_down() {
+        let b = Bridge::with_spawner(
+            Arc::new(AllDownResolver),
+            std::env::temp_dir().join("remora-alldown.toml"),
+            Arc::new(|fut| {
+                tokio::spawn(fut);
+            }),
+        );
+        assert!(matches!(b.list().await, Err(BridgeError::Transport { .. })));
+    }
 }
