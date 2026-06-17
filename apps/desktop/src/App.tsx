@@ -2,17 +2,20 @@ import { useMemo, useRef, useState } from "react";
 import "./App.css";
 import { NewSessionDialog } from "./NewSessionDialog";
 import { Sidebar } from "./Sidebar";
-import { OPEN_CANCELLED } from "./session-store";
+import { OPEN_CANCELLED, tabKey } from "./session-store";
 import { buildTree, type SessionNode } from "./session-tree";
 import { TabBar } from "./TabBar";
 import { Terminal } from "./Terminal";
 import { discoveryStore, useDiscovery } from "./useDiscovery";
-import { useSessions } from "./useSessions";
+import { useReconnect } from "./useReconnect";
+import { sessionStore, useSessions } from "./useSessions";
 
 export const APP_NAME = "Remora";
 
 function App() {
-  const { tabs, activeKey, openSession, closeTab, focusTab } = useSessions();
+  const { tabs, activeKey, openSession, closeTab, focusTab, respawnTab } =
+    useSessions();
+  useReconnect(sessionStore);
   const { config, sessions, configError, discoveryUnavailable, refresh } =
     useDiscovery();
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -29,6 +32,17 @@ function App() {
   // server state (Codex #9); only the spawn path (handleOpened) refreshes.
   function openFromSidebar(node: SessionNode) {
     setNotice(null);
+    if (node.state === "stopped") {
+      // Respawn opens (or focuses) a tab, then drives respawn for that key.
+      void openSession({
+        projectId: node.projectId,
+        sessionId: node.sessionId,
+        agent: node.agent,
+      }).then((r) => {
+        if (r.ok) void respawnTab(tabKey(node.projectId, node.sessionId));
+      });
+      return;
+    }
     // openSession resolves (never rejects) with {ok:false} on failure — e.g. a
     // session that died between the poll and the click. Surface that instead of
     // dropping it silently; the .catch is a belt-and-braces guard.
@@ -108,7 +122,29 @@ function App() {
                 className="pane"
                 style={t.key === activeKey ? undefined : { display: "none" }}
               >
-                <Terminal connection={t.connection} />
+                {t.status === "stopped" ? (
+                  <div className="pane-status" role="status">
+                    <p>Session stopped.</p>
+                    <button
+                      type="button"
+                      onClick={() => void respawnTab(t.key)}
+                    >
+                      Respawn
+                    </button>
+                  </div>
+                ) : t.status === "disconnected" ? (
+                  <div className="pane-status pane-status--error" role="alert">
+                    <p>Disconnected: {t.error}</p>
+                    <button
+                      type="button"
+                      onClick={() => void respawnTab(t.key)}
+                    >
+                      Respawn
+                    </button>
+                  </div>
+                ) : (
+                  <Terminal connection={t.connection} />
+                )}
               </div>
             ))
           )}

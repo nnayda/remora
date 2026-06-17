@@ -37,6 +37,10 @@ export function TabBar({
               className="tab-label"
               onClick={() => onFocus(t.key)}
             >
+              <span
+                className={`tab-status tab-status--${t.status}`}
+                aria-hidden="true"
+              />
               {label}
             </button>
             <button
