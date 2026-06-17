@@ -142,31 +142,6 @@ up cold.
   failing host's cause — aggregate all per-host errors when you touch this.
   Zero impact at one host (hermes); revisit when host #2 is added.
 
-## Respawn should preserve the session's agent, not silently default
-
-- **What:** `SshSource::respawn` rebuilds the spawn with `agent: None`, so a
-  session originally launched with a non-default agent (e.g. an override of
-  the project default) comes back running the project default after a
-  stop→respawn.
-- **Why:** The original `REMORA_AGENT` died with the tmux session, so the
-  transport alone can't recover it — but discovery *did* surface the live
-  agent via `REMORA_AGENT` before the stop. A silent substitution means an
-  in-progress session resumes under a different agent in the same worktree
-  with no warning, which is surprising and potentially wrong.
-- **How:** Either (a) the client persists the last-known agent from the
-  pre-stop `list()` and passes it as `SpawnSpec.agent` on respawn, or (b) the
-  UI explicitly warns that respawn falls back to the project default. (a) is
-  more correct once a client exists to hold the state.
-- **Context:** Stage-6 `/review` (adversarial pass). The `respawn` doc is
-  honest that the original metadata is unrecoverable; this tracks closing the
-  UX gap once a client/UI exists to carry the last-known agent.
-- **Depends on:** a client/UI that retains pre-stop discovery state.
-- **Status (stage-11 eng review, D6): being addressed in stage 11 (PR B).** The
-  sidebar carries the discovered `agent` (the pre-stop `REMORA_AGENT` surfaced
-  by `list()`); PR B adds an `agent` param to the `session_respawn` bridge
-  command + `SshSource::respawn` and passes it through. Remove this entry when
-  PR B lands. See `docs/superpowers/specs/2026-06-17-reconnect-respawn-design.md`.
-
 ## Coalesce bridge output + binary byte codec (PTY firehose backpressure)
 
 - **What:** In the Tauri bridge's PTY→frontend forward task, batch bytes per

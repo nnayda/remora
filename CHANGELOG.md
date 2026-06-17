@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Reconnect & respawn UX (desktop, roadmap stage 11): the app now heals broken
+  sessions automatically. On window focus after a sleep/wake cycle,
+  `reconnectAll` re-attaches every open tab; mid-session drops (ssh keepalive
+  detects them within ~45 s) trigger the same reconnect path without user
+  action. Sessions whose tmux died show a "Stopped" status and a one-click
+  **Respawn** button — the bridge's new `agent` param carries the original
+  agent id (surfaced by pre-stop discovery, D6) so the fresh session runs the
+  same agent the user launched. A permanent failure (bad config, auth error,
+  missing host) classifies as "Disconnected" and shows the cause instead of
+  spinning forever (D5 error classification, exponential backoff with a cap).
+  Remote `TERM` is now pinned to `xterm-256color` on every PTY spawn so real
+  terminal sessions render colour and box-drawing correctly (closes #26). The
+  sidebar's stopped-session rows gain a Respawn action that opens a new tab
+  directly.
 - Real ssh transport wiring (desktop, roadmap stage 11 precursor): the Tauri
   bridge now drives real ssh sessions instead of the in-process fake. It
   resolves the transport per call from the per-device config — a new
