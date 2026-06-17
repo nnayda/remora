@@ -314,6 +314,64 @@ export class SessionStore {
     }
   };
 
+  /**
+   * Open a brand-new tab for a stopped (or otherwise absent) session by calling
+   * the respawn opener directly.  Structurally mirrors `openSession` but:
+   *   • calls `openers.respawn` which returns `Promise<SessionConnection>` (not
+   *     `{connection, attached}`)
+   *   • always commits the tab with `attached: false, status: "live"`
+   */
+  openViaRespawn = async (input: SpawnInput): Promise<OpenResult> => {
+    if (this.disposed) {
+      return { ok: false, error: OPEN_CANCELLED };
+    }
+    const key = tabKey(input.projectId, input.sessionId);
+    const existing = this.tabs.find((t) => t.key === key);
+    if (existing) {
+      this.activeKey = key;
+      this.commit();
+      return { ok: true, attached: false };
+    }
+    if (this.pending.has(key)) {
+      return { ok: false, error: OPEN_CANCELLED };
+    }
+    const token = { cancelled: false };
+    this.pending.set(key, token);
+    let connection: SessionConnection;
+    try {
+      connection = await this.openers.respawn(
+        input.projectId,
+        input.sessionId,
+        input.agent,
+      );
+    } catch (error) {
+      this.pending.delete(key);
+      return { ok: false, error };
+    }
+    this.pending.delete(key);
+
+    if (token.cancelled || this.disposed) {
+      void connection.close().catch(() => {});
+      return { ok: false, error: OPEN_CANCELLED };
+    }
+
+    const tab: Tab = {
+      key,
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      agent: input.agent,
+      connection,
+      attached: false,
+      status: "live",
+      error: null,
+    };
+    this.tabs = [...this.tabs, tab];
+    this.activeKey = key;
+    this.commit();
+    this.registerDeath(tab);
+    return { ok: true, attached: false };
+  };
+
   respawnTab = async (key: string): Promise<void> => {
     const tab = this.tabs.find((t) => t.key === key);
     if (!tab || this.disposed) return;

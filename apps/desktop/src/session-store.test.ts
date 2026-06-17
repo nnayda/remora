@@ -572,3 +572,83 @@ describe("SessionStore reconnectAll/Stale", () => {
     expect(snap.tabs.find((t) => t.key === "p/s2")?.status).toBe("live");
   });
 });
+
+// ─── openViaRespawn tests ─────────────────────────────────────────────────────
+
+describe("SessionStore openViaRespawn", () => {
+  it("openViaRespawn opens a NEW live tab via the respawn opener", async () => {
+    const respawnConn = fakeConn();
+    const openers: StoreOpeners = {
+      spawn: vi.fn(async () => ({ connection: makeConn(), attached: false })),
+      attach: vi.fn(async () => makeConn()),
+      respawn: vi.fn(async () => respawnConn.conn),
+      schedule: vi.fn(),
+    };
+    const store = new SessionStore(openers);
+    const result = await store.openViaRespawn(spec("p", "s"));
+    // spawn must NOT be called — only respawn
+    expect(openers.spawn).not.toHaveBeenCalled();
+    expect(openers.respawn).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ ok: true, attached: false });
+    const snap = store.getSnapshot();
+    expect(snap.tabs).toHaveLength(1);
+    expect(snap.tabs[0].status).toBe("live");
+    expect(snap.tabs[0].connection).toBe(respawnConn.conn);
+    expect(snap.activeKey).toBe("p/s");
+  });
+
+  it("openViaRespawn focuses an already-open tab without re-opening", async () => {
+    const openers: StoreOpeners = {
+      spawn: vi.fn(async () => ({ connection: makeConn(), attached: false })),
+      attach: vi.fn(async () => makeConn()),
+      respawn: vi.fn(async () => fakeConn().conn),
+      schedule: vi.fn(),
+    };
+    const store = new SessionStore(openers);
+    // Open a second tab first so focus is elsewhere
+    await store.openViaRespawn(spec("p", "s"));
+    await store.openSession(spec("p", "other"));
+    expect(store.getSnapshot().activeKey).toBe("p/other");
+    // Now call openViaRespawn for the already-open key
+    const result = await store.openViaRespawn(spec("p", "s"));
+    expect(result).toEqual({ ok: true, attached: false });
+    // No second respawn opener call
+    expect(openers.respawn).toHaveBeenCalledTimes(1);
+    // Focus moved back to the existing tab
+    expect(store.getSnapshot().activeKey).toBe("p/s");
+    expect(store.getSnapshot().tabs).toHaveLength(2);
+  });
+
+  it("openViaRespawn surfaces failure as {ok:false}", async () => {
+    const openers: StoreOpeners = {
+      spawn: vi.fn(async () => ({ connection: makeConn(), attached: false })),
+      attach: vi.fn(async () => makeConn()),
+      respawn: vi.fn(async () => {
+        throw { kind: "transport", message: "refused" };
+      }),
+      schedule: vi.fn(),
+    };
+    const store = new SessionStore(openers);
+    const result = await store.openViaRespawn(spec("p", "s"));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatchObject({ kind: "transport" });
+    expect(store.getSnapshot().tabs).toHaveLength(0);
+  });
+
+  it("openViaRespawn registers death on the new tab", async () => {
+    const respawnConn = fakeConn();
+    const openers: StoreOpeners = {
+      spawn: vi.fn(async () => ({ connection: makeConn(), attached: false })),
+      attach: vi.fn(async () => fakeConn().conn),
+      respawn: vi.fn(async () => respawnConn.conn),
+      schedule: vi.fn(),
+    };
+    const store = new SessionStore(openers);
+    await store.openViaRespawn(spec("p", "s"));
+    expect(store.getSnapshot().tabs[0].status).toBe("live");
+    // Fire the connection's onClose to trigger onDeath
+    respawnConn.die();
+    // The store transitions synchronously to reconnecting
+    expect(store.getSnapshot().tabs[0].status).toBe("reconnecting");
+  });
+});

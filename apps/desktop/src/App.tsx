@@ -2,7 +2,7 @@ import { useMemo, useRef, useState } from "react";
 import "./App.css";
 import { NewSessionDialog } from "./NewSessionDialog";
 import { Sidebar } from "./Sidebar";
-import { OPEN_CANCELLED, tabKey } from "./session-store";
+import { OPEN_CANCELLED } from "./session-store";
 import { buildTree, type SessionNode } from "./session-tree";
 import { TabBar } from "./TabBar";
 import { Terminal } from "./Terminal";
@@ -13,8 +13,15 @@ import { sessionStore, useSessions } from "./useSessions";
 export const APP_NAME = "Remora";
 
 function App() {
-  const { tabs, activeKey, openSession, closeTab, focusTab, respawnTab } =
-    useSessions();
+  const {
+    tabs,
+    activeKey,
+    openSession,
+    openViaRespawn,
+    closeTab,
+    focusTab,
+    respawnTab,
+  } = useSessions();
   useReconnect(sessionStore);
   const { config, sessions, configError, discoveryUnavailable, refresh } =
     useDiscovery();
@@ -33,14 +40,16 @@ function App() {
   function openFromSidebar(node: SessionNode) {
     setNotice(null);
     if (node.state === "stopped") {
-      // Respawn opens (or focuses) a tab, then drives respawn for that key.
-      void openSession({
+      void openViaRespawn({
         projectId: node.projectId,
         sessionId: node.sessionId,
         agent: node.agent,
-      }).then((r) => {
-        if (r.ok) void respawnTab(tabKey(node.projectId, node.sessionId));
-      });
+      })
+        .then((r) => {
+          if (!r.ok && r.error !== OPEN_CANCELLED)
+            setNotice("Could not respawn the session.");
+        })
+        .catch(() => setNotice("Could not respawn the session."));
       return;
     }
     // openSession resolves (never rejects) with {ok:false} on failure — e.g. a
