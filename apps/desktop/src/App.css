@@ -10,8 +10,172 @@ body {
 
 .app {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   height: 100vh;
+}
+
+.main-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.sidebar {
+  width: 240px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  background: #181818;
+  color: #ddd;
+  border-right: 1px solid #333;
+  overflow-y: auto;
+  font-size: 0.85rem;
+}
+
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  font-weight: 600;
+  border-bottom: 1px solid #333;
+}
+
+.sidebar-refresh {
+  border: none;
+  background: none;
+  color: #8ab4f8;
+  cursor: pointer;
+  font: inherit;
+  padding: 2px 4px;
+}
+
+.sidebar-warning {
+  padding: 6px 10px;
+  background: #4a3a1f;
+  color: #ffe3b0;
+  font-size: 0.78rem;
+}
+
+.sidebar-error {
+  padding: 6px 10px;
+  background: #4a1f1f;
+  color: #ffb0b0;
+  font-size: 0.78rem;
+}
+
+.sidebar-empty {
+  padding: 10px;
+  color: #888;
+}
+
+.tree,
+.tree-projects,
+.tree-sessions {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.tree-projects {
+  padding-left: 14px;
+}
+
+.tree-sessions {
+  padding-left: 20px;
+}
+
+.tree-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+
+.tree-toggle:hover {
+  background: #232323;
+}
+
+.tree-caret {
+  width: 1em;
+  color: #888;
+}
+
+.tree-badge {
+  margin-left: auto;
+  color: #888;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+}
+
+.tree-empty {
+  padding: 2px 8px 2px 24px;
+  color: #666;
+  font-style: italic;
+  font-size: 0.78rem;
+}
+
+.tree-session-button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+
+.tree-session-button:hover:not(:disabled) {
+  background: #232323;
+}
+
+.tree-session-button:disabled {
+  color: #777;
+  cursor: default;
+}
+
+.tree-session-button--active {
+  background: #2f3b4f;
+}
+
+.tree-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.tree-dot--live {
+  background: #5fd35f;
+}
+
+.tree-dot--stopped {
+  background: #777;
+}
+
+.tree-open {
+  margin-left: auto;
+  color: #8ab4f8;
+  font-size: 0.6rem;
+}
+
+.sidebar-refresh:focus-visible,
+.tree-toggle:focus-visible,
+.tree-session-button:focus-visible {
+  outline: 2px solid #8ab4f8;
+  outline-offset: -2px;
 }
 
 .tabbar {
