@@ -133,6 +133,14 @@ up cold.
   serial dispatch.
 - **Depends on:** best after ControlMaster (cheap concurrent connections) and
   the execution watchdog (per-call deadlines).
+- **Update (stage-11 PR-A `/review`, F3+F5):** the bridge's `list()` now also
+  loops over **hosts** sequentially (`Bridge::list` awaits each host's
+  `SshSource::list()` one at a time). With N ssh hosts a slow/unreachable one
+  serializes the rest (~N×ConnectTimeout worst case). Parallelize this
+  cross-host loop (`JoinSet`/`join_all`) alongside the per-source `N+M` fan-out.
+  Also (F5): the all-hosts-down error currently surfaces only the *last*
+  failing host's cause — aggregate all per-host errors when you touch this.
+  Zero impact at one host (hermes); revisit when host #2 is added.
 
 ## Respawn should preserve the session's agent, not silently default
 
