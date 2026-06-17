@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const b = vi.hoisted(() => ({
   attachSession: vi.fn(),
   spawnSession: vi.fn(),
+  respawnSession: vi.fn(),
   writeSession: vi.fn(),
   resizeSession: vi.fn(),
   closeSession: vi.fn(),
@@ -11,6 +12,7 @@ const b = vi.hoisted(() => ({
 vi.mock("./bridge", () => ({
   attachSession: b.attachSession,
   spawnSession: b.spawnSession,
+  respawnSession: b.respawnSession,
   writeSession: b.writeSession,
   resizeSession: b.resizeSession,
   closeSession: b.closeSession,
@@ -18,12 +20,44 @@ vi.mock("./bridge", () => ({
 
 import type { BridgeOutput, OnOutput } from "./bridge";
 import {
-  connectSession,
+  attachConnection,
   isSessionExists,
   isSessionNotFound,
   openConnection,
   openSession,
+  respawnConnection,
 } from "./connection";
+
+// A fake opener that hands us the OnOutput so the test can push events.
+function fakeOpener() {
+  let sink: OnOutput | null = null;
+  const open = (o: OnOutput) => {
+    sink = o;
+    return Promise.resolve({} as never); // handle unused in these tests
+  };
+  const emit = (msg: BridgeOutput) => sink?.(msg);
+  return { open, emit };
+}
+
+describe("connection.onClose", () => {
+  it("fires when a closed event is observed", async () => {
+    const f = fakeOpener();
+    const conn = await openConnection(f.open);
+    const onClose = vi.fn();
+    conn.onClose(onClose);
+    f.emit({ event: "closed" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fire on our own close()", async () => {
+    const f = fakeOpener();
+    const conn = await openConnection(f.open);
+    const onClose = vi.fn();
+    conn.onClose(onClose);
+    await conn.close(); // local teardown — bridge is contracted to stay silent
+    expect(onClose).not.toHaveBeenCalled();
+  });
+});
 
 beforeEach(() => {
   for (const f of Object.values(b)) f.mockReset();
@@ -106,59 +140,24 @@ describe("connection.ts — openConnection", () => {
   });
 });
 
-describe("connection.ts — connectSession ladder", () => {
-  it("attaches when the session already exists", async () => {
-    b.attachSession.mockResolvedValue(1);
-    await connectSession("p", "s", null);
-    expect(b.attachSession).toHaveBeenCalledTimes(1);
-    expect(b.spawnSession).not.toHaveBeenCalled();
+describe("connection.ts — attachConnection / respawnConnection", () => {
+  it("attachConnection delegates to attachSession", async () => {
+    b.attachSession.mockResolvedValue(10);
+    const conn = await attachConnection("p", "s");
+    expect(b.attachSession).toHaveBeenCalledWith("p", "s", expect.anything());
+    expect(conn.closed).toBe(false);
   });
 
-  it("spawns when attach reports the session is not found", async () => {
-    b.attachSession.mockRejectedValueOnce({
-      kind: "sessionNotFound",
-      message: "x",
-    });
-    b.spawnSession.mockResolvedValue(2);
-    await connectSession("p", "s", "claude");
-    expect(b.attachSession).toHaveBeenCalledTimes(1);
-    expect(b.spawnSession).toHaveBeenCalledTimes(1);
-    expect(b.spawnSession).toHaveBeenCalledWith(
+  it("respawnConnection delegates to respawnSession", async () => {
+    b.respawnSession.mockResolvedValue(11);
+    const conn = await respawnConnection("p", "s", "claude");
+    expect(b.respawnSession).toHaveBeenCalledWith(
       "p",
       "s",
       "claude",
       expect.anything(),
     );
-  });
-
-  it("falls back to attach when a racing spawn reports the session exists", async () => {
-    b.attachSession
-      .mockRejectedValueOnce({ kind: "sessionNotFound" }) // first attach: not there yet
-      .mockResolvedValueOnce(3); // fallback attach succeeds
-    b.spawnSession.mockRejectedValueOnce({ kind: "sessionExists" });
-    await connectSession("p", "s", null);
-    expect(b.spawnSession).toHaveBeenCalledTimes(1);
-    expect(b.attachSession).toHaveBeenCalledTimes(2);
-  });
-
-  it("rethrows unexpected bridge errors", async () => {
-    b.attachSession.mockRejectedValueOnce({
-      kind: "transport",
-      message: "boom",
-    });
-    await expect(connectSession("p", "s", null)).rejects.toMatchObject({
-      kind: "transport",
-    });
-  });
-
-  it("rethrows an unexpected error from the spawn leg", async () => {
-    b.attachSession.mockRejectedValueOnce({ kind: "sessionNotFound" });
-    b.spawnSession.mockRejectedValueOnce({ kind: "transport", message: "net" });
-    await expect(connectSession("p", "s", null)).rejects.toMatchObject({
-      kind: "transport",
-    });
-    expect(b.spawnSession).toHaveBeenCalledTimes(1);
-    expect(b.attachSession).toHaveBeenCalledTimes(1);
+    expect(conn.closed).toBe(false);
   });
 
   it("error guards match the BridgeError kinds", () => {

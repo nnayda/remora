@@ -6,6 +6,7 @@ import { OPEN_CANCELLED, SessionStore, tabKey } from "./session-store";
 function makeConn(): SessionConnection {
   return {
     subscribe: () => () => {},
+    onClose: () => () => {},
     write: vi.fn(async () => {}),
     resize: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
