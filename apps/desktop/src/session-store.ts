@@ -266,8 +266,10 @@ export class SessionStore {
       pendingToken.cancelled = true;
       return;
     }
-    // Cancel any in-flight reconnect
-    this.newReconnectToken(key);
+    // Cancel any in-flight reconnect and reap the token (tab is being removed).
+    const reconnectToken = this.reconnectTokens.get(key);
+    if (reconnectToken) reconnectToken.cancelled = true;
+    this.reconnectTokens.delete(key);
     const idx = this.tabs.findIndex((t) => t.key === key);
     if (idx === -1) return;
     void this.tabs[idx].connection.close().catch(() => {});
@@ -290,7 +292,7 @@ export class SessionStore {
   respawnTab = async (key: string): Promise<void> => {
     const tab = this.tabs.find((t) => t.key === key);
     if (!tab || this.disposed) return;
-    this.newReconnectToken(key); // cancel any reconnect loop
+    const token = this.newReconnectToken(key); // cancel any reconnect loop
     this.setStatus(key, "reconnecting", null);
     let next: SessionConnection;
     try {
@@ -300,11 +302,11 @@ export class SessionStore {
         tab.agent,
       );
     } catch (e) {
-      if (this.disposed) return;
+      if (token.cancelled || this.disposed) return;
       this.setStatus(key, "disconnected", errorMessage(e));
       return;
     }
-    if (this.disposed) {
+    if (token.cancelled || this.disposed) {
       void next.close().catch(() => {});
       return;
     }

@@ -362,4 +362,99 @@ describe("SessionStore reconnect machine", () => {
     await Promise.resolve();
     expect(store.getSnapshot().tabs[0].status).toBe("live");
   });
+
+  // RACE 1: respawnTab fires while a reconnect attach is pending.
+  // Only the respawn's connection should win; the reconnect's resolution must
+  // NOT additionally swap (no double remote open, no double swapConnection).
+  it("RACE: respawnTab while reconnect pending → exactly one swap, reconnect's connection is closed", async () => {
+    let attachResolve!: (c: SessionConnection) => void;
+    const attachConn = fakeConn();
+    const respawnConn = fakeConn();
+
+    const { store, spawned } = makeStore({
+      // attach hangs until we manually resolve it
+      attach: () =>
+        new Promise<SessionConnection>((res) => {
+          attachResolve = res;
+        }),
+      respawn: () => Promise.resolve(respawnConn.conn),
+    });
+
+    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+
+    // Trigger death → store enters reconnecting, attach is in-flight
+    spawned.die();
+    expect(store.getSnapshot().tabs[0].status).toBe("reconnecting");
+
+    // While attach is still pending, trigger a respawn
+    const respawnPromise = store.respawnTab("p/s");
+
+    // Let the respawn resolve first
+    await respawnPromise;
+
+    // Tab should be live with the respawn connection
+    const tab = store.getSnapshot().tabs[0];
+    expect(tab.status).toBe("live");
+    expect(tab.connection).toBe(respawnConn.conn);
+
+    // Now resolve the stale attach — it must NOT swap again
+    attachResolve(attachConn.conn);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Status must still be live and the reconnect's connection must have been closed
+    expect(store.getSnapshot().tabs[0].status).toBe("live");
+    expect(store.getSnapshot().tabs[0].connection).toBe(respawnConn.conn);
+    expect(attachConn.wasClosed()).toBe(true); // reconnect loser was cleaned up
+  });
+
+  // RACE 2: two concurrent respawnTab calls → only one swap survives.
+  // The second respawn to resolve must find its token cancelled and close its
+  // connection; the tab ends up live with exactly one of the two connections.
+  it("RACE: two concurrent respawnTab calls → exactly one swap, loser connection closed", async () => {
+    let respawn1Resolve!: (c: SessionConnection) => void;
+    let respawn2Resolve!: (c: SessionConnection) => void;
+    const conn1 = fakeConn();
+    const conn2 = fakeConn();
+    let call = 0;
+
+    const { store, spawned } = makeStore({
+      respawn: () => {
+        call += 1;
+        if (call === 1)
+          return new Promise<SessionConnection>((res) => {
+            respawn1Resolve = res;
+          });
+        return new Promise<SessionConnection>((res) => {
+          respawn2Resolve = res;
+        });
+      },
+    });
+
+    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    spawned.die();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // First respawnTab call — hangs
+    const p1 = store.respawnTab("p/s");
+    // Second respawnTab call — also hangs; cancels the first token
+    const p2 = store.respawnTab("p/s");
+
+    // Resolve the first (now-cancelled) respawn then the second (live) respawn
+    respawn1Resolve(conn1.conn);
+    await Promise.resolve();
+    await p1;
+
+    respawn2Resolve(conn2.conn);
+    await Promise.resolve();
+    await p2;
+
+    // Second respawn wins: conn2 is live
+    const tab = store.getSnapshot().tabs[0];
+    expect(tab.status).toBe("live");
+    expect(tab.connection).toBe(conn2.conn);
+    // First respawn's connection was closed (it was the loser)
+    expect(conn1.wasClosed()).toBe(true);
+  });
 });
