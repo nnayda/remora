@@ -12,6 +12,8 @@ import { sessionStore, useSessions } from "./useSessions";
 
 export const APP_NAME = "Remora";
 
+/** Root component: wires the discovery and session stores to the sidebar, tab
+ * bar, terminal panes, and the new-session dialog. */
 function App() {
   const {
     tabs,
@@ -33,10 +35,11 @@ function App() {
   const tree = useMemo(() => buildTree(config, sessions), [config, sessions]);
   const openKeys = useMemo(() => new Set(tabs.map((t) => t.key)), [tabs]);
 
-  // Open (attach/focus) a live session clicked in the sidebar. Reuses the same
-  // deduping path as the dialog — clicking an already-open session just focuses
-  // it. No discovery refresh here: attaching an existing session changes no
-  // server state (Codex #9); only the spawn path (handleOpened) refreshes.
+  /** Open a session clicked in the sidebar, routing by its discovered state:
+   * live → attach/focus, stopped → respawn. Reuses the dialog's deduping path
+   * (an already-open session just focuses). No discovery refresh here: attaching
+   * an existing session changes no server state (Codex #9); only the spawn path
+   * (handleOpened) refreshes. */
   function openFromSidebar(node: SessionNode) {
     setNotice(null);
     if (node.state === "stopped") {
@@ -75,6 +78,8 @@ function App() {
   // exit closes the OS-level PTY + bridge channels; a future window-close hook
   // can call sessionStore.dispose() if explicit teardown is ever needed.
 
+  /** Dialog success callback: close it, note an attach-vs-spawn outcome, restore
+   * focus, and re-list sessions now (a fresh spawn changed server state). */
   function handleOpened(attached: boolean) {
     setDialogOpen(false);
     setNotice(attached ? "Attached to an existing session." : null);

@@ -32,6 +32,7 @@ export interface DiscoverySnapshot {
 
 const EMPTY_CONFIG: ConfigDto = { hosts: [], projects: [], agents: [] };
 
+/** Best-effort human message from an unknown thrown config-load error. */
 function errorMessage(e: unknown): string {
   if (typeof e === "object" && e !== null && "message" in e) {
     return String((e as { message: unknown }).message);
@@ -54,6 +55,7 @@ export class DiscoveryStore {
     discoveryUnavailable: false,
   };
 
+  /** Resolve the poll interval, clamping a 0/negative override to the default. */
   constructor(private readonly deps: DiscoveryDeps) {
     // Guard against a 0/negative override turning the poll into a tight loop
     // that hammers listSessions(); fall back to the 4s default.
@@ -61,6 +63,7 @@ export class DiscoveryStore {
     this.intervalMs = intervalMs > 0 ? intervalMs : 4000;
   }
 
+  /** `useSyncExternalStore` subscribe: register a listener, returns unsubscribe. */
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
     return () => {
@@ -68,8 +71,10 @@ export class DiscoveryStore {
     };
   };
 
+  /** `useSyncExternalStore` getSnapshot: the current immutable snapshot. */
   getSnapshot = (): DiscoverySnapshot => this.snapshot;
 
+  /** Apply a snapshot patch (fresh object) and notify subscribers. */
   private commit(patch: Partial<DiscoverySnapshot>): void {
     // New object every commit so useSyncExternalStore re-renders; unchanged
     // between commits so it does not loop.
@@ -123,6 +128,7 @@ export class DiscoveryStore {
     this.stopTimer();
   };
 
+  /** Arm the poll interval (idempotent: a second call is a no-op). */
   private startTimer(): void {
     if (this.timer !== null) return;
     this.timer = setInterval(() => {
@@ -130,6 +136,7 @@ export class DiscoveryStore {
     }, this.intervalMs);
   }
 
+  /** Clear the poll interval if armed. */
   private stopTimer(): void {
     if (this.timer !== null) {
       clearInterval(this.timer);
@@ -137,6 +144,8 @@ export class DiscoveryStore {
     }
   }
 
+  /** Re-read the config file; a failure surfaces a banner without blanking the
+   * last good config (discovered sessions keep rendering). */
   private async loadConfig(): Promise<void> {
     try {
       const config = await this.deps.loadConfig();
@@ -150,6 +159,8 @@ export class DiscoveryStore {
     }
   }
 
+  /** Poll the session list once, guarding against overlapping in-flight polls
+   * and retaining the last good list when discovery is momentarily down. */
   private async pollSessions(): Promise<void> {
     // In-flight guard: a slow transport's list() must not pile up behind itself
     // (real ssh discovery is 1+N+M round-trips). Skip ticks while one is open.

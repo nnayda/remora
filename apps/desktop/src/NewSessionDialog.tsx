@@ -19,6 +19,7 @@ interface NewSessionDialogProps {
   onClose: () => void;
 }
 
+/** Best-effort human message from an unknown thrown open-session error. */
 function errorMessage(error: unknown): string {
   if (typeof error === "object" && error !== null && "message" in error) {
     return String((error as { message: unknown }).message);
@@ -78,12 +79,15 @@ export function NewSessionDialog({
     }
   }, [model, projectId]);
 
+  /** Switch the selected project and reset the agent to that project's default. */
   function selectProject(id: string) {
     const sel = resolveSelection(model, id);
     setProjectId(sel.projectId);
     setAgent(sel.agent);
   }
 
+  /** Validate, open the session, and reflect the outcome (success closes the
+   * dialog; a real error shows inline; the button never sticks on "Connecting…"). */
   async function submit() {
     if (!valid || submitting) return;
     setSubmitting(true);
@@ -118,7 +122,7 @@ export function NewSessionDialog({
     }
   }
 
-  // Esc closes; Tab is trapped within the dialog.
+  /** Modal keyboard handling: Esc closes, Tab is trapped within the dialog. */
   function onKeyDown(e: KeyboardEvent) {
     if (e.key === "Escape") {
       e.preventDefault();

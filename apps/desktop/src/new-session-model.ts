@@ -21,6 +21,8 @@ export interface NewSessionModel {
   agents: string[];
 }
 
+/** Derive the dialog's pickers from config: join each project to its host
+ * label and default agent, and list the configured agents in config order. */
 export function buildNewSessionModel(config: ConfigDto): NewSessionModel {
   const hostLabels = new Map(config.hosts.map((h) => [h.id, h.name ?? h.id]));
   return {

@@ -53,6 +53,8 @@ export interface HostNode {
 
 type HostTransport = ConfigDto["hosts"][number]["transport"] | null;
 
+/** Project a discovered `SessionMetaDto` into a tree leaf, stamping the
+ * tab-store `key` so the sidebar can match it against open/active tabs. */
 function sessionNode(s: SessionMetaDto): SessionNode {
   return {
     projectId: s.projectId,
@@ -63,6 +65,10 @@ function sessionNode(s: SessionMetaDto): SessionNode {
   };
 }
 
+/** Fold config and the discovery list into the Host → Project → Session tree
+ * the sidebar renders. Sessions whose project isn't in config gather under a
+ * synthetic "Unconfigured" host, which renders last and only when non-empty.
+ * Duplicate (project, session) tuples are deduped first-wins (see module doc). */
 export function buildTree(
   config: ConfigDto,
   sessions: SessionMetaDto[],

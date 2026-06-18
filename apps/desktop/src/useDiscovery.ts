@@ -14,6 +14,9 @@ export const discoveryStore = new DiscoveryStore({
   listSessions,
 });
 
+/** Subscribe a component to the discovery singleton and own its DOM glue
+ * (start once, pause while hidden, refresh on focus). Returns the live config,
+ * sessions, error flags, and the manual `refresh`/`refreshAfterOpen` actions. */
 export function useDiscovery() {
   const snapshot = useSyncExternalStore(
     discoveryStore.subscribe,
