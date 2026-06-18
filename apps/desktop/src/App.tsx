@@ -1,11 +1,11 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { NewSessionDialog } from "./NewSessionDialog";
 import { Sidebar } from "./Sidebar";
 import { OPEN_CANCELLED } from "./session-store";
 import { buildTree, type SessionNode } from "./session-tree";
 import { TabBar } from "./TabBar";
-import { Terminal } from "./Terminal";
+import { Terminal, type TerminalHandle } from "./Terminal";
 import { discoveryStore, useDiscovery } from "./useDiscovery";
 import { useReconnect } from "./useReconnect";
 import { sessionStore, useSessions } from "./useSessions";
@@ -30,10 +30,26 @@ function App() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const newButtonRef = useRef<HTMLButtonElement>(null);
+  // Live focus handles for the mounted terminal panes, keyed by tab key.
+  const terminals = useRef(new Map<string, TerminalHandle>());
+  // Intent flag: set by tab/sidebar selection so the activeKey effect knows the
+  // change was a user pick (focus its terminal) versus a dialog spawn or
+  // background reconnect (leave focus alone). Consumed once per selection.
+  const focusOnSelect = useRef(false);
 
   // Recompute the tree only when config or the polled session list changes.
   const tree = useMemo(() => buildTree(config, sessions), [config, sessions]);
   const openKeys = useMemo(() => new Set(tabs.map((t) => t.key)), [tabs]);
+
+  // Focus the now-active terminal after its pane is rendered (the pane is hidden
+  // via style.display until activeKey points to it, so focus must wait for the
+  // commit). Gated by focusOnSelect so only an explicit tab/sidebar selection
+  // grabs focus — the dialog spawn path keeps focus on newButtonRef.
+  useEffect(() => {
+    if (!focusOnSelect.current) return;
+    focusOnSelect.current = false;
+    if (activeKey !== null) terminals.current.get(activeKey)?.focus();
+  }, [activeKey]);
 
   /** Open a session clicked in the sidebar, routing by its discovered state:
    * live → attach/focus, stopped → respawn. Reuses the dialog's deduping path
@@ -42,6 +58,7 @@ function App() {
    * (handleOpened) refreshes. */
   function openFromSidebar(node: SessionNode) {
     setNotice(null);
+    focusOnSelect.current = true;
     if (node.state === "stopped") {
       void openViaRespawn({
         projectId: node.projectId,
@@ -107,6 +124,7 @@ function App() {
           activeKey={activeKey}
           onFocus={(key) => {
             setNotice(null);
+            focusOnSelect.current = true;
             focusTab(key);
           }}
           onClose={(key) => {
@@ -115,6 +133,9 @@ function App() {
           }}
           onNew={() => {
             setNotice(null);
+            // Drop any unconsumed selection intent so spawning from the dialog
+            // doesn't later yank focus off newButtonRef onto the new terminal.
+            focusOnSelect.current = false;
             setDialogOpen(true);
           }}
           newButtonRef={newButtonRef}
@@ -157,7 +178,13 @@ function App() {
                     </button>
                   </div>
                 ) : (
-                  <Terminal connection={t.connection} />
+                  <Terminal
+                    connection={t.connection}
+                    ref={(h) => {
+                      if (h) terminals.current.set(t.key, h);
+                      else terminals.current.delete(t.key);
+                    }}
+                  />
                 )}
               </div>
             ))
