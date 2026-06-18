@@ -44,20 +44,24 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # src-tauri needs the Tauri Linux system libraries to compile.
+      # src-tauri needs the Tauri Linux system libraries to compile. The
+      # GitHub-hosted runner's Ubuntu mirror throttles these downloads badly
+      # (libwebkit2gtk alone can take ~8 min), so cache the .debs to skip the
+      # mirror on subsequent runs.
       - name: Install Tauri system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            curl \
-            wget \
-            file \
-            libxdo-dev \
-            libssl-dev \
-            libayatana-appindicator3-dev \
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: >-
+            libwebkit2gtk-4.1-dev
+            build-essential
+            curl
+            wget
+            file
+            libxdo-dev
+            libssl-dev
+            libayatana-appindicator3-dev
             librsvg2-dev
+          version: 1.0
 
       - uses: Swatinem/rust-cache@v2
 
