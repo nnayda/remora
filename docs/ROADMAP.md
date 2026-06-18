@@ -8,9 +8,11 @@ no relay, no mobile.
 Status markers: ✅ done · ☐ open.
 
 Already done: repo scaffold (#1–#10) and the spine spike (roadmap step 1 in
-[VISION.md](VISION.md)). **Phase 1 is complete** (#14–#19); the Tauri bridge
-(stage 7) and the Embedded terminal component (stage 8) are also complete;
-the next open stage is Tabs + one-click session spawn (stage 9).
+[VISION.md](VISION.md)). **Phase 1 is complete** (#14–#19), and **Phase 2's
+hero scenario is closed**: stages 7–11 are all merged (reconnect & respawn
+shipped in #27). The next open stage is the kubectl exec transport (stage 12).
+Dogfooding the merged build surfaced refinements and gaps — see
+[Open enhancement issues](#open-enhancement-issues) below.
 
 ## Phase 1 — Protocol & core (the seam) — ✅ complete
 
@@ -57,20 +59,20 @@ the next open stage is Tabs + one-click session spawn (stage 9).
    drive resize from the DOM. Never parse bytes — the emulator owns screen
    state (spike lesson).
 
-9. ☐ **Tabs + one-click session spawn**
+9. ✅ **Tabs + one-click session spawn**
    Tabbed window, one tab per session; a "new session" flow that picks
    host/project and spawns. This is the first point where the app is
-   actually usable.
+   actually usable. (Refinements filed: #31, #34, #35.)
 
-10. ☐ **Sidebar with live session state**
+10. ✅ **Sidebar with live session state**
     Hosts → projects → sessions from the config-and-discovery join,
     refreshed live; click a discovered session to attach it as a tab.
 
-11. ☐ **Reconnect & respawn UX**
+11. ✅ **Reconnect & respawn UX**
     Detect dead channels, re-attach on app focus/restart, re-attach all
     open tabs after sleep; one-click respawn for *stopped* sessions. This
     PR closes the hero scenario: sleep the laptop, reopen, everything is
-    live.
+    live. (Session *teardown* — the inverse — is filed as #33.)
 
 12. ☐ **kubectl exec transport**
     Second `SessionSource` backend (same trait, new impl). Validates the
@@ -107,6 +109,33 @@ the next open stage is Tabs + one-click session spawn (stage 9).
 - **Relay mode**, then **mobile + push notifications** — VISION.md steps
   6–7.
 
+## Open enhancement issues
+
+Filed from dogfooding the merged hero scenario (stages 7–11) on hermes —
+refinements and gaps, not new roadmap stages. Linked here so they don't get
+lost between the stage list and the issue tracker.
+
+Refinements to the stage-9 spawn flow:
+
+- **#31** — drive the new-session dialog from config: project/agent pickers
+  instead of free text, plus host selection. Carries a model question — a
+  `Project` binds to exactly one host today, so per-spawn host choice may need
+  the config model to change.
+- **#34** — choose worktree-vs-shared at spawn time (currently fixed per
+  project in config).
+- **#35** — spawn with *no* agent: just a plain shell.
+
+New capability / larger:
+
+- **#33** — close & remove a session (kill tmux, optionally clean up the
+  worktree). Needs a new `SessionSource` method; worth designing before
+  **stage 12 (kubectl)** so the second transport implements teardown too.
+- **#32** — manage hosts/projects from the app (write the config, which is
+  read-only today). Larger; effectively post-MVP.
+
+Earlier dogfood issues, for context: #28, #29 (terminal focus/UX), #30
+(agent-exit drops to a dead pane — interacts with #35).
+
 ## Dependencies & parallelism
 
 Hard dependencies per stage (a stage needs these merged first):
@@ -121,9 +150,9 @@ Hard dependencies per stage (a stage needs these merged first):
 | ✅ 6 Discovery & join | 3, 4 |
 | ✅ 7 Tauri bridge | 2 (runs on the test double) |
 | ✅ 8 Terminal component | 7 |
-| ☐ 9 Tabs + spawn | 5, 8 |
-| ☐ 10 Sidebar | 6, 9 |
-| ☐ 11 Reconnect & respawn | 6, 10 |
+| ✅ 9 Tabs + spawn | 5, 8 |
+| ✅ 10 Sidebar | 6, 9 |
+| ✅ 11 Reconnect & respawn | 6, 10 |
 | ☐ 12 kubectl transport | 2, 3 (lessons from 4–6 help, not required) |
 | ☐ 13–15 Panels | 4, 9 (independent of each other) |
 | ☐ 16 CI & packaging | — |
