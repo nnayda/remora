@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Config-driven new-session dialog (desktop): the "New session" dialog now
+  picks a **project** and **agent** from the per-device config instead of
+  free-text fields that could silently mismatch the TOML. The project dropdown
+  shows each project's host (so you choose the host by choosing the project),
+  and the agent dropdown lists configured agents, defaulting to the project's
+  default. A new `agents` field on the config DTO carries the agent ids to the
+  frontend (the launch argv stays server-side, test-enforced). The selection
+  self-heals if config changes while the dialog is open, and an empty config
+  shows a clear "no projects configured" state. Addresses #31; refines roadmap
+  stage 9.
 - Reconnect & respawn UX (desktop, roadmap stage 11): the app now heals broken
   sessions automatically. On window focus after a sleep/wake cycle,
   `reconnectAll` re-attaches every open tab; mid-session drops (ssh keepalive
