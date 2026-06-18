@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConfigDto, SessionMetaDto } from "./bindings";
 import { type DiscoveryDeps, DiscoveryStore } from "./discovery-store";
 
-const emptyConfig: ConfigDto = { hosts: [], projects: [] };
+const emptyConfig: ConfigDto = { hosts: [], projects: [], agents: [] };
 const session = (sessionId: string): SessionMetaDto => ({
   projectId: "api",
   sessionId,
@@ -48,6 +48,7 @@ describe("DiscoveryStore", () => {
         async (): Promise<ConfigDto> => ({
           hosts: [{ id: "h", name: null, transport: "ssh" }],
           projects: [],
+          agents: [],
         }),
       ),
       listSessions: vi.fn(async () => [session("fix")]),
