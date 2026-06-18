@@ -79,6 +79,13 @@ export async function openConnection(open: Opener): Promise<SessionConnection> {
       };
     },
     onClose(listener) {
+      // Fire-once contract: if death already happened (listeners cleared),
+      // a late registration must still see it — else `registerDeath` could
+      // miss the signal and leave a tab `live` over a dead channel.
+      if (closed) {
+        listener();
+        return () => {};
+      }
       closeListeners.add(listener);
       return () => closeListeners.delete(listener);
     },

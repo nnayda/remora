@@ -69,6 +69,18 @@ describe("connection.onClose", () => {
     await conn.close(); // local teardown — bridge is contracted to stay silent
     expect(onClose).not.toHaveBeenCalled();
   });
+
+  it("fires immediately when registered AFTER the connection already closed", async () => {
+    // A late registerDeath (e.g. swapping in a connection that died in the
+    // race window) must still see the death, or the tab stays live over a
+    // dead channel.
+    const f = fakeOpener();
+    const conn = await openConnection(f.open);
+    f.emit({ event: "closed" });
+    const onClose = vi.fn();
+    conn.onClose(onClose);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
 });
 
 beforeEach(() => {
