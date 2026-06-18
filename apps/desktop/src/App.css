@@ -340,3 +340,66 @@ body {
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+/* Status pane — shown instead of the terminal when a tab is stopped/disconnected. */
+.pane-status {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  gap: 12px;
+  color: #aaa;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9rem;
+  background: #1e1e1e;
+}
+
+.pane-status p {
+  margin: 0;
+}
+
+.pane-status button {
+  padding: 6px 14px;
+  border-radius: 4px;
+  border: 1px solid #555;
+  background: #333;
+  color: #eee;
+  cursor: pointer;
+  font: inherit;
+}
+
+.pane-status button:hover {
+  background: #444;
+}
+
+.pane-status--error {
+  color: #ff8a8a;
+}
+
+/* Tab status indicator dot — matches .tree-dot--* colors. */
+.tab-status {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-right: 5px;
+  vertical-align: middle;
+}
+
+.tab-status--live {
+  background: #5fd35f;
+}
+
+.tab-status--reconnecting {
+  background: #f0a830;
+}
+
+.tab-status--stopped {
+  background: #777;
+}
+
+.tab-status--disconnected {
+  background: #e05050;
+}

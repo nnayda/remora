@@ -68,10 +68,16 @@ export async function attachSession(
 export async function respawnSession(
   projectId: string,
   sessionId: string,
+  agent: string | null,
   onOutput: OnOutput,
 ): Promise<ChannelHandle> {
   return unwrap(
-    await commands.sessionRespawn(projectId, sessionId, makeChannel(onOutput)),
+    await commands.sessionRespawn(
+      projectId,
+      sessionId,
+      agent,
+      makeChannel(onOutput),
+    ),
   );
 }
 

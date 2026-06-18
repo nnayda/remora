@@ -7,7 +7,7 @@ interface SidebarProps {
   activeKey: string | null;
   /** Tab keys currently open, marked so the user sees what's already a tab. */
   openKeys: Set<string>;
-  /** Open (attach/focus) a live session. Stopped sessions never call this. */
+  /** Open (attach/focus) a session. App routes by node.state: live→attach, stopped→respawn. */
   onOpenSession: (node: SessionNode) => void;
   /** Non-fatal config read error; shown as a banner above the tree. */
   configError: string | null;
@@ -17,11 +17,12 @@ interface SidebarProps {
 }
 
 /**
- * Host → Project → Session tree (stage 10). A thin renderer over the
- * `buildTree` model: it owns only collapse state and click routing. Live
- * sessions open as tabs; stopped sessions are display-only (respawn is a later
- * stage). Component-render behaviour is covered by manual QA + a deferred e2e
- * (vitest runs in node with no DOM); the tree model and store are unit-tested.
+ * Host → Project → Session tree. A thin renderer over the `buildTree` model:
+ * it owns only collapse state and click routing. Live sessions open as tabs;
+ * stopped sessions are clickable and route through App's openFromSidebar which
+ * branches on node.state to trigger respawn. Component-render behaviour is
+ * covered by manual QA + a deferred e2e (vitest runs in node with no DOM); the
+ * tree model and store are unit-tested.
  */
 export function Sidebar({
   tree,
@@ -197,10 +198,9 @@ function SessionRow({
       <button
         type="button"
         className={`tree-session-button${active ? " tree-session-button--active" : ""}`}
-        // Stopped sessions are display-only until respawn lands (later stage).
-        disabled={stopped}
+        // Live → attach/focus; stopped → respawn (App routes by session.state).
         aria-current={active ? "true" : undefined}
-        title={stopped ? "Stopped — respawn comes in a later stage" : undefined}
+        title={stopped ? "Stopped — click to respawn" : undefined}
         onClick={() => onOpenSession(session)}
       >
         <span

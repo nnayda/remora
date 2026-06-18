@@ -34,9 +34,19 @@ export function TabBar({
               type="button"
               role="tab"
               aria-selected={active}
+              // Status is shown as a color dot (aria-hidden); fold it into the
+              // accessible name so screen-reader users hear reconnecting/
+              // stopped/disconnected, not just the session label.
+              aria-label={
+                t.status === "live" ? undefined : `${label}, ${t.status}`
+              }
               className="tab-label"
               onClick={() => onFocus(t.key)}
             >
+              <span
+                className={`tab-status tab-status--${t.status}`}
+                aria-hidden="true"
+              />
               {label}
             </button>
             <button

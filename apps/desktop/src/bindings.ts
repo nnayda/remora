@@ -38,9 +38,9 @@ async sessionAttach(projectId: string, sessionId: string, onOutput: TAURI_CHANNE
     else return { status: "error", error: e  as any };
 }
 },
-async sessionRespawn(projectId: string, sessionId: string, onOutput: TAURI_CHANNEL<BridgeOutput>) : Promise<Result<ChannelHandle, BridgeError>> {
+async sessionRespawn(projectId: string, sessionId: string, agent: string | null, onOutput: TAURI_CHANNEL<BridgeOutput>) : Promise<Result<ChannelHandle, BridgeError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("session_respawn", { projectId, sessionId, onOutput }) };
+    return { status: "ok", data: await TAURI_INVOKE("session_respawn", { projectId, sessionId, agent, onOutput }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };

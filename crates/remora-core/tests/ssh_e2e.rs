@@ -299,7 +299,7 @@ async fn e2e_discovery_stopped_then_respawn_reuses_worktree() {
 
     // Respawn -> Live again, and the marker file (in-progress work) survived.
     let mut channel = source
-        .respawn(&project, &session_id)
+        .respawn(&project, &session_id, None)
         .await
         .expect("respawn");
     channel
@@ -390,7 +390,7 @@ async fn e2e_respawn_of_vanished_worktree_is_not_found() {
         .expect("rm worktree");
 
     let err = source
-        .respawn(&project, &session_id)
+        .respawn(&project, &session_id, None)
         .await
         .expect_err("vanished worktree");
     assert!(
