@@ -40,7 +40,7 @@ const session = (
 const cfg = (
   hosts: ConfigDto["hosts"],
   projects: ConfigDto["projects"],
-): ConfigDto => ({ hosts, projects });
+): ConfigDto => ({ hosts, projects, agents: [] });
 
 describe("buildTree", () => {
   it("nests projects under their configured host", () => {

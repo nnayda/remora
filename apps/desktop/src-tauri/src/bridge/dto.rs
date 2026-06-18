@@ -14,6 +14,7 @@ use remora_core::config::{Config, Host, Project, Transport};
 pub struct ConfigDto {
     pub hosts: Vec<HostDto>,
     pub projects: Vec<ProjectDto>,
+    pub agents: Vec<AgentDto>,
 }
 
 /// A configured host, label-only. The `transport` discriminant is all the UI
@@ -46,6 +47,15 @@ pub struct ProjectDto {
     pub agent: String,
 }
 
+/// A configured agent, id-only. The launch `command` argv is a launch detail
+/// (not a label) and is intentionally omitted — the new-session dialog needs
+/// only the id to pass as `SpawnSpec::agent`.
+#[derive(Clone, Debug, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDto {
+    pub id: String,
+}
+
 impl From<Config> for ConfigDto {
     fn from(config: Config) -> Self {
         // BTreeMap iteration is sorted, so the sidebar render order is stable.
@@ -59,6 +69,13 @@ impl From<Config> for ConfigDto {
                 .projects
                 .into_iter()
                 .map(|(id, project)| project_dto(id.as_str(), project))
+                .collect(),
+            agents: config
+                .agents
+                .into_keys()
+                .map(|id| AgentDto {
+                    id: id.as_str().to_owned(),
+                })
                 .collect(),
         }
     }
@@ -160,6 +177,37 @@ mod tests {
         assert_eq!(dto.projects[0].id, "api");
         assert_eq!(dto.projects[0].host_id, "alpha");
         assert_eq!(dto.projects[0].agent, "claude");
+    }
+
+    #[test]
+    fn maps_agent_ids_in_btreemap_order_without_argv() {
+        let mut config = Config::default();
+        config.agents.insert(
+            AgentId::new("zeta").expect("id"),
+            Agent {
+                command: vec!["zeta-cli".into()],
+            },
+        );
+        config.agents.insert(
+            AgentId::new("alpha").expect("id"),
+            Agent {
+                command: vec!["alpha-cli".into()],
+            },
+        );
+
+        let dto = ConfigDto::from(config);
+
+        // BTreeMap order: alpha before zeta. The dialog needs the id to pass as
+        // `SpawnSpec::agent`, nothing more.
+        assert_eq!(
+            dto.agents.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["alpha", "zeta"]
+        );
+
+        // The launch argv is a launch detail, not a label — it must not cross.
+        let json = serde_json::to_string(&dto).expect("serialize");
+        assert!(!json.contains("zeta-cli"), "AgentDto leaked argv: {json}");
+        assert!(!json.contains("alpha-cli"), "AgentDto leaked argv: {json}");
     }
 
     #[test]

@@ -30,7 +30,7 @@ export interface DiscoverySnapshot {
   discoveryUnavailable: boolean;
 }
 
-const EMPTY_CONFIG: ConfigDto = { hosts: [], projects: [] };
+const EMPTY_CONFIG: ConfigDto = { hosts: [], projects: [], agents: [] };
 
 function errorMessage(e: unknown): string {
   if (typeof e === "object" && e !== null && "message" in e) {

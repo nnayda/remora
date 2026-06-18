@@ -161,6 +161,7 @@ function App() {
       </div>
       {dialogOpen && (
         <NewSessionDialog
+          config={config}
           openSession={openSession}
           onOpened={handleOpened}
           onClose={() => {

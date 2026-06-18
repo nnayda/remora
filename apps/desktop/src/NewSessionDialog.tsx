@@ -1,9 +1,19 @@
-import { type KeyboardEvent, useEffect, useRef, useState } from "react";
+import {
+  type KeyboardEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import type { ConfigDto } from "./bindings";
+import { buildNewSessionModel, resolveSelection } from "./new-session-model";
 import type { OpenResult, SpawnInput } from "./session-store";
 import { OPEN_CANCELLED } from "./session-store";
 import { isValidSlug } from "./spawn-input";
 
 interface NewSessionDialogProps {
+  /** Per-device config; drives the project and agent pickers. */
+  config: ConfigDto;
   openSession: (input: SpawnInput) => Promise<OpenResult>;
   onOpened: (attached: boolean) => void;
   onClose: () => void;
@@ -18,37 +28,74 @@ function errorMessage(error: unknown): string {
 
 /** Thin modal shell. Owns the connecting + error UI; never leaves an orphan tab. */
 export function NewSessionDialog({
+  config,
   openSession,
   onOpened,
   onClose,
 }: NewSessionDialogProps) {
-  const [projectId, setProjectId] = useState("");
+  const model = useMemo(() => buildNewSessionModel(config), [config]);
+  const initial = resolveSelection(model, "");
+  const [projectId, setProjectId] = useState(initial.projectId);
   const [sessionId, setSessionId] = useState("");
-  const [agent, setAgent] = useState("");
+  // Agent defaults to the selected project's default; project changes reset it.
+  const [agent, setAgent] = useState(initial.agent);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
-  const firstFieldRef = useRef<HTMLInputElement>(null);
+  const firstFieldRef = useRef<HTMLSelectElement>(null);
 
-  const agentOk = agent === "" || isValidSlug(agent);
-  const valid = isValidSlug(projectId) && isValidSlug(sessionId) && agentOk;
+  const selectedProject =
+    model.projects.find((p) => p.id === projectId) ?? null;
+  // Membership guards (not mere non-empty) so a stale selection that matches no
+  // option can't submit a project/agent the config no longer has.
+  const valid =
+    selectedProject !== null &&
+    model.agents.includes(agent) &&
+    isValidSlug(sessionId);
 
-  // Focus the first field on open; restore focus to the opener on close.
+  // Focus the first field on open; restore focus to the opener on close. Falls
+  // back to the first focusable control (e.g. Close in the no-projects state,
+  // where the project <select> isn't rendered).
   useEffect(() => {
     const previouslyFocused = document.activeElement as HTMLElement | null;
-    firstFieldRef.current?.focus();
+    const target =
+      firstFieldRef.current ??
+      dialogRef.current?.querySelector<HTMLElement>(
+        'button, select, input, [tabindex]:not([tabindex="-1"])',
+      );
+    target?.focus();
     return () => previouslyFocused?.focus?.();
   }, []);
+
+  // Re-clamp the selection if config changes while the dialog is open (manual
+  // refresh, or the first config load arriving after open). A no-op while
+  // projectId is still valid, so a user's agent override stands.
+  useEffect(() => {
+    if (!model.projects.some((p) => p.id === projectId)) {
+      const sel = resolveSelection(model, projectId);
+      setProjectId(sel.projectId);
+      setAgent(sel.agent);
+    }
+  }, [model, projectId]);
+
+  function selectProject(id: string) {
+    const sel = resolveSelection(model, id);
+    setProjectId(sel.projectId);
+    setAgent(sel.agent);
+  }
 
   async function submit() {
     if (!valid || submitting) return;
     setSubmitting(true);
     setError(null);
     try {
+      // Send null when the agent is the project default so spawn resolves the
+      // live default (preserving SpawnInput's "null = project default" path);
+      // an explicit override sends its id.
       const result = await openSession({
         projectId,
         sessionId,
-        agent: agent === "" ? null : agent,
+        agent: agent === selectedProject?.defaultAgent ? null : agent,
       });
       if (result.ok) {
         onOpened(result.attached);
@@ -94,6 +141,8 @@ export function NewSessionDialog({
     }
   }
 
+  const hasProjects = model.projects.length > 0;
+
   return (
     // biome-ignore lint/a11y/noStaticElementInteractions: backdrop key handling
     <div className="dialog-backdrop" onKeyDown={onKeyDown}>
@@ -105,48 +154,78 @@ export function NewSessionDialog({
         aria-label="New session"
       >
         <h2>New session</h2>
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            void submit();
-          }}
-        >
-          <label>
-            Project
-            <input
-              ref={firstFieldRef}
-              value={projectId}
-              onChange={(e) => setProjectId(e.target.value)}
-            />
-          </label>
-          <label>
-            Session
-            <input
-              value={sessionId}
-              onChange={(e) => setSessionId(e.target.value)}
-            />
-          </label>
-          <label>
-            Agent (optional)
-            <input value={agent} onChange={(e) => setAgent(e.target.value)} />
-            <span className="hint">
-              Applies only when spawning a new session.
-            </span>
-          </label>
-          {error && (
+        {!hasProjects ? (
+          <>
             <p className="dialog-error" role="alert">
-              {error}
+              No projects configured. Add a project to your config.toml to start
+              a session.
             </p>
-          )}
-          <div className="dialog-actions">
-            <button type="button" onClick={onClose}>
-              Cancel
-            </button>
-            <button type="submit" disabled={!valid || submitting}>
-              {submitting ? "Connecting…" : "Open"}
-            </button>
-          </div>
-        </form>
+            <div className="dialog-actions">
+              <button type="button" onClick={onClose}>
+                Close
+              </button>
+            </div>
+          </>
+        ) : (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void submit();
+            }}
+          >
+            <label>
+              Project
+              <select
+                ref={firstFieldRef}
+                value={projectId}
+                onChange={(e) => selectProject(e.target.value)}
+              >
+                {model.projects.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.label} ({p.hostLabel})
+                  </option>
+                ))}
+              </select>
+            </label>
+            {selectedProject && (
+              <p className="hint">Host: {selectedProject.hostLabel}</p>
+            )}
+            <label>
+              Session
+              <input
+                value={sessionId}
+                onChange={(e) => setSessionId(e.target.value)}
+              />
+            </label>
+            <label>
+              Agent
+              <select value={agent} onChange={(e) => setAgent(e.target.value)}>
+                {model.agents.map((id) => (
+                  <option key={id} value={id}>
+                    {id}
+                    {selectedProject?.defaultAgent === id ? " (default)" : ""}
+                  </option>
+                ))}
+              </select>
+              <span className="hint">
+                Applies only when spawning a new session.
+              </span>
+            </label>
+            {error && (
+              <p className="dialog-error" role="alert">
+                {error}
+              </p>
+            )}
+            <div className="dialog-actions">
+              <button type="button" onClick={onClose}>
+                Cancel
+              </button>
+              <button type="submit" disabled={!valid || submitting}>
+                {submitting ? "Connecting…" : "Open"}
+              </button>
+            </div>
+          </form>
+        )}
       </div>
     </div>
   );

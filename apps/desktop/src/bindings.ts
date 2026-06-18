@@ -82,6 +82,12 @@ async sessionClose(handle: ChannelHandle) : Promise<Result<null, BridgeError>> {
 
 /** user-defined types **/
 
+/**
+ * A configured agent, id-only. The launch `command` argv is a launch detail
+ * (not a label) and is intentionally omitted — the new-session dialog needs
+ * only the id to pass as `SpawnSpec::agent`.
+ */
+export type AgentDto = { id: string }
 export type BridgeError = { kind: "sessionExists"; message: string } | { kind: "sessionNotFound"; message: string } | { kind: "channelClosed" } | { kind: "transport"; message: string } | { kind: "plan"; message: string } | { kind: "invalidId"; message: string } | { kind: "unknownHandle" } | { kind: "invalidSize"; message: string } | 
 /**
  * The config file exists but could not be read or parsed. A *missing*
@@ -104,7 +110,7 @@ export type ChannelHandle = number
  * The whole per-device config, projected for the sidebar. `Default` is the
  * empty config a fresh device (no file yet) renders.
  */
-export type ConfigDto = { hosts: HostDto[]; projects: ProjectDto[] }
+export type ConfigDto = { hosts: HostDto[]; projects: ProjectDto[]; agents: AgentDto[] }
 /**
  * A configured host, label-only. The `transport` discriminant is all the UI
  * needs (an icon/badge); the connection details never cross.
