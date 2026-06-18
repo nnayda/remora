@@ -101,14 +101,17 @@ export async function openConnection(open: Opener): Promise<SessionConnection> {
   };
 }
 
+/** Narrow an unknown thrown value to a typed `BridgeError` (it carries `kind`). */
 function isBridgeError(e: unknown): e is BridgeError {
   return typeof e === "object" && e !== null && "kind" in e;
 }
 
+/** True when `e` is the bridge's "the session is gone" error. */
 export function isSessionNotFound(e: unknown): boolean {
   return isBridgeError(e) && e.kind === "sessionNotFound";
 }
 
+/** True when `e` is the bridge's "a live session already holds this name" error. */
 export function isSessionExists(e: unknown): boolean {
   return isBridgeError(e) && e.kind === "sessionExists";
 }

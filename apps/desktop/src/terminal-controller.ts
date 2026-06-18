@@ -24,6 +24,8 @@ export class TerminalController {
   private lastCols = 0;
   private resizeRaf = 0;
 
+  /** Mount an xterm into `element` and wire it to `connection`: stream output
+   * in, keystrokes out, and fit-on-resize. */
   constructor(
     element: HTMLElement,
     private readonly connection: SessionConnection,
@@ -52,6 +54,7 @@ export class TerminalController {
     this.syncSize(); // initial fit
   }
 
+  /** Mark the terminal dead and print a notice; input stops after this. */
   private handleClosed(): void {
     if (this.closed) return;
     this.closed = true;
@@ -59,13 +62,14 @@ export class TerminalController {
     this.term.write("\r\n\x1b[90m[session closed]\x1b[0m\r\n");
   }
 
-  // Surface (don't swallow) a fire-and-forget write/resize rejection. Log only:
-  // the bridge's `closed` event is the authoritative death signal, so a single
-  // transient rejection must not force-close an otherwise live session.
+  /** Surface (don't swallow) a fire-and-forget write/resize rejection. Log only:
+   * the bridge's `closed` event is the authoritative death signal, so a single
+   * transient rejection must not force-close an otherwise live session. */
   private logTransportError(op: "write" | "resize", error: unknown): void {
     console.error(`terminal ${op} failed`, error);
   }
 
+  /** Coalesce a burst of ResizeObserver callbacks into one fit on the next frame. */
   private scheduleFit(): void {
     if (this.resizeRaf) return; // coalesce a burst of observe callbacks into one fit
     this.resizeRaf = requestAnimationFrame(() => {
@@ -74,6 +78,8 @@ export class TerminalController {
     });
   }
 
+  /** Fit the emulator to its element and push the new geometry to the remote
+   * TTY, skipping zero/unchanged sizes (the bridge rejects a 0x0 winsize). */
   private syncSize(): void {
     if (this.closed) return;
     this.fit.fit();
@@ -87,6 +93,7 @@ export class TerminalController {
       .catch((e) => this.logTransportError("resize", e));
   }
 
+  /** Tear down all listeners, the ResizeObserver, and the xterm instance. */
   dispose(): void {
     if (this.resizeRaf) cancelAnimationFrame(this.resizeRaf);
     this.observer.disconnect();

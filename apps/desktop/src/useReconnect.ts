@@ -7,6 +7,8 @@ export interface ReconnectTarget {
   reconnectStale(): void;
 }
 
+/** Pick the reconnect strategy from how long the window was hidden: a long gap
+ * (slept laptop) reconnects all tabs, a short gap (alt-tab) only kicks stale ones. */
 export function decideReconnect(gapMs: number): "all" | "stale" {
   return gapMs > LONG_GAP_MS ? "all" : "stale";
 }

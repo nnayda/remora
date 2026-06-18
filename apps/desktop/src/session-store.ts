@@ -83,8 +83,10 @@ export class SessionStore {
   private listeners = new Set<() => void>();
   private snapshot: Snapshot = { tabs: [], activeKey: null };
 
+  /** Inject the openers (spawn/attach/respawn + timer) so tests can fake them. */
   constructor(private readonly openers: StoreOpeners) {}
 
+  /** `useSyncExternalStore` subscribe: register a listener, returns unsubscribe. */
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
     return () => {
@@ -92,8 +94,10 @@ export class SessionStore {
     };
   };
 
+  /** `useSyncExternalStore` getSnapshot: the current immutable snapshot. */
   getSnapshot = (): Snapshot => this.snapshot;
 
+  /** Publish a fresh snapshot (defensively-copied tabs) and notify subscribers. */
   private commit(): void {
     // New snapshot object every commit so useSyncExternalStore re-renders;
     // unchanged between commits so it does not loop. Each tab is a fresh
@@ -106,6 +110,7 @@ export class SessionStore {
     for (const listener of this.listeners) listener();
   }
 
+  /** Set one tab's status + error message and commit. */
   private setStatus(
     key: string,
     status: TabStatus,
@@ -117,10 +122,13 @@ export class SessionStore {
     this.commit();
   }
 
+  /** Arm the connection's death listener to drive this tab into reconnect. */
   private registerDeath(tab: Tab): void {
     tab.connection.onClose(() => this.onDeath(tab.key));
   }
 
+  /** Channel death handler: move a still-recoverable tab into reconnecting and
+   * kick off the attach-retry loop (stopped/disconnected tabs are left alone). */
   private onDeath(key: string): void {
     const tab = this.tabs.find((t) => t.key === key);
     if (!tab || tab.status === "stopped" || tab.status === "disconnected")
@@ -129,6 +137,8 @@ export class SessionStore {
     void this.startReconnect(key, 0);
   }
 
+  /** Mint a fresh reconnect token for `key`, cancelling any older loop so only
+   * the newest one proceeds (see `startReconnect`). */
   private newReconnectToken(key: string): ReconnectToken {
     const prev = this.reconnectTokens.get(key);
     if (prev) prev.cancelled = true; // cancel any older loop
@@ -262,6 +272,8 @@ export class SessionStore {
     return { ok: true, attached: opened.attached };
   }
 
+  /** Open (or focus, if already open) a session via the spawn opener — spawn
+   * first, attaching the running one on `sessionExists`. */
   openSession = async (input: SpawnInput): Promise<OpenResult> => {
     // After dispose() the store is dead — never start new work. The opener
     // spawns/attaches a real session, a side effect we must not perform
@@ -280,6 +292,8 @@ export class SessionStore {
     return this.openTab(input, (p, s, a) => this.openers.spawn(p, s, a));
   };
 
+  /** Close a tab: cancel an in-flight open/reconnect if any, else close the
+   * connection, drop the tab, and refocus a neighbour. */
   closeTab = (key: string): void => {
     const pendingToken = this.pending.get(key);
     if (pendingToken) {
@@ -303,6 +317,7 @@ export class SessionStore {
     this.commit();
   };
 
+  /** Make `key` the active tab (no-op if already active or unknown). */
   focusTab = (key: string): void => {
     if (this.activeKey === key) return;
     if (!this.tabs.some((t) => t.key === key)) return;
@@ -393,6 +408,8 @@ export class SessionStore {
     this.swapConnection(key, next, "live");
   };
 
+  /** App teardown: cancel all pending opens/reconnects and close every
+   * connection. Terminal — a disposed store never opens new work. */
   dispose = (): void => {
     this.disposed = true;
     for (const token of this.pending.values()) token.cancelled = true;

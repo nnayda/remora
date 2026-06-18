@@ -14,6 +14,8 @@ export const sessionStore = new SessionStore({
   schedule: (fn, ms) => setTimeout(fn, ms),
 });
 
+/** Subscribe a component to the session-store singleton: returns the live tabs
+ * and active key plus the open/close/focus/respawn actions. */
 export function useSessions() {
   const snapshot = useSyncExternalStore(
     sessionStore.subscribe,

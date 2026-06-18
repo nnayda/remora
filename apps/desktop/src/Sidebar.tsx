@@ -81,6 +81,7 @@ export function Sidebar({
   );
 }
 
+/** One host row: a collapse toggle plus its project rows (or an empty hint). */
 function HostRow({
   host,
   collapsed,
@@ -132,6 +133,7 @@ function HostRow({
   );
 }
 
+/** One project row: a collapse toggle plus its session rows (or an empty hint). */
 function ProjectRow({
   rowId,
   project,
@@ -181,6 +183,8 @@ function ProjectRow({
   );
 }
 
+/** One session leaf: a state dot, the session id, and an open-tab marker;
+ * clicking it routes through `onOpenSession` (App branches on session.state). */
 function SessionRow({
   session,
   active,
