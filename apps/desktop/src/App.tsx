@@ -41,15 +41,27 @@ function App() {
   const tree = useMemo(() => buildTree(config, sessions), [config, sessions]);
   const openKeys = useMemo(() => new Set(tabs.map((t) => t.key)), [tabs]);
 
-  // Focus the now-active terminal after its pane is rendered (the pane is hidden
-  // via style.display until activeKey points to it, so focus must wait for the
-  // commit). Gated by focusOnSelect so only an explicit tab/sidebar selection
-  // grabs focus — the dialog spawn path keeps focus on newButtonRef.
+  // Status of the active tab, so the focus effect re-fires when a freshly opened
+  // or respawned session goes live (a stopped/reconnecting tab renders a
+  // placeholder or a not-yet-ready terminal until it does).
+  const activeStatus = tabs.find((t) => t.key === activeKey)?.status ?? null;
+
+  // Focus the now-active terminal once it's live and its pane has mounted.
+  // Gated by focusOnSelect so only an explicit tab/sidebar selection grabs focus
+  // — the dialog spawn path keeps focus on newButtonRef. The intent flag is held
+  // (not consumed) until the terminal exists, so opening a new session or
+  // reopening a stopped one — which mount the terminal a tick or two after
+  // activeKey flips — still lands focus. Focus is deferred to the next frame so a
+  // just-opened xterm has its input ready to accept it.
   useEffect(() => {
     if (!focusOnSelect.current) return;
+    if (activeKey === null || activeStatus !== "live") return; // wait for live
+    const handle = terminals.current.get(activeKey);
+    if (!handle) return; // terminal not mounted yet; stay armed for when it is
     focusOnSelect.current = false;
-    if (activeKey !== null) terminals.current.get(activeKey)?.focus();
-  }, [activeKey]);
+    const raf = requestAnimationFrame(() => handle.focus());
+    return () => cancelAnimationFrame(raf);
+  }, [activeKey, activeStatus]);
 
   /** Open a session clicked in the sidebar, routing by its discovered state:
    * live → attach/focus, stopped → respawn. Reuses the dialog's deduping path
