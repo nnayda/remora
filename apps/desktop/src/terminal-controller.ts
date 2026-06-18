@@ -54,6 +54,14 @@ export class TerminalController {
     this.syncSize(); // initial fit
   }
 
+  /** Move keyboard focus into the emulator so the user can type immediately.
+   * No-op once closed: a dead session takes no input, so there's nothing to
+   * type into. */
+  focus(): void {
+    if (this.closed) return;
+    this.term.focus();
+  }
+
   /** Mark the terminal dead and print a notice; input stops after this. */
   private handleClosed(): void {
     if (this.closed) return;
