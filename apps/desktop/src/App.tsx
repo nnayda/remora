@@ -66,10 +66,17 @@ function App() {
         agent: node.agent,
       })
         .then((r) => {
-          if (!r.ok && r.error !== OPEN_CANCELLED)
+          if (!r.ok && r.error !== OPEN_CANCELLED) {
+            // A failed open never changes activeKey, so the intent flag would
+            // stay armed and steal focus on the next unrelated change. Disarm.
+            focusOnSelect.current = false;
             setNotice("Could not respawn the session.");
+          }
         })
-        .catch(() => setNotice("Could not respawn the session."));
+        .catch(() => {
+          focusOnSelect.current = false;
+          setNotice("Could not respawn the session.");
+        });
       return;
     }
     // openSession resolves (never rejects) with {ok:false} on failure — e.g. a
@@ -82,10 +89,13 @@ function App() {
     })
       .then((result) => {
         if (!result.ok && result.error !== OPEN_CANCELLED) {
+          // See the respawn path: disarm so a no-op open can't leak focus.
+          focusOnSelect.current = false;
           setNotice("Could not open the session. It may have stopped.");
         }
       })
       .catch(() => {
+        focusOnSelect.current = false;
         setNotice("Could not open the session. It may have stopped.");
       });
   }
@@ -124,6 +134,14 @@ function App() {
           activeKey={activeKey}
           onFocus={(key) => {
             setNotice(null);
+            // Re-selecting the active tab leaves activeKey unchanged, so the
+            // effect won't fire — focus its (already-visible) terminal directly
+            // and leave the intent flag disarmed.
+            if (key === activeKey) {
+              focusOnSelect.current = false;
+              terminals.current.get(key)?.focus();
+              return;
+            }
             focusOnSelect.current = true;
             focusTab(key);
           }}
