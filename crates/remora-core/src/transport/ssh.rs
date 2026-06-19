@@ -193,6 +193,30 @@ fn join_agent_command(argv: &[String]) -> String {
     shlex::try_join(argv.iter().map(String::as_str)).expect("config bans control/nul characters")
 }
 
+/// Wraps the joined agent command so a clean / user-interrupted exit
+/// (0 graceful, 130 SIGINT/Ctrl-C, 143 SIGTERM) execs an interactive login
+/// shell in the same dir, keeping the pane alive with a real prompt (#30); any
+/// other non-zero exit propagates so `remain-on-exit` retains the dead pane and
+/// its error for inspection (#28). `${SHELL:-/bin/sh}` defends against an unset
+/// SHELL in the pane environment.
+///
+/// `__remora_rc=$?` MUST be the first statement after the agent command —
+/// nothing may run between the agent and the `$?` capture or it records the
+/// wrong code.
+///
+/// ```text
+///   <agent> exits
+///        │  $? captured immediately
+///        ├── 0 | 130 | 143 ──▶ exec $SHELL -l   (pane lives → usable shell, #30)
+///        └── else ───────────▶ exit $rc          (pane dies → remain-on-exit
+///                                                 keeps dead pane + status, #28)
+/// ```
+fn wrap_with_shell_fallback(agent_command: &str) -> String {
+    format!(
+        r#"{agent_command}; __remora_rc=$?; case "$__remora_rc" in 0|130|143) exec "${{SHELL:-/bin/sh}}" -l ;; *) exit "$__remora_rc" ;; esac"#
+    )
+}
+
 /// `tmux new-session -d -s <name> -c <dir> <agent…>` — the atomic creation
 /// lock. No metadata trailer (set-environment runs separately so a metadata
 /// failure can't falsely fail a live session). The agent command is joined
@@ -208,8 +232,13 @@ fn new_session_argv(host: &SshHost, plan: &SpawnPlan) -> Vec<String> {
     argv.push(quote_remote_path(&plan.dir));
     // The agent command is ONE shell-quoted arg, not one per token: the login
     // shell strips this outer layer, then tmux's `sh -c` re-parses the inner
-    // joined string back into the intended argv (the double-shell hazard).
-    argv.push(shell_quote(&join_agent_command(&plan.agent_argv)));
+    // string back into the intended argv (the double-shell hazard). It is
+    // wrapped first so a clean / interrupted agent exit drops to a login shell
+    // instead of a dead pane (#30); a crash still propagates to the retained
+    // pane (#28).
+    argv.push(shell_quote(&wrap_with_shell_fallback(&join_agent_command(
+        &plan.agent_argv,
+    ))));
     argv
 }
 
@@ -907,16 +936,43 @@ mod tests {
         assert_eq!(argv[n + 3], "remora_api_fix-login");
         assert_eq!(argv[n + 4], "-c");
         assert_eq!(argv[n + 5], "\"$HOME\"/.remora/worktrees/api/fix-login");
-        // Agent command joined into ONE shell-quoted arg (double-shell safe).
-        assert_eq!(argv[n + 6], "'claude --continue'");
+        // Agent command wrapped in the shell-fallback compound, then joined into
+        // ONE shell-quoted arg (double-shell safe).
+        assert_eq!(
+            argv[n + 6],
+            shell_quote(&wrap_with_shell_fallback("claude --continue"))
+        );
         assert!(argv.get(n + 7).is_none(), "agent command is a single arg");
+        // The `;` inside the wrapped command is part of the single quoted arg,
+        // never its own argv element — so there is still no metadata trailer.
         assert!(!argv.iter().any(|a| a == "set-environment" || a == ";"));
     }
 
     #[test]
+    fn wrap_with_shell_fallback_gates_on_clean_exit_codes() {
+        let wrapped = wrap_with_shell_fallback("claude --continue");
+        // The agent runs first; `$?` is captured IMMEDIATELY after (nothing may
+        // run between the agent and the capture or it records the wrong code).
+        assert!(
+            wrapped.starts_with("claude --continue; __remora_rc=$?;"),
+            "got: {wrapped}"
+        );
+        // Graceful (0), SIGINT/Ctrl-C (130), SIGTERM (143) drop to a login shell.
+        assert!(
+            wrapped.contains(r#"0|130|143) exec "${SHELL:-/bin/sh}" -l ;;"#),
+            "got: {wrapped}"
+        );
+        // Any other code propagates so `remain-on-exit` keeps the dead pane (#28).
+        assert!(
+            wrapped.contains(r#"*) exit "$__remora_rc" ;;"#),
+            "got: {wrapped}"
+        );
+    }
+
+    #[test]
     fn agent_command_survives_the_double_shell() {
-        // An agent arg containing a space must survive BOTH the ssh login
-        // shell and tmux's `sh -c` re-parse of new-session's shell-command.
+        // An agent arg containing a space must survive BOTH the ssh login shell
+        // and tmux's `sh -c` re-parse — now wrapped in the shell-fallback compound.
         let plan = SpawnPlan {
             agent_argv: vec![
                 "claude".into(),
@@ -930,13 +986,19 @@ mod tests {
             .iter()
             .position(|a| a == "new-session")
             .expect("new-session");
-        // Exactly one agent-command arg after `-c <dir>` (joined, not per-token).
+        // Still exactly one agent-command arg after `-c <dir>` (wrapped, not per-token).
         assert_eq!(argv.len(), n + 7);
-        // The inner joined string re-parses (via tmux's sh -c) back to the argv.
-        let inner = join_agent_command(&plan.agent_argv);
-        assert_eq!(shlex::split(&inner), Some(plan.agent_argv.clone()));
-        // The outer layer is what ssh's login shell strips to yield `inner`.
+        // The inner string the ssh login shell yields (tmux's `sh -c` re-parses
+        // it) is the wrapped compound built from the joined agent fragment.
+        let fragment = join_agent_command(&plan.agent_argv);
+        let inner = wrap_with_shell_fallback(&fragment);
         assert_eq!(argv[n + 6], shell_quote(&inner));
+        // The agent fragment keeps its per-token quoting inside the compound, so
+        // the spaced arg stays a single shell word ahead of the gate.
+        assert!(
+            inner.starts_with("claude --append-system-prompt 'Be concise';"),
+            "got: {inner}"
+        );
     }
 
     #[test]
