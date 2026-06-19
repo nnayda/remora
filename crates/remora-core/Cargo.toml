@@ -13,9 +13,11 @@ portable-pty = { workspace = true }
 remora-protocol = { workspace = true }
 serde = { workspace = true }
 shlex = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
 toml = { workspace = true }
+toml_edit = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
