@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Config editor channel (desktop bridge): a **local-only** counterpart to the
+  redacted display path lets the app manage the per-device config. A new
+  un-redacted `EditorConfigDto` (its own module, with a guard test that it ships
+  the full connection values and does **not** share a `From<Config>` with the
+  display `ConfigDto`) plus `config_get_editable` and nine
+  `config_{insert,update,remove}_{host,project,agent}` commands. Mutations run
+  the core's `ConfigDocument` (load → mutate → atomic save) behind a serialization
+  `Mutex`, reading fresh each time so no update is lost; a rejected edit (dup id,
+  missing id, dangling/used reference, save IO) surfaces as a new
+  `BridgeError::ConfigEdit` carrying the sanitized reason for inline display,
+  distinct from `Config` (whole-file load failure → banner). TS bindings
+  regenerated. Second slice of #32 (ADR-0006); the management UI lands in a
+  follow-up.
 - Config write-back foundation (core): `remora-core` can now create, edit, and
   remove hosts, projects, and agents in the per-device `config.toml` via a new
   `ConfigDocument` (toml_edit) that preserves comments and formatting. Every

@@ -32,6 +32,14 @@ pub enum BridgeError {
     Config {
         message: String,
     },
+    /// An in-app config edit (insert/update/remove) was rejected: a duplicate
+    /// id, a missing id, a dangling reference, a referenced entry being removed,
+    /// or a save IO failure. Carries the rendered (already sanitized)
+    /// `ConfigError`. Distinct from `Config` (whole-file load failure → sidebar
+    /// banner) so the frontend can show this inline on the offending form.
+    ConfigEdit {
+        message: String,
+    },
 }
 
 impl From<SourceError> for BridgeError {
