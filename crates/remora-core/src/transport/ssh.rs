@@ -443,6 +443,19 @@ fn has_session_argv(host: &SshHost, tmux_name: &str) -> Vec<String> {
     argv
 }
 
+/// Whether a failed `has-session`/`new-session` stderr positively means the
+/// session does not exist (server up but name unknown, or no server at all),
+/// as opposed to an ambiguous transport failure (ssh/auth/network) that also
+/// exits non-zero. Matched case-insensitively to survive a non-English
+/// `LC_MESSAGES`. Mirrors the cold-state phrases in `classify_list_sessions`,
+/// plus has-session's own `can't find session`.
+fn stderr_signals_session_absent(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("can't find session")
+        || lower.contains("no server running")
+        || lower.contains("no sessions")
+}
+
 /// Opens the PTY attach channel to an existing session (no liveness
 /// preflight — callers that need one do it first; see `SshSource::attach`).
 fn attach_channel(
@@ -486,9 +499,13 @@ fn run_spawn(
         // exists; if the probe can't run, leave the worktree (better an orphan
         // than a nuked live session).
         if plan.branch.is_some() && !matches!(err, SourceError::SessionExists { .. }) {
+            // A non-zero `has-session` does NOT by itself mean "absent": an
+            // ssh/auth/network failure also exits non-zero (as `Ok(success=
+            // false)`, not `Err`). Only a known tmux "no such session" stderr is
+            // safe to clean up on; treat anything ambiguous as "leave it".
             let session_absent = exec
                 .run(&has_session_argv(host, &plan.tmux_name))
-                .map(|out| !out.success)
+                .map(|out| !out.success && stderr_signals_session_absent(&out.stderr))
                 .unwrap_or(false);
             if session_absent {
                 let _ = exec.run(&worktree_remove_argv(host, plan));
@@ -1096,6 +1113,26 @@ mod tests {
     }
 
     #[test]
+    fn stderr_signals_session_absent_only_for_known_tmux_phrases() {
+        // Positive: tmux's "no such session" phrasings (case-insensitive).
+        assert!(stderr_signals_session_absent(
+            "can't find session: remora_api_x"
+        ));
+        assert!(stderr_signals_session_absent(
+            "no server running on /tmp/tmux-1000/default"
+        ));
+        assert!(stderr_signals_session_absent("CAN'T FIND SESSION"));
+        // Negative: ambiguous transport failures must NOT read as absent.
+        assert!(!stderr_signals_session_absent(
+            "ssh: connect to host devbox port 22: Connection refused"
+        ));
+        assert!(!stderr_signals_session_absent(
+            "Permission denied (publickey)"
+        ));
+        assert!(!stderr_signals_session_absent(""));
+    }
+
+    #[test]
     fn other_new_session_failure_is_transport() {
         let (p, s) = ids();
         let err = classify_new_session_failure("no server running on /tmp/tmux", &p, &s);
@@ -1309,6 +1346,31 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.iter().any(|a| a == "remove")),
             "a live session's worktree must never be force-removed"
+        );
+    }
+
+    #[test]
+    fn ambiguous_has_session_probe_failure_does_not_remove_the_worktree() {
+        // An ssh/network/auth failure surfaces as a non-zero remote command
+        // (`Ok(success=false)`), NOT as `Err`. A bare `!success` probe would
+        // read that as "session absent" and remove a possibly-live worktree.
+        // Only known tmux "absent" stderr is safe to clean up on; anything
+        // ambiguous leaves the worktree.
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                                               // worktree add
+            Ok(FakeExec::fail("set-option: unknown option: remain-on-exit")), // created, set-option failed
+            Ok(FakeExec::fail(
+                "ssh: connect to host devbox port 22: Connection refused",
+            )), // has-session probe itself failed
+        ]);
+        let err =
+            run_spawn(&fake, &host("devbox", None, None), &plan).expect_err("transport error");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
+        let calls = fake.calls.lock().expect("lock");
+        assert!(
+            !calls.iter().any(|c| c.iter().any(|a| a == "remove")),
+            "an ambiguous probe failure must not trigger worktree removal"
         );
     }
 
