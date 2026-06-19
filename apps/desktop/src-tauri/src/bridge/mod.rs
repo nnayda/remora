@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod dto;
+pub mod editor_dto;
 pub mod error;
 pub mod output;
 pub mod resolve;
@@ -11,7 +12,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use remora_core::config::{Config, ConfigError};
+use remora_core::config::{Config, ConfigDocument, ConfigError, HostId};
 use remora_core::{SessionChannel, SessionSource, SourceError};
 
 use remora_protocol::{
@@ -21,6 +22,7 @@ use resolve::SourceResolver;
 use tokio::sync::{mpsc, oneshot};
 
 use dto::ConfigDto;
+use editor_dto::{AgentInputDto, EditorConfigDto, HostInputDto, ProjectInputDto};
 use error::{BridgeError, SessionMetaDto};
 use output::{BridgeOutput, ChannelHandle, OutputSink};
 
@@ -38,9 +40,15 @@ pub struct Bridge {
     channels: Registry,
     next_handle: AtomicU64,
     spawn_task: Spawner,
-    /// Per-device config file (read-only). Resolved once at construction; read
-    /// fresh on every `config()` so an external edit shows on manual refresh.
+    /// Per-device config file. Resolved once at construction; read fresh on
+    /// every `config()`/`config_editable()` so an external edit shows on
+    /// refresh, and rewritten in place by the editor commands.
     config_path: PathBuf,
+    /// Serializes the editor channel's load → mutate → save critical section so
+    /// overlapping in-process mutations cannot lose updates (eng review #2).
+    /// Read paths don't take it — `save` is atomic (temp + rename), so a reader
+    /// always sees a whole file. Cross-process is out of scope until the relay.
+    config_mutex: tokio::sync::Mutex<()>,
 }
 
 impl Bridge {
@@ -66,6 +74,7 @@ impl Bridge {
             next_handle: AtomicU64::new(0),
             spawn_task,
             config_path,
+            config_mutex: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -254,6 +263,134 @@ impl Bridge {
     /// silently-empty sidebar.
     pub fn config(&self) -> Result<ConfigDto, BridgeError> {
         Ok(self.load_config()?.into())
+    }
+
+    // ---- Editor channel (local-only, un-redacted) ----
+
+    /// The full, **un-redacted** config for the settings forms (counterpart to
+    /// `config()`). Same missing→empty / unreadable→`Config` rules. Local-only:
+    /// it carries connection secrets and must never cross the relay.
+    pub fn config_editable(&self) -> Result<EditorConfigDto, BridgeError> {
+        Ok(self.load_config()?.into())
+    }
+
+    pub async fn config_insert_host(
+        &self,
+        id: String,
+        input: HostInputDto,
+    ) -> Result<(), BridgeError> {
+        let id = parse_id(HostId::new(id))?;
+        let host = input.into_host();
+        self.mutate(|doc| doc.insert_host(&id, &host)).await
+    }
+
+    pub async fn config_update_host(
+        &self,
+        id: String,
+        input: HostInputDto,
+    ) -> Result<(), BridgeError> {
+        let id = parse_id(HostId::new(id))?;
+        let host = input.into_host();
+        self.mutate(|doc| doc.update_host(&id, &host)).await
+    }
+
+    pub async fn config_remove_host(&self, id: String) -> Result<(), BridgeError> {
+        let id = parse_id(HostId::new(id))?;
+        self.mutate(|doc| doc.remove_host(&id)).await
+    }
+
+    pub async fn config_insert_project(
+        &self,
+        id: String,
+        input: ProjectInputDto,
+    ) -> Result<(), BridgeError> {
+        let id = parse_id(ProjectId::new(id))?;
+        let project = input.into_project()?;
+        self.mutate(|doc| doc.insert_project(&id, &project)).await
+    }
+
+    pub async fn config_update_project(
+        &self,
+        id: String,
+        input: ProjectInputDto,
+    ) -> Result<(), BridgeError> {
+        let id = parse_id(ProjectId::new(id))?;
+        let project = input.into_project()?;
+        self.mutate(|doc| doc.update_project(&id, &project)).await
+    }
+
+    pub async fn config_remove_project(&self, id: String) -> Result<(), BridgeError> {
+        let id = parse_id(ProjectId::new(id))?;
+        self.mutate(|doc| doc.remove_project(&id)).await
+    }
+
+    pub async fn config_insert_agent(
+        &self,
+        id: String,
+        input: AgentInputDto,
+    ) -> Result<(), BridgeError> {
+        let id = parse_id(AgentId::new(id))?;
+        let agent = input.into_agent();
+        self.mutate(|doc| doc.insert_agent(&id, &agent)).await
+    }
+
+    pub async fn config_update_agent(
+        &self,
+        id: String,
+        input: AgentInputDto,
+    ) -> Result<(), BridgeError> {
+        let id = parse_id(AgentId::new(id))?;
+        let agent = input.into_agent();
+        self.mutate(|doc| doc.update_agent(&id, &agent)).await
+    }
+
+    pub async fn config_remove_agent(&self, id: String) -> Result<(), BridgeError> {
+        let id = parse_id(AgentId::new(id))?;
+        self.mutate(|doc| doc.remove_agent(&id)).await
+    }
+
+    /// The editor critical section: serialize on the mutex, then load → mutate →
+    /// save. Reading fresh inside the lock means each mutation sees the prior
+    /// one's result (no stale cache). A rejected mutation or a save failure
+    /// surfaces as `ConfigEdit`; only a pre-mutation *read* failure (the file is
+    /// unreadable) is a `Config` load error.
+    async fn mutate(
+        &self,
+        edit: impl FnOnce(&mut ConfigDocument) -> Result<(), ConfigError>,
+    ) -> Result<(), BridgeError> {
+        let _guard = self.config_mutex.lock().await;
+        let mut doc = self.read_document()?;
+        edit(&mut doc).map_err(config_edit)?;
+        doc.save(&self.config_path).map_err(config_edit)?;
+        Ok(())
+    }
+
+    /// Reads the config file into an editable document. A *missing* file is an
+    /// empty document (a fresh device edits from scratch); an unreadable file is
+    /// a `Config` load error; an existing-but-invalid file is a `ConfigEdit` (it
+    /// blocks the edit, shown on the form).
+    fn read_document(&self) -> Result<ConfigDocument, BridgeError> {
+        let raw = match std::fs::read_to_string(&self.config_path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(BridgeError::Config {
+                    message: format!(
+                        "cannot read config file `{}`: {e}",
+                        self.config_path.display()
+                    ),
+                })
+            }
+        };
+        ConfigDocument::parse(&raw).map_err(config_edit)
+    }
+}
+
+/// Rejected mutations carry the rendered `ConfigError` (already sanitized via
+/// `config.rs`); the frontend shows it inline on the form.
+fn config_edit(e: ConfigError) -> BridgeError {
+    BridgeError::ConfigEdit {
+        message: e.to_string(),
     }
 }
 
@@ -882,6 +1019,182 @@ mod tests {
         b.write(h2, b"alive".to_vec())
             .await
             .expect("new channel writable");
+    }
+
+    // ---- Editor channel (PR2): config mutation commands ----
+    use super::editor_dto::{
+        AgentInputDto, HostInputDto, ProjectInputDto, TransportDto, WorkspaceModeDto,
+    };
+
+    fn ssh_input() -> HostInputDto {
+        HostInputDto {
+            name: Some("Dev box".into()),
+            transport: TransportDto::Ssh {
+                host: "secret-hostname".into(),
+                user: Some("rootuser".into()),
+                port: Some(2222),
+            },
+        }
+    }
+    fn project_input() -> ProjectInputDto {
+        ProjectInputDto {
+            name: Some("API".into()),
+            host_id: "devbox".into(),
+            path: "/srv/api".into(),
+            workspace: WorkspaceModeDto::Worktree,
+            agent: "claude".into(),
+        }
+    }
+    fn agent_input() -> AgentInputDto {
+        AgentInputDto {
+            command: vec!["claude".into(), "--flag".into()],
+        }
+    }
+    /// A bridge over a guaranteed-absent temp config file (fresh-device start).
+    fn editor_bridge(tag: &str) -> (Bridge, PathBuf) {
+        let path = temp_config_path(tag);
+        std::fs::remove_file(&path).ok();
+        let b = bridge_with_config(Arc::new(FakeSessionSource::new()), path.clone());
+        (b, path)
+    }
+
+    #[tokio::test]
+    async fn all_insert_commands_persist_and_are_editable() {
+        let (b, path) = editor_bridge("insert-all");
+        // Order matters: a project references its host + agent, which must exist
+        // first (re-validation enforces it).
+        b.config_insert_host("devbox".into(), ssh_input())
+            .await
+            .expect("insert host");
+        b.config_insert_agent("claude".into(), agent_input())
+            .await
+            .expect("insert agent");
+        b.config_insert_project("api".into(), project_input())
+            .await
+            .expect("insert project");
+        let dto = b.config_editable().expect("editable read");
+        std::fs::remove_file(&path).ok();
+        assert!(dto.hosts.iter().any(|h| h.id == "devbox"), "{dto:?}");
+        assert!(dto.agents.iter().any(|a| a.id == "claude"), "{dto:?}");
+        assert!(dto.projects.iter().any(|p| p.id == "api"), "{dto:?}");
+    }
+
+    #[tokio::test]
+    async fn update_commands_edit_in_place() {
+        let (b, path) = editor_bridge("update-all");
+        b.config_insert_host("devbox".into(), ssh_input())
+            .await
+            .expect("insert host");
+        b.config_insert_agent("claude".into(), agent_input())
+            .await
+            .expect("insert agent");
+        let mut renamed = ssh_input();
+        renamed.name = Some("Renamed".into());
+        b.config_update_host("devbox".into(), renamed)
+            .await
+            .expect("update host");
+        b.config_update_agent(
+            "claude".into(),
+            AgentInputDto {
+                command: vec!["claude".into(), "--resume".into()],
+            },
+        )
+        .await
+        .expect("update agent");
+        let dto = b.config_editable().expect("editable");
+        std::fs::remove_file(&path).ok();
+        let host = dto.hosts.iter().find(|h| h.id == "devbox").expect("host");
+        assert_eq!(host.name.as_deref(), Some("Renamed"));
+        let agent = dto.agents.iter().find(|a| a.id == "claude").expect("agent");
+        assert_eq!(agent.command, vec!["claude", "--resume"]);
+    }
+
+    #[tokio::test]
+    async fn remove_commands_delete_in_dependency_order() {
+        let (b, path) = editor_bridge("remove-all");
+        b.config_insert_host("devbox".into(), ssh_input())
+            .await
+            .expect("host");
+        b.config_insert_agent("claude".into(), agent_input())
+            .await
+            .expect("agent");
+        b.config_insert_project("api".into(), project_input())
+            .await
+            .expect("project");
+        // Remove the project first (it references host+agent), then both.
+        b.config_remove_project("api".into())
+            .await
+            .expect("remove project");
+        b.config_remove_agent("claude".into())
+            .await
+            .expect("remove agent");
+        b.config_remove_host("devbox".into())
+            .await
+            .expect("remove host");
+        let dto = b.config_editable().expect("editable");
+        std::fs::remove_file(&path).ok();
+        assert!(dto.hosts.is_empty() && dto.projects.is_empty() && dto.agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn insert_host_rejects_a_bad_slug_id() {
+        let (b, path) = editor_bridge("bad-slug");
+        let err = b
+            .config_insert_host("BAD UPPER".into(), ssh_input())
+            .await
+            .expect_err("a non-slug id must be rejected");
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(err, BridgeError::InvalidId { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn insert_duplicate_host_is_config_edit() {
+        let (b, path) = editor_bridge("dup-host");
+        b.config_insert_host("devbox".into(), ssh_input())
+            .await
+            .expect("first insert");
+        let err = b
+            .config_insert_host("devbox".into(), ssh_input())
+            .await
+            .expect_err("duplicate id must be rejected");
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(err, BridgeError::ConfigEdit { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn remove_referenced_host_is_config_edit() {
+        let (b, path) = editor_bridge("remove-ref");
+        b.config_insert_host("devbox".into(), ssh_input())
+            .await
+            .expect("host");
+        b.config_insert_agent("claude".into(), agent_input())
+            .await
+            .expect("agent");
+        b.config_insert_project("api".into(), project_input())
+            .await
+            .expect("project");
+        // devbox is still referenced by project api — integrity must block it.
+        let err = b
+            .config_remove_host("devbox".into())
+            .await
+            .expect_err("removing a referenced host must be rejected");
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(err, BridgeError::ConfigEdit { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn config_editable_carries_connection_secrets() {
+        let (b, path) = editor_bridge("editable-secrets");
+        b.config_insert_host("devbox".into(), ssh_input())
+            .await
+            .expect("host");
+        let dto = b.config_editable().expect("editable");
+        let json = serde_json::to_string(&dto).expect("serialize");
+        std::fs::remove_file(&path).ok();
+        // The editor channel is un-redacted (counterpart to config_get).
+        assert!(json.contains("secret-hostname"), "{json}");
+        assert!(json.contains("rootuser"), "{json}");
+        assert!(json.contains("2222"), "{json}");
     }
 
     // End-to-end through the REAL ConfigResolver (the routing tests above use

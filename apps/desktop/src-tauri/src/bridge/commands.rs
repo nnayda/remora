@@ -4,6 +4,7 @@ use tauri::ipc::Channel;
 use tauri_specta::{collect_commands, Builder};
 
 use crate::bridge::dto::ConfigDto;
+use crate::bridge::editor_dto::{AgentInputDto, EditorConfigDto, HostInputDto, ProjectInputDto};
 use crate::bridge::error::{BridgeError, SessionMetaDto};
 use crate::bridge::output::{BridgeOutput, ChannelHandle, ChannelSink};
 use crate::bridge::Bridge;
@@ -104,6 +105,103 @@ async fn session_close(
     Ok(())
 }
 
+// ---- Editor channel (PR2): local-only, un-redacted config management ----
+
+#[tauri::command]
+#[specta::specta]
+async fn config_get_editable(
+    bridge: tauri::State<'_, Bridge>,
+) -> Result<EditorConfigDto, BridgeError> {
+    bridge.config_editable()
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn config_insert_host(
+    bridge: tauri::State<'_, Bridge>,
+    id: String,
+    input: HostInputDto,
+) -> Result<(), BridgeError> {
+    bridge.config_insert_host(id, input).await
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn config_update_host(
+    bridge: tauri::State<'_, Bridge>,
+    id: String,
+    input: HostInputDto,
+) -> Result<(), BridgeError> {
+    bridge.config_update_host(id, input).await
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn config_remove_host(
+    bridge: tauri::State<'_, Bridge>,
+    id: String,
+) -> Result<(), BridgeError> {
+    bridge.config_remove_host(id).await
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn config_insert_project(
+    bridge: tauri::State<'_, Bridge>,
+    id: String,
+    input: ProjectInputDto,
+) -> Result<(), BridgeError> {
+    bridge.config_insert_project(id, input).await
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn config_update_project(
+    bridge: tauri::State<'_, Bridge>,
+    id: String,
+    input: ProjectInputDto,
+) -> Result<(), BridgeError> {
+    bridge.config_update_project(id, input).await
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn config_remove_project(
+    bridge: tauri::State<'_, Bridge>,
+    id: String,
+) -> Result<(), BridgeError> {
+    bridge.config_remove_project(id).await
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn config_insert_agent(
+    bridge: tauri::State<'_, Bridge>,
+    id: String,
+    input: AgentInputDto,
+) -> Result<(), BridgeError> {
+    bridge.config_insert_agent(id, input).await
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn config_update_agent(
+    bridge: tauri::State<'_, Bridge>,
+    id: String,
+    input: AgentInputDto,
+) -> Result<(), BridgeError> {
+    bridge.config_update_agent(id, input).await
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn config_remove_agent(
+    bridge: tauri::State<'_, Bridge>,
+    id: String,
+) -> Result<(), BridgeError> {
+    bridge.config_remove_agent(id).await
+}
+
 /// Shared by `run()` and the bindings export test, so the command list lives once.
 pub fn builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new().commands(collect_commands![
@@ -114,7 +212,17 @@ pub fn builder() -> Builder<tauri::Wry> {
         session_respawn,
         session_write,
         session_resize,
-        session_close
+        session_close,
+        config_get_editable,
+        config_insert_host,
+        config_update_host,
+        config_remove_host,
+        config_insert_project,
+        config_update_project,
+        config_remove_project,
+        config_insert_agent,
+        config_update_agent,
+        config_remove_agent
     ])
 }
 

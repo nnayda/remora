@@ -69,6 +69,86 @@ async sessionClose(handle: ChannelHandle) : Promise<Result<null, BridgeError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+async configGetEditable() : Promise<Result<EditorConfigDto, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("config_get_editable") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async configInsertHost(id: string, input: HostInputDto) : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("config_insert_host", { id, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async configUpdateHost(id: string, input: HostInputDto) : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("config_update_host", { id, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async configRemoveHost(id: string) : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("config_remove_host", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async configInsertProject(id: string, input: ProjectInputDto) : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("config_insert_project", { id, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async configUpdateProject(id: string, input: ProjectInputDto) : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("config_update_project", { id, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async configRemoveProject(id: string) : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("config_remove_project", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async configInsertAgent(id: string, input: AgentInputDto) : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("config_insert_agent", { id, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async configUpdateAgent(id: string, input: AgentInputDto) : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("config_update_agent", { id, input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async configRemoveAgent(id: string) : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("config_remove_agent", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -88,6 +168,10 @@ async sessionClose(handle: ChannelHandle) : Promise<Result<null, BridgeError>> {
  * only the id to pass as `SpawnSpec::agent`.
  */
 export type AgentDto = { id: string }
+/**
+ * Form payload for create/edit of an agent.
+ */
+export type AgentInputDto = { command: string[] }
 export type BridgeError = { kind: "sessionExists"; message: string } | { kind: "sessionNotFound"; message: string } | { kind: "channelClosed" } | { kind: "transport"; message: string } | { kind: "plan"; message: string } | { kind: "invalidId"; message: string } | { kind: "unknownHandle" } | { kind: "invalidSize"; message: string } | 
 /**
  * The config file exists but could not be read or parsed. A *missing*
@@ -95,7 +179,15 @@ export type BridgeError = { kind: "sessionExists"; message: string } | { kind: "
  * valid). Permission/parse/validation failures surface here so the sidebar
  * shows a banner instead of a silently-empty tree.
  */
-{ kind: "config"; message: string }
+{ kind: "config"; message: string } | 
+/**
+ * An in-app config edit (insert/update/remove) was rejected: a duplicate
+ * id, a missing id, a dangling reference, a referenced entry being removed,
+ * or a save IO failure. Carries the rendered (already sanitized)
+ * `ConfigError`. Distinct from `Config` (whole-file load failure → sidebar
+ * banner) so the frontend can show this inline on the offending form.
+ */
+{ kind: "configEdit"; message: string }
 /**
  * Streamed from a session's PTY to the frontend. Internally tagged + camelCase
  * so the generated TS is a clean discriminated union. A local bridge<->frontend
@@ -112,16 +204,43 @@ export type ChannelHandle = number
  */
 export type ConfigDto = { hosts: HostDto[]; projects: ProjectDto[]; agents: AgentDto[] }
 /**
+ * An agent with its full launch argv (the display `AgentDto` carries only id).
+ */
+export type EditorAgentDto = { id: string; command: string[] }
+/**
+ * The whole per-device config, projected **un-redacted** for the editor forms.
+ */
+export type EditorConfigDto = { hosts: EditorHostDto[]; projects: EditorProjectDto[]; agents: EditorAgentDto[] }
+/**
+ * A host with its full connection details (the editable form state).
+ */
+export type EditorHostDto = { id: string; name: string | null; transport: TransportDto }
+/**
+ * A project with every editable field, including the on-host `path` and
+ * `workspace` mode that the display `ProjectDto` omits.
+ */
+export type EditorProjectDto = { id: string; name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string }
+/**
  * A configured host, label-only. The `transport` discriminant is all the UI
  * needs (an icon/badge); the connection details never cross.
  */
 export type HostDto = { id: string; name: string | null; transport: TransportKindDto }
+/**
+ * Form payload for create/edit of a host. The entry id is a separate command
+ * argument, so it is not carried here.
+ */
+export type HostInputDto = { name: string | null; transport: TransportDto }
 /**
  * A configured project: its label, the host it lives on, and its default
  * agent. The on-host `path` is intentionally omitted — it is not needed to
  * render the tree and is closer to a connection detail than a label.
  */
 export type ProjectDto = { id: string; name: string | null; hostId: string; agent: string }
+/**
+ * Form payload for create/edit of a project. `host_id` and `agent` are
+ * references to existing entries; converting parses them into ids.
+ */
+export type ProjectInputDto = { name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string }
 export type SessionMetaDto = { projectId: string; sessionId: string; state: SessionStateDto; 
 /**
  * Agent id the sandbox advertises for this session. Untrusted,
@@ -136,9 +255,19 @@ agent: string | null; createdAt: number | null;
 workspacePath: string | null }
 export type SessionStateDto = "live" | "stopped"
 /**
+ * Transport + connection details, shared by the read projection and the write
+ * inputs (it round-trips: what the form shows is what it submits). Internally
+ * tagged on `kind` so the TS side discriminates on a single field.
+ */
+export type TransportDto = { kind: "ssh"; host: string; user: string | null; port: number | null } | { kind: "kubectl"; pod: string; namespace: string | null; context: string | null; container: string | null }
+/**
  * Which transport a host uses — the discriminant only, no connection fields.
  */
 export type TransportKindDto = "ssh" | "kubectl"
+/**
+ * Workspace mode, shared by the read projection and the write inputs.
+ */
+export type WorkspaceModeDto = "worktree" | "shared"
 
 /** tauri-specta globals **/
 
