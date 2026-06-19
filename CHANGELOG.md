@@ -134,6 +134,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The stopped-session screen now names the cause (closes #28). When a tab lands
+  on the in-tab Respawn screen — e.g. an agent that exited immediately and whose
+  tmux session is then gone — the overlay reads "Session stopped: claude:
+  command not found" instead of a bare "Session stopped." The connection keeps a
+  small rolling tail of the PTY output it received; on the stopped transition the
+  dead connection's last meaningful line (escape sequences stripped) becomes the
+  cause. Frontend-only, so the core transport stays agent-opaque; when no usable
+  output was seen the overlay falls back to the bare message. Completes part (b)
+  of the atomic-`remain-on-exit` fix below.
 - A fast-exiting agent now surfaces its error instead of a bare "Stopped"
   (closes #28). `remain-on-exit` is applied **atomically** with `tmux
   new-session`, in the same tmux invocation via tmux's own argv `;` command

@@ -174,7 +174,17 @@ export class SessionStore {
     } catch (e) {
       if (t.cancelled || this.disposed) return;
       const fate = reconnectFate(e);
-      if (fate === "stopped") return this.setStatus(key, "stopped", null);
+      if (fate === "stopped") {
+        // The session is gone, but the now-dead connection still holds the last
+        // bytes it received — surface them as the cause so a fast-exiting agent
+        // reads "Session stopped: claude: command not found" instead of a bare
+        // message (#28). `tab.connection` is the dead one (not yet swapped).
+        return this.setStatus(
+          key,
+          "stopped",
+          tab.connection.lastOutput() || null,
+        );
+      }
       if (fate === "terminal")
         return this.setStatus(key, "disconnected", errorMessage(e));
       // retry: schedule next attempt with capped backoff, threading the SAME

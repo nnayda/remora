@@ -189,7 +189,7 @@ function App() {
               >
                 {t.status === "stopped" ? (
                   <div className="pane-status" role="status">
-                    <p>Session stopped.</p>
+                    <p>Session stopped{t.error ? `: ${t.error}` : "."}</p>
                     <button
                       type="button"
                       onClick={() => void respawnTab(t.key)}

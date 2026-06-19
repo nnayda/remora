@@ -11,6 +11,7 @@ function makeConn(): SessionConnection {
     resize: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
     closed: false,
+    lastOutput: () => "",
   };
 }
 
@@ -236,7 +237,8 @@ describe("SessionStore", () => {
 // ─── Reconnect state machine tests ───────────────────────────────────────────
 
 // Minimal fake connection that lets the test drive death + capture close().
-function fakeConn() {
+// `lastOutput` is the cause line this connection would surface (#28).
+function fakeConn(lastOutput = "") {
   let closeListener: (() => void) | null = null;
   let closedFlag = false;
   const conn: SessionConnection = {
@@ -256,6 +258,7 @@ function fakeConn() {
     get closed() {
       return closedFlag;
     },
+    lastOutput: () => lastOutput,
   };
   return { conn, die: () => closeListener?.(), wasClosed: () => closedFlag };
 }
@@ -276,8 +279,11 @@ function fakeClock() {
   };
 }
 
-function makeStore(overrides: Partial<StoreOpeners> = {}) {
-  const spawned = fakeConn();
+function makeStore(
+  overrides: Partial<StoreOpeners> = {},
+  spawnedLastOutput = "",
+) {
+  const spawned = fakeConn(spawnedLastOutput);
   const clock = fakeClock();
   const openers: StoreOpeners = {
     spawn: () => Promise.resolve({ connection: spawned.conn, attached: false }),
@@ -322,7 +328,27 @@ describe("SessionStore reconnect machine", () => {
     spawned.die();
     await Promise.resolve();
     await Promise.resolve();
-    expect(store.getSnapshot().tabs[0].status).toBe("stopped");
+    const tab = store.getSnapshot().tabs[0];
+    expect(tab.status).toBe("stopped");
+    // No usable last output → no cause (overlay reads a bare "Session stopped.").
+    expect(tab.error).toBeNull();
+  });
+
+  it("death → stopped carries the dead connection's last output as the cause", async () => {
+    const { store, spawned } = makeStore(
+      {
+        attach: () =>
+          Promise.reject({ kind: "sessionNotFound", message: "gone" }),
+      },
+      "claude: command not found",
+    );
+    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    spawned.die();
+    await Promise.resolve();
+    await Promise.resolve();
+    const tab = store.getSnapshot().tabs[0];
+    expect(tab.status).toBe("stopped");
+    expect(tab.error).toBe("claude: command not found");
   });
 
   it("death → disconnected with cause on a config error (no retry loop)", async () => {
