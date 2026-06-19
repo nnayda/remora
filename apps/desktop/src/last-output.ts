@@ -20,9 +20,11 @@ const CSI = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 // OSC: ESC ] … terminated by BEL (\x07) or ST (ESC \). Window-title sets, etc.
 // biome-ignore lint/suspicious/noControlCharactersInRegex: matching terminal escapes requires the ESC/BEL bytes.
 const OSC = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
-// Any other escape: ESC followed by one byte (charset selects like ESC ( B, etc).
+// Any other escape: ESC, optional intermediate bytes (0x20-0x2F, e.g. the `(`
+// in a charset select `ESC ( B`), then an optional final byte (0x30-0x7E). The
+// trailing `?` also sweeps a lone ESC left dangling at the tail cut.
 // biome-ignore lint/suspicious/noControlCharactersInRegex: matching terminal escapes requires the ESC byte.
-const ESC = /\x1b[@-Z\\-_]?/g;
+const ESC = /\x1b[ -/]*[0-~]?/g;
 // Remaining C0 control chars except \t (\x09), \n (\x0a), \r (\x0d).
 // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping terminal control bytes is the point.
 const CTRL = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;

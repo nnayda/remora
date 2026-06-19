@@ -17,6 +17,14 @@ describe("extractCause", () => {
     ).toBe("claude: command not found");
   });
 
+  it("strips charset-select escapes (ESC ( B and friends)", () => {
+    // A two-intermediate escape the agent emits to pick the ASCII charset; the
+    // ESC, the `(` intermediate, and the `B` final must all be consumed.
+    expect(extractCause(enc("\x1b(Bclaude: command not found\n"))).toBe(
+      "claude: command not found",
+    );
+  });
+
   it("strips OSC sequences (e.g. window-title sets)", () => {
     // OSC 0 ; title BEL — a title set tmux/agents emit; must not leak into text.
     expect(extractCause(enc("\x1b]0;some title\x07auth failed\n"))).toBe(
