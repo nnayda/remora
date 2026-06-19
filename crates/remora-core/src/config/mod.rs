@@ -2,8 +2,13 @@
 //!
 //! One human-editable TOML file per device (ADR-0004). Hosts and projects
 //! are *configured* here; sessions are never stored — they are discovered
-//! live from each host and joined back to this config. The app never
-//! rewrites this file: types here are deserialize-only by design.
+//! live from each host and joined back to this config.
+//!
+//! The types here are the validated, read-only *view*. The app can also
+//! *write* this file (add/edit/remove hosts, projects, agents) through
+//! [`ConfigDocument`], which preserves comments and re-uses the validation
+//! below as its single source of truth — see ADR-0006. (This supersedes the
+//! original "deserialize-only, never rewritten" stance from ADR-0004.)
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -11,6 +16,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub use remora_protocol::{AgentId, InvalidIdError, ProjectId};
+
+pub mod document;
+pub use document::ConfigDocument;
 
 /// Location of the per-device config file *relative to the OS config dir*
 /// (ADR-0004: one human-editable TOML per device). The subdir + filename are
@@ -189,6 +197,16 @@ pub enum ConfigError {
     /// reported, not just the first.
     #[error("{}", display_issues(.0))]
     Invalid(Vec<ValidationIssue>),
+    /// A rejected in-app edit (insert/update/remove). Carries the rendered,
+    /// already-sanitized reason. Distinct from `Invalid` (a whole-file load
+    /// failure) so the editor channel can surface it on the offending form.
+    #[error("{0}")]
+    Edit(String),
+    /// The format-preserving editor could not parse the document. After
+    /// [`Config::from_toml_str`] accepts the input this should not occur; it
+    /// exists so the editor never has to unwrap a `toml_edit` parse.
+    #[error("config document parse error: {0}")]
+    DocumentParse(String),
 }
 
 /// One semantic problem in an otherwise well-formed config file.
