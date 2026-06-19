@@ -134,6 +134,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A fast-exiting agent now surfaces its error instead of a bare "Stopped"
+  (closes #28). `remain-on-exit` is applied **atomically** with `tmux
+  new-session`, in the same tmux invocation via tmux's own argv `;` command
+  separator (shell-quoted so the remote login shell passes it through), rather
+  than as a separate follow-up `set-option`. Previously an agent that exited
+  immediately — a bad flag, an auth error, or the binary missing from the
+  non-login PATH — could die in the window between `new-session` returning and
+  the option landing, destroying the session before its pane (and the real
+  error, e.g. `claude: command not found`) could be retained; the follow-up
+  attach then hit "no sessions" and the failure surfaced as an opaque "Session
+  Stopped." With the option set atomically, the dead pane is retained, the
+  session lists as live, and the attach shows the agent's actual error.
 - Quitting the agent drops to a usable shell instead of a dead pane (closes
   #30). The agent is no longer the tmux pane's top-level process: it is wrapped
   so a clean or user-interrupted exit (status 0, 130 SIGINT/Ctrl-C, 143
