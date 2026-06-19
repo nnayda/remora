@@ -10,8 +10,13 @@ import {
   spawnSession,
   writeSession,
 } from "./bridge";
+import { extractCause } from "./last-output";
 
 export type { BridgeOutput, OnOutput };
+
+/** Bytes of trailing PTY output retained for `lastOutput` (#28). Enough for a
+ * few screens of text; bounds memory against a chatty or looping pane. */
+const TAIL_CAP = 8192;
 
 /** One open bridge channel: a buffered output stream plus input controls. */
 export interface SessionConnection {
@@ -25,6 +30,10 @@ export interface SessionConnection {
   close(): Promise<void>;
   /** True once a `{ event: "closed" }` message has been observed. */
   readonly closed: boolean;
+  /** Last meaningful line of the output this channel received (#28): turns a
+   * bare "Session stopped." into one that names the cause (e.g. an agent's
+   * `command not found`). Empty string when no usable output was seen. */
+  lastOutput(): string;
 }
 
 /** How a connection opens its channel: a bridge call wired to an OnOutput. */
@@ -46,8 +55,16 @@ export async function openConnection(open: Opener): Promise<SessionConnection> {
   const buffer: BridgeOutput[] = [];
   let closed = false;
   const closeListeners = new Set<() => void>();
+  // Rolling tail of received bytes, capped at TAIL_CAP. Tracked independently of
+  // `subscriber`/`buffer` (those are the subscribe-handoff path) so it survives
+  // regardless of whether a terminal is attached when the channel dies.
+  let tail: number[] = [];
 
   const onOutput: OnOutput = (msg) => {
+    if (msg.event === "bytes") {
+      tail.push(...msg.bytes);
+      if (tail.length > TAIL_CAP) tail = tail.slice(tail.length - TAIL_CAP);
+    }
     if (msg.event === "closed" && !closed) {
       // First close TRANSITION: fire death listeners exactly once, then clear
       // so a second `closed` event (or a lingering listener) can't re-trigger
@@ -68,6 +85,9 @@ export async function openConnection(open: Opener): Promise<SessionConnection> {
   return {
     get closed() {
       return closed;
+    },
+    lastOutput() {
+      return extractCause(Uint8Array.from(tail));
     },
     subscribe(onMessage) {
       subscriber = onMessage;

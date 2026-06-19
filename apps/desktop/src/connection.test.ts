@@ -83,6 +83,44 @@ describe("connection.onClose", () => {
   });
 });
 
+describe("connection.lastOutput", () => {
+  it("returns the cause line from the bytes the channel received", async () => {
+    const f = fakeOpener();
+    const conn = await openConnection(f.open);
+    f.emit({
+      event: "bytes",
+      bytes: [...new TextEncoder().encode("booting\n")],
+    });
+    f.emit({
+      event: "bytes",
+      bytes: [...new TextEncoder().encode("claude: command not found\n")],
+    });
+    f.emit({ event: "closed" });
+    expect(conn.lastOutput()).toBe("claude: command not found");
+  });
+
+  it("is empty when no output was ever received", async () => {
+    const f = fakeOpener();
+    const conn = await openConnection(f.open);
+    f.emit({ event: "closed" });
+    expect(conn.lastOutput()).toBe("");
+  });
+
+  it("keeps only the tail when output exceeds the cap", async () => {
+    const f = fakeOpener();
+    const conn = await openConnection(f.open);
+    // A burst far larger than the 8 KB cap: the early bytes must be dropped, the
+    // final line preserved.
+    const filler = `${"a".repeat(20000)}\n`;
+    f.emit({ event: "bytes", bytes: [...new TextEncoder().encode(filler)] });
+    f.emit({
+      event: "bytes",
+      bytes: [...new TextEncoder().encode("final line\n")],
+    });
+    expect(conn.lastOutput()).toBe("final line");
+  });
+});
+
 beforeEach(() => {
   for (const f of Object.values(b)) f.mockReset();
 });
