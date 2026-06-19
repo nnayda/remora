@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Config write-back foundation (core): `remora-core` can now create, edit, and
+  remove hosts, projects, and agents in the per-device `config.toml` via a new
+  `ConfigDocument` (toml_edit) that preserves comments and formatting. Every
+  mutation re-validates through the existing load-time checks, so referential
+  integrity and validate-before-save come for free; explicit insert/update
+  guard against silently overwriting an existing entry; and saves are atomic
+  (temp + rename, `0600` on unix, symlink-preserving, never persisting a file
+  the app could not reload). A degraded `parse_lenient` mode recovers a
+  hand-broken file in place. First slice of #32 (ADR-0006); the bridge editor
+  channel and management UI land in follow-ups.
 - Config-driven new-session dialog (desktop): the "New session" dialog now
   picks a **project** and **agent** from the per-device config instead of
   free-text fields that could silently mismatch the TOML. The project dropdown
