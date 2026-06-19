@@ -46,23 +46,32 @@ impl ConfigDocument {
         Ok(Self { doc, strict: true })
     }
 
-    /// Opens a *syntactically* valid file that may be **semantically invalid**,
-    /// returning the document plus every validation issue found. This is the
-    /// degraded-mode recovery path: the UI shows what's broken and lets the
-    /// user delete/replace the offending entry without the whole file having to
-    /// be valid first. Only the TOML grammar can fail here.
+    /// Opens a file the schema can still deserialize but that may be
+    /// **semantically invalid**, returning the document plus every validation
+    /// issue found. This is the degraded-mode recovery path: the UI shows what's
+    /// broken and lets the user delete/replace the offending entry without the
+    /// whole file having to be valid first.
+    ///
+    /// Two kinds of failure are *not* recoverable this way and surface as
+    /// `Err`: a TOML grammar error (`toml_edit` cannot parse it), and a
+    /// structural/type error where the schema cannot even deserialize the
+    /// document (a section that is not a table, a field of the wrong type, …).
+    /// Those carry no per-entry [`ValidationIssue`] the editor could act on, so
+    /// the caller is told the file is unopenable rather than handed a document
+    /// that silently pretends to be clean. A fully valid file comes back as a
+    /// strict document (its edits re-validate like any normal load).
     pub fn parse_lenient(input: &str) -> Result<(Self, Vec<ValidationIssue>), ConfigError> {
         let doc = input
             .parse::<DocumentMut>()
             .map_err(|e| ConfigError::DocumentParse(e.to_string()))?;
-        let issues = match Config::from_toml_str(input) {
-            Ok(_) => Vec::new(),
-            Err(ConfigError::Invalid(issues)) => issues,
-            // A pure syntax/io error can't happen (toml_edit just parsed it);
-            // anything else carries no per-entry issues to surface.
-            Err(_) => Vec::new(),
+        let (strict, issues) = match Config::from_toml_str(input) {
+            Ok(_) => (true, Vec::new()),
+            Err(ConfigError::Invalid(issues)) => (false, issues),
+            // A structural/type error (toml deserialize) leaves nothing the
+            // editor can repair entry-by-entry; surface it, don't hide it.
+            Err(e) => return Err(e),
         };
-        Ok((Self { doc, strict: false }, issues))
+        Ok((Self { doc, strict }, issues))
     }
 
     /// Serializes the document back to TOML, preserving comments and layout.
@@ -262,7 +271,12 @@ fn ensure_present(
 /// table); comments on other keys and unrelated tables are preserved.
 fn set_entry(doc: &mut DocumentMut, section: &str, id: &str, item: Item) {
     let root = doc.as_table_mut();
-    if !root.contains_key(section) {
+    // Create the parent when it is missing *or* present but not table-like, so
+    // the insert below can never silently no-op against a stray scalar of the
+    // same name. (`parse_lenient` now rejects a non-table section up front, so
+    // this is defence-in-depth; an inline `section = { … }` is already
+    // table-like and is left untouched.)
+    if !root.get(section).map(Item::is_table_like).unwrap_or(false) {
         let mut parent = Table::new();
         // Implicit parent => emit `[hosts.devbox]`, never a standalone `[hosts]`.
         parent.set_implicit(true);
@@ -571,6 +585,45 @@ mod tests {
             ConfigDocument::parse_lenient("[hosts.a]\ntransport = \"telnet\"\n").expect("lenient");
         // A degraded document is invalid; config() must surface that, not panic.
         assert!(matches!(doc.config(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn parse_lenient_rejects_a_structural_error_instead_of_faking_clean() {
+        // Grammatically valid TOML, but `hosts` is a string, not a table: the
+        // schema can't deserialize it, so there are no per-entry issues to
+        // recover. Lenient parse must surface the error, not hand back a doc
+        // that reports zero issues while silently mutating nothing.
+        let (doc, issues) = match ConfigDocument::parse_lenient("hosts = \"oops\"\n") {
+            Ok(ok) => ok,
+            Err(e) => {
+                assert!(matches!(e, ConfigError::Parse(_)), "{e:?}");
+                return;
+            }
+        };
+        panic!(
+            "expected a structural error, got a degraded doc: {issues:?}\n{}",
+            doc.to_toml()
+        );
+    }
+
+    #[test]
+    fn parse_lenient_of_a_valid_file_yields_a_strict_doc() {
+        // A clean file has nothing to recover, so lenient parse returns a strict
+        // document: a later edit that breaks referential integrity is rejected,
+        // exactly as on the normal load path.
+        let (mut doc, issues) = ConfigDocument::parse_lenient(LINKED).expect("valid file opens");
+        assert!(issues.is_empty(), "a valid file has no issues: {issues:?}");
+        let dangling = Project {
+            name: None,
+            host: hid("devbox"),
+            path: "/x".into(),
+            workspace: WorkspaceMode::Worktree,
+            agent: aid("nope"),
+        };
+        let err = doc
+            .insert_project(&pid("api2"), &dangling)
+            .expect_err("strict doc must re-validate and reject a dangling agent ref");
+        assert!(matches!(err, ConfigError::Invalid(_)), "{err:?}");
     }
 
     #[test]
