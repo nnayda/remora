@@ -35,6 +35,9 @@ const CTRL = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
  * visible text remains. A `\r`-overwritten line yields only its final segment.
  */
 export function extractCause(bytes: Uint8Array, maxLen = 200): string {
+  // Clamp to a positive integer so a stray 0/negative/fractional/NaN argument
+  // can't slip into the `slice(0, limit - 1)` path and mangle the cap.
+  const limit = Number.isFinite(maxLen) ? Math.max(1, Math.trunc(maxLen)) : 200;
   const text = new TextDecoder("utf-8", { fatal: false })
     .decode(bytes)
     .replace(OSC, "")
@@ -52,6 +55,6 @@ export function extractCause(bytes: Uint8Array, maxLen = 200): string {
     if (trimmed) last = trimmed;
   }
 
-  if (last.length <= maxLen) return last;
-  return `${last.slice(0, maxLen - 1)}…`;
+  if (last.length <= limit) return last;
+  return `${last.slice(0, limit - 1)}…`;
 }

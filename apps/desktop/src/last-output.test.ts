@@ -59,6 +59,14 @@ describe("extractCause", () => {
     expect(extractCause(new Uint8Array())).toBe("");
   });
 
+  it("clamps a non-positive or fractional maxLen instead of mis-truncating", () => {
+    // maxLen <= 0 must not fall into the slice(0, -1) footgun; clamp to >= 1.
+    expect(extractCause(enc("hello world\n"), 0)).toBe("…");
+    expect(extractCause(enc("hello world\n"), -5)).toBe("…");
+    // Fractional limits truncate to an integer (limit 3 → 2 chars + ellipsis).
+    expect(extractCause(enc("hello\n"), 3.9)).toBe("he…");
+  });
+
   it("truncates a long line to maxLen with an ellipsis", () => {
     const long = "x".repeat(300);
     const out = extractCause(enc(`${long}\n`), 200);
