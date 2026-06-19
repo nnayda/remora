@@ -187,7 +187,7 @@ pub struct ProjectInputDto {
 
 impl ProjectInputDto {
     /// Parses the `host_id`/`agent` reference slugs into ids. A malformed slug
-    /// is an [`BridgeError::InvalidId`]; *referential* validity (the host/agent
+    /// yields [`BridgeError::InvalidId`]; *referential* validity (the host/agent
     /// actually existing) is enforced later by the core's re-validation.
     pub fn into_project(self) -> Result<Project, BridgeError> {
         let invalid = |e: remora_protocol::InvalidIdError| BridgeError::InvalidId {

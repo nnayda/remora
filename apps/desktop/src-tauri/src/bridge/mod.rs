@@ -369,22 +369,48 @@ impl Bridge {
     /// empty document (a fresh device edits from scratch); an unreadable file is
     /// a `Config` load error; an existing-but-invalid file is a `ConfigEdit` (it
     /// blocks the edit, shown on the form).
+    ///
+    /// Applies the same guards as [`Config::load`] — refuse a non-regular file
+    /// (FIFO/dir/device) or an implausibly large one — so a hostile config path
+    /// can't hang or OOM the edit while it holds `config_mutex`.
     fn read_document(&self) -> Result<ConfigDocument, BridgeError> {
-        let raw = match std::fs::read_to_string(&self.config_path) {
-            Ok(s) => s,
+        let path = &self.config_path;
+        let config_err = |msg: String| BridgeError::Config { message: msg };
+        let raw = match std::fs::metadata(path) {
+            Ok(meta) => {
+                if !meta.is_file() {
+                    return Err(config_err(format!(
+                        "cannot read config file `{}`: not a regular file",
+                        path.display()
+                    )));
+                }
+                if meta.len() > MAX_EDIT_CONFIG_BYTES {
+                    return Err(config_err(format!(
+                        "config file `{}` is {} bytes; refusing to read more than {MAX_EDIT_CONFIG_BYTES}",
+                        path.display(),
+                        meta.len()
+                    )));
+                }
+                std::fs::read_to_string(path).map_err(|e| {
+                    config_err(format!("cannot read config file `{}`: {e}", path.display()))
+                })?
+            }
+            // A missing file is a fresh device: edit from an empty document.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => {
-                return Err(BridgeError::Config {
-                    message: format!(
-                        "cannot read config file `{}`: {e}",
-                        self.config_path.display()
-                    ),
-                })
+                return Err(config_err(format!(
+                    "cannot read config file `{}`: {e}",
+                    path.display()
+                )))
             }
         };
         ConfigDocument::parse(&raw).map_err(config_edit)
     }
 }
+
+/// Upper bound on a plausible hand-edited config, mirroring the private cap in
+/// [`Config::load`]. Keep in step with it.
+const MAX_EDIT_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// Rejected mutations carry the rendered `ConfigError` (already sanitized via
 /// `config.rs`); the frontend shows it inline on the form.
@@ -1195,6 +1221,73 @@ mod tests {
         assert!(json.contains("secret-hostname"), "{json}");
         assert!(json.contains("rootuser"), "{json}");
         assert!(json.contains("2222"), "{json}");
+    }
+
+    #[tokio::test]
+    async fn update_and_remove_missing_id_are_config_edit() {
+        let (b, path) = editor_bridge("missing-id");
+        let upd = b
+            .config_update_host("ghost".into(), ssh_input())
+            .await
+            .expect_err("update of a missing id must be rejected");
+        let rem = b
+            .config_remove_agent("ghost".into())
+            .await
+            .expect_err("remove of a missing id must be rejected");
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(upd, BridgeError::ConfigEdit { .. }), "{upd:?}");
+        assert!(matches!(rem, BridgeError::ConfigEdit { .. }), "{rem:?}");
+    }
+
+    #[tokio::test]
+    async fn mutation_on_a_non_regular_config_path_is_config_error() {
+        // A directory at the config path: metadata says not-a-regular-file, so
+        // the editor read must refuse it (the size/is_file guard) and classify
+        // it as a load error, not an inline edit rejection.
+        let b = bridge_with_config(Arc::new(FakeSessionSource::new()), std::env::temp_dir());
+        let err = b
+            .config_insert_host("devbox".into(), ssh_input())
+            .await
+            .expect_err("a non-regular config path must be rejected");
+        assert!(matches!(err, BridgeError::Config { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn mutation_on_a_malformed_base_is_config_edit() {
+        let path = temp_config_path("malformed-edit");
+        std::fs::write(&path, "this is = not = valid = toml =").expect("write");
+        let b = bridge_with_config(Arc::new(FakeSessionSource::new()), path.clone());
+        let err = b
+            .config_insert_host("devbox".into(), ssh_input())
+            .await
+            .expect_err("editing a malformed base must be rejected");
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(err, BridgeError::ConfigEdit { .. }), "{err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_inserts_do_not_lose_updates() {
+        let path = temp_config_path("concurrent");
+        std::fs::remove_file(&path).ok();
+        let b = Arc::new(bridge_with_config(
+            Arc::new(FakeSessionSource::new()),
+            path.clone(),
+        ));
+        // Two overlapping inserts of distinct hosts. The mutex serializes the
+        // load → mutate → save critical section and each mutation re-reads
+        // fresh, so both must land — without the lock a read-modify-write race
+        // would drop one (last writer wins).
+        let (b1, b2) = (Arc::clone(&b), Arc::clone(&b));
+        let t1 =
+            tokio::spawn(async move { b1.config_insert_host("hosta".into(), ssh_input()).await });
+        let t2 =
+            tokio::spawn(async move { b2.config_insert_host("hostb".into(), ssh_input()).await });
+        t1.await.expect("join 1").expect("insert a");
+        t2.await.expect("join 2").expect("insert b");
+        let dto = b.config_editable().expect("editable");
+        std::fs::remove_file(&path).ok();
+        assert!(dto.hosts.iter().any(|h| h.id == "hosta"), "{dto:?}");
+        assert!(dto.hosts.iter().any(|h| h.id == "hostb"), "{dto:?}");
     }
 
     // End-to-end through the REAL ConfigResolver (the routing tests above use
