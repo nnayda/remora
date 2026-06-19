@@ -1,11 +1,11 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { NewSessionDialog } from "./NewSessionDialog";
 import { Sidebar } from "./Sidebar";
 import { OPEN_CANCELLED } from "./session-store";
 import { buildTree, type SessionNode } from "./session-tree";
 import { TabBar } from "./TabBar";
-import { Terminal } from "./Terminal";
+import { Terminal, type TerminalHandle } from "./Terminal";
 import { discoveryStore, useDiscovery } from "./useDiscovery";
 import { useReconnect } from "./useReconnect";
 import { sessionStore, useSessions } from "./useSessions";
@@ -30,10 +30,38 @@ function App() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const newButtonRef = useRef<HTMLButtonElement>(null);
+  // Live focus handles for the mounted terminal panes, keyed by tab key.
+  const terminals = useRef(new Map<string, TerminalHandle>());
+  // Intent flag: set by tab/sidebar selection so the activeKey effect knows the
+  // change was a user pick (focus its terminal) versus a dialog spawn or
+  // background reconnect (leave focus alone). Consumed once per selection.
+  const focusOnSelect = useRef(false);
 
   // Recompute the tree only when config or the polled session list changes.
   const tree = useMemo(() => buildTree(config, sessions), [config, sessions]);
   const openKeys = useMemo(() => new Set(tabs.map((t) => t.key)), [tabs]);
+
+  // Status of the active tab, so the focus effect re-fires when a freshly opened
+  // or respawned session goes live (a stopped/reconnecting tab renders a
+  // placeholder or a not-yet-ready terminal until it does).
+  const activeStatus = tabs.find((t) => t.key === activeKey)?.status ?? null;
+
+  // Focus the now-active terminal once it's live and its pane has mounted.
+  // Gated by focusOnSelect so only an explicit tab/sidebar selection grabs focus
+  // — the dialog spawn path keeps focus on newButtonRef. The intent flag is held
+  // (not consumed) until the terminal exists, so opening a new session or
+  // reopening a stopped one — which mount the terminal a tick or two after
+  // activeKey flips — still lands focus. Focus is deferred to the next frame so a
+  // just-opened xterm has its input ready to accept it.
+  useEffect(() => {
+    if (!focusOnSelect.current) return;
+    if (activeKey === null || activeStatus !== "live") return; // wait for live
+    const handle = terminals.current.get(activeKey);
+    if (!handle) return; // terminal not mounted yet; stay armed for when it is
+    focusOnSelect.current = false;
+    const raf = requestAnimationFrame(() => handle.focus());
+    return () => cancelAnimationFrame(raf);
+  }, [activeKey, activeStatus]);
 
   /** Open a session clicked in the sidebar, routing by its discovered state:
    * live → attach/focus, stopped → respawn. Reuses the dialog's deduping path
@@ -42,6 +70,7 @@ function App() {
    * (handleOpened) refreshes. */
   function openFromSidebar(node: SessionNode) {
     setNotice(null);
+    focusOnSelect.current = true;
     if (node.state === "stopped") {
       void openViaRespawn({
         projectId: node.projectId,
@@ -49,10 +78,17 @@ function App() {
         agent: node.agent,
       })
         .then((r) => {
-          if (!r.ok && r.error !== OPEN_CANCELLED)
+          if (!r.ok && r.error !== OPEN_CANCELLED) {
+            // A failed open never changes activeKey, so the intent flag would
+            // stay armed and steal focus on the next unrelated change. Disarm.
+            focusOnSelect.current = false;
             setNotice("Could not respawn the session.");
+          }
         })
-        .catch(() => setNotice("Could not respawn the session."));
+        .catch(() => {
+          focusOnSelect.current = false;
+          setNotice("Could not respawn the session.");
+        });
       return;
     }
     // openSession resolves (never rejects) with {ok:false} on failure — e.g. a
@@ -65,10 +101,13 @@ function App() {
     })
       .then((result) => {
         if (!result.ok && result.error !== OPEN_CANCELLED) {
+          // See the respawn path: disarm so a no-op open can't leak focus.
+          focusOnSelect.current = false;
           setNotice("Could not open the session. It may have stopped.");
         }
       })
       .catch(() => {
+        focusOnSelect.current = false;
         setNotice("Could not open the session. It may have stopped.");
       });
   }
@@ -107,6 +146,15 @@ function App() {
           activeKey={activeKey}
           onFocus={(key) => {
             setNotice(null);
+            // Re-selecting the active tab leaves activeKey unchanged, so the
+            // effect won't fire — focus its (already-visible) terminal directly
+            // and leave the intent flag disarmed.
+            if (key === activeKey) {
+              focusOnSelect.current = false;
+              terminals.current.get(key)?.focus();
+              return;
+            }
+            focusOnSelect.current = true;
             focusTab(key);
           }}
           onClose={(key) => {
@@ -115,6 +163,9 @@ function App() {
           }}
           onNew={() => {
             setNotice(null);
+            // Drop any unconsumed selection intent so spawning from the dialog
+            // doesn't later yank focus off newButtonRef onto the new terminal.
+            focusOnSelect.current = false;
             setDialogOpen(true);
           }}
           newButtonRef={newButtonRef}
@@ -157,7 +208,13 @@ function App() {
                     </button>
                   </div>
                 ) : (
-                  <Terminal connection={t.connection} />
+                  <Terminal
+                    connection={t.connection}
+                    ref={(h) => {
+                      if (h) terminals.current.set(t.key, h);
+                      else terminals.current.delete(t.key);
+                    }}
+                  />
                 )}
               </div>
             ))

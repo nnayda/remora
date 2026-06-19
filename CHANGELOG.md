@@ -131,3 +131,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   later stages. Adds the `portable-pty` dependency.
 - Project scaffold: pnpm + Cargo workspaces, Tauri 2 desktop app skeleton,
   `remora-core` / `remora-protocol` crates, CI, and community docs.
+
+### Fixed
+
+- Quitting the agent drops to a usable shell instead of a dead pane (closes
+  #30). The agent is no longer the tmux pane's top-level process: it is wrapped
+  so a clean or user-interrupted exit (status 0, 130 SIGINT/Ctrl-C, 143
+  SIGTERM) execs an interactive login shell in the same worktree — the pane
+  stays alive with a real prompt and the full login PATH, so the agent is
+  re-runnable. Any other non-zero exit (a real crash, bad flag, or
+  `command not found`) still propagates so `remain-on-exit` keeps the dead pane
+  and its error inspectable (preserving #28).

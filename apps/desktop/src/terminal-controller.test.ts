@@ -17,6 +17,7 @@ const xt = vi.hoisted(() => {
     open = vi.fn();
     dispose = vi.fn();
     loadAddon = vi.fn();
+    focus = vi.fn();
     constructor() {
       state.term = this;
     }
@@ -181,6 +182,21 @@ describe("TerminalController", () => {
     conn.write.mockClear();
     xt.state.term?.dataCb?.("x");
     expect(conn.write).not.toHaveBeenCalled();
+  });
+
+  it("focus() moves keyboard focus into the emulator", () => {
+    const conn = fakeConn();
+    const c = new TerminalController(el, conn as unknown as SessionConnection);
+    c.focus();
+    expect(xt.state.term?.focus).toHaveBeenCalled();
+  });
+
+  it("focus() is a no-op after the session is closed", () => {
+    const conn = fakeConn();
+    const c = new TerminalController(el, conn as unknown as SessionConnection);
+    conn.emit({ event: "closed" });
+    c.focus();
+    expect(xt.state.term?.focus).not.toHaveBeenCalled();
   });
 
   it("dispose tears down observer, subscription, onData, and terminal", () => {

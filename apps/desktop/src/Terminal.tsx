@@ -1,15 +1,38 @@
-import { useEffect, useRef } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 import type { SessionConnection } from "./connection";
 import { TerminalController } from "./terminal-controller";
 
-/** Thin React shell: own a div, construct/dispose a TerminalController on it. */
-export function Terminal({ connection }: { connection: SessionConnection }) {
-  const ref = useRef<HTMLDivElement>(null);
+/** Imperative handle exposed to parents so they can move keyboard focus into
+ * the emulator (e.g. when this pane becomes the active session). */
+export interface TerminalHandle {
+  focus(): void;
+}
+
+/** Thin React shell: own a div, construct/dispose a TerminalController on it,
+ * and expose a `focus()` handle so the parent can focus the emulator once this
+ * pane is the visible one. */
+export const Terminal = forwardRef<
+  TerminalHandle,
+  { connection: SessionConnection }
+>(function Terminal({ connection }, ref) {
+  const elRef = useRef<HTMLDivElement>(null);
+  const controllerRef = useRef<TerminalController | null>(null);
   useEffect(() => {
-    const el = ref.current;
+    const el = elRef.current;
     if (!el) return;
     const controller = new TerminalController(el, connection);
-    return () => controller.dispose();
+    controllerRef.current = controller;
+    return () => {
+      controller.dispose();
+      controllerRef.current = null;
+    };
   }, [connection]);
-  return <div ref={ref} className="terminal" />;
-}
+  useImperativeHandle(
+    ref,
+    () => ({
+      focus: () => controllerRef.current?.focus(),
+    }),
+    [],
+  );
+  return <div ref={elRef} className="terminal" />;
+});
