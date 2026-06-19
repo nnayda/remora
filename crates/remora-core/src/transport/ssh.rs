@@ -474,11 +474,25 @@ fn run_spawn(
     }
 
     if let Err(err) = create_session(exec, host, plan) {
-        // A non-duplicate failure means no session was created, so the
-        // worktree we just made is orphaned — best-effort remove it so the
-        // slot stays retryable. A duplicate means a live session owns it.
+        // A non-duplicate failure usually means no session was created, so the
+        // worktree we just made is orphaned — best-effort remove it so the slot
+        // stays retryable. A duplicate means a live session already owns it.
+        //
+        // But the lock command is `new-session ';' set-option` sharing one exit
+        // code (#28): a non-zero exit can also mean the session WAS created and
+        // only the trailing set-option failed. Force-removing the worktree then
+        // would yank a LIVE session's cwd out from under it. So gate the cleanup
+        // on a has-session probe and remove only once it confirms no session
+        // exists; if the probe can't run, leave the worktree (better an orphan
+        // than a nuked live session).
         if plan.branch.is_some() && !matches!(err, SourceError::SessionExists { .. }) {
-            let _ = exec.run(&worktree_remove_argv(host, plan));
+            let session_absent = exec
+                .run(&has_session_argv(host, &plan.tmux_name))
+                .map(|out| !out.success)
+                .unwrap_or(false);
+            if session_absent {
+                let _ = exec.run(&worktree_remove_argv(host, plan));
+            }
         }
         return Err(err);
     }
@@ -1263,6 +1277,7 @@ mod tests {
         let fake = FakeExec::new(vec![
             Ok(FakeExec::ok()),                      // worktree add
             Ok(FakeExec::fail("no server running")), // new-session: generic failure
+            Ok(FakeExec::fail("no server running")), // has-session: confirms no session
         ]);
         let err = run_spawn(&fake, &host("devbox", None, None), &plan).expect_err("should fail");
         assert!(matches!(err, SourceError::Transport(_)));
@@ -1272,6 +1287,28 @@ mod tests {
         assert!(
             calls.last().expect("a call").iter().any(|a| a == "remove"),
             "non-duplicate failure removes the orphaned worktree"
+        );
+    }
+
+    #[test]
+    fn live_session_worktree_is_not_removed_when_set_option_fails() {
+        // The atomic new-session+set-option command shares one exit code (#28):
+        // a non-zero exit can mean the session WAS created but the trailing
+        // set-option failed. The session is then live, so its worktree must NOT
+        // be force-removed. A has-session probe gates the orphan cleanup.
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                                               // worktree add
+            Ok(FakeExec::fail("set-option: unknown option: remain-on-exit")), // created, set-option failed
+            Ok(FakeExec::ok()), // has-session: the session IS live
+        ]);
+        let err =
+            run_spawn(&fake, &host("devbox", None, None), &plan).expect_err("transport error");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
+        let calls = fake.calls.lock().expect("lock");
+        assert!(
+            !calls.iter().any(|c| c.iter().any(|a| a == "remove")),
+            "a live session's worktree must never be force-removed"
         );
     }
 
