@@ -132,7 +132,9 @@ function App() {
     void stopSession(node.projectId, node.sessionId).then((r) => {
       if (r.ok) {
         void discoveryStore.refreshAfterOpen();
-      } else {
+      } else if (r.error) {
+        // A bare {ok:false} with no error is the in-flight guard (double-click)
+        // or a disposed store — neither is a real failure, so stay quiet.
         setNotice("Could not stop the session.");
       }
     });

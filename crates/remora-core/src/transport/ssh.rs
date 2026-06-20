@@ -574,7 +574,20 @@ fn worktree_has_work(
     if !rev.success {
         return Err(SourceError::Transport(rev.stderr));
     }
-    let not_on_remote = rev.stdout.trim().parse::<u64>().unwrap_or(0) > 0;
+    // `rev-list --count` always prints a number on success. Unparseable stdout
+    // means the probe result is unreadable — fail safe toward Transport (the
+    // caller then requires `force`), NEVER toward "clean", which would let
+    // `remove` delete a possibly-dirty worktree. Same direction as the !success
+    // guards above.
+    let not_on_remote = match rev.stdout.trim().parse::<u64>() {
+        Ok(count) => count > 0,
+        Err(_) => {
+            return Err(SourceError::Transport(format!(
+                "unparseable rev-list count: {:?}",
+                rev.stdout.trim()
+            )))
+        }
+    };
 
     Ok(match (uncommitted, not_on_remote) {
         (false, false) => None,
@@ -779,6 +792,15 @@ fn run_stop(
 /// Ends a session for good. Worktree mode: optional dirty gate (unless force) →
 /// kill tmux → idempotent worktree remove → idempotent branch delete. Shared
 /// mode: kill tmux only (never touches the project dir).
+///
+/// Accepted limitation: the dirty probe and the kill are separate round-trips,
+/// so a still-running agent could write new uncommitted work in the window
+/// between the probe reading "clean" and tmux dying — that work is then lost to
+/// `worktree remove`. Killing first would close the window but would break the
+/// `WorkspaceDirty` "refuses and changes nothing" contract (a refusal would
+/// leave tmux dead). The window is one round-trip on an explicit, confirmed
+/// teardown of a session the user has decided is done; treated as accepted,
+/// same race class as the cross-client teardown-vs-respawn race (ADR-0004).
 fn run_remove(
     exec: &dyn SshExec,
     host: &SshHost,
@@ -2193,6 +2215,19 @@ mod tests {
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out("")),
             Ok(FakeExec::fail("fatal: bad object HEAD")),
+        ]);
+        let err = worktree_has_work(&fake, &host("devbox", None, None), "~/x").expect_err("err");
+        assert!(matches!(err, SourceError::Transport(_)));
+    }
+
+    #[test]
+    fn worktree_has_work_fails_safe_on_unparseable_count() {
+        // rev-list exits 0 but stdout is not a number (defensive: a future git
+        // or a corrupted stream). Must fail toward Transport, never "clean" —
+        // otherwise `remove` could delete a possibly-dirty worktree.
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("")),          // status: clean
+            Ok(FakeExec::out("garbage\n")), // rev-list: success but non-numeric
         ]);
         let err = worktree_has_work(&fake, &host("devbox", None, None), "~/x").expect_err("err");
         assert!(matches!(err, SourceError::Transport(_)));
