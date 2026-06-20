@@ -220,11 +220,19 @@ mod tests {
         let mut config = Config::default();
         config.projects.insert(
             ProjectId::new("api").expect("id"),
-            Project { name: None, host: HostId::new("h").expect("id"), path: "/p".into(),
-                      workspace: WorkspaceMode::Shared, agent: AgentId::new("claude").expect("id") },
+            Project {
+                name: None,
+                host: HostId::new("h").expect("id"),
+                path: "/p".into(),
+                workspace: WorkspaceMode::Shared,
+                agent: AgentId::new("claude").expect("id"),
+            },
         );
         let dto = ConfigDto::from(config);
-        assert!(matches!(dto.projects[0].workspace, WorkspaceModeDto::Shared));
+        assert!(matches!(
+            dto.projects[0].workspace,
+            WorkspaceModeDto::Shared
+        ));
     }
 
     #[test]

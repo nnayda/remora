@@ -809,8 +809,12 @@ mod tests {
         ) -> Result<SessionChannel, SourceError> {
             unreachable!()
         }
-        async fn stop(&self, _: &ProjectId, _: &SessionId) -> Result<(), SourceError> { unreachable!() }
-        async fn remove(&self, _: &ProjectId, _: &SessionId, _: bool) -> Result<(), SourceError> { unreachable!() }
+        async fn stop(&self, _: &ProjectId, _: &SessionId) -> Result<(), SourceError> {
+            unreachable!()
+        }
+        async fn remove(&self, _: &ProjectId, _: &SessionId, _: bool) -> Result<(), SourceError> {
+            unreachable!()
+        }
         async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
             Ok(vec![
                 SessionMeta {
@@ -969,8 +973,12 @@ mod tests {
         ) -> Result<SessionChannel, SourceError> {
             unreachable!()
         }
-        async fn stop(&self, _: &ProjectId, _: &SessionId) -> Result<(), SourceError> { unreachable!() }
-        async fn remove(&self, _: &ProjectId, _: &SessionId, _: bool) -> Result<(), SourceError> { unreachable!() }
+        async fn stop(&self, _: &ProjectId, _: &SessionId) -> Result<(), SourceError> {
+            unreachable!()
+        }
+        async fn remove(&self, _: &ProjectId, _: &SessionId, _: bool) -> Result<(), SourceError> {
+            unreachable!()
+        }
         async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
             Err(SourceError::Transport("host down".into()))
         }
@@ -1318,36 +1326,72 @@ mod tests {
     #[tokio::test]
     async fn stop_then_list_shows_stopped() {
         let src = Arc::new(FakeSessionSource::new());
-        src.spawn(SpawnSpec { project_id: pid("api"), session_id: sid("x"), agent: None }).await.expect("spawn");
+        src.spawn(SpawnSpec {
+            project_id: pid("api"),
+            session_id: sid("x"),
+            agent: None,
+        })
+        .await
+        .expect("spawn");
         let b = bridge(src);
         b.stop("api".into(), "x".into()).await.expect("stop");
-        assert!(matches!(b.list().await.expect("list")[0].state, SessionStateDto::Stopped));
+        assert!(matches!(
+            b.list().await.expect("list")[0].state,
+            SessionStateDto::Stopped
+        ));
     }
 
     #[tokio::test]
     async fn remove_force_drops_the_session() {
         let src = Arc::new(FakeSessionSource::new());
-        src.spawn(SpawnSpec { project_id: pid("api"), session_id: sid("x"), agent: None }).await.expect("spawn");
+        src.spawn(SpawnSpec {
+            project_id: pid("api"),
+            session_id: sid("x"),
+            agent: None,
+        })
+        .await
+        .expect("spawn");
         let b = bridge(src);
-        b.remove("api".into(), "x".into(), true).await.expect("remove");
+        b.remove("api".into(), "x".into(), true)
+            .await
+            .expect("remove");
         assert!(b.list().await.expect("list").is_empty());
     }
 
     #[tokio::test]
     async fn remove_dirty_maps_to_workspace_dirty() {
         let src = Arc::new(FakeSessionSource::new());
-        src.spawn(SpawnSpec { project_id: pid("api"), session_id: sid("x"), agent: None }).await.expect("spawn");
-        src.mark_dirty(&pid("api"), &sid("x"), remora_core::DirtyReason::Uncommitted);
+        src.spawn(SpawnSpec {
+            project_id: pid("api"),
+            session_id: sid("x"),
+            agent: None,
+        })
+        .await
+        .expect("spawn");
+        src.mark_dirty(
+            &pid("api"),
+            &sid("x"),
+            remora_core::DirtyReason::Uncommitted,
+        );
         let b = bridge(src);
-        let err = b.remove("api".into(), "x".into(), false).await.expect_err("dirty");
+        let err = b
+            .remove("api".into(), "x".into(), false)
+            .await
+            .expect_err("dirty");
         assert!(matches!(err, BridgeError::WorkspaceDirty { .. }));
     }
 
     #[tokio::test]
     async fn stop_remove_reject_invalid_ids() {
         let b = bridge(Arc::new(FakeSessionSource::new()));
-        assert!(matches!(b.stop("API".into(), "x".into()).await, Err(BridgeError::InvalidId { .. })));
-        assert!(matches!(b.remove("API".into(), "x".into(), false).await, Err(BridgeError::InvalidId { .. })));
+        assert!(matches!(
+            b.stop("API".into(), "x".into()).await,
+            Err(BridgeError::InvalidId { .. })
+        ));
+        assert!(matches!(
+            b.remove("API".into(), "x".into(), false).await,
+            Err(BridgeError::InvalidId { .. })
+        ));
     }
 
     #[tokio::test]

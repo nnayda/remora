@@ -154,6 +154,9 @@ mod tests {
             "session `api_fix-login` has uncommitted changes and commits not on any remote that would be lost"
         );
         assert_eq!(DirtyReason::Uncommitted.to_string(), "uncommitted changes");
-        assert_eq!(DirtyReason::NotOnRemote.to_string(), "commits not on any remote");
+        assert_eq!(
+            DirtyReason::NotOnRemote.to_string(),
+            "commits not on any remote"
+        );
     }
 }

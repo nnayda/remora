@@ -69,11 +69,8 @@ pub trait SessionSource: Send + Sync {
     /// Kills the session's tmux session, leaving the worktree intact so the
     /// session surfaces as *stopped* and can be respawned. Idempotent: an
     /// already-absent or already-stopped session is `Ok(())`.
-    async fn stop(
-        &self,
-        project_id: &ProjectId,
-        session_id: &SessionId,
-    ) -> Result<(), SourceError>;
+    async fn stop(&self, project_id: &ProjectId, session_id: &SessionId)
+        -> Result<(), SourceError>;
 
     /// Permanently destroys the session: kills the tmux session, then for
     /// worktree-mode projects removes the worktree directory and branch.

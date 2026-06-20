@@ -77,8 +77,10 @@ impl From<SourceError> for BridgeError {
             SourceError::ChannelClosed => BridgeError::ChannelClosed,
             SourceError::Plan(_) => BridgeError::Plan { message },
             // WorkspaceDirty must be placed BEFORE the catch-all.
-            SourceError::WorkspaceDirty { reason, .. } =>
-                BridgeError::WorkspaceDirty { message, reason: reason.into() },
+            SourceError::WorkspaceDirty { reason, .. } => BridgeError::WorkspaceDirty {
+                message,
+                reason: reason.into(),
+            },
             // #[non_exhaustive]: unknown future variants degrade to Transport.
             _ => BridgeError::Transport { message },
         }
@@ -174,7 +176,10 @@ mod tests {
                 session_id: SessionId::new("x").expect("slug"),
                 reason: remora_core::DirtyReason::NotOnRemote,
             }),
-            BridgeError::WorkspaceDirty { reason: DirtyReasonDto::NotOnRemote, .. }
+            BridgeError::WorkspaceDirty {
+                reason: DirtyReasonDto::NotOnRemote,
+                ..
+            }
         ));
     }
 

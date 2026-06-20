@@ -186,7 +186,12 @@ fn worktree_remove_argv(host: &SshHost, project_path: &str, dir: &str) -> Vec<St
 /// `tmux kill-session -t <name>`.
 fn kill_session_argv(host: &SshHost, tmux_name: &str) -> Vec<String> {
     let mut argv = ssh_base_argv(host, false);
-    argv.extend(["tmux".into(), "kill-session".into(), "-t".into(), tmux_name.into()]);
+    argv.extend([
+        "tmux".into(),
+        "kill-session".into(),
+        "-t".into(),
+        tmux_name.into(),
+    ]);
     argv
 }
 
@@ -582,7 +587,9 @@ fn worktree_has_work(
 /// `git worktree remove` stderr meaning the worktree is already gone — so a
 /// retry after a partial removal converges instead of erroring (D4).
 fn stderr_signals_worktree_absent(stderr: &str) -> bool {
-    stderr.to_ascii_lowercase().contains("is not a working tree")
+    stderr
+        .to_ascii_lowercase()
+        .contains("is not a working tree")
 }
 
 /// `git branch -D` stderr meaning the branch is already gone (D4).
@@ -884,7 +891,11 @@ impl SessionSource for SshSource {
             .map_err(|e| SourceError::Transport(format!("respawn task: {e}")))?
     }
 
-    async fn stop(&self, project_id: &ProjectId, session_id: &SessionId) -> Result<(), SourceError> {
+    async fn stop(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<(), SourceError> {
         let exec = Arc::clone(&self.exec);
         let host = self.host.clone();
         let config = Arc::clone(&self.config);
@@ -894,14 +905,21 @@ impl SessionSource for SshSource {
             .map_err(|e| SourceError::Transport(format!("stop task: {e}")))?
     }
 
-    async fn remove(&self, project_id: &ProjectId, session_id: &SessionId, force: bool) -> Result<(), SourceError> {
+    async fn remove(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        force: bool,
+    ) -> Result<(), SourceError> {
         let exec = Arc::clone(&self.exec);
         let host = self.host.clone();
         let config = Arc::clone(&self.config);
         let (p, s) = (project_id.clone(), session_id.clone());
-        tokio::task::spawn_blocking(move || run_remove(exec.as_ref(), &host, &config, &p, &s, force))
-            .await
-            .map_err(|e| SourceError::Transport(format!("remove task: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            run_remove(exec.as_ref(), &host, &config, &p, &s, force)
+        })
+        .await
+        .map_err(|e| SourceError::Transport(format!("remove task: {e}")))?
     }
 }
 
@@ -1013,8 +1031,12 @@ mod tests {
         }
 
         fn count_calls_with(&self, needle: &str) -> usize {
-            self.calls.lock().expect("lock").iter()
-                .filter(|argv| argv.iter().any(|a| a == needle)).count()
+            self.calls
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == needle))
+                .count()
         }
 
         /// Returns the first recorded argv that contains the given substring.
@@ -1982,7 +2004,10 @@ mod tests {
     #[test]
     fn kill_session_argv_targets_the_session() {
         let argv = kill_session_argv(&host("devbox", None, None), "remora_api_fix-login");
-        let k = argv.iter().position(|a| a == "kill-session").expect("kill-session");
+        let k = argv
+            .iter()
+            .position(|a| a == "kill-session")
+            .expect("kill-session");
         assert_eq!(argv[k - 1], "tmux");
         assert_eq!(argv[k + 1], "-t");
         assert_eq!(argv[k + 2], "remora_api_fix-login");
@@ -1992,16 +2017,27 @@ mod tests {
     #[test]
     fn dirty_probe_argv_run_in_the_worktree() {
         let s = status_porcelain_argv(&host("devbox", None, None), "~/.remora/worktrees/api/x");
-        assert_eq!(s[s.iter().position(|a| a == "-C").expect("-C") + 1], "\"$HOME\"/.remora/worktrees/api/x");
+        assert_eq!(
+            s[s.iter().position(|a| a == "-C").expect("-C") + 1],
+            "\"$HOME\"/.remora/worktrees/api/x"
+        );
         assert!(s.iter().any(|a| a == "status") && s.iter().any(|a| a == "--porcelain"));
         let r = not_on_remote_argv(&host("devbox", None, None), "~/.remora/worktrees/api/x");
         assert!(r.iter().any(|a| a == "rev-list") && r.iter().any(|a| a == "--count"));
-        assert!(r.iter().any(|a| a == "HEAD") && r.iter().any(|a| a == "--not") && r.iter().any(|a| a == "--remotes"));
+        assert!(
+            r.iter().any(|a| a == "HEAD")
+                && r.iter().any(|a| a == "--not")
+                && r.iter().any(|a| a == "--remotes")
+        );
     }
 
     #[test]
     fn branch_delete_argv_force_deletes_in_the_project() {
-        let argv = branch_delete_argv(&host("devbox", None, None), "/home/dev/api", "remora/fix-login");
+        let argv = branch_delete_argv(
+            &host("devbox", None, None),
+            "/home/dev/api",
+            "remora/fix-login",
+        );
         let g = argv.iter().position(|a| a == "git").expect("git");
         assert_eq!(argv[g + 1], "-C");
         assert_eq!(argv[g + 2], "/home/dev/api");
@@ -2079,7 +2115,8 @@ mod tests {
     #[test]
     fn kill_session_propagates_transport_failure() {
         let fake = FakeExec::new(vec![Ok(FakeExec::fail("Permission denied (publickey)"))]);
-        let err = kill_session(&fake, &host("devbox", None, None), "remora_api_x").expect_err("err");
+        let err =
+            kill_session(&fake, &host("devbox", None, None), "remora_api_x").expect_err("err");
         assert!(matches!(err, SourceError::Transport(_)));
     }
 
@@ -2091,14 +2128,29 @@ mod tests {
         let fake = FakeExec::new(vec![Ok(FakeExec::out("")), Ok(FakeExec::out("0\n"))]);
         assert_eq!(worktree_has_work(&fake, &h, dir).expect("ok"), None);
         // dirty tree + 0 → Uncommitted
-        let fake = FakeExec::new(vec![Ok(FakeExec::out(" M src/x.rs\n")), Ok(FakeExec::out("0\n"))]);
-        assert_eq!(worktree_has_work(&fake, &h, dir).expect("ok"), Some(DirtyReason::Uncommitted));
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out(" M src/x.rs\n")),
+            Ok(FakeExec::out("0\n")),
+        ]);
+        assert_eq!(
+            worktree_has_work(&fake, &h, dir).expect("ok"),
+            Some(DirtyReason::Uncommitted)
+        );
         // clean + 3 not-on-remote → NotOnRemote
         let fake = FakeExec::new(vec![Ok(FakeExec::out("")), Ok(FakeExec::out("3\n"))]);
-        assert_eq!(worktree_has_work(&fake, &h, dir).expect("ok"), Some(DirtyReason::NotOnRemote));
+        assert_eq!(
+            worktree_has_work(&fake, &h, dir).expect("ok"),
+            Some(DirtyReason::NotOnRemote)
+        );
         // dirty + 3 → Both
-        let fake = FakeExec::new(vec![Ok(FakeExec::out("?? new\n")), Ok(FakeExec::out("3\n"))]);
-        assert_eq!(worktree_has_work(&fake, &h, dir).expect("ok"), Some(DirtyReason::Both));
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("?? new\n")),
+            Ok(FakeExec::out("3\n")),
+        ]);
+        assert_eq!(
+            worktree_has_work(&fake, &h, dir).expect("ok"),
+            Some(DirtyReason::Both)
+        );
     }
 
     #[test]
@@ -2111,16 +2163,26 @@ mod tests {
 
     #[test]
     fn absent_classifiers_match_git_phrasings() {
-        assert!(stderr_signals_worktree_absent("fatal: '~/x' is not a working tree"));
-        assert!(!stderr_signals_worktree_absent("fatal: could not lock config file"));
+        assert!(stderr_signals_worktree_absent(
+            "fatal: '~/x' is not a working tree"
+        ));
+        assert!(!stderr_signals_worktree_absent(
+            "fatal: could not lock config file"
+        ));
         // Positive: git's real phrasing for a deleted branch that is already gone.
-        assert!(stderr_signals_branch_absent("error: branch 'remora/x' not found."));
-        assert!(!stderr_signals_branch_absent("error: Cannot delete branch checked out at '~/x'"));
+        assert!(stderr_signals_branch_absent(
+            "error: branch 'remora/x' not found."
+        ));
+        assert!(!stderr_signals_branch_absent(
+            "error: Cannot delete branch checked out at '~/x'"
+        ));
         // Negative: bare "not found" without "branch" must NOT match — otherwise
         // `run_remove` would silently swallow a real `git branch -D` failure like
         // `remote: Repository not found` or an SSH error that happens to contain
         // "not found".
-        assert!(!stderr_signals_branch_absent("remote: Repository not found"));
+        assert!(!stderr_signals_branch_absent(
+            "remote: Repository not found"
+        ));
         assert!(!stderr_signals_branch_absent("fatal: 'origin' not found"));
     }
 
@@ -2128,7 +2190,10 @@ mod tests {
     fn worktree_has_work_fails_safe_when_revlist_probe_fails() {
         // Status probe succeeds (clean output) but rev-list probe fails →
         // Transport (fail-safe: never treat an unreadable probe as clean).
-        let fake = FakeExec::new(vec![Ok(FakeExec::out("")), Ok(FakeExec::fail("fatal: bad object HEAD"))]);
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("")),
+            Ok(FakeExec::fail("fatal: bad object HEAD")),
+        ]);
         let err = worktree_has_work(&fake, &host("devbox", None, None), "~/x").expect_err("err");
         assert!(matches!(err, SourceError::Transport(_)));
     }
@@ -2138,7 +2203,14 @@ mod tests {
     #[test]
     fn run_stop_kills_only_the_session() {
         let fake = FakeExec::new(vec![Ok(FakeExec::ok())]);
-        assert!(run_stop(&fake, &host("devbox", None, None), &test_config(), &pid("api"), &sid("fix-login")).is_ok());
+        assert!(run_stop(
+            &fake,
+            &host("devbox", None, None),
+            &test_config(),
+            &pid("api"),
+            &sid("fix-login")
+        )
+        .is_ok());
         assert_eq!(fake.count_calls_with("kill-session"), 1);
         assert_eq!(fake.count_calls_with("worktree"), 0);
     }
@@ -2146,19 +2218,27 @@ mod tests {
     #[test]
     fn run_remove_clean_worktree_runs_probe_kill_remove_delete_in_order() {
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::out("")),   // status --porcelain (clean)
-            Ok(FakeExec::out("0\n")),// rev-list (on remote)
-            Ok(FakeExec::ok()),      // kill-session
-            Ok(FakeExec::ok()),      // worktree remove
-            Ok(FakeExec::ok()),      // branch -D
+            Ok(FakeExec::out("")),    // status --porcelain (clean)
+            Ok(FakeExec::out("0\n")), // rev-list (on remote)
+            Ok(FakeExec::ok()),       // kill-session
+            Ok(FakeExec::ok()),       // worktree remove
+            Ok(FakeExec::ok()),       // branch -D
         ]);
-        assert!(run_remove(&fake, &host("devbox", None, None), &test_config(), &pid("api"), &sid("fix-login"), false).is_ok());
+        assert!(run_remove(
+            &fake,
+            &host("devbox", None, None),
+            &test_config(),
+            &pid("api"),
+            &sid("fix-login"),
+            false
+        )
+        .is_ok());
         let calls = fake.calls.lock().expect("lock");
         assert!(calls[0].iter().any(|a| a == "status"));
         assert!(calls[1].iter().any(|a| a == "rev-list"));
         assert!(calls[2].iter().any(|a| a == "kill-session"));
         assert!(calls[3].iter().any(|a| a == "remove")); // worktree remove
-        assert!(calls[4].iter().any(|a| a == "-D"));      // branch -D
+        assert!(calls[4].iter().any(|a| a == "-D")); // branch -D
     }
 
     #[test]
@@ -2167,9 +2247,22 @@ mod tests {
             Ok(FakeExec::out(" M src/x.rs\n")), // status dirty
             Ok(FakeExec::out("0\n")),           // rev-list
         ]);
-        let err = run_remove(&fake, &host("devbox", None, None), &test_config(), &pid("api"), &sid("fix-login"), false)
-            .expect_err("dirty");
-        assert!(matches!(err, SourceError::WorkspaceDirty { reason: DirtyReason::Uncommitted, .. }));
+        let err = run_remove(
+            &fake,
+            &host("devbox", None, None),
+            &test_config(),
+            &pid("api"),
+            &sid("fix-login"),
+            false,
+        )
+        .expect_err("dirty");
+        assert!(matches!(
+            err,
+            SourceError::WorkspaceDirty {
+                reason: DirtyReason::Uncommitted,
+                ..
+            }
+        ));
         assert_eq!(fake.count_calls_with("kill-session"), 0);
         assert_eq!(fake.count_calls_with("remove"), 0);
     }
@@ -2181,7 +2274,15 @@ mod tests {
             Ok(FakeExec::ok()), // worktree remove
             Ok(FakeExec::ok()), // branch -D
         ]);
-        assert!(run_remove(&fake, &host("devbox", None, None), &test_config(), &pid("api"), &sid("fix-login"), true).is_ok());
+        assert!(run_remove(
+            &fake,
+            &host("devbox", None, None),
+            &test_config(),
+            &pid("api"),
+            &sid("fix-login"),
+            true
+        )
+        .is_ok());
         assert_eq!(fake.count_calls_with("status"), 0);
         assert_eq!(fake.count_calls_with("rev-list"), 0);
     }
@@ -2189,11 +2290,21 @@ mod tests {
     #[test]
     fn run_remove_is_idempotent_on_already_gone_worktree_and_branch() {
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                                  // kill (force path)
+            Ok(FakeExec::ok()),                                       // kill (force path)
             Ok(FakeExec::fail("fatal: '~/x' is not a working tree")), // worktree remove (already gone)
-            Ok(FakeExec::fail("error: branch 'remora/fix-login' not found.")), // branch (already gone)
+            Ok(FakeExec::fail(
+                "error: branch 'remora/fix-login' not found.",
+            )), // branch (already gone)
         ]);
-        assert!(run_remove(&fake, &host("devbox", None, None), &test_config(), &pid("api"), &sid("fix-login"), true).is_ok());
+        assert!(run_remove(
+            &fake,
+            &host("devbox", None, None),
+            &test_config(),
+            &pid("api"),
+            &sid("fix-login"),
+            true
+        )
+        .is_ok());
     }
 
     #[test]
@@ -2212,7 +2323,15 @@ mod tests {
         "#;
         let config = Arc::new(Config::from_toml_str(toml).expect("config"));
         let fake = FakeExec::new(vec![Ok(FakeExec::ok())]); // only kill
-        assert!(run_remove(&fake, &host("devbox", None, None), &config, &pid("scratch"), &sid("s1"), false).is_ok());
+        assert!(run_remove(
+            &fake,
+            &host("devbox", None, None),
+            &config,
+            &pid("scratch"),
+            &sid("s1"),
+            false
+        )
+        .is_ok());
         assert_eq!(fake.count_calls_with("kill-session"), 1);
         assert_eq!(fake.count_calls_with("worktree"), 0);
         assert_eq!(fake.count_calls_with("status"), 0); // no dirty probe in shared mode
@@ -2237,15 +2356,30 @@ mod tests {
             command = ["claude"]
         "#;
         let config = Arc::new(Config::from_toml_str(toml).expect("config"));
-        let fake = FakeExec::new(vec![Ok(FakeExec::ok()), Ok(FakeExec::ok()), Ok(FakeExec::ok())]);
-        assert!(run_remove(&fake, &host("devbox", None, None), &config, &pid("api"), &sid("fix-login"), true).is_ok());
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),
+            Ok(FakeExec::ok()),
+            Ok(FakeExec::ok()),
+        ]);
+        assert!(run_remove(
+            &fake,
+            &host("devbox", None, None),
+            &config,
+            &pid("api"),
+            &sid("fix-login"),
+            true
+        )
+        .is_ok());
     }
 
     #[tokio::test]
     async fn ssh_source_stop_dispatches_kill() {
         let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::ok())]));
         let source = SshSource::with_exec(host("devbox", None, None), test_config(), fake.clone());
-        source.stop(&pid("api"), &sid("fix-login")).await.expect("stop");
+        source
+            .stop(&pid("api"), &sid("fix-login"))
+            .await
+            .expect("stop");
         assert_eq!(fake.count_calls_with("kill-session"), 1);
     }
 }
@@ -2297,8 +2431,7 @@ mod realgit_probe_tests {
 
     fn temp_repo(tag: &str) -> std::path::PathBuf {
         // `tag` keeps the two repos in one test distinct (same pid otherwise collides).
-        let base = std::env::temp_dir()
-            .join(format!("remora-probe-{}-{tag}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("remora-probe-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("mkdir");
         git(&base, &["init", "-q", "-b", "main"]);
@@ -2332,7 +2465,10 @@ mod realgit_probe_tests {
 
         // Give it a remote and mark everything pushed → clean.
         let remote = temp_repo("remote");
-        git(&repo, &["remote", "add", "origin", &remote.to_string_lossy()]);
+        git(
+            &repo,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
         git(&repo, &["push", "-q", "origin", "main"]);
         git(&repo, &["fetch", "-q", "origin"]);
         assert_eq!(

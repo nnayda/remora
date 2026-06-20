@@ -89,7 +89,10 @@ impl FakeSessionSource {
     /// Marks a session's worktree as having unsafe-to-lose work, so `remove`
     /// without `force` reports `WorkspaceDirty`. Test affordance only.
     pub fn mark_dirty(&self, project_id: &ProjectId, session_id: &SessionId, reason: DirtyReason) {
-        if let Some(session) = self.lock_sessions().get_mut(&(project_id.clone(), session_id.clone())) {
+        if let Some(session) = self
+            .lock_sessions()
+            .get_mut(&(project_id.clone(), session_id.clone()))
+        {
             session.dirty = Some(reason);
         }
     }
@@ -263,18 +266,32 @@ impl SessionSource for FakeSessionSource {
         Ok(metas)
     }
 
-    async fn stop(&self, project_id: &ProjectId, session_id: &SessionId) -> Result<(), SourceError> {
-        if let Some(session) = self.lock_sessions().get_mut(&(project_id.clone(), session_id.clone())) {
+    async fn stop(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<(), SourceError> {
+        if let Some(session) = self
+            .lock_sessions()
+            .get_mut(&(project_id.clone(), session_id.clone()))
+        {
             session.state = SessionState::Stopped;
             session.kill_channels();
         }
         Ok(()) // absent → idempotent Ok
     }
 
-    async fn remove(&self, project_id: &ProjectId, session_id: &SessionId, force: bool) -> Result<(), SourceError> {
+    async fn remove(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        force: bool,
+    ) -> Result<(), SourceError> {
         let key = (project_id.clone(), session_id.clone());
         let mut sessions = self.lock_sessions();
-        let Some(session) = sessions.get_mut(&key) else { return Ok(()) };
+        let Some(session) = sessions.get_mut(&key) else {
+            return Ok(());
+        };
         if !force {
             if let Some(reason) = session.dirty {
                 return Err(SourceError::WorkspaceDirty {
@@ -602,7 +619,10 @@ mod tests {
         let (p, s) = ids("api", "x");
         source.stop(&p, &s).await.expect("stop");
         assert!(channel.recv().await.is_none());
-        assert_eq!(source.list().await.expect("list")[0].state, SessionState::Stopped);
+        assert_eq!(
+            source.list().await.expect("list")[0].state,
+            SessionState::Stopped
+        );
     }
 
     #[tokio::test]
@@ -628,7 +648,13 @@ mod tests {
         let (p, s) = ids("api", "x");
         source.mark_dirty(&p, &s, crate::DirtyReason::Both);
         let err = source.remove(&p, &s, false).await.expect_err("dirty");
-        assert!(matches!(err, SourceError::WorkspaceDirty { reason: crate::DirtyReason::Both, .. }));
+        assert!(matches!(
+            err,
+            SourceError::WorkspaceDirty {
+                reason: crate::DirtyReason::Both,
+                ..
+            }
+        ));
         assert_eq!(source.list().await.expect("list").len(), 1); // still there
     }
 
