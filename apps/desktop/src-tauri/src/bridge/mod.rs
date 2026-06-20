@@ -22,7 +22,9 @@ use resolve::SourceResolver;
 use tokio::sync::{mpsc, oneshot};
 
 use dto::ConfigDto;
-use editor_dto::{AgentInputDto, EditorConfigDto, HostInputDto, ProjectInputDto};
+use editor_dto::{
+    AgentInputDto, EditableConfigDto, EditorConfigDto, HostInputDto, ProjectInputDto,
+};
 use error::{BridgeError, SessionMetaDto};
 use output::{BridgeOutput, ChannelHandle, OutputSink};
 
@@ -268,10 +270,33 @@ impl Bridge {
     // ---- Editor channel (local-only, un-redacted) ----
 
     /// The full, **un-redacted** config for the settings forms (counterpart to
-    /// `config()`). Same missing→empty / unreadable→`Config` rules. Local-only:
-    /// it carries connection secrets and must never cross the relay.
-    pub fn config_editable(&self) -> Result<EditorConfigDto, BridgeError> {
-        Ok(self.load_config()?.into())
+    /// `config()`), plus its validation state for degraded-mode recovery
+    /// (ADR-0006). Local-only: it carries connection secrets and must never
+    /// cross the relay.
+    ///
+    /// A *missing* file is an empty (valid) config. A *valid* file yields
+    /// `config: Some` with no issues. A file that deserializes but is
+    /// *semantically* invalid yields `config: None` plus the issues and the
+    /// present entry ids, so the UI can delete the offending entries. A file
+    /// that is unreadable or unparseable is a `Config` load error (banner).
+    pub fn config_editable(&self) -> Result<EditableConfigDto, BridgeError> {
+        let raw = self.read_config_string()?;
+        match ConfigDocument::parse_lenient(&raw) {
+            Ok((doc, issues)) => Ok(EditableConfigDto {
+                // A strict (valid) doc yields a typed config; a degraded one
+                // can't, so `config` is None and `issues`/`present` drive the
+                // recovery UI instead.
+                config: doc.config().ok().map(EditorConfigDto::from),
+                issues: issues.iter().map(ToString::to_string).collect(),
+                present: doc.present_ids().into(),
+            }),
+            // A TOML grammar error or a structural/type error carries no
+            // per-entry issue the editor could repair — surface it as a load
+            // banner rather than a degraded doc that pretends to have parsed.
+            Err(e) => Err(BridgeError::Config {
+                message: e.to_string(),
+            }),
+        }
     }
 
     pub async fn config_insert_host(
@@ -369,14 +394,21 @@ impl Bridge {
     /// empty document (a fresh device edits from scratch); an unreadable file is
     /// a `Config` load error; an existing-but-invalid file is a `ConfigEdit` (it
     /// blocks the edit, shown on the form).
-    ///
-    /// Applies the same guards as [`Config::load`] — refuse a non-regular file
-    /// (FIFO/dir/device) or an implausibly large one — so a hostile config path
-    /// can't hang or OOM the edit while it holds `config_mutex`.
     fn read_document(&self) -> Result<ConfigDocument, BridgeError> {
+        let raw = self.read_config_string()?;
+        ConfigDocument::parse(&raw).map_err(config_edit)
+    }
+
+    /// Reads the config file to a string with the same guards as [`Config::load`]
+    /// — a *missing* file is an empty string (fresh device); a non-regular file
+    /// (FIFO/dir/device) or an implausibly large one is refused — so a hostile
+    /// config path can't hang or OOM the read (which may hold `config_mutex`).
+    /// Shared by [`Self::read_document`] (mutations) and [`Self::config_editable`]
+    /// (the degraded-aware read).
+    fn read_config_string(&self) -> Result<String, BridgeError> {
         let path = &self.config_path;
         let config_err = |msg: String| BridgeError::Config { message: msg };
-        let raw = match std::fs::metadata(path) {
+        match std::fs::metadata(path) {
             Ok(meta) => {
                 if !meta.is_file() {
                     return Err(config_err(format!(
@@ -393,18 +425,15 @@ impl Bridge {
                 }
                 std::fs::read_to_string(path).map_err(|e| {
                     config_err(format!("cannot read config file `{}`: {e}", path.display()))
-                })?
+                })
             }
             // A missing file is a fresh device: edit from an empty document.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => {
-                return Err(config_err(format!(
-                    "cannot read config file `{}`: {e}",
-                    path.display()
-                )))
-            }
-        };
-        ConfigDocument::parse(&raw).map_err(config_edit)
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(config_err(format!(
+                "cannot read config file `{}`: {e}",
+                path.display()
+            ))),
+        }
     }
 }
 
@@ -1098,7 +1127,11 @@ mod tests {
         b.config_insert_project("api".into(), project_input())
             .await
             .expect("insert project");
-        let dto = b.config_editable().expect("editable read");
+        let dto = b
+            .config_editable()
+            .expect("editable read")
+            .config
+            .expect("valid base");
         std::fs::remove_file(&path).ok();
         assert!(dto.hosts.iter().any(|h| h.id == "devbox"), "{dto:?}");
         assert!(dto.agents.iter().any(|a| a.id == "claude"), "{dto:?}");
@@ -1127,7 +1160,11 @@ mod tests {
         )
         .await
         .expect("update agent");
-        let dto = b.config_editable().expect("editable");
+        let dto = b
+            .config_editable()
+            .expect("editable")
+            .config
+            .expect("valid base");
         std::fs::remove_file(&path).ok();
         let host = dto.hosts.iter().find(|h| h.id == "devbox").expect("host");
         assert_eq!(host.name.as_deref(), Some("Renamed"));
@@ -1157,7 +1194,11 @@ mod tests {
         b.config_remove_host("devbox".into())
             .await
             .expect("remove host");
-        let dto = b.config_editable().expect("editable");
+        let dto = b
+            .config_editable()
+            .expect("editable")
+            .config
+            .expect("valid base");
         std::fs::remove_file(&path).ok();
         assert!(dto.hosts.is_empty() && dto.projects.is_empty() && dto.agents.is_empty());
     }
@@ -1206,6 +1247,53 @@ mod tests {
             .expect_err("removing a referenced host must be rejected");
         std::fs::remove_file(&path).ok();
         assert!(matches!(err, BridgeError::ConfigEdit { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn config_editable_of_a_valid_base_has_config_and_no_issues() {
+        let (b, path) = editor_bridge("editable-valid");
+        b.config_insert_host("devbox".into(), ssh_input())
+            .await
+            .expect("host");
+        let dto = b.config_editable().expect("editable");
+        std::fs::remove_file(&path).ok();
+        assert!(dto.issues.is_empty(), "a valid base has no issues: {dto:?}");
+        let config = dto.config.expect("valid base carries a typed config");
+        assert!(config.hosts.iter().any(|h| h.id == "devbox"), "{config:?}");
+    }
+
+    #[tokio::test]
+    async fn config_editable_reports_a_degraded_base_with_present_ids() {
+        let (b, path) = editor_bridge("editable-degraded");
+        // A semantically invalid base: two hosts with bad transports. The file
+        // can't produce a typed config, but degraded mode must still open it,
+        // report what's wrong, and list the ids the user can delete to recover.
+        std::fs::write(
+            &path,
+            "[hosts.a]\ntransport = \"telnet\"\n[hosts.b]\ntransport = \"nope\"\n",
+        )
+        .expect("seed invalid config");
+        let dto = b.config_editable().expect("a degraded base still opens");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            dto.config.is_none(),
+            "a degraded base yields no typed config: {dto:?}"
+        );
+        assert_eq!(dto.issues.len(), 2, "both bad transports reported: {dto:?}");
+        assert_eq!(dto.present.hosts, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn config_editable_of_an_unparseable_base_is_a_load_error() {
+        let (b, path) = editor_bridge("editable-unparseable");
+        // A TOML grammar error isn't recoverable entry-by-entry — it must
+        // surface as a load banner, not a degraded document pretending to parse.
+        std::fs::write(&path, "this is not = = toml\n").expect("seed");
+        let err = b
+            .config_editable()
+            .expect_err("an unparseable base is a load error");
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(err, BridgeError::Config { .. }), "{err:?}");
     }
 
     #[tokio::test]
@@ -1284,7 +1372,11 @@ mod tests {
             tokio::spawn(async move { b2.config_insert_host("hostb".into(), ssh_input()).await });
         t1.await.expect("join 1").expect("insert a");
         t2.await.expect("join 2").expect("insert b");
-        let dto = b.config_editable().expect("editable");
+        let dto = b
+            .config_editable()
+            .expect("editable")
+            .config
+            .expect("valid base");
         std::fs::remove_file(&path).ok();
         assert!(dto.hosts.iter().any(|h| h.id == "hosta"), "{dto:?}");
         assert!(dto.hosts.iter().any(|h| h.id == "hostb"), "{dto:?}");

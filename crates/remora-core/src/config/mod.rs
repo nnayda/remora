@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 pub use remora_protocol::{AgentId, InvalidIdError, ProjectId};
 
 pub mod document;
-pub use document::ConfigDocument;
+pub use document::{ConfigDocument, PresentIds};
 
 /// Location of the per-device config file *relative to the OS config dir*
 /// (ADR-0004: one human-editable TOML per device). The subdir + filename are

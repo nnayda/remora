@@ -19,6 +19,18 @@ use super::{
     ValidationIssue,
 };
 
+/// The entry ids present in each section of the document, regardless of whether
+/// the document is semantically valid. Powers degraded-mode recovery (ADR-0006):
+/// when a degraded base can't produce a typed [`Config`], the UI still needs the
+/// ids so the user can delete the offending entries one by one until the file
+/// validates.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PresentIds {
+    pub hosts: Vec<String>,
+    pub projects: Vec<String>,
+    pub agents: Vec<String>,
+}
+
 /// An editable, format-preserving view of the config file (ADR-0006).
 pub struct ConfigDocument {
     doc: DocumentMut,
@@ -72,6 +84,18 @@ impl ConfigDocument {
             Err(e) => return Err(e),
         };
         Ok((Self { doc, strict }, issues))
+    }
+
+    /// The entry ids present in each section, regardless of validity. Listed in
+    /// the same accessor the mutators use (a plain `[section.id]` table), so
+    /// every id returned here is one [`Self::remove_host`] et al. can act on —
+    /// the contract degraded-mode recovery relies on.
+    pub fn present_ids(&self) -> PresentIds {
+        PresentIds {
+            hosts: section_ids(&self.doc, "hosts"),
+            projects: section_ids(&self.doc, "projects"),
+            agents: section_ids(&self.doc, "agents"),
+        }
     }
 
     /// Serializes the document back to TOML, preserving comments and layout.
@@ -230,6 +254,17 @@ impl ConfigDocument {
         tmp.persist(target).map_err(|e| io(e.error))?;
         Ok(())
     }
+}
+
+/// The entry ids under `[section.*]`, in document order. Uses the same
+/// `as_table` accessor as [`contains`]/[`remove_entry`], so an id listed here is
+/// always one those mutators can find — degraded recovery never offers a delete
+/// that can't fire.
+fn section_ids(doc: &DocumentMut, section: &str) -> Vec<String> {
+    doc.get(section)
+        .and_then(|s| s.as_table())
+        .map(|t| t.iter().map(|(k, _)| k.to_string()).collect())
+        .unwrap_or_default()
 }
 
 /// True when `[section.id]` is present in the document.
@@ -577,6 +612,28 @@ mod tests {
         doc.remove_host(&hid("a")).expect("degraded-mode delete");
         assert!(doc.to_toml().contains("[hosts.b]"));
         assert!(!doc.to_toml().contains("[hosts.a]"));
+    }
+
+    #[test]
+    fn present_ids_lists_every_entry_even_in_a_degraded_doc() {
+        // A semantically invalid base (two hosts with bad transports) plus a
+        // project and an agent. Degraded mode needs every id so the user can
+        // delete entries one by one until the file validates.
+        let input = "[hosts.a]\ntransport = \"telnet\"\n[hosts.b]\ntransport = \"nope\"\n[projects.api]\nhost = \"a\"\npath = \"/x\"\nworkspace = \"worktree\"\nagent = \"claude\"\n[agents.claude]\ncommand = [\"claude\"]\n";
+        let (doc, _issues) = ConfigDocument::parse_lenient(input).expect("lenient");
+        let present = doc.present_ids();
+        assert_eq!(present.hosts, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(present.projects, vec!["api".to_string()]);
+        assert_eq!(present.agents, vec!["claude".to_string()]);
+    }
+
+    #[test]
+    fn present_ids_of_an_empty_doc_is_empty() {
+        let doc = ConfigDocument::parse("").expect("empty is valid");
+        let present = doc.present_ids();
+        assert!(present.hosts.is_empty());
+        assert!(present.projects.is_empty());
+        assert!(present.agents.is_empty());
     }
 
     #[test]

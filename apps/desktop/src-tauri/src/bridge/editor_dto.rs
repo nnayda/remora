@@ -13,11 +13,49 @@
 //! enforces the split.
 
 use remora_core::config::{
-    Agent, Config, Host, HostId, KubectlHost, Project, SshHost, Transport, WorkspaceMode,
+    Agent, Config, Host, HostId, KubectlHost, PresentIds, Project, SshHost, Transport,
+    WorkspaceMode,
 };
 use remora_protocol::AgentId;
 
 use crate::bridge::error::BridgeError;
+
+/// The editable config plus its validation state (ADR-0006 degraded mode).
+///
+/// In the normal case `config` is `Some` and `issues` is empty. When the base
+/// file is *semantically* invalid, `config` is `None` (no typed config can be
+/// produced), `issues` lists what is broken (rendered + sanitized), and
+/// `present` lists the entry ids still in the file so the UI can offer
+/// per-entity delete recovery without the whole document having to validate
+/// first. A file that isn't even parseable surfaces as a `Config` load error,
+/// not a degraded document.
+#[derive(Clone, Debug, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditableConfigDto {
+    pub config: Option<EditorConfigDto>,
+    pub issues: Vec<String>,
+    pub present: PresentEntitiesDto,
+}
+
+/// Entry ids present in each section of the document, regardless of validity —
+/// the delete targets degraded-mode recovery offers.
+#[derive(Clone, Debug, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PresentEntitiesDto {
+    pub hosts: Vec<String>,
+    pub projects: Vec<String>,
+    pub agents: Vec<String>,
+}
+
+impl From<PresentIds> for PresentEntitiesDto {
+    fn from(ids: PresentIds) -> Self {
+        PresentEntitiesDto {
+            hosts: ids.hosts,
+            projects: ids.projects,
+            agents: ids.agents,
+        }
+    }
+}
 
 /// The whole per-device config, projected **un-redacted** for the editor forms.
 #[derive(Clone, Debug, serde::Serialize, specta::Type)]

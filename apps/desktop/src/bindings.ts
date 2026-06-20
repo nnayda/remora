@@ -70,7 +70,7 @@ async sessionClose(handle: ChannelHandle) : Promise<Result<null, BridgeError>> {
     else return { status: "error", error: e  as any };
 }
 },
-async configGetEditable() : Promise<Result<EditorConfigDto, BridgeError>> {
+async configGetEditable() : Promise<Result<EditableConfigDto, BridgeError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("config_get_editable") };
 } catch (e) {
@@ -204,6 +204,18 @@ export type ChannelHandle = number
  */
 export type ConfigDto = { hosts: HostDto[]; projects: ProjectDto[]; agents: AgentDto[] }
 /**
+ * The editable config plus its validation state (ADR-0006 degraded mode).
+ * 
+ * In the normal case `config` is `Some` and `issues` is empty. When the base
+ * file is *semantically* invalid, `config` is `None` (no typed config can be
+ * produced), `issues` lists what is broken (rendered + sanitized), and
+ * `present` lists the entry ids still in the file so the UI can offer
+ * per-entity delete recovery without the whole document having to validate
+ * first. A file that isn't even parseable surfaces as a `Config` load error,
+ * not a degraded document.
+ */
+export type EditableConfigDto = { config: EditorConfigDto | null; issues: string[]; present: PresentEntitiesDto }
+/**
  * An agent with its full launch argv (the display `AgentDto` carries only id).
  */
 export type EditorAgentDto = { id: string; command: string[] }
@@ -230,6 +242,11 @@ export type HostDto = { id: string; name: string | null; transport: TransportKin
  * argument, so it is not carried here.
  */
 export type HostInputDto = { name: string | null; transport: TransportDto }
+/**
+ * Entry ids present in each section of the document, regardless of validity —
+ * the delete targets degraded-mode recovery offers.
+ */
+export type PresentEntitiesDto = { hosts: string[]; projects: string[]; agents: string[] }
 /**
  * A configured project: its label, the host it lives on, and its default
  * agent. The on-host `path` is intentionally omitted — it is not needed to
