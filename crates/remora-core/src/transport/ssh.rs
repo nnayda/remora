@@ -758,7 +758,6 @@ fn run_list(
 }
 
 /// Kills the session's tmux (idempotent). Worktree survives → Stopped.
-#[allow(dead_code)]
 fn run_stop(
     exec: &dyn SshExec,
     host: &SshHost,
@@ -773,7 +772,6 @@ fn run_stop(
 /// Ends a session for good. Worktree mode: optional dirty gate (unless force) →
 /// kill tmux → idempotent worktree remove → idempotent branch delete. Shared
 /// mode: kill tmux only (never touches the project dir).
-#[allow(dead_code)]
 fn run_remove(
     exec: &dyn SshExec,
     host: &SshHost,
@@ -884,6 +882,26 @@ impl SessionSource for SshSource {
         tokio::task::spawn_blocking(move || run_respawn(exec.as_ref(), &host, &plan))
             .await
             .map_err(|e| SourceError::Transport(format!("respawn task: {e}")))?
+    }
+
+    async fn stop(&self, project_id: &ProjectId, session_id: &SessionId) -> Result<(), SourceError> {
+        let exec = Arc::clone(&self.exec);
+        let host = self.host.clone();
+        let config = Arc::clone(&self.config);
+        let (p, s) = (project_id.clone(), session_id.clone());
+        tokio::task::spawn_blocking(move || run_stop(exec.as_ref(), &host, &config, &p, &s))
+            .await
+            .map_err(|e| SourceError::Transport(format!("stop task: {e}")))?
+    }
+
+    async fn remove(&self, project_id: &ProjectId, session_id: &SessionId, force: bool) -> Result<(), SourceError> {
+        let exec = Arc::clone(&self.exec);
+        let host = self.host.clone();
+        let config = Arc::clone(&self.config);
+        let (p, s) = (project_id.clone(), session_id.clone());
+        tokio::task::spawn_blocking(move || run_remove(exec.as_ref(), &host, &config, &p, &s, force))
+            .await
+            .map_err(|e| SourceError::Transport(format!("remove task: {e}")))?
     }
 }
 
@@ -2221,6 +2239,14 @@ mod tests {
         let config = Arc::new(Config::from_toml_str(toml).expect("config"));
         let fake = FakeExec::new(vec![Ok(FakeExec::ok()), Ok(FakeExec::ok()), Ok(FakeExec::ok())]);
         assert!(run_remove(&fake, &host("devbox", None, None), &config, &pid("api"), &sid("fix-login"), true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn ssh_source_stop_dispatches_kill() {
+        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::ok())]));
+        let source = SshSource::with_exec(host("devbox", None, None), test_config(), fake.clone());
+        source.stop(&pid("api"), &sid("fix-login")).await.expect("stop");
+        assert_eq!(fake.count_calls_with("kill-session"), 1);
     }
 }
 

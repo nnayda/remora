@@ -791,6 +791,8 @@ mod tests {
         ) -> Result<SessionChannel, SourceError> {
             unreachable!()
         }
+        async fn stop(&self, _: &ProjectId, _: &SessionId) -> Result<(), SourceError> { unreachable!() }
+        async fn remove(&self, _: &ProjectId, _: &SessionId, _: bool) -> Result<(), SourceError> { unreachable!() }
         async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
             Ok(vec![
                 SessionMeta {
@@ -949,6 +951,8 @@ mod tests {
         ) -> Result<SessionChannel, SourceError> {
             unreachable!()
         }
+        async fn stop(&self, _: &ProjectId, _: &SessionId) -> Result<(), SourceError> { unreachable!() }
+        async fn remove(&self, _: &ProjectId, _: &SessionId, _: bool) -> Result<(), SourceError> { unreachable!() }
         async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
             Err(SourceError::Transport("host down".into()))
         }
