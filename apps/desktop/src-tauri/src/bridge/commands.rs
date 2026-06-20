@@ -4,7 +4,7 @@ use tauri::ipc::Channel;
 use tauri_specta::{collect_commands, Builder};
 
 use crate::bridge::dto::ConfigDto;
-use crate::bridge::editor_dto::{AgentInputDto, EditorConfigDto, HostInputDto, ProjectInputDto};
+use crate::bridge::editor_dto::{AgentInputDto, EditableConfigDto, HostInputDto, ProjectInputDto};
 use crate::bridge::error::{BridgeError, SessionMetaDto};
 use crate::bridge::output::{BridgeOutput, ChannelHandle, ChannelSink};
 use crate::bridge::Bridge;
@@ -111,7 +111,7 @@ async fn session_close(
 #[specta::specta]
 async fn config_get_editable(
     bridge: tauri::State<'_, Bridge>,
-) -> Result<EditorConfigDto, BridgeError> {
+) -> Result<EditableConfigDto, BridgeError> {
     bridge.config_editable()
 }
 
