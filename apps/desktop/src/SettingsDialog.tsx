@@ -85,10 +85,30 @@ export function SettingsDialog({
     return () => previouslyFocused?.focus?.();
   }, []);
 
+  // Move focus when the body switches. Entering a form lands focus on its first
+  // control (Edit forms have no autoFocus — the id field is create-only); going
+  // back to the list keeps focus inside the modal rather than dropping it to
+  // <body> off the now-unmounted form button. Runs after the mount effect, so
+  // that effect still captures the opener (not the dialog) for restore-on-close.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: re-run on view change
+  useEffect(() => {
+    if (view.kind === "list") {
+      dialogRef.current?.focus();
+      return;
+    }
+    dialogRef.current
+      ?.querySelector<HTMLElement>(
+        "form input, form select, form textarea, form button",
+      )
+      ?.focus();
+  }, [view]);
+
   function onKeyDown(e: KeyboardEvent) {
     if (e.key === "Escape") {
       e.preventDefault();
-      onClose();
+      // Esc backs out of an open form to the list; from the list it closes.
+      if (view.kind === "list") onClose();
+      else setView({ kind: "list" });
       return;
     }
     if (e.key !== "Tab") return;
@@ -169,6 +189,9 @@ export function SettingsDialog({
           <p className="hint">Loading…</p>
         ) : view.kind === "host" ? (
           <HostForm
+            // Keyed by identity so a switch to a different entity remounts with
+            // fresh state instead of reusing the once-initialized form.
+            key={`host-${view.mode}-${view.initial?.id ?? "new"}`}
             mode={view.mode}
             initial={view.initial}
             onSubmit={submitHost}
@@ -176,6 +199,7 @@ export function SettingsDialog({
           />
         ) : view.kind === "project" ? (
           <ProjectForm
+            key={`project-${view.mode}-${view.initial?.id ?? "new"}`}
             mode={view.mode}
             initial={view.initial}
             hostIds={model.hosts.map((h) => h.id)}
@@ -185,6 +209,7 @@ export function SettingsDialog({
           />
         ) : view.kind === "agent" ? (
           <AgentForm
+            key={`agent-${view.mode}-${view.initial?.id ?? "new"}`}
             mode={view.mode}
             initial={view.initial}
             onSubmit={submitAgent}

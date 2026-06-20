@@ -233,7 +233,12 @@ body {
 .tab-label:focus-visible,
 .tab-close:focus-visible,
 .tab-new:focus-visible,
-.dialog-actions button:focus-visible {
+.dialog-actions button:focus-visible,
+.settings-section-head button:focus-visible,
+.argv-add:focus-visible,
+.settings-row button:focus-visible,
+.argv-row button:focus-visible,
+.settings-dialog select:focus-visible {
   outline: 2px solid #8ab4f8;
   outline-offset: -2px;
 }

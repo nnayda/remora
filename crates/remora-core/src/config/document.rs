@@ -257,20 +257,23 @@ impl ConfigDocument {
 }
 
 /// The entry ids under `[section.*]`, in document order. Uses the same
-/// `as_table` accessor as [`contains`]/[`remove_entry`], so an id listed here is
-/// always one those mutators can find — degraded recovery never offers a delete
-/// that can't fire.
+/// table-like accessor as [`contains`]/[`remove_entry`]/[`set_entry`], so an id
+/// listed here is always one those mutators can find — degraded recovery never
+/// offers a delete that can't fire. `as_table_like` (not `as_table`) so the
+/// inline-table form `section = { id = { … } }` is seen too, not just
+/// `[section.id]` headers.
 fn section_ids(doc: &DocumentMut, section: &str) -> Vec<String> {
     doc.get(section)
-        .and_then(|s| s.as_table())
+        .and_then(|s| s.as_table_like())
         .map(|t| t.iter().map(|(k, _)| k.to_string()).collect())
         .unwrap_or_default()
 }
 
-/// True when `[section.id]` is present in the document.
+/// True when `[section.id]` is present in the document. `as_table_like` so an
+/// inline-table section counts too (see [`section_ids`]).
 fn contains(doc: &DocumentMut, section: &str, id: &str) -> bool {
     doc.get(section)
-        .and_then(|s| s.as_table())
+        .and_then(|s| s.as_table_like())
         .map(|t| t.contains_key(id))
         .unwrap_or(false)
 }
@@ -317,7 +320,10 @@ fn set_entry(doc: &mut DocumentMut, section: &str, id: &str, item: Item) {
         parent.set_implicit(true);
         root.insert(section, Item::Table(parent));
     }
-    if let Some(parent) = root[section].as_table_mut() {
+    // `as_table_like_mut` (not `as_table_mut`) so an inline-table section
+    // (`hosts = { … }`) is mutated in place instead of silently no-op'd;
+    // toml_edit coerces the `Item::Table` into the inline form and preserves it.
+    if let Some(parent) = root[section].as_table_like_mut() {
         parent.insert(id, item);
     }
 }
@@ -331,7 +337,8 @@ fn remove_entry(
     kind: &str,
 ) -> Result<(), ConfigError> {
     ensure_present(doc, section, id, kind)?;
-    if let Some(parent) = doc.get_mut(section).and_then(|s| s.as_table_mut()) {
+    // `as_table_like_mut` so a delete also fires on an inline-table section.
+    if let Some(parent) = doc.get_mut(section).and_then(|s| s.as_table_like_mut()) {
         parent.remove(id);
     }
     Ok(())
@@ -625,6 +632,46 @@ mod tests {
         assert_eq!(present.hosts, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(present.projects, vec!["api".to_string()]);
         assert_eq!(present.agents, vec!["claude".to_string()]);
+    }
+
+    #[test]
+    fn inline_table_section_supports_edit_and_present_ids() {
+        // A hand-written config may use the inline-table form of a section
+        // (valid TOML, deserializes the same as `[hosts.devbox]`). The editor
+        // must still see the entry and mutate it in place — not silently no-op
+        // while reporting success.
+        let input = "hosts = { devbox = { transport = \"ssh\", host = \"old\" } }\n";
+        let mut doc = ConfigDocument::parse(input).expect("inline-table config is valid");
+        assert_eq!(
+            doc.present_ids().hosts,
+            vec!["devbox".to_string()],
+            "present_ids must list an inline-table entry"
+        );
+        doc.update_host(
+            &hid("devbox"),
+            &Host {
+                name: None,
+                transport: Transport::Ssh(SshHost {
+                    host: "new".into(),
+                    user: None,
+                    port: None,
+                }),
+            },
+        )
+        .expect("update");
+        assert_eq!(
+            doc.config().expect("valid").hosts[&hid("devbox")].transport,
+            Transport::Ssh(SshHost {
+                host: "new".into(),
+                user: None,
+                port: None
+            }),
+            "the edit must actually change the stored host, not no-op: {}",
+            doc.to_toml()
+        );
+        // And a delete must fire on the inline form too (degraded recovery).
+        doc.remove_host(&hid("devbox")).expect("remove");
+        assert!(doc.present_ids().hosts.is_empty(), "{}", doc.to_toml());
     }
 
     #[test]

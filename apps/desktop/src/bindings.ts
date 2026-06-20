@@ -244,7 +244,9 @@ export type HostDto = { id: string; name: string | null; transport: TransportKin
 export type HostInputDto = { name: string | null; transport: TransportDto }
 /**
  * Entry ids present in each section of the document, regardless of validity —
- * the delete targets degraded-mode recovery offers.
+ * the delete targets degraded-mode recovery offers. Mirrors core's
+ * [`PresentIds`] field-for-field; the `From` impl below is the single place to
+ * update if either gains a section, so keep the two in lockstep.
  */
 export type PresentEntitiesDto = { hosts: string[]; projects: string[]; agents: string[] }
 /**

@@ -38,7 +38,9 @@ pub struct EditableConfigDto {
 }
 
 /// Entry ids present in each section of the document, regardless of validity —
-/// the delete targets degraded-mode recovery offers.
+/// the delete targets degraded-mode recovery offers. Mirrors core's
+/// [`PresentIds`] field-for-field; the `From` impl below is the single place to
+/// update if either gains a section, so keep the two in lockstep.
 #[derive(Clone, Debug, serde::Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct PresentEntitiesDto {
