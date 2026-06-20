@@ -10,7 +10,7 @@ use remora_protocol::{ProjectId, SessionId, SessionMeta, SpawnSpec};
 use super::pty_process::spawn_pty_channel;
 use crate::config::{Config, SshHost, WorkspaceMode};
 use crate::discovery::{self, DiscoveredEnv};
-use crate::naming::{parse_tmux_session_name, tmux_session_name};
+use crate::naming::{branch_name, parse_tmux_session_name, tmux_session_name, worktree_path};
 use crate::spawn_plan::{plan_spawn, PlanError, SpawnPlan};
 use crate::{SessionChannel, SessionSource, SourceError};
 
@@ -171,16 +171,105 @@ fn worktree_add_argv(host: &SshHost, plan: &SpawnPlan) -> Vec<String> {
 /// failure (no live session owns it), so the project/session slot stays
 /// retryable. `--force` because the fresh worktree may have a checked-out
 /// branch and no commits yet.
-fn worktree_remove_argv(host: &SshHost, plan: &SpawnPlan) -> Vec<String> {
+fn worktree_remove_argv(host: &SshHost, project_path: &str, dir: &str) -> Vec<String> {
     let mut argv = ssh_base_argv(host, false);
     argv.push("git".into());
     argv.push("-C".into());
-    argv.push(quote_remote_path(&plan.project_path));
+    argv.push(quote_remote_path(project_path));
     argv.push("worktree".into());
     argv.push("remove".into());
     argv.push("--force".into());
-    argv.push(quote_remote_path(&plan.dir));
+    argv.push(quote_remote_path(dir));
     argv
+}
+
+/// `tmux kill-session -t <name>`.
+#[allow(dead_code)]
+fn kill_session_argv(host: &SshHost, tmux_name: &str) -> Vec<String> {
+    let mut argv = ssh_base_argv(host, false);
+    argv.extend(["tmux".into(), "kill-session".into(), "-t".into(), tmux_name.into()]);
+    argv
+}
+
+/// `git -C <worktree> status --porcelain` — uncommitted-changes probe.
+#[allow(dead_code)]
+fn status_porcelain_argv(host: &SshHost, worktree_dir: &str) -> Vec<String> {
+    let mut argv = ssh_base_argv(host, false);
+    argv.push("git".into());
+    argv.push("-C".into());
+    argv.push(quote_remote_path(worktree_dir));
+    argv.extend(["status".into(), "--porcelain".into()]);
+    argv
+}
+
+/// `git -C <worktree> rev-list --count HEAD --not --remotes` — counts commits
+/// not reachable from any remote-tracking ref (a never-pushed branch's commits,
+/// or every commit if no remote is configured).
+#[allow(dead_code)]
+fn not_on_remote_argv(host: &SshHost, worktree_dir: &str) -> Vec<String> {
+    let mut argv = ssh_base_argv(host, false);
+    argv.push("git".into());
+    argv.push("-C".into());
+    argv.push(quote_remote_path(worktree_dir));
+    argv.extend([
+        "rev-list".into(),
+        "--count".into(),
+        "HEAD".into(),
+        "--not".into(),
+        "--remotes".into(),
+    ]);
+    argv
+}
+
+/// `git -C <project> branch -D <branch>` — force-delete the local branch.
+#[allow(dead_code)]
+fn branch_delete_argv(host: &SshHost, project_path: &str, branch: &str) -> Vec<String> {
+    let mut argv = ssh_base_argv(host, false);
+    argv.push("git".into());
+    argv.push("-C".into());
+    argv.push(quote_remote_path(project_path));
+    argv.extend(["branch".into(), "-D".into(), shell_quote(branch)]);
+    argv
+}
+
+/// Resolved teardown facts — like a `SpawnPlan` minus everything agent-related,
+/// so teardown never depends on agent config (D3).
+#[allow(dead_code)]
+#[derive(Debug)]
+struct TeardownPaths {
+    tmux_name: String,
+    workspace: WorkspaceMode,
+    project_path: String,
+    dir: String,
+    branch: Option<String>,
+}
+
+/// Resolves teardown paths from config + naming helpers (no `plan_spawn`, no
+/// agent lookup). An unknown project is `Transport` (the bridge's `resolve_for`
+/// already guards this upstream; defensive here).
+#[allow(dead_code)]
+fn teardown_paths(
+    config: &Config,
+    project_id: &ProjectId,
+    session_id: &SessionId,
+) -> Result<TeardownPaths, SourceError> {
+    let project = config.projects.get(project_id).ok_or_else(|| {
+        SourceError::Transport(format!("unknown project `{project_id}` for teardown"))
+    })?;
+    let (dir, branch) = match project.workspace {
+        WorkspaceMode::Worktree => (
+            worktree_path(project_id, session_id),
+            Some(branch_name(session_id)),
+        ),
+        WorkspaceMode::Shared => (project.path.clone(), None),
+    };
+    Ok(TeardownPaths {
+        tmux_name: tmux_session_name(project_id, session_id),
+        workspace: project.workspace,
+        project_path: project.path.clone(),
+        dir,
+        branch,
+    })
 }
 
 /// Joins the agent argv into a single shell command line (one sh-safe
@@ -508,7 +597,7 @@ fn run_spawn(
                 .map(|out| !out.success && stderr_signals_session_absent(&out.stderr))
                 .unwrap_or(false);
             if session_absent {
-                let _ = exec.run(&worktree_remove_argv(host, plan));
+                let _ = exec.run(&worktree_remove_argv(host, &plan.project_path, &plan.dir));
             }
         }
         return Err(err);
@@ -1763,5 +1852,89 @@ mod tests {
             new_session.iter().any(|a| a.contains("codex")),
             "respawn should launch the supplied agent, got: {new_session:?}"
         );
+    }
+
+    #[test]
+    fn kill_session_argv_targets_the_session() {
+        let argv = kill_session_argv(&host("devbox", None, None), "remora_api_fix-login");
+        let k = argv.iter().position(|a| a == "kill-session").expect("kill-session");
+        assert_eq!(argv[k - 1], "tmux");
+        assert_eq!(argv[k + 1], "-t");
+        assert_eq!(argv[k + 2], "remora_api_fix-login");
+        assert!(!argv.iter().any(|a| a == "-tt"), "non-interactive");
+    }
+
+    #[test]
+    fn dirty_probe_argv_run_in_the_worktree() {
+        let s = status_porcelain_argv(&host("devbox", None, None), "~/.remora/worktrees/api/x");
+        assert_eq!(s[s.iter().position(|a| a == "-C").expect("-C") + 1], "\"$HOME\"/.remora/worktrees/api/x");
+        assert!(s.iter().any(|a| a == "status") && s.iter().any(|a| a == "--porcelain"));
+        let r = not_on_remote_argv(&host("devbox", None, None), "~/.remora/worktrees/api/x");
+        assert!(r.iter().any(|a| a == "rev-list") && r.iter().any(|a| a == "--count"));
+        assert!(r.iter().any(|a| a == "HEAD") && r.iter().any(|a| a == "--not") && r.iter().any(|a| a == "--remotes"));
+    }
+
+    #[test]
+    fn branch_delete_argv_force_deletes_in_the_project() {
+        let argv = branch_delete_argv(&host("devbox", None, None), "/home/dev/api", "remora/fix-login");
+        let g = argv.iter().position(|a| a == "git").expect("git");
+        assert_eq!(argv[g + 1], "-C");
+        assert_eq!(argv[g + 2], "/home/dev/api");
+        assert_eq!(argv[g + 3], "branch");
+        assert_eq!(argv[g + 4], "-D");
+        assert_eq!(argv[g + 5], "remora/fix-login");
+    }
+
+    #[test]
+    fn teardown_paths_worktree_resolves_without_agent() {
+        // teardown_paths itself must not consult agents (D3); the config still
+        // needs a valid agent entry so from_toml_str accepts it.
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.api]
+            host = "devbox"
+            path = "/home/dev/api"
+            workspace = "worktree"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+        "#;
+        let config = Config::from_toml_str(toml).expect("config");
+        let p = teardown_paths(&config, &pid("api"), &sid("fix-login")).expect("paths");
+        assert_eq!(p.tmux_name, "remora_api_fix-login");
+        assert_eq!(p.project_path, "/home/dev/api");
+        assert_eq!(p.dir, "~/.remora/worktrees/api/fix-login");
+        assert_eq!(p.branch.as_deref(), Some("remora/fix-login"));
+        assert_eq!(p.workspace, WorkspaceMode::Worktree);
+    }
+
+    #[test]
+    fn teardown_paths_shared_has_no_branch() {
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.scratch]
+            host = "devbox"
+            path = "~/scratch"
+            workspace = "shared"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+        "#;
+        let config = Config::from_toml_str(toml).expect("config");
+        let p = teardown_paths(&config, &pid("scratch"), &sid("s1")).expect("paths");
+        assert_eq!(p.dir, "~/scratch");
+        assert_eq!(p.branch, None);
+        assert_eq!(p.workspace, WorkspaceMode::Shared);
+    }
+
+    #[test]
+    fn teardown_paths_unknown_project_is_transport() {
+        let config = Config::default();
+        let err = teardown_paths(&config, &pid("ghost"), &sid("x")).expect_err("unknown");
+        assert!(matches!(err, SourceError::Transport(_)));
     }
 }
