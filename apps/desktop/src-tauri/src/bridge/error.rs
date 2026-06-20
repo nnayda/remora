@@ -2,6 +2,24 @@
 use remora_core::SourceError;
 use remora_protocol::{SessionMeta, SessionState};
 
+#[derive(Clone, Copy, Debug, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum DirtyReasonDto {
+    Uncommitted,
+    NotOnRemote,
+    Both,
+}
+
+impl From<remora_core::DirtyReason> for DirtyReasonDto {
+    fn from(r: remora_core::DirtyReason) -> Self {
+        match r {
+            remora_core::DirtyReason::Uncommitted => DirtyReasonDto::Uncommitted,
+            remora_core::DirtyReason::NotOnRemote => DirtyReasonDto::NotOnRemote,
+            remora_core::DirtyReason::Both => DirtyReasonDto::Both,
+        }
+    }
+}
+
 #[derive(Debug, serde::Serialize, specta::Type)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum BridgeError {
@@ -40,6 +58,13 @@ pub enum BridgeError {
     ConfigEdit {
         message: String,
     },
+    /// A session removal was blocked because the workspace has unsaved state
+    /// (uncommitted changes or commits not pushed to any remote). Carry the
+    /// reason so the frontend can show a targeted warning and offer `force`.
+    WorkspaceDirty {
+        message: String,
+        reason: DirtyReasonDto,
+    },
 }
 
 impl From<SourceError> for BridgeError {
@@ -51,6 +76,9 @@ impl From<SourceError> for BridgeError {
             SourceError::SessionNotFound { .. } => BridgeError::SessionNotFound { message },
             SourceError::ChannelClosed => BridgeError::ChannelClosed,
             SourceError::Plan(_) => BridgeError::Plan { message },
+            // WorkspaceDirty must be placed BEFORE the catch-all.
+            SourceError::WorkspaceDirty { reason, .. } =>
+                BridgeError::WorkspaceDirty { message, reason: reason.into() },
             // #[non_exhaustive]: unknown future variants degrade to Transport.
             _ => BridgeError::Transport { message },
         }
@@ -139,6 +167,14 @@ mod tests {
                 ProjectId::new("ghost").expect("slug")
             ))),
             BridgeError::Plan { .. }
+        ));
+        assert!(matches!(
+            BridgeError::from(SourceError::WorkspaceDirty {
+                project_id: ProjectId::new("api").expect("slug"),
+                session_id: SessionId::new("x").expect("slug"),
+                reason: remora_core::DirtyReason::NotOnRemote,
+            }),
+            BridgeError::WorkspaceDirty { reason: DirtyReasonDto::NotOnRemote, .. }
         ));
     }
 

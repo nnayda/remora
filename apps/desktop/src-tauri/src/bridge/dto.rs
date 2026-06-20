@@ -5,6 +5,7 @@
 //! The `From` impls are the **redaction boundary** — connection secrets
 //! (ssh user/host/port, kube pod/namespace/context/container) live in
 //! `remora_core::config` and MUST NOT be copied here. A test enforces it.
+use crate::bridge::editor_dto::WorkspaceModeDto;
 use remora_core::config::{Config, Host, Project, Transport};
 
 /// The whole per-device config, projected for the sidebar. `Default` is the
@@ -35,15 +36,17 @@ pub enum TransportKindDto {
     Kubectl,
 }
 
-/// A configured project: its label, the host it lives on, and its default
-/// agent. The on-host `path` is intentionally omitted — it is not needed to
-/// render the tree and is closer to a connection detail than a label.
+/// A configured project: its label, the host it lives on, its workspace mode,
+/// and its default agent. The on-host `path` is intentionally omitted — it is
+/// not needed to render the tree and is closer to a connection detail than a
+/// label. Workspace mode is structural (it affects session UI), not a secret.
 #[derive(Clone, Debug, serde::Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectDto {
     pub id: String,
     pub name: Option<String>,
     pub host_id: String,
+    pub workspace: WorkspaceModeDto,
     pub agent: String,
 }
 
@@ -97,13 +100,15 @@ fn host_dto(id: &str, host: Host) -> HostDto {
     }
 }
 
-/// Reads only the project's label, its host edge, and default agent — never the
-/// on-host `path` or workspace mode.
+/// Reads the project's label, its host edge, workspace mode, and default agent.
+/// The on-host `path` is intentionally omitted — it is not needed to render the
+/// tree and is closer to a connection detail than a label.
 fn project_dto(id: &str, project: Project) -> ProjectDto {
     ProjectDto {
         id: id.to_owned(),
         name: project.name,
         host_id: project.host.as_str().to_owned(),
+        workspace: project.workspace.into(),
         agent: project.agent.as_str().to_owned(),
     }
 }
@@ -208,6 +213,18 @@ mod tests {
         let json = serde_json::to_string(&dto).expect("serialize");
         assert!(!json.contains("zeta-cli"), "AgentDto leaked argv: {json}");
         assert!(!json.contains("alpha-cli"), "AgentDto leaked argv: {json}");
+    }
+
+    #[test]
+    fn project_dto_carries_workspace_mode() {
+        let mut config = Config::default();
+        config.projects.insert(
+            ProjectId::new("api").expect("id"),
+            Project { name: None, host: HostId::new("h").expect("id"), path: "/p".into(),
+                      workspace: WorkspaceMode::Shared, agent: AgentId::new("claude").expect("id") },
+        );
+        let dto = ConfigDto::from(config);
+        assert!(matches!(dto.projects[0].workspace, WorkspaceModeDto::Shared));
     }
 
     #[test]

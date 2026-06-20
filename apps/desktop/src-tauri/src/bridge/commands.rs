@@ -105,6 +105,27 @@ async fn session_close(
     Ok(())
 }
 
+#[tauri::command]
+#[specta::specta]
+async fn session_stop(
+    bridge: tauri::State<'_, Bridge>,
+    project_id: String,
+    session_id: String,
+) -> Result<(), BridgeError> {
+    bridge.stop(project_id, session_id).await
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn session_remove(
+    bridge: tauri::State<'_, Bridge>,
+    project_id: String,
+    session_id: String,
+    force: bool,
+) -> Result<(), BridgeError> {
+    bridge.remove(project_id, session_id, force).await
+}
+
 // ---- Editor channel (PR2): local-only, un-redacted config management ----
 
 #[tauri::command]
@@ -210,6 +231,8 @@ pub fn builder() -> Builder<tauri::Wry> {
         session_spawn,
         session_attach,
         session_respawn,
+        session_stop,
+        session_remove,
         session_write,
         session_resize,
         session_close,

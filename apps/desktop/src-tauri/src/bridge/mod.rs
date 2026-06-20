@@ -136,6 +136,23 @@ impl Bridge {
         Ok(self.open_channel(channel, sink))
     }
 
+    pub async fn stop(&self, project_id: String, session_id: String) -> Result<(), BridgeError> {
+        let (p, s) = parse_ids(project_id, session_id)?;
+        self.resolve_for(&p)?.stop(&p, &s).await?;
+        Ok(())
+    }
+
+    pub async fn remove(
+        &self,
+        project_id: String,
+        session_id: String,
+        force: bool,
+    ) -> Result<(), BridgeError> {
+        let (p, s) = parse_ids(project_id, session_id)?;
+        self.resolve_for(&p)?.remove(&p, &s, force).await?;
+        Ok(())
+    }
+
     pub async fn respawn(
         &self,
         project_id: String,
@@ -490,6 +507,7 @@ mod tests {
     use remora_protocol::{SessionMeta, SessionState};
 
     use super::resolve::SourceResolver;
+    use error::SessionStateDto;
 
     /// Test resolver: returns one fixed source for every project, and as the
     /// sole element of `all()`. Lets the existing single-source tests run
@@ -1297,6 +1315,41 @@ mod tests {
     // End-to-end through the REAL ConfigResolver (the routing tests above use
     // fakes): a spawn for a project absent from config surfaces as Config, not
     // Transport — proving load_config → for_project is wired and classified.
+    #[tokio::test]
+    async fn stop_then_list_shows_stopped() {
+        let src = Arc::new(FakeSessionSource::new());
+        src.spawn(SpawnSpec { project_id: pid("api"), session_id: sid("x"), agent: None }).await.expect("spawn");
+        let b = bridge(src);
+        b.stop("api".into(), "x".into()).await.expect("stop");
+        assert!(matches!(b.list().await.expect("list")[0].state, SessionStateDto::Stopped));
+    }
+
+    #[tokio::test]
+    async fn remove_force_drops_the_session() {
+        let src = Arc::new(FakeSessionSource::new());
+        src.spawn(SpawnSpec { project_id: pid("api"), session_id: sid("x"), agent: None }).await.expect("spawn");
+        let b = bridge(src);
+        b.remove("api".into(), "x".into(), true).await.expect("remove");
+        assert!(b.list().await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_dirty_maps_to_workspace_dirty() {
+        let src = Arc::new(FakeSessionSource::new());
+        src.spawn(SpawnSpec { project_id: pid("api"), session_id: sid("x"), agent: None }).await.expect("spawn");
+        src.mark_dirty(&pid("api"), &sid("x"), remora_core::DirtyReason::Uncommitted);
+        let b = bridge(src);
+        let err = b.remove("api".into(), "x".into(), false).await.expect_err("dirty");
+        assert!(matches!(err, BridgeError::WorkspaceDirty { .. }));
+    }
+
+    #[tokio::test]
+    async fn stop_remove_reject_invalid_ids() {
+        let b = bridge(Arc::new(FakeSessionSource::new()));
+        assert!(matches!(b.stop("API".into(), "x".into()).await, Err(BridgeError::InvalidId { .. })));
+        assert!(matches!(b.remove("API".into(), "x".into(), false).await, Err(BridgeError::InvalidId { .. })));
+    }
+
     #[tokio::test]
     async fn spawn_unknown_project_is_config_error() {
         let path = temp_config_path("unknown-project");
