@@ -1104,7 +1104,9 @@ describe("SessionStore Fix D coverage", () => {
   });
 
   it("remove closes the tab on success", async () => {
-    const { store } = makeStore({ remove: vi.fn().mockResolvedValue(undefined) });
+    const { store } = makeStore({
+      remove: vi.fn().mockResolvedValue(undefined),
+    });
     await store.openSession({ projectId: "api", sessionId: "x", agent: null });
     const r = await store.remove("api", "x", false);
     expect(r).toEqual({ ok: true });
@@ -1112,7 +1114,11 @@ describe("SessionStore Fix D coverage", () => {
   });
 
   it("remove surfaces WorkspaceDirty for the force escalation", async () => {
-    const dirty = { kind: "workspaceDirty", message: "x", reason: "uncommitted" };
+    const dirty = {
+      kind: "workspaceDirty",
+      message: "x",
+      reason: "uncommitted",
+    };
     const { store } = makeStore({ remove: vi.fn().mockRejectedValue(dirty) });
     const r = await store.remove("api", "x", false);
     expect(r).toEqual({ ok: false, dirty: "uncommitted" });
@@ -1120,12 +1126,17 @@ describe("SessionStore Fix D coverage", () => {
 
   it("remove is guarded against a double-fire", async () => {
     let resolve!: () => void;
-    const remove = vi.fn().mockReturnValue(new Promise<void>((r) => { resolve = r; }));
+    const remove = vi.fn().mockReturnValue(
+      new Promise<void>((r) => {
+        resolve = r;
+      }),
+    );
     const { store } = makeStore({ remove });
     const first = store.remove("api", "x", true);
     const second = await store.remove("api", "x", true); // in-flight → rejected
     expect(second).toEqual({ ok: false });
-    resolve(); await first;
+    resolve();
+    await first;
     expect(remove).toHaveBeenCalledTimes(1);
   });
 

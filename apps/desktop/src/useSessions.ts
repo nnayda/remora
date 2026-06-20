@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from "react";
+import { removeSession, stopSession } from "./bridge";
 import { attachConnection, openSession, respawnConnection } from "./connection";
-import { stopSession, removeSession } from "./bridge";
 import { SessionStore } from "./session-store";
 
 /**

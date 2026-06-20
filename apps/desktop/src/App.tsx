@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
+import type { WorkspaceModeDto } from "./bindings";
+import { ConfirmRemoveDialog } from "./ConfirmRemoveDialog";
 import { NewSessionDialog } from "./NewSessionDialog";
 import { Sidebar } from "./Sidebar";
 import { OPEN_CANCELLED } from "./session-store";
@@ -23,12 +25,19 @@ function App() {
     closeTab,
     focusTab,
     respawnTab,
+    stopSession,
+    removeSession,
   } = useSessions();
   useReconnect(sessionStore);
   const { config, sessions, configError, discoveryUnavailable, refresh } =
     useDiscovery();
   const [dialogOpen, setDialogOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [removeTarget, setRemoveTarget] = useState<{
+    projectId: string;
+    sessionId: string;
+    workspace: WorkspaceModeDto | null;
+  } | null>(null);
   const newButtonRef = useRef<HTMLButtonElement>(null);
   // Live focus handles for the mounted terminal panes, keyed by tab key.
   const terminals = useRef(new Map<string, TerminalHandle>());
@@ -117,6 +126,43 @@ function App() {
   // exit closes the OS-level PTY + bridge channels; a future window-close hook
   // can call sessionStore.dispose() if explicit teardown is ever needed.
 
+  /** Stop a live worktree session (kills tmux, keeps the worktree). */
+  function onStop(node: SessionNode) {
+    setNotice(null);
+    void stopSession(node.projectId, node.sessionId).then((r) => {
+      if (r.ok) {
+        void discoveryStore.refreshAfterOpen();
+      } else {
+        setNotice("Could not stop the session.");
+      }
+    });
+  }
+
+  /** Open the remove confirm dialog for any session. */
+  function onRemove(node: SessionNode) {
+    setNotice(null);
+    setRemoveTarget({
+      projectId: node.projectId,
+      sessionId: node.sessionId,
+      workspace: node.workspace,
+    });
+  }
+
+  /** Open the remove confirm dialog from a tab (stopped/disconnected pane). */
+  function onRemoveTab(projectId: string, sessionId: string) {
+    setNotice(null);
+    // Find the workspace from the tree if available.
+    const node = tree
+      .flatMap((h) => h.projects)
+      .flatMap((p) => p.sessions)
+      .find((s) => s.projectId === projectId && s.sessionId === sessionId);
+    setRemoveTarget({
+      projectId,
+      sessionId,
+      workspace: node?.workspace ?? null,
+    });
+  }
+
   /** Dialog success callback: close it, note an attach-vs-spawn outcome, restore
    * focus, and re-list sessions now (a fresh spawn changed server state). */
   function handleOpened(attached: boolean) {
@@ -139,6 +185,8 @@ function App() {
         configError={configError}
         discoveryUnavailable={discoveryUnavailable}
         onRefresh={() => void refresh()}
+        onStop={onStop}
+        onRemove={onRemove}
       />
       <div className="main-col">
         <TabBar
@@ -190,22 +238,38 @@ function App() {
                 {t.status === "stopped" ? (
                   <div className="pane-status" role="status">
                     <p>Session stopped{t.error ? `: ${t.error}` : "."}</p>
-                    <button
-                      type="button"
-                      onClick={() => void respawnTab(t.key)}
-                    >
-                      Respawn
-                    </button>
+                    <div className="pane-status-actions">
+                      <button
+                        type="button"
+                        onClick={() => void respawnTab(t.key)}
+                      >
+                        Respawn
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onRemoveTab(t.projectId, t.sessionId)}
+                      >
+                        Remove…
+                      </button>
+                    </div>
                   </div>
                 ) : t.status === "disconnected" ? (
                   <div className="pane-status pane-status--error" role="alert">
                     <p>Disconnected: {t.error}</p>
-                    <button
-                      type="button"
-                      onClick={() => void respawnTab(t.key)}
-                    >
-                      Respawn
-                    </button>
+                    <div className="pane-status-actions">
+                      <button
+                        type="button"
+                        onClick={() => void respawnTab(t.key)}
+                      >
+                        Respawn
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onRemoveTab(t.projectId, t.sessionId)}
+                      >
+                        Remove…
+                      </button>
+                    </div>
                   </div>
                 ) : (
                   <Terminal
@@ -229,6 +293,20 @@ function App() {
           onClose={() => {
             setDialogOpen(false);
             newButtonRef.current?.focus();
+          }}
+        />
+      )}
+      {removeTarget && (
+        <ConfirmRemoveDialog
+          projectId={removeTarget.projectId}
+          sessionId={removeTarget.sessionId}
+          workspace={removeTarget.workspace}
+          onConfirm={(force) =>
+            removeSession(removeTarget.projectId, removeTarget.sessionId, force)
+          }
+          onClose={() => {
+            setRemoveTarget(null);
+            void discoveryStore.refreshAfterOpen();
           }}
         />
       )}
