@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Session teardown (desktop): **Stop** a session (kills its tmux, keeps the
+  worktree, respawnable) or **Remove** it for good (kills tmux and, in worktree
+  mode, removes the worktree + deletes the local branch) — from a sidebar row
+  menu or the stopped/disconnected pane. Two new `SessionSource` methods
+  (`stop`/`remove`, no default impls) carry teardown through the seam; the ssh
+  transport derives paths from config + naming helpers (never `plan_spawn`) and
+  makes each step idempotent so a retried remove converges. `remove` refuses a
+  worktree with uncommitted work or commits not on any remote (typed
+  `WorkspaceDirty { reason }`, probed with `git status --porcelain` +
+  `rev-list --not --remotes`, fail-safe to `Transport` on an unreadable probe)
+  unless the user force-confirms in a two-stage dialog; the remote branch is
+  never deleted. The store drives the tab transition explicitly so a removed
+  session never leaves a dead Respawn screen. Closes #33.
 - Config management UI (desktop): a Settings modal (⚙ in the sidebar header)
   lets you create, edit, and remove **hosts** (ssh + kubectl), **projects**, and
   **agents** without hand-editing `config.toml`. Forms reuse the new-session

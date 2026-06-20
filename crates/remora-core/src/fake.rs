@@ -20,7 +20,7 @@ use remora_protocol::{
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::{SessionChannel, SessionSource, SourceError};
+use crate::{DirtyReason, SessionChannel, SessionSource, SourceError};
 
 /// In-memory [`SessionSource`] double. One instance = one fake host.
 ///
@@ -40,6 +40,9 @@ struct FakeSession {
     /// Echo tasks for currently open channels; aborting one drops its
     /// transport ends, which the caller observes as channel death.
     channels: Vec<JoinHandle<()>>,
+    /// Simulated worktree dirtiness: set by [`FakeSessionSource::mark_dirty`]
+    /// so tests can exercise the `remove` dirty gate without real git.
+    dirty: Option<DirtyReason>,
 }
 
 impl FakeSession {
@@ -80,6 +83,17 @@ impl FakeSessionSource {
         let mut sessions = self.lock_sessions();
         if let Some(session) = sessions.get_mut(&(project_id.clone(), session_id.clone())) {
             session.kill_channels();
+        }
+    }
+
+    /// Marks a session's worktree as having unsafe-to-lose work, so `remove`
+    /// without `force` reports `WorkspaceDirty`. Test affordance only.
+    pub fn mark_dirty(&self, project_id: &ProjectId, session_id: &SessionId, reason: DirtyReason) {
+        if let Some(session) = self
+            .lock_sessions()
+            .get_mut(&(project_id.clone(), session_id.clone()))
+        {
+            session.dirty = Some(reason);
         }
     }
 
@@ -156,6 +170,7 @@ impl SessionSource for FakeSessionSource {
                 agent: spec.agent.map(String::from),
                 resizes,
                 channels: vec![task],
+                dirty: None,
             },
         );
         Ok(channel)
@@ -249,6 +264,46 @@ impl SessionSource for FakeSessionSource {
                 .cmp(&(b.project_id.as_str(), b.session_id.as_str()))
         });
         Ok(metas)
+    }
+
+    async fn stop(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<(), SourceError> {
+        if let Some(session) = self
+            .lock_sessions()
+            .get_mut(&(project_id.clone(), session_id.clone()))
+        {
+            session.state = SessionState::Stopped;
+            session.kill_channels();
+        }
+        Ok(()) // absent → idempotent Ok
+    }
+
+    async fn remove(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        force: bool,
+    ) -> Result<(), SourceError> {
+        let key = (project_id.clone(), session_id.clone());
+        let mut sessions = self.lock_sessions();
+        let Some(session) = sessions.get_mut(&key) else {
+            return Ok(());
+        };
+        if !force {
+            if let Some(reason) = session.dirty {
+                return Err(SourceError::WorkspaceDirty {
+                    project_id: project_id.clone(),
+                    session_id: session_id.clone(),
+                    reason,
+                });
+            }
+        }
+        session.kill_channels();
+        sessions.remove(&key);
+        Ok(())
     }
 }
 
@@ -555,6 +610,69 @@ mod tests {
         source.kill_channels(&project, &session);
         assert!(source.resizes(&project, &session).is_empty());
         assert!(source.list().await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_marks_stopped_and_kills_channels() {
+        let source = FakeSessionSource::new();
+        let mut channel = source.spawn(spec("api", "x")).await.expect("spawn");
+        let (p, s) = ids("api", "x");
+        source.stop(&p, &s).await.expect("stop");
+        assert!(channel.recv().await.is_none());
+        assert_eq!(
+            source.list().await.expect("list")[0].state,
+            SessionState::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_absent_session_is_ok() {
+        let source = FakeSessionSource::new();
+        let (p, s) = ids("api", "ghost");
+        source.stop(&p, &s).await.expect("idempotent");
+    }
+
+    #[tokio::test]
+    async fn remove_clean_session_disappears_from_list() {
+        let source = FakeSessionSource::new();
+        source.spawn(spec("api", "x")).await.expect("spawn");
+        let (p, s) = ids("api", "x");
+        source.remove(&p, &s, false).await.expect("remove");
+        assert!(source.list().await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_dirty_without_force_is_workspace_dirty_and_keeps_session() {
+        let source = FakeSessionSource::new();
+        source.spawn(spec("api", "x")).await.expect("spawn");
+        let (p, s) = ids("api", "x");
+        source.mark_dirty(&p, &s, crate::DirtyReason::Both);
+        let err = source.remove(&p, &s, false).await.expect_err("dirty");
+        assert!(matches!(
+            err,
+            SourceError::WorkspaceDirty {
+                reason: crate::DirtyReason::Both,
+                ..
+            }
+        ));
+        assert_eq!(source.list().await.expect("list").len(), 1); // still there
+    }
+
+    #[tokio::test]
+    async fn remove_dirty_with_force_succeeds() {
+        let source = FakeSessionSource::new();
+        source.spawn(spec("api", "x")).await.expect("spawn");
+        let (p, s) = ids("api", "x");
+        source.mark_dirty(&p, &s, crate::DirtyReason::Uncommitted);
+        source.remove(&p, &s, true).await.expect("force remove");
+        assert!(source.list().await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_absent_session_is_ok() {
+        let source = FakeSessionSource::new();
+        let (p, s) = ids("api", "ghost");
+        source.remove(&p, &s, false).await.expect("idempotent");
     }
 
     #[tokio::test]

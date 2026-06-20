@@ -12,7 +12,13 @@ describe("buildNewSessionModel", () => {
       config({
         hosts: [{ id: "hermes", name: "Hermes box", transport: "ssh" }],
         projects: [
-          { id: "api", name: "API", hostId: "hermes", agent: "claude" },
+          {
+            id: "api",
+            name: "API",
+            hostId: "hermes",
+            agent: "claude",
+            workspace: "worktree" as const,
+          },
         ],
         agents: [{ id: "claude" }],
       }),
@@ -33,7 +39,13 @@ describe("buildNewSessionModel", () => {
       config({
         hosts: [{ id: "hermes", name: null, transport: "ssh" }],
         projects: [
-          { id: "api", name: null, hostId: "hermes", agent: "claude" },
+          {
+            id: "api",
+            name: null,
+            hostId: "hermes",
+            agent: "claude",
+            workspace: "worktree" as const,
+          },
         ],
         agents: [{ id: "claude" }],
       }),
@@ -46,7 +58,15 @@ describe("buildNewSessionModel", () => {
   it("falls back to the host id when the host is not in config", () => {
     const model = buildNewSessionModel(
       config({
-        projects: [{ id: "api", name: null, hostId: "ghost", agent: "claude" }],
+        projects: [
+          {
+            id: "api",
+            name: null,
+            hostId: "ghost",
+            agent: "claude",
+            workspace: "worktree" as const,
+          },
+        ],
         agents: [{ id: "claude" }],
       }),
     );
@@ -75,8 +95,20 @@ describe("resolveSelection", () => {
     config({
       hosts: [{ id: "h", name: null, transport: "ssh" }],
       projects: [
-        { id: "api", name: null, hostId: "h", agent: "claude" },
-        { id: "web", name: null, hostId: "h", agent: "codex" },
+        {
+          id: "api",
+          name: null,
+          hostId: "h",
+          agent: "claude",
+          workspace: "worktree" as const,
+        },
+        {
+          id: "web",
+          name: null,
+          hostId: "h",
+          agent: "codex",
+          workspace: "worktree" as const,
+        },
       ],
       agents: [{ id: "claude" }, { id: "codex" }],
     }),
