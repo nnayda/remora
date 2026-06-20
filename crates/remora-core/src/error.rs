@@ -7,6 +7,28 @@ use remora_protocol::{ProjectId, SessionId};
 /// message, so one error cannot flood a log line.
 const MAX_TRANSPORT_DETAIL_LEN: usize = 256;
 
+/// Why a worktree is unsafe to remove without `force`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirtyReason {
+    /// Working tree has uncommitted changes.
+    Uncommitted,
+    /// HEAD has commits not reachable from any remote-tracking ref.
+    NotOnRemote,
+    /// Both of the above.
+    Both,
+}
+
+impl std::fmt::Display for DirtyReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            DirtyReason::Uncommitted => "uncommitted changes",
+            DirtyReason::NotOnRemote => "commits not on any remote",
+            DirtyReason::Both => "uncommitted changes and commits not on any remote",
+        };
+        f.write_str(s)
+    }
+}
+
 /// Escapes and bounds transport detail for display. Real transports fill
 /// it from backend output (ssh/kubectl stderr), which carries
 /// remote-influenced bytes — escape control characters inside `Display`
@@ -45,6 +67,14 @@ pub enum SourceError {
     SessionNotFound {
         project_id: ProjectId,
         session_id: SessionId,
+    },
+    /// `remove` refused: the worktree has uncommitted work or commits not on
+    /// any remote, and `force` was not set. Nothing was changed.
+    #[error("session `{project_id}_{session_id}` has {reason} that would be lost")]
+    WorkspaceDirty {
+        project_id: ProjectId,
+        session_id: SessionId,
+        reason: DirtyReason,
     },
     /// Spawn could not be planned from local config (unknown project or
     /// agent). Carries the typed [`PlanError`] so the offending id survives
@@ -110,5 +140,20 @@ mod tests {
             shown.len(),
             "transport error: ".len() + MAX_TRANSPORT_DETAIL_LEN + '…'.len_utf8()
         );
+    }
+
+    #[test]
+    fn workspace_dirty_names_session_and_reason() {
+        let err = SourceError::WorkspaceDirty {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("fix-login").expect("slug"),
+            reason: DirtyReason::Both,
+        };
+        assert_eq!(
+            err.to_string(),
+            "session `api_fix-login` has uncommitted changes and commits not on any remote that would be lost"
+        );
+        assert_eq!(DirtyReason::Uncommitted.to_string(), "uncommitted changes");
+        assert_eq!(DirtyReason::NotOnRemote.to_string(), "commits not on any remote");
     }
 }
