@@ -1,20 +1,28 @@
 import { Channel } from "@tauri-apps/api/core";
 import {
+  type AgentInputDto,
   type BridgeError,
   type BridgeOutput,
   type ChannelHandle,
   type ConfigDto,
   commands,
+  type EditableConfigDto,
+  type HostInputDto,
+  type ProjectInputDto,
   type Result,
   type SessionMetaDto,
   type SessionStateDto,
 } from "./bindings";
 
 export type {
+  AgentInputDto,
   BridgeError,
   BridgeOutput,
   ChannelHandle,
   ConfigDto,
+  EditableConfigDto,
+  HostInputDto,
+  ProjectInputDto,
   SessionMetaDto,
   SessionStateDto,
 };
@@ -42,6 +50,76 @@ export async function listSessions(): Promise<SessionMetaDto[]> {
 /** Read the resolved per-device config (hosts, projects, agents). */
 export async function getConfig(): Promise<ConfigDto> {
   return unwrap(await commands.configGet());
+}
+
+/** Read the **un-redacted** editable config for the Settings forms, with its
+ * validation state for degraded-mode recovery (ADR-0006). Local-only. */
+export async function getEditableConfig(): Promise<EditableConfigDto> {
+  return unwrap(await commands.configGetEditable());
+}
+
+/** Create a host. Rejects a duplicate id or an invalid edit with the typed
+ * `BridgeError` (`configEdit`/`invalidId`), shown inline on the form. */
+export async function insertHost(
+  id: string,
+  input: HostInputDto,
+): Promise<void> {
+  unwrap(await commands.configInsertHost(id, input));
+}
+
+/** Edit a host in place (also the display-name rename path). */
+export async function updateHost(
+  id: string,
+  input: HostInputDto,
+): Promise<void> {
+  unwrap(await commands.configUpdateHost(id, input));
+}
+
+/** Remove a host. Rejected (`configEdit`) if a project still references it. */
+export async function removeHost(id: string): Promise<void> {
+  unwrap(await commands.configRemoveHost(id));
+}
+
+/** Create a project. */
+export async function insertProject(
+  id: string,
+  input: ProjectInputDto,
+): Promise<void> {
+  unwrap(await commands.configInsertProject(id, input));
+}
+
+/** Edit a project in place. */
+export async function updateProject(
+  id: string,
+  input: ProjectInputDto,
+): Promise<void> {
+  unwrap(await commands.configUpdateProject(id, input));
+}
+
+/** Remove a project. */
+export async function removeProject(id: string): Promise<void> {
+  unwrap(await commands.configRemoveProject(id));
+}
+
+/** Create an agent. */
+export async function insertAgent(
+  id: string,
+  input: AgentInputDto,
+): Promise<void> {
+  unwrap(await commands.configInsertAgent(id, input));
+}
+
+/** Edit an agent in place. */
+export async function updateAgent(
+  id: string,
+  input: AgentInputDto,
+): Promise<void> {
+  unwrap(await commands.configUpdateAgent(id, input));
+}
+
+/** Remove an agent. Rejected (`configEdit`) if a project still references it. */
+export async function removeAgent(id: string): Promise<void> {
+  unwrap(await commands.configRemoveAgent(id));
 }
 
 /** Spawn a new session and open its channel; `onOutput` receives the stream.

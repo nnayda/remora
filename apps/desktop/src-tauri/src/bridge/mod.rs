@@ -392,11 +392,21 @@ impl Bridge {
 
     /// Reads the config file into an editable document. A *missing* file is an
     /// empty document (a fresh device edits from scratch); an unreadable file is
-    /// a `Config` load error; an existing-but-invalid file is a `ConfigEdit` (it
-    /// blocks the edit, shown on the form).
+    /// a `Config` load error.
+    ///
+    /// Reads **leniently** so degraded-mode recovery (deleting the entry that
+    /// breaks the file) can operate on a semantically-invalid base. A valid base
+    /// still yields a *strict* document, so normal edits re-validate exactly as
+    /// before; a degraded base yields a document whose edits skip per-edit
+    /// validation but whose `save` still refuses to persist an invalid result
+    /// (so a delete that doesn't fully recover the file is rejected, never
+    /// bricking it). A grammar/structural error carries nothing to repair
+    /// entry-by-entry, so it blocks the edit (`ConfigEdit`).
     fn read_document(&self) -> Result<ConfigDocument, BridgeError> {
         let raw = self.read_config_string()?;
-        ConfigDocument::parse(&raw).map_err(config_edit)
+        ConfigDocument::parse_lenient(&raw)
+            .map(|(doc, _issues)| doc)
+            .map_err(config_edit)
     }
 
     /// Reads the config file to a string with the same guards as [`Config::load`]
@@ -1245,6 +1255,44 @@ mod tests {
             .config_remove_host("devbox".into())
             .await
             .expect_err("removing a referenced host must be rejected");
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(err, BridgeError::ConfigEdit { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn degraded_single_fault_delete_recovers_the_file() {
+        let (b, path) = editor_bridge("degraded-recover");
+        // One broken host, everything else fine: deleting it restores validity,
+        // so the mutation must read the degraded base, delete, and save.
+        std::fs::write(
+            &path,
+            "[hosts.bad]\ntransport = \"telnet\"\n[agents.claude]\ncommand = [\"claude\"]\n",
+        )
+        .expect("seed degraded config");
+        b.config_remove_host("bad".into())
+            .await
+            .expect("deleting the offending host recovers the file");
+        let dto = b.config_editable().expect("editable after recovery");
+        std::fs::remove_file(&path).ok();
+        let config = dto.config.expect("file is valid again");
+        assert!(config.hosts.is_empty(), "{config:?}");
+        assert!(config.agents.iter().any(|a| a.id == "claude"), "{config:?}");
+    }
+
+    #[tokio::test]
+    async fn degraded_delete_that_leaves_it_invalid_is_config_edit() {
+        let (b, path) = editor_bridge("degraded-still-bad");
+        // Two independent faults: deleting one still leaves an invalid file, so
+        // save must refuse rather than brick it — surfaced as ConfigEdit.
+        std::fs::write(
+            &path,
+            "[hosts.a]\ntransport = \"telnet\"\n[hosts.b]\ntransport = \"nope\"\n",
+        )
+        .expect("seed");
+        let err = b
+            .config_remove_host("a".into())
+            .await
+            .expect_err("a still-invalid result must be rejected at save");
         std::fs::remove_file(&path).ok();
         assert!(matches!(err, BridgeError::ConfigEdit { .. }), "{err:?}");
     }
