@@ -8,8 +8,11 @@ describe("formErrorMessage", () => {
     );
   });
 
-  it("coerces a non-string message", () => {
-    expect(formErrorMessage({ message: 42 })).toBe("42");
+  it("falls back when message is non-string or empty", () => {
+    expect(formErrorMessage({ message: 42 })).toBe("Something went wrong.");
+    expect(formErrorMessage({ message: "" })).toBe("Something went wrong.");
+    expect(formErrorMessage({ message: "   " })).toBe("Something went wrong.");
+    expect(formErrorMessage({ message: null })).toBe("Something went wrong.");
   });
 
   it("falls back for null, bare strings, and message-less objects", () => {
