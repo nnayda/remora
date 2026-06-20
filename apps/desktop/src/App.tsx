@@ -131,15 +131,20 @@ function App() {
   /** Stop a live worktree session (kills tmux, keeps the worktree). */
   function onStop(node: SessionNode) {
     setNotice(null);
-    void stopSession(node.projectId, node.sessionId).then((r) => {
-      if (r.ok) {
-        void discoveryStore.refreshAfterOpen();
-      } else if (r.error) {
-        // A bare {ok:false} with no error is the in-flight guard (double-click)
-        // or a disposed store — neither is a real failure, so stay quiet.
-        setNotice("Could not stop the session.");
-      }
-    });
+    void stopSession(node.projectId, node.sessionId)
+      .then((r) => {
+        if (r.ok) {
+          void discoveryStore.refreshAfterOpen();
+        } else if (r.error) {
+          // A bare {ok:false} with no error is the in-flight guard (double-click)
+          // or a disposed store — neither is a real failure, so stay quiet.
+          setNotice("Could not stop the session.");
+        }
+      })
+      // The store action resolves rather than rejects, but guard anyway so an
+      // unexpected throw can't become an unhandled rejection (matches the
+      // .then().catch() pattern openFromSidebar uses).
+      .catch(() => setNotice("Could not stop the session."));
   }
 
   /** Open the remove confirm dialog for any session. */

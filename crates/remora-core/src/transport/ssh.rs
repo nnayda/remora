@@ -2464,11 +2464,19 @@ mod realgit_probe_tests {
         assert!(ok, "git {args:?} failed");
     }
 
-    fn temp_repo(tag: &str) -> std::path::PathBuf {
+    fn temp_repo(tag: &str, bare: bool) -> std::path::PathBuf {
         // `tag` keeps the two repos in one test distinct (same pid otherwise collides).
         let base = std::env::temp_dir().join(format!("remora-probe-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("mkdir");
+        if bare {
+            // A push target must be bare — pushing `main` to a non-bare repo with
+            // `main` checked out is rejected ("refusing to update checked out
+            // branch"), which made this test flaky (CodeRabbit). A bare remote
+            // has no working tree, so the push always lands.
+            git(&base, &["init", "-q", "--bare", "-b", "main"]);
+            return base;
+        }
         git(&base, &["init", "-q", "-b", "main"]);
         git(&base, &["config", "user.email", "t@t"]);
         git(&base, &["config", "user.name", "t"]);
@@ -2489,7 +2497,7 @@ mod realgit_probe_tests {
 
     #[test]
     fn probe_reports_each_real_git_state() {
-        let repo = temp_repo("repo");
+        let repo = temp_repo("repo", false);
         let dir = repo.to_string_lossy().into_owned();
 
         // No remote configured → the single base commit is "not on any remote".
@@ -2499,7 +2507,7 @@ mod realgit_probe_tests {
         );
 
         // Give it a remote and mark everything pushed → clean.
-        let remote = temp_repo("remote");
+        let remote = temp_repo("remote", true);
         git(
             &repo,
             &["remote", "add", "origin", &remote.to_string_lossy()],

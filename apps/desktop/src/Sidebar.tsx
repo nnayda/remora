@@ -266,7 +266,7 @@ function SessionRow({
         <button
           type="button"
           className="tree-session-menu-toggle"
-          aria-label="Session actions"
+          aria-label={`Session actions for ${session.sessionId}`}
           aria-expanded={menuOpen}
           onClick={(e) => {
             e.stopPropagation();
