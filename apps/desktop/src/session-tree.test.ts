@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ConfigDto, SessionMetaDto } from "./bindings";
+import type { ConfigDto, SessionMetaDto, WorkspaceModeDto } from "./bindings";
 import { tabKey } from "./session-store";
 import { buildTree, UNCONFIGURED_HOST_ID } from "./session-tree";
 
@@ -17,11 +17,13 @@ const project = (
   hostId: string,
   agent = "claude",
   name: string | null = null,
+  workspace: WorkspaceModeDto = "worktree",
 ) => ({
   id,
   name,
   hostId,
   agent,
+  workspace,
 });
 const session = (
   projectId: string,
@@ -149,5 +151,32 @@ describe("buildTree", () => {
     );
     expect(tree.map((h) => h.id)).toEqual(["alpha", "zeta"]);
     expect(tree.some((h) => h.unconfigured)).toBe(false);
+  });
+
+  it("carries workspace mode from a configured worktree project onto its session leaf", () => {
+    const tree = buildTree(
+      cfg(
+        [host("devbox", "ssh")],
+        [project("api", "devbox", "claude", null, "worktree")],
+      ),
+      [session("api", "fix")],
+    );
+    expect(tree[0].projects[0].sessions[0].workspace).toBe("worktree");
+  });
+
+  it("carries workspace mode 'shared' from a configured shared project onto its session leaf", () => {
+    const tree = buildTree(
+      cfg(
+        [host("devbox", "ssh")],
+        [project("api", "devbox", "claude", null, "shared")],
+      ),
+      [session("api", "fix")],
+    );
+    expect(tree[0].projects[0].sessions[0].workspace).toBe("shared");
+  });
+
+  it("carries null workspace for unconfigured-project sessions", () => {
+    const tree = buildTree(cfg([], []), [session("ghost", "x")]);
+    expect(tree[0].projects[0].sessions[0].workspace).toBeNull();
   });
 });

@@ -1,4 +1,9 @@
-import type { ConfigDto, SessionMetaDto, SessionStateDto } from "./bindings";
+import type {
+  ConfigDto,
+  SessionMetaDto,
+  SessionStateDto,
+  WorkspaceModeDto,
+} from "./bindings";
 import { tabKey } from "./session-store";
 
 /**
@@ -31,6 +36,12 @@ export interface SessionNode {
   agent: string | null;
   /** Identity shared with the tab store, so the sidebar can match open/active tabs. */
   key: string;
+  /**
+   * Workspace mode inherited from the owning configured project, or null for
+   * unconfigured-project sessions whose workspace mode is unknown. Used by the
+   * UI to gate the Stop action (worktree-mode live sessions only).
+   */
+  workspace: WorkspaceModeDto | null;
 }
 
 export interface ProjectNode {
@@ -54,14 +65,20 @@ export interface HostNode {
 type HostTransport = ConfigDto["hosts"][number]["transport"] | null;
 
 /** Project a discovered `SessionMetaDto` into a tree leaf, stamping the
- * tab-store `key` so the sidebar can match it against open/active tabs. */
-function sessionNode(s: SessionMetaDto): SessionNode {
+ * tab-store `key` so the sidebar can match it against open/active tabs.
+ * `workspace` is the owning configured project's mode, or null for sessions
+ * whose project is not in config. */
+function sessionNode(
+  s: SessionMetaDto,
+  workspace: WorkspaceModeDto | null,
+): SessionNode {
   return {
     projectId: s.projectId,
     sessionId: s.sessionId,
     state: s.state,
     agent: s.agent,
     key: tabKey(s.projectId, s.sessionId),
+    workspace,
   };
 }
 
@@ -75,6 +92,10 @@ export function buildTree(
 ): HostNode[] {
   // 1. Seed one ProjectNode per configured project, indexed by id. Sessions
   //    append into these in pass 3; hosts adopt them in pass 4.
+  //    Also build a workspace-mode lookup so sessionNode can carry it.
+  const projectWorkspace = new Map<string, WorkspaceModeDto>(
+    config.projects.map((p) => [p.id, p.workspace]),
+  );
   const projectNodes = new Map<string, ProjectNode>();
   for (const p of config.projects) {
     projectNodes.set(p.id, {
@@ -119,7 +140,9 @@ export function buildTree(
     seen.add(key);
     const project = projectNodes.get(s.projectId);
     if (project) {
-      project.sessions.push(sessionNode(s));
+      project.sessions.push(
+        sessionNode(s, projectWorkspace.get(s.projectId) ?? null),
+      );
       continue;
     }
     let synthetic = unconfiguredProjects.get(s.projectId);
@@ -133,7 +156,7 @@ export function buildTree(
       unconfiguredProjects.set(s.projectId, synthetic);
       unconfigured.projects.push(synthetic);
     }
-    synthetic.sessions.push(sessionNode(s));
+    synthetic.sessions.push(sessionNode(s, null));
   }
 
   // 4. Attach configured projects to their hosts (config order preserved). A
