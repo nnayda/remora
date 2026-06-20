@@ -12,7 +12,7 @@ use crate::config::{Config, SshHost, WorkspaceMode};
 use crate::discovery::{self, DiscoveredEnv};
 use crate::naming::{branch_name, parse_tmux_session_name, tmux_session_name, worktree_path};
 use crate::spawn_plan::{plan_spawn, PlanError, SpawnPlan};
-use crate::{SessionChannel, SessionSource, SourceError};
+use crate::{DirtyReason, SessionChannel, SessionSource, SourceError};
 
 /// Single-token shell quoting for the remote login shell, via `shlex`.
 /// Config validation bans control/nul characters (stage 3), so `try_quote`
@@ -543,6 +543,61 @@ fn stderr_signals_session_absent(stderr: &str) -> bool {
     lower.contains("can't find session")
         || lower.contains("no server running")
         || lower.contains("no sessions")
+}
+
+/// `tmux kill-session`, treating an already-absent session as success — the
+/// goal state is "no tmux session of this name" (reuses the spawn-path classifier).
+#[allow(dead_code)]
+fn kill_session(exec: &dyn SshExec, host: &SshHost, tmux_name: &str) -> Result<(), SourceError> {
+    let out = exec.run(&kill_session_argv(host, tmux_name))?;
+    if out.success || stderr_signals_session_absent(&out.stderr) {
+        Ok(())
+    } else {
+        Err(SourceError::Transport(out.stderr))
+    }
+}
+
+/// Whether a worktree has work that `remove` must not silently destroy:
+/// uncommitted changes (`status --porcelain` non-empty) and/or commits not on
+/// any remote (`rev-list --count … --not --remotes` > 0). A probe that itself
+/// fails → `Transport` (fail-safe: never delete on an unreadable probe).
+#[allow(dead_code)]
+fn worktree_has_work(
+    exec: &dyn SshExec,
+    host: &SshHost,
+    worktree_dir: &str,
+) -> Result<Option<DirtyReason>, SourceError> {
+    let status = exec.run(&status_porcelain_argv(host, worktree_dir))?;
+    if !status.success {
+        return Err(SourceError::Transport(status.stderr));
+    }
+    let uncommitted = !status.stdout.trim().is_empty();
+
+    let rev = exec.run(&not_on_remote_argv(host, worktree_dir))?;
+    if !rev.success {
+        return Err(SourceError::Transport(rev.stderr));
+    }
+    let not_on_remote = rev.stdout.trim().parse::<u64>().unwrap_or(0) > 0;
+
+    Ok(match (uncommitted, not_on_remote) {
+        (false, false) => None,
+        (true, false) => Some(DirtyReason::Uncommitted),
+        (false, true) => Some(DirtyReason::NotOnRemote),
+        (true, true) => Some(DirtyReason::Both),
+    })
+}
+
+/// `git worktree remove` stderr meaning the worktree is already gone — so a
+/// retry after a partial removal converges instead of erroring (D4).
+#[allow(dead_code)]
+fn stderr_signals_worktree_absent(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("is not a working tree")
+}
+
+/// `git branch -D` stderr meaning the branch is already gone (D4).
+#[allow(dead_code)]
+fn stderr_signals_branch_absent(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("not found")
 }
 
 /// Opens the PTY attach channel to an existing session (no liveness
@@ -1936,5 +1991,59 @@ mod tests {
         let config = Config::default();
         let err = teardown_paths(&config, &pid("ghost"), &sid("x")).expect_err("unknown");
         assert!(matches!(err, SourceError::Transport(_)));
+    }
+
+    // --- Task 3: kill + dirty-probe helpers ---
+
+    use crate::DirtyReason;
+
+    #[test]
+    fn kill_session_tolerates_absent_session() {
+        // "no such session" / "no server" → already-stopped → success.
+        let fake = FakeExec::new(vec![Ok(FakeExec::fail("can't find session: remora_api_x"))]);
+        assert!(kill_session(&fake, &host("devbox", None, None), "remora_api_x").is_ok());
+        let fake = FakeExec::new(vec![Ok(FakeExec::fail("no server running on /tmp/tmux"))]);
+        assert!(kill_session(&fake, &host("devbox", None, None), "remora_api_x").is_ok());
+    }
+
+    #[test]
+    fn kill_session_propagates_transport_failure() {
+        let fake = FakeExec::new(vec![Ok(FakeExec::fail("Permission denied (publickey)"))]);
+        let err = kill_session(&fake, &host("devbox", None, None), "remora_api_x").expect_err("err");
+        assert!(matches!(err, SourceError::Transport(_)));
+    }
+
+    #[test]
+    fn worktree_has_work_classifies_each_signal() {
+        let dir = "~/.remora/worktrees/api/x";
+        let h = host("devbox", None, None);
+        // clean tree + 0 not-on-remote → None
+        let fake = FakeExec::new(vec![Ok(FakeExec::out("")), Ok(FakeExec::out("0\n"))]);
+        assert_eq!(worktree_has_work(&fake, &h, dir).expect("ok"), None);
+        // dirty tree + 0 → Uncommitted
+        let fake = FakeExec::new(vec![Ok(FakeExec::out(" M src/x.rs\n")), Ok(FakeExec::out("0\n"))]);
+        assert_eq!(worktree_has_work(&fake, &h, dir).expect("ok"), Some(DirtyReason::Uncommitted));
+        // clean + 3 not-on-remote → NotOnRemote
+        let fake = FakeExec::new(vec![Ok(FakeExec::out("")), Ok(FakeExec::out("3\n"))]);
+        assert_eq!(worktree_has_work(&fake, &h, dir).expect("ok"), Some(DirtyReason::NotOnRemote));
+        // dirty + 3 → Both
+        let fake = FakeExec::new(vec![Ok(FakeExec::out("?? new\n")), Ok(FakeExec::out("3\n"))]);
+        assert_eq!(worktree_has_work(&fake, &h, dir).expect("ok"), Some(DirtyReason::Both));
+    }
+
+    #[test]
+    fn worktree_has_work_fails_safe_on_ambiguous_probe() {
+        // status probe itself errors → Transport (never read as clean).
+        let fake = FakeExec::new(vec![Ok(FakeExec::fail("fatal: not a git repository"))]);
+        let err = worktree_has_work(&fake, &host("devbox", None, None), "~/x").expect_err("err");
+        assert!(matches!(err, SourceError::Transport(_)));
+    }
+
+    #[test]
+    fn absent_classifiers_match_git_phrasings() {
+        assert!(stderr_signals_worktree_absent("fatal: '~/x' is not a working tree"));
+        assert!(!stderr_signals_worktree_absent("fatal: could not lock config file"));
+        assert!(stderr_signals_branch_absent("error: branch 'remora/x' not found."));
+        assert!(!stderr_signals_branch_absent("error: Cannot delete branch checked out at '~/x'"));
     }
 }
