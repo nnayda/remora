@@ -22,6 +22,8 @@ function instantOpeners(attached = false): StoreOpeners {
     attach: vi.fn(async () => makeConn()),
     respawn: vi.fn(async () => makeConn()),
     schedule: vi.fn(),
+    stop: vi.fn(async () => {}),
+    remove: vi.fn(async () => {}),
   };
 }
 
@@ -80,6 +82,8 @@ describe("SessionStore", () => {
       attach: vi.fn(async () => makeConn()),
       respawn: vi.fn(async () => makeConn()),
       schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
     };
     const store = new SessionStore(openers);
     await store.openSession(spec("a", "1"));
@@ -117,6 +121,8 @@ describe("SessionStore", () => {
       attach: vi.fn(async () => makeConn()),
       respawn: vi.fn(async () => makeConn()),
       schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
     };
     const store = new SessionStore(openers);
     const pending = store.openSession(spec("a", "1"));
@@ -151,6 +157,8 @@ describe("SessionStore", () => {
       attach: vi.fn(async () => makeConn()),
       respawn: vi.fn(async () => makeConn()),
       schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
     };
     const store = new SessionStore(openers);
     await store.openSession(spec("a", "1")); // committed
@@ -171,6 +179,8 @@ describe("SessionStore", () => {
       attach: vi.fn(async () => makeConn()),
       respawn: vi.fn(async () => makeConn()),
       schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
     };
     const store = new SessionStore(openers);
     const result = await store.openSession(spec("a", "1"));
@@ -224,6 +234,8 @@ describe("SessionStore", () => {
       attach: vi.fn(async () => makeConn()),
       respawn: vi.fn(async () => makeConn()),
       schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
     };
     const store = new SessionStore(openers);
     store.dispose();
@@ -290,6 +302,8 @@ function makeStore(
     attach: () => Promise.resolve(fakeConn().conn),
     respawn: () => Promise.resolve(fakeConn().conn),
     schedule: clock.schedule,
+    stop: () => Promise.resolve(),
+    remove: () => Promise.resolve(),
     ...overrides,
   };
   return { store: new SessionStore(openers), clock, spawned };
@@ -666,6 +680,8 @@ describe("SessionStore openViaRespawn", () => {
       attach: vi.fn(async () => makeConn()),
       respawn: vi.fn(async () => respawnConn.conn),
       schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
     };
     const store = new SessionStore(openers);
     const result = await store.openViaRespawn(spec("p", "s"));
@@ -686,6 +702,8 @@ describe("SessionStore openViaRespawn", () => {
       attach: vi.fn(async () => makeConn()),
       respawn: vi.fn(async () => fakeConn().conn),
       schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
     };
     const store = new SessionStore(openers);
     // Open a second tab first so focus is elsewhere
@@ -710,6 +728,8 @@ describe("SessionStore openViaRespawn", () => {
         throw { kind: "transport", message: "refused" };
       }),
       schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
     };
     const store = new SessionStore(openers);
     const result = await store.openViaRespawn(spec("p", "s"));
@@ -725,6 +745,8 @@ describe("SessionStore openViaRespawn", () => {
       attach: vi.fn(async () => fakeConn().conn),
       respawn: vi.fn(async () => respawnConn.conn),
       schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
     };
     const store = new SessionStore(openers);
     await store.openViaRespawn(spec("p", "s"));
@@ -769,6 +791,8 @@ describe("SessionStore openViaRespawn", () => {
         return freshConn.conn;
       }),
       schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
     };
     const store2 = new SessionStore(openers2);
     const { conn: spawnConn2, die: die2 } = fakeConn();
@@ -826,6 +850,8 @@ describe("SessionStore Fix D coverage", () => {
       },
       respawn: () => Promise.resolve(fakeConn().conn),
       schedule: clock.schedule,
+      stop: () => Promise.resolve(),
+      remove: () => Promise.resolve(),
     };
     const store = new SessionStore(openers);
     await store.openSession({ projectId: "p", sessionId: "live", agent: null });
@@ -892,6 +918,8 @@ describe("SessionStore Fix D coverage", () => {
       },
       respawn: () => Promise.resolve(fakeConn().conn),
       schedule: clock.schedule,
+      stop: () => Promise.resolve(),
+      remove: () => Promise.resolve(),
     };
 
     const store = new SessionStore(openers);
@@ -968,6 +996,8 @@ describe("SessionStore Fix D coverage", () => {
       ),
       respawn: vi.fn(async () => respawnConn.conn),
       schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
     };
     const store2 = new SessionStore(openers2);
     // Provide a fresh spawn conn
@@ -1008,6 +1038,8 @@ describe("SessionStore Fix D coverage", () => {
         throw { kind: "transport", message: "refused" };
       }),
       schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
     };
     const initialConn = fakeConn();
     (openers.spawn as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
@@ -1059,6 +1091,42 @@ describe("SessionStore Fix D coverage", () => {
     for (let i = 3; i < delays.length; i++) {
       expect(delays[i]).toBe(8000);
     }
+  });
+
+  // Task 10: stop/remove teardown actions
+
+  it("stop sets the open tab to stopped and cancels reconnect", async () => {
+    const { store } = makeStore({ stop: vi.fn().mockResolvedValue(undefined) });
+    await store.openSession({ projectId: "api", sessionId: "x", agent: null });
+    const r = await store.stop("api", "x");
+    expect(r).toEqual({ ok: true });
+    expect(store.getSnapshot().tabs[0].status).toBe("stopped");
+  });
+
+  it("remove closes the tab on success", async () => {
+    const { store } = makeStore({ remove: vi.fn().mockResolvedValue(undefined) });
+    await store.openSession({ projectId: "api", sessionId: "x", agent: null });
+    const r = await store.remove("api", "x", false);
+    expect(r).toEqual({ ok: true });
+    expect(store.getSnapshot().tabs).toHaveLength(0);
+  });
+
+  it("remove surfaces WorkspaceDirty for the force escalation", async () => {
+    const dirty = { kind: "workspaceDirty", message: "x", reason: "uncommitted" };
+    const { store } = makeStore({ remove: vi.fn().mockRejectedValue(dirty) });
+    const r = await store.remove("api", "x", false);
+    expect(r).toEqual({ ok: false, dirty: "uncommitted" });
+  });
+
+  it("remove is guarded against a double-fire", async () => {
+    let resolve!: () => void;
+    const remove = vi.fn().mockReturnValue(new Promise<void>((r) => { resolve = r; }));
+    const { store } = makeStore({ remove });
+    const first = store.remove("api", "x", true);
+    const second = await store.remove("api", "x", true); // in-flight → rejected
+    expect(second).toEqual({ ok: false });
+    resolve(); await first;
+    expect(remove).toHaveBeenCalledTimes(1);
   });
 
   // D6: closeTab during backoff — cancelled retry is a no-op

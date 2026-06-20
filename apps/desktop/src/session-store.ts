@@ -1,5 +1,13 @@
 import type { SessionConnection } from "./connection";
 import { errorMessage, reconnectFate } from "./connection";
+import type { DirtyReasonDto } from "./bindings";
+
+export type TeardownResult = { ok: true } | { ok: false; error?: unknown };
+export type RemoveResult = { ok: true } | { ok: false; dirty?: DirtyReasonDto; error?: unknown };
+
+function isWorkspaceDirty(e: unknown): e is { kind: "workspaceDirty"; reason: DirtyReasonDto } {
+  return typeof e === "object" && e !== null && (e as { kind?: string }).kind === "workspaceDirty";
+}
 
 /** Identity + dedupe key for a tab. */
 export function tabKey(projectId: string, sessionId: string): string {
@@ -45,6 +53,8 @@ export interface StoreOpeners {
   ): Promise<SessionConnection>;
   /** Injected timer so tests drive backoff deterministically. */
   schedule(fn: () => void, ms: number): unknown;
+  stop(projectId: string, sessionId: string): Promise<void>;
+  remove(projectId: string, sessionId: string, force: boolean): Promise<void>;
 }
 
 /** Returned by `openSession` when the open was cancelled (closed/disposed
@@ -82,6 +92,7 @@ export class SessionStore {
   private disposed = false;
   private listeners = new Set<() => void>();
   private snapshot: Snapshot = { tabs: [], activeKey: null };
+  private teardownPending = new Set<string>();
 
   /** Inject the openers (spawn/attach/respawn + timer) so tests can fake them. */
   constructor(private readonly openers: StoreOpeners) {}
@@ -416,6 +427,49 @@ export class SessionStore {
       return;
     }
     this.swapConnection(key, next, "live");
+  };
+
+  /** Stop a session (kill tmux, keep the worktree). An open tab flips to
+   * "stopped" directly — we do NOT wait for the channel-death path, which would
+   * flicker through "reconnecting" and waste an attach (D2). */
+  stop = async (projectId: string, sessionId: string): Promise<TeardownResult> => {
+    if (this.disposed) return { ok: false };
+    const key = tabKey(projectId, sessionId);
+    if (this.teardownPending.has(key)) return { ok: false };
+    this.teardownPending.add(key);
+    try {
+      await this.openers.stop(projectId, sessionId);
+    } catch (error) {
+      this.teardownPending.delete(key);
+      return { ok: false, error };
+    }
+    this.teardownPending.delete(key);
+    // Cancel any in-flight reconnect loop (the killed channel's onDeath may have
+    // started one) so it doesn't race our status set, then mark the tab stopped.
+    const token = this.reconnectTokens.get(key);
+    if (token) token.cancelled = true;
+    if (this.tabs.some((t) => t.key === key)) this.setStatus(key, "stopped", null);
+    return { ok: true };
+  };
+
+  /** Remove a session for good. On success the local tab is closed (silent;
+   * closeTab also cancels the reconnect token). WorkspaceDirty is surfaced so the
+   * UI can confirm a force-remove (D2/D5). */
+  remove = async (projectId: string, sessionId: string, force: boolean): Promise<RemoveResult> => {
+    if (this.disposed) return { ok: false };
+    const key = tabKey(projectId, sessionId);
+    if (this.teardownPending.has(key)) return { ok: false };
+    this.teardownPending.add(key);
+    try {
+      await this.openers.remove(projectId, sessionId, force);
+    } catch (error) {
+      this.teardownPending.delete(key);
+      if (isWorkspaceDirty(error)) return { ok: false, dirty: error.reason };
+      return { ok: false, error };
+    }
+    this.teardownPending.delete(key);
+    this.closeTab(key); // no-op if not open; else silent close + token cancel
+    return { ok: true };
   };
 
   /** App teardown: cancel all pending opens/reconnects and close every
