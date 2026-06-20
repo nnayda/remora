@@ -18,6 +18,8 @@ interface SidebarProps {
   onStop: (node: SessionNode) => void;
   /** Open the remove confirm dialog for any session. */
   onRemove: (node: SessionNode) => void;
+  /** Open the config-management (Settings) modal. */
+  onOpenSettings: () => void;
 }
 
 /**
@@ -38,6 +40,7 @@ export function Sidebar({
   onRefresh,
   onStop,
   onRemove,
+  onOpenSettings,
 }: SidebarProps) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const toggle = (id: string) =>
@@ -52,9 +55,20 @@ export function Sidebar({
     <nav className="sidebar" aria-label="Sessions">
       <div className="sidebar-header">
         <span>Sessions</span>
-        <button type="button" className="sidebar-refresh" onClick={onRefresh}>
-          Refresh
-        </button>
+        <div className="sidebar-header-actions">
+          <button
+            type="button"
+            className="sidebar-refresh"
+            onClick={onOpenSettings}
+            aria-label="Settings"
+            title="Settings"
+          >
+            ⚙
+          </button>
+          <button type="button" className="sidebar-refresh" onClick={onRefresh}>
+            Refresh
+          </button>
+        </div>
       </div>
       {discoveryUnavailable && (
         <div className="sidebar-warning" role="status">

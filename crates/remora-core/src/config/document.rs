@@ -19,6 +19,18 @@ use super::{
     ValidationIssue,
 };
 
+/// The entry ids present in each section of the document, regardless of whether
+/// the document is semantically valid. Powers degraded-mode recovery (ADR-0006):
+/// when a degraded base can't produce a typed [`Config`], the UI still needs the
+/// ids so the user can delete the offending entries one by one until the file
+/// validates.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PresentIds {
+    pub hosts: Vec<String>,
+    pub projects: Vec<String>,
+    pub agents: Vec<String>,
+}
+
 /// An editable, format-preserving view of the config file (ADR-0006).
 pub struct ConfigDocument {
     doc: DocumentMut,
@@ -72,6 +84,18 @@ impl ConfigDocument {
             Err(e) => return Err(e),
         };
         Ok((Self { doc, strict }, issues))
+    }
+
+    /// The entry ids present in each section, regardless of validity. Listed in
+    /// the same accessor the mutators use (a plain `[section.id]` table), so
+    /// every id returned here is one [`Self::remove_host`] et al. can act on —
+    /// the contract degraded-mode recovery relies on.
+    pub fn present_ids(&self) -> PresentIds {
+        PresentIds {
+            hosts: section_ids(&self.doc, "hosts"),
+            projects: section_ids(&self.doc, "projects"),
+            agents: section_ids(&self.doc, "agents"),
+        }
     }
 
     /// Serializes the document back to TOML, preserving comments and layout.
@@ -232,10 +256,24 @@ impl ConfigDocument {
     }
 }
 
-/// True when `[section.id]` is present in the document.
+/// The entry ids under `[section.*]`, in document order. Uses the same
+/// table-like accessor as [`contains`]/[`remove_entry`]/[`set_entry`], so an id
+/// listed here is always one those mutators can find — degraded recovery never
+/// offers a delete that can't fire. `as_table_like` (not `as_table`) so the
+/// inline-table form `section = { id = { … } }` is seen too, not just
+/// `[section.id]` headers.
+fn section_ids(doc: &DocumentMut, section: &str) -> Vec<String> {
+    doc.get(section)
+        .and_then(|s| s.as_table_like())
+        .map(|t| t.iter().map(|(k, _)| k.to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// True when `[section.id]` is present in the document. `as_table_like` so an
+/// inline-table section counts too (see [`section_ids`]).
 fn contains(doc: &DocumentMut, section: &str, id: &str) -> bool {
     doc.get(section)
-        .and_then(|s| s.as_table())
+        .and_then(|s| s.as_table_like())
         .map(|t| t.contains_key(id))
         .unwrap_or(false)
 }
@@ -282,7 +320,10 @@ fn set_entry(doc: &mut DocumentMut, section: &str, id: &str, item: Item) {
         parent.set_implicit(true);
         root.insert(section, Item::Table(parent));
     }
-    if let Some(parent) = root[section].as_table_mut() {
+    // `as_table_like_mut` (not `as_table_mut`) so an inline-table section
+    // (`hosts = { … }`) is mutated in place instead of silently no-op'd;
+    // toml_edit coerces the `Item::Table` into the inline form and preserves it.
+    if let Some(parent) = root[section].as_table_like_mut() {
         parent.insert(id, item);
     }
 }
@@ -296,7 +337,8 @@ fn remove_entry(
     kind: &str,
 ) -> Result<(), ConfigError> {
     ensure_present(doc, section, id, kind)?;
-    if let Some(parent) = doc.get_mut(section).and_then(|s| s.as_table_mut()) {
+    // `as_table_like_mut` so a delete also fires on an inline-table section.
+    if let Some(parent) = doc.get_mut(section).and_then(|s| s.as_table_like_mut()) {
         parent.remove(id);
     }
     Ok(())
@@ -577,6 +619,68 @@ mod tests {
         doc.remove_host(&hid("a")).expect("degraded-mode delete");
         assert!(doc.to_toml().contains("[hosts.b]"));
         assert!(!doc.to_toml().contains("[hosts.a]"));
+    }
+
+    #[test]
+    fn present_ids_lists_every_entry_even_in_a_degraded_doc() {
+        // A semantically invalid base (two hosts with bad transports) plus a
+        // project and an agent. Degraded mode needs every id so the user can
+        // delete entries one by one until the file validates.
+        let input = "[hosts.a]\ntransport = \"telnet\"\n[hosts.b]\ntransport = \"nope\"\n[projects.api]\nhost = \"a\"\npath = \"/x\"\nworkspace = \"worktree\"\nagent = \"claude\"\n[agents.claude]\ncommand = [\"claude\"]\n";
+        let (doc, _issues) = ConfigDocument::parse_lenient(input).expect("lenient");
+        let present = doc.present_ids();
+        assert_eq!(present.hosts, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(present.projects, vec!["api".to_string()]);
+        assert_eq!(present.agents, vec!["claude".to_string()]);
+    }
+
+    #[test]
+    fn inline_table_section_supports_edit_and_present_ids() {
+        // A hand-written config may use the inline-table form of a section
+        // (valid TOML, deserializes the same as `[hosts.devbox]`). The editor
+        // must still see the entry and mutate it in place — not silently no-op
+        // while reporting success.
+        let input = "hosts = { devbox = { transport = \"ssh\", host = \"old\" } }\n";
+        let mut doc = ConfigDocument::parse(input).expect("inline-table config is valid");
+        assert_eq!(
+            doc.present_ids().hosts,
+            vec!["devbox".to_string()],
+            "present_ids must list an inline-table entry"
+        );
+        doc.update_host(
+            &hid("devbox"),
+            &Host {
+                name: None,
+                transport: Transport::Ssh(SshHost {
+                    host: "new".into(),
+                    user: None,
+                    port: None,
+                }),
+            },
+        )
+        .expect("update");
+        assert_eq!(
+            doc.config().expect("valid").hosts[&hid("devbox")].transport,
+            Transport::Ssh(SshHost {
+                host: "new".into(),
+                user: None,
+                port: None
+            }),
+            "the edit must actually change the stored host, not no-op: {}",
+            doc.to_toml()
+        );
+        // And a delete must fire on the inline form too (degraded recovery).
+        doc.remove_host(&hid("devbox")).expect("remove");
+        assert!(doc.present_ids().hosts.is_empty(), "{}", doc.to_toml());
+    }
+
+    #[test]
+    fn present_ids_of_an_empty_doc_is_empty() {
+        let doc = ConfigDocument::parse("").expect("empty is valid");
+        let present = doc.present_ids();
+        assert!(present.hosts.is_empty());
+        assert!(present.projects.is_empty());
+        assert!(present.agents.is_empty());
     }
 
     #[test]
