@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Config management UI (desktop): a Settings modal (⚙ in the sidebar header)
+  lets you create, edit, and remove **hosts** (ssh + kubectl), **projects**, and
+  **agents** without hand-editing `config.toml`. Forms reuse the new-session
+  dialog's shell (focus trap, inline errors); ids are create-only (immutable
+  join keys, ADR-0004) and host/agent references are dropdowns of existing
+  entries so a dangling reference can't be made. A rejected save (dup/used id,
+  validation) shows inline; every successful mutation re-reads the config and
+  refreshes the sidebar. When the base file is **semantically invalid**, the
+  modal opens in degraded-recovery mode — it lists the problems and the entries
+  present so you can delete the offending ones in place (the bridge now reads
+  leniently so a recovering delete can run; the core still refuses to persist an
+  invalid result). Form-state logic lives in a node-tested `config-editor-model`.
+  Final slice of #32 (ADR-0006).
 - Config editor channel (desktop bridge): a **local-only** counterpart to the
   redacted display path lets the app manage the per-device config. A new
   un-redacted `EditorConfigDto` (its own module, with a guard test that it ships

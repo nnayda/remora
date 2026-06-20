@@ -14,6 +14,8 @@ interface SidebarProps {
   /** True when the last discovery poll failed (last good tree still shown). */
   discoveryUnavailable: boolean;
   onRefresh: () => void;
+  /** Open the config-management (Settings) modal. */
+  onOpenSettings: () => void;
 }
 
 /**
@@ -32,6 +34,7 @@ export function Sidebar({
   configError,
   discoveryUnavailable,
   onRefresh,
+  onOpenSettings,
 }: SidebarProps) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const toggle = (id: string) =>
@@ -46,9 +49,20 @@ export function Sidebar({
     <nav className="sidebar" aria-label="Sessions">
       <div className="sidebar-header">
         <span>Sessions</span>
-        <button type="button" className="sidebar-refresh" onClick={onRefresh}>
-          Refresh
-        </button>
+        <div className="sidebar-header-actions">
+          <button
+            type="button"
+            className="sidebar-refresh"
+            onClick={onOpenSettings}
+            aria-label="Settings"
+            title="Settings"
+          >
+            ⚙
+          </button>
+          <button type="button" className="sidebar-refresh" onClick={onRefresh}>
+            Refresh
+          </button>
+        </div>
       </div>
       {discoveryUnavailable && (
         <div className="sidebar-warning" role="status">

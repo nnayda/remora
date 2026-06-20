@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { NewSessionDialog } from "./NewSessionDialog";
+import { SettingsDialog } from "./SettingsDialog";
 import { Sidebar } from "./Sidebar";
 import { OPEN_CANCELLED } from "./session-store";
 import { buildTree, type SessionNode } from "./session-tree";
@@ -28,6 +29,7 @@ function App() {
   const { config, sessions, configError, discoveryUnavailable, refresh } =
     useDiscovery();
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const newButtonRef = useRef<HTMLButtonElement>(null);
   // Live focus handles for the mounted terminal panes, keyed by tab key.
@@ -139,6 +141,10 @@ function App() {
         configError={configError}
         discoveryUnavailable={discoveryUnavailable}
         onRefresh={() => void refresh()}
+        onOpenSettings={() => {
+          setNotice(null);
+          setSettingsOpen(true);
+        }}
       />
       <div className="main-col">
         <TabBar
@@ -230,6 +236,13 @@ function App() {
             setDialogOpen(false);
             newButtonRef.current?.focus();
           }}
+        />
+      )}
+      {settingsOpen && (
+        <SettingsDialog
+          // A config edit changes the sidebar's (redacted) view; re-read it.
+          onConfigChanged={() => void refresh()}
+          onClose={() => setSettingsOpen(false)}
         />
       )}
     </main>
