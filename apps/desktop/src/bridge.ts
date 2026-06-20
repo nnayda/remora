@@ -5,6 +5,7 @@ import {
   type ChannelHandle,
   type ConfigDto,
   commands,
+  type DirtyReasonDto,
   type Result,
   type SessionMetaDto,
   type SessionStateDto,
@@ -15,6 +16,7 @@ export type {
   BridgeOutput,
   ChannelHandle,
   ConfigDto,
+  DirtyReasonDto,
   SessionMetaDto,
   SessionStateDto,
 };
@@ -111,4 +113,22 @@ export async function resizeSession(
 /** Close our end of a session channel (reaps the backing transport child). */
 export async function closeSession(handle: ChannelHandle): Promise<void> {
   unwrap(await commands.sessionClose(handle));
+}
+
+/** Kill a session's tmux (worktree survives, respawnable). */
+export async function stopSession(
+  projectId: string,
+  sessionId: string,
+): Promise<void> {
+  unwrap(await commands.sessionStop(projectId, sessionId));
+}
+
+/** Tear a session down for good. Throws BridgeError {kind:"workspaceDirty"} when
+ * the worktree has uncommitted/not-on-remote work and `force` is false. */
+export async function removeSession(
+  projectId: string,
+  sessionId: string,
+  force: boolean,
+): Promise<void> {
+  unwrap(await commands.sessionRemove(projectId, sessionId, force));
 }

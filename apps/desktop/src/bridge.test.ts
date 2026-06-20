@@ -8,6 +8,8 @@ const c = vi.hoisted(() => ({
   sessionWrite: vi.fn(),
   sessionResize: vi.fn(),
   sessionClose: vi.fn(),
+  sessionStop: vi.fn(),
+  sessionRemove: vi.fn(),
 }));
 
 vi.mock("./bindings", () => ({ commands: c }));
@@ -115,5 +117,20 @@ describe("bridge.ts", () => {
     await expect(bridge.closeSession(1 as never)).rejects.toEqual({
       kind: "unknownHandle",
     });
+  });
+
+  it("removeSession forwards force and throws the typed error", async () => {
+    c.sessionRemove.mockResolvedValue({
+      status: "error",
+      error: {
+        kind: "workspaceDirty",
+        message: "x",
+        reason: "uncommitted",
+      },
+    } as never);
+    await expect(bridge.removeSession("api", "x", false)).rejects.toMatchObject(
+      { kind: "workspaceDirty", reason: "uncommitted" },
+    );
+    expect(c.sessionRemove).toHaveBeenCalledWith("api", "x", false);
   });
 });
