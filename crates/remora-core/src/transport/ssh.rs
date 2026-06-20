@@ -595,9 +595,13 @@ fn stderr_signals_worktree_absent(stderr: &str) -> bool {
 }
 
 /// `git branch -D` stderr meaning the branch is already gone (D4).
+/// Requires BOTH "branch" and "not found" so unrelated errors like
+/// `remote: Repository not found` or an SSH error cannot be mistaken for
+/// an already-absent branch and silently swallowed by `run_remove`.
 #[allow(dead_code)]
 fn stderr_signals_branch_absent(stderr: &str) -> bool {
-    stderr.to_ascii_lowercase().contains("not found")
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("branch") && lower.contains("not found")
 }
 
 /// Opens the PTY attach channel to an existing session (no liveness
@@ -2043,7 +2047,23 @@ mod tests {
     fn absent_classifiers_match_git_phrasings() {
         assert!(stderr_signals_worktree_absent("fatal: '~/x' is not a working tree"));
         assert!(!stderr_signals_worktree_absent("fatal: could not lock config file"));
+        // Positive: git's real phrasing for a deleted branch that is already gone.
         assert!(stderr_signals_branch_absent("error: branch 'remora/x' not found."));
         assert!(!stderr_signals_branch_absent("error: Cannot delete branch checked out at '~/x'"));
+        // Negative: bare "not found" without "branch" must NOT match — otherwise
+        // `run_remove` would silently swallow a real `git branch -D` failure like
+        // `remote: Repository not found` or an SSH error that happens to contain
+        // "not found".
+        assert!(!stderr_signals_branch_absent("remote: Repository not found"));
+        assert!(!stderr_signals_branch_absent("fatal: 'origin' not found"));
+    }
+
+    #[test]
+    fn worktree_has_work_fails_safe_when_revlist_probe_fails() {
+        // Status probe succeeds (clean output) but rev-list probe fails →
+        // Transport (fail-safe: never treat an unreadable probe as clean).
+        let fake = FakeExec::new(vec![Ok(FakeExec::out("")), Ok(FakeExec::fail("fatal: bad object HEAD"))]);
+        let err = worktree_has_work(&fake, &host("devbox", None, None), "~/x").expect_err("err");
+        assert!(matches!(err, SourceError::Transport(_)));
     }
 }
