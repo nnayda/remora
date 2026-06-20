@@ -2223,3 +2223,114 @@ mod tests {
         assert!(run_remove(&fake, &host("devbox", None, None), &config, &pid("api"), &sid("fix-login"), true).is_ok());
     }
 }
+
+#[cfg(test)]
+mod realgit_probe_tests {
+    use super::*;
+    use std::process::Command;
+
+    // Runs the tail of an ssh argv (everything after the host) as a LOCAL
+    // process, so the real `git`/`status`/`rev-list` semantics are exercised.
+    struct LocalExec;
+    impl SshExec for LocalExec {
+        fn run(&self, argv: &[String]) -> Result<RemoteOutput, SourceError> {
+            // argv = ["ssh", ...flags, host, "git", "-C", <dir>, ...]; take from "git".
+            let start = argv
+                .iter()
+                .position(|a| a == "git" || a == "tmux")
+                .expect("cmd");
+            let prog = &argv[start];
+            // The dir arg is shell-quoted ("$HOME"/x or '/p'); these tests pass
+            // absolute paths with no special chars, so strip optional quotes.
+            let unquote = |s: &str| s.trim_matches('\'').to_string();
+            let args: Vec<String> = argv[start + 1..].iter().map(|a| unquote(a)).collect();
+            let out = Command::new(unquote(prog))
+                .args(&args)
+                .output()
+                .map_err(|e| SourceError::Transport(e.to_string()))?;
+            Ok(RemoteOutput {
+                success: out.status.success(),
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            })
+        }
+        fn open_channel(&self, _: &[String]) -> Result<SessionChannel, SourceError> {
+            unreachable!("probe tests never attach")
+        }
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    fn temp_repo(tag: &str) -> std::path::PathBuf {
+        // `tag` keeps the two repos in one test distinct (same pid otherwise collides).
+        let base = std::env::temp_dir()
+            .join(format!("remora-probe-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("mkdir");
+        git(&base, &["init", "-q", "-b", "main"]);
+        git(&base, &["config", "user.email", "t@t"]);
+        git(&base, &["config", "user.name", "t"]);
+        std::fs::write(base.join("README"), "x").expect("write");
+        git(&base, &["add", "."]);
+        git(&base, &["commit", "-qm", "base"]);
+        base
+    }
+
+    // host() with no ssh prefix matters not here — LocalExec strips it.
+    fn h() -> SshHost {
+        SshHost {
+            host: "x".into(),
+            user: None,
+            port: None,
+        }
+    }
+
+    #[test]
+    fn probe_reports_each_real_git_state() {
+        let repo = temp_repo("repo");
+        let dir = repo.to_string_lossy().into_owned();
+
+        // No remote configured → the single base commit is "not on any remote".
+        assert_eq!(
+            worktree_has_work(&LocalExec, &h(), &dir).expect("probe"),
+            Some(DirtyReason::NotOnRemote)
+        );
+
+        // Give it a remote and mark everything pushed → clean.
+        let remote = temp_repo("remote");
+        git(&repo, &["remote", "add", "origin", &remote.to_string_lossy()]);
+        git(&repo, &["push", "-q", "origin", "main"]);
+        git(&repo, &["fetch", "-q", "origin"]);
+        assert_eq!(
+            worktree_has_work(&LocalExec, &h(), &dir).expect("probe"),
+            None
+        );
+
+        // Dirty the tree → Uncommitted.
+        std::fs::write(repo.join("README"), "changed").expect("write");
+        assert_eq!(
+            worktree_has_work(&LocalExec, &h(), &dir).expect("probe"),
+            Some(DirtyReason::Uncommitted)
+        );
+
+        // Commit locally (not pushed) → NotOnRemote (dirty cleared, local commit added).
+        // Note: `git commit -a` stages and commits the modified README, clearing
+        // the dirty flag; the new commit is not on origin → NotOnRemote (not Both).
+        git(&repo, &["commit", "-aqm", "local work"]);
+        assert_eq!(
+            worktree_has_work(&LocalExec, &h(), &dir).expect("probe"),
+            Some(DirtyReason::NotOnRemote)
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&remote);
+    }
+}
