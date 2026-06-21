@@ -49,6 +49,52 @@ up cold.
   `1 + N + M` blocking remote commands per discovery refresh (vs spawn's ~3),
   so the unbounded-execution exposure multiplies. Bump this above ControlMaster
   once discovery ships.
+- **kubectl note (stage-12 eng review):** the kubectl transport shares this
+  gap and deliberately does NOT use `--request-timeout` to bound execution
+  (it would sever a legitimately-slow `git worktree add`, since for `kubectl
+  exec` the streamed command is one long API request — unlike ssh's
+  `ConnectTimeout`, which bounds only the handshake). Design this watchdog at
+  the shared `RemoteExec`/`capture` seam so both transports get it at once.
+
+## kubectl exec connection reuse
+
+- **What:** Avoid a fresh API-server round-trip (TLS + auth + SPDY/websocket
+  upgrade to the kubelet) for every `kubectl exec`. A worktree-mode spawn fires
+  ~5-6 execs (worktree-add, new-session, 3× set-environment, attach); `list()`
+  fires `1 + N + M`.
+- **Why:** On a high-RTT cluster every op pays full connection setup, so spawns
+  and the discovery poll feel sluggish — the kubectl analog of the ssh
+  ControlMaster cost, multiplied by the same `list()` fan-out.
+- **How:** kubectl has no `ControlMaster` equivalent. Options: a persistent
+  `kubectl port-forward` + reused channel, or drop the `kubectl` binary and
+  drive the client-go/SPDY streaming exec API directly (heavier, pulls in a
+  k8s client). Investigate which fits the `RemoteExec` seam.
+- **Pros:** Faster kubectl spawns and discovery. **Cons:** Substantial
+  transport-specific machinery (port-forward lifecycle or a k8s client dep);
+  breaks parity with the unoptimized ssh path until ControlMaster also lands.
+- **Context:** Stage-12 eng review (perf section). kubectl shipped without it
+  to keep parity with how ssh ships (no multiplexing). See
+  `docs/superpowers/specs/2026-06-20-kubectl-transport-design.md`.
+- **Depends on:** none; pairs conceptually with the ssh ControlMaster item.
+
+## App-level liveness heartbeat (kubectl idle dead-link detection)
+
+- **What:** Detect a half-open/dead channel for an *idle* session at the app
+  (or future relay) layer, independent of transport keepalive.
+- **Why:** ssh surfaces a dead link as channel death in ~45s via
+  `ServerAliveInterval/CountMax`. `kubectl exec` exposes no keepalive knob, so
+  an idle kubectl tab only notices death on OS TCP timeout (minutes). The
+  stage-11 reconnect-on-focus path already re-attaches on wake, so the hero
+  scenario works; this only tightens sub-minute idle detection.
+- **How:** A periodic app-side liveness probe per open channel (or a relay
+  heartbeat) that tears down and flips the tab to reconnect on miss. Benefits
+  both transports but only kubectl *needs* it.
+- **Pros:** Uniform, transport-independent dead-link detection. **Cons:** New
+  app/bridge plumbing + a probe cadence to tune; ssh already covers its case.
+- **Context:** Stage-12 eng review (architecture, Finding 3). Accepted as a
+  documented kubectl limitation for the MVP. See
+  `docs/superpowers/specs/2026-06-20-kubectl-transport-design.md`.
+- **Depends on:** none.
 
 ## tmux 3.0 `#{E:}` inline session metadata (collapse discovery round-trips)
 
