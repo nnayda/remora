@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { removeSession, stopSession } from "./bridge";
 import { attachConnection, openSession, respawnConnection } from "./connection";
 import { SessionStore } from "./session-store";
 
@@ -12,6 +13,8 @@ export const sessionStore = new SessionStore({
   attach: (p, s) => attachConnection(p, s),
   respawn: (p, s, a) => respawnConnection(p, s, a),
   schedule: (fn, ms) => setTimeout(fn, ms),
+  stop: (p, s) => stopSession(p, s),
+  remove: (p, s, force) => removeSession(p, s, force),
 });
 
 /** Subscribe a component to the session-store singleton: returns the live tabs
@@ -29,5 +32,7 @@ export function useSessions() {
     closeTab: sessionStore.closeTab,
     focusTab: sessionStore.focusTab,
     respawnTab: sessionStore.respawnTab,
+    stopSession: sessionStore.stop,
+    removeSession: sessionStore.remove,
   };
 }

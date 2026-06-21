@@ -46,6 +46,22 @@ async sessionRespawn(projectId: string, sessionId: string, agent: string | null,
     else return { status: "error", error: e  as any };
 }
 },
+async sessionStop(projectId: string, sessionId: string) : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("session_stop", { projectId, sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async sessionRemove(projectId: string, sessionId: string, force: boolean) : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("session_remove", { projectId, sessionId, force }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async sessionWrite(handle: ChannelHandle, bytes: number[]) : Promise<Result<null, BridgeError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("session_write", { handle, bytes }) };
@@ -187,7 +203,13 @@ export type BridgeError = { kind: "sessionExists"; message: string } | { kind: "
  * `ConfigError`. Distinct from `Config` (whole-file load failure → sidebar
  * banner) so the frontend can show this inline on the offending form.
  */
-{ kind: "configEdit"; message: string }
+{ kind: "configEdit"; message: string } | 
+/**
+ * A session removal was blocked because the workspace has unsaved state
+ * (uncommitted changes or commits not pushed to any remote). Carry the
+ * reason so the frontend can show a targeted warning and offer `force`.
+ */
+{ kind: "workspaceDirty"; message: string; reason: DirtyReasonDto }
 /**
  * Streamed from a session's PTY to the frontend. Internally tagged + camelCase
  * so the generated TS is a clean discriminated union. A local bridge<->frontend
@@ -203,6 +225,7 @@ export type ChannelHandle = number
  * empty config a fresh device (no file yet) renders.
  */
 export type ConfigDto = { hosts: HostDto[]; projects: ProjectDto[]; agents: AgentDto[] }
+export type DirtyReasonDto = "uncommitted" | "notOnRemote" | "both"
 /**
  * The editable config plus its validation state (ADR-0006 degraded mode).
  * 
@@ -250,11 +273,12 @@ export type HostInputDto = { name: string | null; transport: TransportDto }
  */
 export type PresentEntitiesDto = { hosts: string[]; projects: string[]; agents: string[] }
 /**
- * A configured project: its label, the host it lives on, and its default
- * agent. The on-host `path` is intentionally omitted — it is not needed to
- * render the tree and is closer to a connection detail than a label.
+ * A configured project: its label, the host it lives on, its workspace mode,
+ * and its default agent. The on-host `path` is intentionally omitted — it is
+ * not needed to render the tree and is closer to a connection detail than a
+ * label. Workspace mode is structural (it affects session UI), not a secret.
  */
-export type ProjectDto = { id: string; name: string | null; hostId: string; agent: string }
+export type ProjectDto = { id: string; name: string | null; hostId: string; workspace: WorkspaceModeDto; agent: string }
 /**
  * Form payload for create/edit of a project. `host_id` and `agent` are
  * references to existing entries; converting parses them into ids.

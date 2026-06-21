@@ -14,6 +14,10 @@ interface SidebarProps {
   /** True when the last discovery poll failed (last good tree still shown). */
   discoveryUnavailable: boolean;
   onRefresh: () => void;
+  /** Stop a live worktree session (kills tmux, keeps the worktree). */
+  onStop: (node: SessionNode) => void;
+  /** Open the remove confirm dialog for any session. */
+  onRemove: (node: SessionNode) => void;
   /** Open the config-management (Settings) modal. */
   onOpenSettings: () => void;
 }
@@ -34,6 +38,8 @@ export function Sidebar({
   configError,
   discoveryUnavailable,
   onRefresh,
+  onStop,
+  onRemove,
   onOpenSettings,
 }: SidebarProps) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
@@ -87,6 +93,8 @@ export function Sidebar({
               activeKey={activeKey}
               openKeys={openKeys}
               onOpenSession={onOpenSession}
+              onStop={onStop}
+              onRemove={onRemove}
             />
           ))}
         </ul>
@@ -103,6 +111,8 @@ function HostRow({
   activeKey,
   openKeys,
   onOpenSession,
+  onStop,
+  onRemove,
 }: {
   host: HostNode;
   collapsed: Set<string>;
@@ -110,6 +120,8 @@ function HostRow({
   activeKey: string | null;
   openKeys: Set<string>;
   onOpenSession: (node: SessionNode) => void;
+  onStop: (node: SessionNode) => void;
+  onRemove: (node: SessionNode) => void;
 }) {
   const isCollapsed = collapsed.has(host.id);
   return (
@@ -138,6 +150,8 @@ function HostRow({
                 activeKey={activeKey}
                 openKeys={openKeys}
                 onOpenSession={onOpenSession}
+                onStop={onStop}
+                onRemove={onRemove}
               />
             ))
           )}
@@ -156,6 +170,8 @@ function ProjectRow({
   activeKey,
   openKeys,
   onOpenSession,
+  onStop,
+  onRemove,
 }: {
   rowId: string;
   project: ProjectNode;
@@ -164,6 +180,8 @@ function ProjectRow({
   activeKey: string | null;
   openKeys: Set<string>;
   onOpenSession: (node: SessionNode) => void;
+  onStop: (node: SessionNode) => void;
+  onRemove: (node: SessionNode) => void;
 }) {
   const isCollapsed = collapsed.has(rowId);
   return (
@@ -188,6 +206,8 @@ function ProjectRow({
                 active={session.key === activeKey}
                 open={openKeys.has(session.key)}
                 onOpenSession={onOpenSession}
+                onStop={onStop}
+                onRemove={onRemove}
               />
             ))
           )}
@@ -197,41 +217,89 @@ function ProjectRow({
   );
 }
 
-/** One session leaf: a state dot, the session id, and an open-tab marker;
- * clicking it routes through `onOpenSession` (App branches on session.state). */
+/** One session leaf: a state dot, the session id, an open-tab marker, and a
+ * ⋮ menu with Stop (worktree live only) and Remove… actions. */
 function SessionRow({
   session,
   active,
   open,
   onOpenSession,
+  onStop,
+  onRemove,
 }: {
   session: SessionNode;
   active: boolean;
   open: boolean;
   onOpenSession: (node: SessionNode) => void;
+  onStop: (node: SessionNode) => void;
+  onRemove: (node: SessionNode) => void;
 }) {
+  const [menuOpen, setMenuOpen] = useState(false);
   const stopped = session.state === "stopped";
+  const canStop = session.state === "live" && session.workspace === "worktree";
+
   return (
     <li className="tree-session">
-      <button
-        type="button"
-        className={`tree-session-button${active ? " tree-session-button--active" : ""}`}
-        // Live → attach/focus; stopped → respawn (App routes by session.state).
-        aria-current={active ? "true" : undefined}
-        title={stopped ? "Stopped — click to respawn" : undefined}
-        onClick={() => onOpenSession(session)}
-      >
-        <span
-          className={`tree-dot tree-dot--${session.state}`}
-          aria-hidden="true"
-        />
-        <span className="tree-label">{session.sessionId}</span>
-        {open && (
-          <span className="tree-open" role="img" aria-label="open tab">
-            ●
-          </span>
-        )}
-      </button>
+      <div className="tree-session-row">
+        <button
+          type="button"
+          className={`tree-session-button${active ? " tree-session-button--active" : ""}`}
+          // Live → attach/focus; stopped → respawn (App routes by session.state).
+          aria-current={active ? "true" : undefined}
+          title={stopped ? "Stopped — click to respawn" : undefined}
+          onClick={() => {
+            setMenuOpen(false);
+            onOpenSession(session);
+          }}
+        >
+          <span
+            className={`tree-dot tree-dot--${session.state}`}
+            aria-hidden="true"
+          />
+          <span className="tree-label">{session.sessionId}</span>
+          {open && (
+            <span className="tree-open" role="img" aria-label="open tab">
+              ●
+            </span>
+          )}
+        </button>
+        <button
+          type="button"
+          className="tree-session-menu-toggle"
+          aria-label={`Session actions for ${session.sessionId}`}
+          aria-expanded={menuOpen}
+          onClick={(e) => {
+            e.stopPropagation();
+            setMenuOpen((v) => !v);
+          }}
+        >
+          ⋮
+        </button>
+      </div>
+      {menuOpen && (
+        <div className="tree-session-menu">
+          {canStop && (
+            <button
+              type="button"
+              onClick={() => {
+                setMenuOpen(false);
+                onStop(session);
+              }}
+            >
+              Stop
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              setMenuOpen(false);
+              onRemove(session);
+            }}
+          >
+            Remove…
+          </button>
+        </div>
+      )}
     </li>
   );
 }

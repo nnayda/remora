@@ -130,9 +130,7 @@ Refinements to the stage-9 spawn flow:
 
 New capability / larger:
 
-- **#33** — close & remove a session (kill tmux, optionally clean up the
-  worktree). Needs a new `SessionSource` method; worth designing before
-  **stage 12 (kubectl)** so the second transport implements teardown too.
+- **#33** ✅ — session teardown shipped: `stop`/`remove` across core, ssh transport, bridge, and frontend (sidebar menu, confirm dialog, workspace-dirty guard). Implemented before stage 12 so kubectl picks up the trait method too.
 - **#32** — manage hosts/projects from the app (write the config, which is
   read-only today). Larger; effectively post-MVP.
 
