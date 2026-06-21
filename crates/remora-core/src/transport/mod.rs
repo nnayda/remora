@@ -5,4 +5,5 @@ mod pty_process;
 mod remote;
 pub mod ssh;
 
+pub use kubectl::KubectlSource;
 pub use ssh::SshSource;
