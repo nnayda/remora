@@ -1044,10 +1044,10 @@ mod tests {
         let ConfigError::Invalid(issues) = &err else {
             panic!("expected Invalid, got: {err}");
         };
-        // telnet transport, relative path, empty command — and the project's
-        // host reference stays valid because `devbox` *is* configured, just
-        // broken: a broken host must not cascade into phantom unknown-host
-        // errors.
+        // telnet transport, relative path, empty command [] (which is valid
+        // for plain shell) — and the project's host reference stays valid
+        // because `devbox` *is* configured, just broken: a broken host must
+        // not cascade into phantom unknown-host errors.
         assert_eq!(issues.len(), 3, "{issues:?}");
         let msg = err.to_string();
         assert!(msg.contains("3 problems"), "{msg}");
@@ -1137,7 +1137,7 @@ mod tests {
 
     #[test]
     fn rejects_blank_agent_command_elements() {
-        // Whitespace-only argv elements are as broken as empty ones.
+        // Whitespace-only argv elements are invalid in command arrays.
         let issues = issues_of("[agents.claude]\ncommand = [\"   \"]\n");
         assert_eq!(issues.len(), 1, "{issues:?}");
 
