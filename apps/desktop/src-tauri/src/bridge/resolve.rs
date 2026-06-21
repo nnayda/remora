@@ -60,14 +60,12 @@ impl SourceResolver for ConfigResolver {
         config
             .hosts
             .values()
-            .filter_map(|host| match &host.transport {
-                Transport::Ssh(ssh) => {
-                    Some(Arc::new(SshSource::new(ssh.clone(), Arc::clone(config)))
-                        as Arc<dyn SessionSource>)
-                }
+            .map(|host| match &host.transport {
+                Transport::Ssh(ssh) => Arc::new(SshSource::new(ssh.clone(), Arc::clone(config)))
+                    as Arc<dyn SessionSource>,
                 Transport::Kubectl(k) => {
-                    Some(Arc::new(KubectlSource::new(k.clone(), Arc::clone(config)))
-                        as Arc<dyn SessionSource>)
+                    Arc::new(KubectlSource::new(k.clone(), Arc::clone(config)))
+                        as Arc<dyn SessionSource>
                 }
             })
             .collect()
