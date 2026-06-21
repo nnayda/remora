@@ -840,4 +840,20 @@ mod tests {
         assert!(cfg.agents.contains_key(&aid("claude")));
         assert_eq!(cfg.projects[&pid("api")].path, "/srv/api");
     }
+
+    #[test]
+    fn empty_command_agent_round_trips() {
+        let mut doc = ConfigDocument::parse("").expect("empty doc parses");
+        doc.insert_agent(&aid("shell"), &Agent { command: vec![] })
+            .expect("inserting a plain-shell agent is valid");
+        let out = doc.to_toml();
+        assert!(out.contains("command = []"), "writes an empty array: {out}");
+        let reparsed = ConfigDocument::parse(&out).expect("re-parses");
+        assert!(
+            reparsed.config().expect("valid").agents[&aid("shell")]
+                .command
+                .is_empty(),
+            "command survives the round-trip as empty",
+        );
+    }
 }
