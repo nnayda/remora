@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **kubectl exec transport** (core): a second `SessionSource` backend that runs
+  sessions in a Kubernetes pod over `kubectl exec`, alongside ssh (stage 12).
+  To prove the transport seam isn't ssh-shaped, the transport-neutral logic —
+  quoting, the tmux/git command token builders, error classification, and the
+  spawn/respawn/list orchestration — was extracted from `ssh.rs` into a shared
+  `remote.rs` behind a `RemoteExec` seam; ssh and kubectl are now thin
+  connection adapters that compose their argv and delegate to shared
+  `capture`/`open_pty` tails (ssh's composed argv stays byte-identical). The
+  kubectl adapter builds `kubectl [--context X] [-n NS] exec [-c C] [-i -t]
+  <pod> -- sh -c '…'`, joining the same logical tokens ssh feeds its remote
+  shell. Per-transport differences are deliberate: no `--request-timeout` (it
+  would sever a slow `git worktree add`), an in-container `env TERM=…` wrap (so
+  the pod's tmux renders correctly), and a pod preflight probe that fails closed
+  with a clear error when the pod lacks `sh`/`tmux`/`git`. The desktop bridge now
+  resolves kubectl hosts to a live `KubectlSource`. An ignored `kubectl_e2e`
+  suite mirrors `ssh_e2e` for on-cluster verification. Known kubectl limitations
+  (no keepalive for idle dead-link detection, per-op connection cost, unbounded
+  execution) are documented and tracked in `TODOS.md`. Session teardown
+  (`stop`/`remove`, added in #50) is implemented for both transports through the
+  shared `remote.rs` orchestration, so kubectl gets it for free.
 - Session teardown (desktop): **Stop** a session (kills its tmux, keeps the
   worktree, respawnable) or **Remove** it for good (kills tmux and, in worktree
   mode, removes the worktree + deletes the local branch) — from a sidebar row

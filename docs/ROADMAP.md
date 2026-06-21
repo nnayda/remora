@@ -10,7 +10,9 @@ Status markers: ✅ done · ☐ open.
 Already done: repo scaffold (#1–#10) and the spine spike (roadmap step 1 in
 [VISION.md](VISION.md)). **Phase 1 is complete** (#14–#19), and **Phase 2's
 hero scenario is closed**: stages 7–11 are all merged (reconnect & respawn
-shipped in #27). The next open stage is the kubectl exec transport (stage 12).
+shipped in #27). The **kubectl exec transport (stage 12) is now merged** — the
+second backend that proved the `SessionSource` seam isn't ssh-shaped. The next
+open work is the Phase 3 panels (stages 13–15).
 Dogfooding the merged build surfaced refinements and gaps — see
 [Open enhancement issues](#open-enhancement-issues) below.
 
@@ -47,7 +49,7 @@ Dogfooding the merged build surfaced refinements and gaps — see
    against local config; detect surviving worktrees with no tmux session
    as *stopped*, and support respawn (ADR-0004). Core logic + ssh impl.
 
-## Phase 2 — Desktop shell (the hero scenario) — ☐ open
+## Phase 2 — Desktop shell (the hero scenario) — ✅ complete
 
 7. ✅ **Tauri bridge**
    The src-tauri layer: own `SessionSource` instances, expose
@@ -74,10 +76,11 @@ Dogfooding the merged build surfaced refinements and gaps — see
     PR closes the hero scenario: sleep the laptop, reopen, everything is
     live. (Session *teardown* — the inverse — is filed as #33.)
 
-12. ☐ **kubectl exec transport**
-    Second `SessionSource` backend (same trait, new impl). Validates the
-    seam isn't ssh-shaped, and disconnect/zombie semantics get checked
-    per-transport as the spike warned.
+12. ✅ **kubectl exec transport**
+    Second `SessionSource` backend (same trait, new impl). Validated the
+    seam isn't ssh-shaped by extracting a transport-neutral core (`remote.rs`)
+    out of the ssh transport and adding kubectl as a thin connection adapter;
+    disconnect/zombie semantics were checked per-transport as the spike warned.
 
 ## Phase 3 — Panels around the terminal — ☐ open
 
@@ -151,7 +154,7 @@ Hard dependencies per stage (a stage needs these merged first):
 | ✅ 9 Tabs + spawn | 5, 8 |
 | ✅ 10 Sidebar | 6, 9 |
 | ✅ 11 Reconnect & respawn | 6, 10 |
-| ☐ 12 kubectl transport | 2, 3 (lessons from 4–6 help, not required) |
+| ✅ 12 kubectl transport | 2, 3 (lessons from 4–6 help, not required) |
 | ☐ 13–15 Panels | 4, 9 (independent of each other) |
 | ☐ 16 CI & packaging | — |
 | ☐ 17 Getting-started docs | 11, 16 |

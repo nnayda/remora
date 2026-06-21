@@ -20,7 +20,7 @@ pub use error::{DirtyReason, SourceError};
 pub use fake::FakeSessionSource;
 pub use source::SessionSource;
 pub use spawn_plan::{plan_spawn, PlanError, SpawnPlan};
-pub use transport::SshSource;
+pub use transport::{KubectlSource, SshSource};
 
 pub use remora_protocol::{
     AgentId, ChannelInput, ChannelOutput, InvalidIdError, InvalidTerminalSizeError, ProjectId,
