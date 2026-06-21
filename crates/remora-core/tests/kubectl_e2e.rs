@@ -32,6 +32,43 @@ fn e2e_host() -> KubectlHost {
     }
 }
 
+/// Runs `kubectl [--context …] [-n …] exec [-c …] <pod> -- <args…>` directly
+/// against the E2E pod, using the SAME targeting options as `e2e_host()` so the
+/// out-of-band setup commands can't silently hit a different pod than the
+/// transport under test in a non-default cluster. Asserts the command exited
+/// zero (not merely that the process spawned) so a failed kill/rm fails the
+/// test loudly instead of corrupting later assertions.
+fn kubectl_exec_in_pod(args: &[&str]) {
+    let host = e2e_host();
+    let mut argv: Vec<String> = Vec::new();
+    if let Some(ctx) = &host.context {
+        argv.push("--context".into());
+        argv.push(ctx.clone());
+    }
+    if let Some(ns) = &host.namespace {
+        argv.push("-n".into());
+        argv.push(ns.clone());
+    }
+    argv.push("exec".into());
+    if let Some(container) = &host.container {
+        argv.push("-c".into());
+        argv.push(container.clone());
+    }
+    argv.push(host.pod.clone());
+    argv.push("--".into());
+    argv.extend(args.iter().map(|s| (*s).to_string()));
+
+    let out = std::process::Command::new("kubectl")
+        .args(&argv)
+        .output()
+        .expect("spawn kubectl exec");
+    assert!(
+        out.status.success(),
+        "kubectl exec {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Reads PTY output until `needle` appears, or panics after 10s. Total
 /// deadline (not per-recv) so a steady non-matching stream still times out.
 async fn recv_until_contains(channel: &mut SessionChannel, needle: &str) {
@@ -266,18 +303,8 @@ async fn e2e_discovery_stopped_then_respawn_reuses_worktree() {
 
     // Kill the tmux session (the worktree survives) -> discovery must report
     // Stopped. Use kubectl exec to reach the pod directly.
-    std::process::Command::new("kubectl")
-        .args([
-            "exec",
-            &pod,
-            "--",
-            "tmux",
-            "kill-session",
-            "-t",
-            &format!("remora_gitproj_{session}"),
-        ])
-        .output()
-        .expect("kill-session");
+    let target = format!("remora_gitproj_{session}");
+    kubectl_exec_in_pod(&["tmux", "kill-session", "-t", &target]);
 
     let listed = source.list().await.expect("list");
     let me = listed
@@ -362,29 +389,10 @@ async fn e2e_respawn_of_vanished_worktree_is_not_found() {
     // case: the git admin entry survives a bare `rm -rf`, so discovery still
     // lists it, but the directory is gone). Respawn must fail closed with
     // SessionNotFound rather than spawning into a vanished dir.
-    std::process::Command::new("kubectl")
-        .args([
-            "exec",
-            &pod,
-            "--",
-            "tmux",
-            "kill-session",
-            "-t",
-            &format!("remora_gitproj_{session}"),
-        ])
-        .output()
-        .expect("kill-session");
-    std::process::Command::new("kubectl")
-        .args([
-            "exec",
-            &pod,
-            "--",
-            "sh",
-            "-c",
-            &format!("rm -rf $HOME/.remora/worktrees/gitproj/{session}"),
-        ])
-        .output()
-        .expect("rm worktree");
+    let target = format!("remora_gitproj_{session}");
+    kubectl_exec_in_pod(&["tmux", "kill-session", "-t", &target]);
+    let rm = format!("rm -rf $HOME/.remora/worktrees/gitproj/{session}");
+    kubectl_exec_in_pod(&["sh", "-c", &rm]);
 
     let err = source
         .respawn(&project, &session_id, None)
