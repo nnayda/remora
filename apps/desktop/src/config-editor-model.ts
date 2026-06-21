@@ -204,14 +204,22 @@ export function toProjectInput(form: ProjectFormState): ProjectInputDto {
 export interface AgentFormState {
   id: string;
   command: string[];
+  /** When true, this agent has no launch command — a plain shell (#35). The
+   * argv editor is disabled but its rows are preserved so unchecking restores
+   * them; only `[]` is sent on save. */
+  plainShell: boolean;
 }
 
 export function emptyAgentForm(): AgentFormState {
-  return { id: "", command: [""] };
+  return { id: "", command: [""], plainShell: false };
 }
 
 export function agentFormFromDto(dto: EditorAgentDto): AgentFormState {
-  return { id: dto.id, command: [...dto.command] };
+  return {
+    id: dto.id,
+    command: dto.command.length > 0 ? [...dto.command] : [""],
+    plainShell: dto.command.length === 0,
+  };
 }
 
 /** Append a new blank argv row. */
@@ -253,13 +261,16 @@ export function validateAgentForm(
 ): string | null {
   const idError = validateId(form.id, mode);
   if (idError) return idError;
-  if (form.command.every((arg) => arg.trim() === "")) {
+  if (!form.plainShell && form.command.every((arg) => arg.trim() === "")) {
     return "Command cannot be empty.";
   }
   return null;
 }
 
 export function toAgentInput(form: AgentFormState): AgentInputDto {
+  if (form.plainShell) {
+    return { command: [] };
+  }
   return {
     command: form.command.map((arg) => arg.trim()).filter((arg) => arg !== ""),
   };

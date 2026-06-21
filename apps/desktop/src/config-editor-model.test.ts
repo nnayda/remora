@@ -233,6 +233,7 @@ describe("project form", () => {
 describe("agent form", () => {
   it("starts with a single empty argv row", () => {
     expect(emptyAgentForm().command).toEqual([""]);
+    expect(emptyAgentForm().plainShell).toBe(false);
   });
 
   it("prefills argv from a dto", () => {
@@ -256,13 +257,37 @@ describe("agent form", () => {
   });
 
   it("rejects an all-blank command", () => {
-    const blank = { id: "ok", command: ["", "  "] };
+    const blank = { id: "ok", command: ["", "  "], plainShell: false };
     expect(validateAgentForm(blank, "create")).toMatch(/command/i);
   });
 
   it("builds an input trimming and dropping blank rows", () => {
-    const form = { id: "ok", command: [" claude ", "", "-r"] };
+    const form = {
+      id: "ok",
+      command: [" claude ", "", "-r"],
+      plainShell: false,
+    };
     expect(validateAgentForm(form, "create")).toBeNull();
     expect(toAgentInput(form)).toEqual({ command: ["claude", "-r"] });
+  });
+
+  it("seeds plainShell from an empty dto command", () => {
+    expect(agentFormFromDto({ id: "shell", command: [] }).plainShell).toBe(
+      true,
+    );
+    expect(
+      agentFormFromDto({ id: "claude", command: ["claude"] }).plainShell,
+    ).toBe(false);
+  });
+
+  it("plain shell is valid with an empty command and saves []", () => {
+    const form = { id: "shell", command: ["claude"], plainShell: true };
+    expect(validateAgentForm(form, "create")).toBeNull();
+    expect(toAgentInput(form)).toEqual({ command: [] });
+  });
+
+  it("still rejects an all-blank command when not a plain shell", () => {
+    const form = { id: "ok", command: ["", "  "], plainShell: false };
+    expect(validateAgentForm(form, "create")).toMatch(/command/i);
   });
 });
