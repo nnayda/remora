@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use remora_core::config::{Config, Transport};
-use remora_core::{SessionSource, SshSource};
+use remora_core::{KubectlSource, SessionSource, SshSource};
 use remora_protocol::ProjectId;
 
 use super::error::BridgeError;
@@ -12,15 +12,14 @@ use super::error::BridgeError;
 /// building one per call is fine (no connection opens until attach/list).
 pub trait SourceResolver: Send + Sync {
     /// Transport for `project_id`'s host. Errors if the project or its host
-    /// is unknown, or the host's transport is unsupported (kubectl, stage 12).
+    /// is unknown, or the host's transport config is invalid.
     fn for_project(
         &self,
         config: &Arc<Config>,
         project_id: &ProjectId,
     ) -> Result<Arc<dyn SessionSource>, BridgeError>;
 
-    /// One transport per supported (ssh) host, for discovery aggregation.
-    /// Kubectl hosts are skipped until stage 12.
+    /// One transport per host (ssh and kubectl), for discovery aggregation.
     fn all(&self, config: &Arc<Config>) -> Vec<Arc<dyn SessionSource>>;
 }
 
@@ -51,12 +50,9 @@ impl SourceResolver for ConfigResolver {
             })?;
         match &host.transport {
             Transport::Ssh(ssh) => Ok(Arc::new(SshSource::new(ssh.clone(), Arc::clone(config)))),
-            Transport::Kubectl(_) => Err(BridgeError::Config {
-                message: format!(
-                    "host `{}` uses the kubectl transport, not supported yet (stage 12)",
-                    project.host.as_str()
-                ),
-            }),
+            Transport::Kubectl(k) => {
+                Ok(Arc::new(KubectlSource::new(k.clone(), Arc::clone(config))))
+            }
         }
     }
 
@@ -69,7 +65,10 @@ impl SourceResolver for ConfigResolver {
                     Some(Arc::new(SshSource::new(ssh.clone(), Arc::clone(config)))
                         as Arc<dyn SessionSource>)
                 }
-                Transport::Kubectl(_) => None,
+                Transport::Kubectl(k) => {
+                    Some(Arc::new(KubectlSource::new(k.clone(), Arc::clone(config)))
+                        as Arc<dyn SessionSource>)
+                }
             })
             .collect()
     }
@@ -106,22 +105,21 @@ mod tests {
     }
 
     #[test]
-    fn for_project_kubectl_host_is_unsupported_config_error() {
+    fn for_project_builds_kubectl_source() {
         let toml = "[hosts.k8s]\ntransport = \"kubectl\"\npod = \"p\"\n\
             [projects.api]\nhost = \"k8s\"\npath = \"/srv/api\"\nworkspace = \"worktree\"\nagent = \"claude\"\n\
             [agents.claude]\ncommand = [\"claude\"]\n";
         let r = ConfigResolver;
-        let err = r.for_project(&config(toml), &pid("api"));
-        assert!(matches!(err, Err(BridgeError::Config { .. })));
+        assert!(r.for_project(&config(toml), &pid("api")).is_ok());
     }
 
     #[test]
-    fn all_skips_kubectl_and_counts_ssh_hosts() {
+    fn all_counts_ssh_and_kubectl_hosts() {
         let toml = "[hosts.a]\ntransport = \"ssh\"\nhost = \"a\"\n\
             [hosts.b]\ntransport = \"ssh\"\nhost = \"b\"\n\
             [hosts.k]\ntransport = \"kubectl\"\npod = \"p\"\n";
         let r = ConfigResolver;
-        assert_eq!(r.all(&config(toml)).len(), 2);
+        assert_eq!(r.all(&config(toml)).len(), 3);
     }
 
     #[test]
