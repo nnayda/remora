@@ -6,38 +6,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use remora_protocol::{ProjectId, SessionId, SessionMeta, SpawnSpec};
 
-use super::remote::{capture, open_pty, RemoteExec, RemoteOutput};
+use super::remote::{
+    attach_tokens, capture, dir_exists_tokens, has_session_tokens, list_sessions_tokens,
+    new_session_tokens, open_pty, set_environment_tokens, show_environment_query_tokens,
+    worktree_add_tokens, worktree_list_tokens, worktree_remove_tokens, RemoteExec, RemoteOutput,
+};
 use crate::config::{Config, SshHost, WorkspaceMode};
 use crate::discovery::{self, DiscoveredEnv};
 use crate::naming::{parse_tmux_session_name, tmux_session_name};
 use crate::spawn_plan::{plan_spawn, PlanError, SpawnPlan};
 use crate::{SessionChannel, SessionSource, SourceError};
-
-/// Single-token shell quoting for the remote login shell, via `shlex`.
-/// Config validation bans control/nul characters (stage 3), so `try_quote`
-/// cannot hit its nul-byte error path here.
-fn shell_quote(token: &str) -> String {
-    shlex::try_quote(token)
-        .expect("config bans control/nul characters")
-        .into_owned()
-}
-
-/// Renders a logical remote path (`/…`, `~/…`, or `~`) into one shell token
-/// that the remote shell resolves to the intended directory. Quoting
-/// disables tilde expansion, so a leading `~` is emitted as a double-quoted
-/// `$HOME` with the remainder passed through `shell_quote` (bare for normal
-/// slug/path chars, quoted only if it contains shell-special bytes):
-/// `~/api` -> `"$HOME"/api`. Config rejects `~user` and control chars
-/// (stage 3), so these three cases are exhaustive.
-fn quote_remote_path(path: &str) -> String {
-    if path == "~" {
-        "\"$HOME\"".to_string()
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        format!("\"$HOME\"{}", shell_quote(&format!("/{rest}")))
-    } else {
-        shell_quote(path)
-    }
-}
 
 /// Builds the full ssh argv: connection flags + the logical remote tokens.
 /// `interactive` adds `-tt`. This is the single place ssh argvs are composed,
@@ -65,7 +43,6 @@ impl RemoteExec for RealSshExec {
 /// One instance = one configured ssh host (matches the `SessionSource`
 /// trait doc).
 pub struct SshSource {
-    host: SshHost,
     config: Arc<Config>,
     exec: Arc<dyn RemoteExec>,
 }
@@ -74,15 +51,14 @@ impl SshSource {
     /// Wraps a configured ssh host as a transport.
     pub fn new(host: SshHost, config: Arc<Config>) -> Self {
         Self {
-            host: host.clone(),
             config,
             exec: Arc::new(RealSshExec { host }),
         }
     }
 
     #[cfg(test)]
-    fn with_exec(host: SshHost, config: Arc<Config>, exec: Arc<dyn RemoteExec>) -> Self {
-        Self { host, config, exec }
+    fn with_exec(_host: SshHost, config: Arc<Config>, exec: Arc<dyn RemoteExec>) -> Self {
+        Self { config, exec }
     }
 }
 
@@ -113,210 +89,6 @@ fn ssh_base_argv(host: &SshHost, interactive: bool) -> Vec<String> {
         argv.push(user.clone());
     }
     argv.push(host.host.clone());
-    argv
-}
-
-/// Builds the ssh argv (program + args) for attaching to `tmux_name`, as a
-/// pure `Vec<String>` so it is unit-testable without spawning anything.
-///
-/// `host`/`user` are config-validated (no leading `-`, no whitespace, no
-/// control chars — stage 3) and `port` is a `u16`, so every token is safe;
-/// the remote command is still passed as discrete argv elements, never a
-/// joined shell string (ADR-0004). No `--` separator: the remote command
-/// begins with the literal `tmux` and nothing here needs an options
-/// terminator (a trailing `--` breaks on ssh clients that don't re-parse
-/// options after the destination, e.g. Dropbear).
-fn attach_argv(host: &SshHost, tmux_name: &str) -> Vec<String> {
-    let mut argv = ssh_base_argv(host, true);
-    // `-d` evicts every other client on attach (sequential-handoff model).
-    argv.push("tmux".into());
-    argv.push("attach-session".into());
-    argv.push("-d".into());
-    argv.push("-t".into());
-    argv.push(tmux_name.into());
-    argv
-}
-
-/// `git -C <project> worktree add -b <branch> <worktree>` over ssh.
-/// Precondition: `plan.branch` is `Some` (worktree mode); the only caller
-/// checks. `git worktree add` creates leading directories.
-fn worktree_add_argv(host: &SshHost, plan: &SpawnPlan) -> Vec<String> {
-    let branch = plan.branch.as_deref().unwrap_or_default();
-    let mut argv = ssh_base_argv(host, false);
-    argv.push("git".into());
-    argv.push("-C".into());
-    argv.push(quote_remote_path(&plan.project_path));
-    argv.push("worktree".into());
-    argv.push("add".into());
-    argv.push("-b".into());
-    argv.push(shell_quote(branch));
-    argv.push(quote_remote_path(&plan.dir));
-    argv
-}
-
-/// `git -C <project> worktree remove --force <worktree>` — best-effort
-/// cleanup of an orphaned worktree after a non-duplicate `new-session`
-/// failure (no live session owns it), so the project/session slot stays
-/// retryable. `--force` because the fresh worktree may have a checked-out
-/// branch and no commits yet.
-fn worktree_remove_argv(host: &SshHost, plan: &SpawnPlan) -> Vec<String> {
-    let mut argv = ssh_base_argv(host, false);
-    argv.push("git".into());
-    argv.push("-C".into());
-    argv.push(quote_remote_path(&plan.project_path));
-    argv.push("worktree".into());
-    argv.push("remove".into());
-    argv.push("--force".into());
-    argv.push(quote_remote_path(&plan.dir));
-    argv
-}
-
-/// Joins the agent argv into a single shell command line (one sh-safe
-/// string). `tmux new-session` re-runs its shell-command argument through
-/// `sh -c` — a *second* shell parse — so per-token quoting alone would be
-/// stripped before tmux sees it. Joining here (minimal per-token quoting)
-/// produces a string that `sh -c` re-parses back into the original argv.
-/// Config bans control/nul characters, so `try_join` cannot error.
-fn join_agent_command(argv: &[String]) -> String {
-    shlex::try_join(argv.iter().map(String::as_str)).expect("config bans control/nul characters")
-}
-
-/// Wraps the joined agent command so a clean / user-interrupted exit
-/// (0 graceful, 130 SIGINT/Ctrl-C, 143 SIGTERM) execs an interactive login
-/// shell in the same dir, keeping the pane alive with a real prompt (#30); any
-/// other non-zero exit propagates so `remain-on-exit` retains the dead pane and
-/// its error for inspection (#28). `${SHELL:-/bin/sh}` defends against an unset
-/// SHELL in the pane environment.
-///
-/// `__remora_rc=$?` MUST be the first statement after the agent command —
-/// nothing may run between the agent and the `$?` capture or it records the
-/// wrong code.
-///
-/// ```text
-///   <agent> exits
-///        │  $? captured immediately
-///        ├── 0 | 130 | 143 ──▶ exec $SHELL -l   (pane lives → usable shell, #30)
-///        └── else ───────────▶ exit $rc          (pane dies → remain-on-exit
-///                                                 keeps dead pane + status, #28)
-/// ```
-fn wrap_with_shell_fallback(agent_command: &str) -> String {
-    format!(
-        r#"{agent_command}; __remora_rc=$?; case "$__remora_rc" in 0|130|143) exec "${{SHELL:-/bin/sh}}" -l ;; *) exit "$__remora_rc" ;; esac"#
-    )
-}
-
-/// `tmux new-session -d -s <name> -c <dir> <agent…> ';' set-option -t <name>
-/// remain-on-exit on` — the atomic creation lock, with `remain-on-exit` applied
-/// in the **same tmux invocation** via tmux's own argv command separator.
-///
-/// Applying the option atomically (rather than as a follow-up `exec`) closes a
-/// race that surfaced dogfooding (#28): a fast-exiting agent (a bad flag, an
-/// auth error, the binary missing from the non-login PATH) used to exit in the
-/// window *between* `new-session` returning and a separate `set-option`
-/// landing, destroying the session before `remain-on-exit` took hold. The
-/// follow-up attach then hit "no sessions" and the real error (`claude:
-/// command not found`) died with the pane, surfacing as a bare "stopped".
-/// tmux runs a client's command list to completion before its event loop
-/// reaps the exited child, so the option is set before the window can close.
-///
-/// The `;` is **shell-quoted** (`';'`) so the remote login shell passes it to
-/// tmux as a literal separator token rather than eating it as a shell statement
-/// separator — this is tmux's argv `;`, distinct from ADR-0004's un-batching of
-/// shell-`;`-joined remote commands. No `set-environment` trailer: that still
-/// runs separately so an untrusted-metadata failure can't fail a live session.
-/// The agent command is joined and quoted as a single arg (see
-/// `join_agent_command`). On a duplicate-name failure tmux aborts the command
-/// list, so the trailing `set-option` never touches the live session that owns
-/// the name.
-fn new_session_argv(host: &SshHost, plan: &SpawnPlan) -> Vec<String> {
-    let mut argv = ssh_base_argv(host, false);
-    argv.push("tmux".into());
-    argv.push("new-session".into());
-    argv.push("-d".into());
-    argv.push("-s".into());
-    argv.push(plan.tmux_name.clone());
-    argv.push("-c".into());
-    argv.push(quote_remote_path(&plan.dir));
-    // The agent command is ONE shell-quoted arg, not one per token: the login
-    // shell strips this outer layer, then tmux's `sh -c` re-parses the inner
-    // string back into the intended argv (the double-shell hazard). It is
-    // wrapped first so a clean / interrupted agent exit drops to a login shell
-    // instead of a dead pane (#30); a crash still propagates to the retained
-    // pane (#28).
-    argv.push(shell_quote(&wrap_with_shell_fallback(&join_agent_command(
-        &plan.agent_argv,
-    ))));
-    // Atomically retain a fast-exiting agent's pane (#28). `shell_quote(";")`
-    // yields `';'`, surviving the remote login shell as a literal tmux argv
-    // separator.
-    argv.push(shell_quote(";"));
-    argv.push("set-option".into());
-    argv.push("-t".into());
-    argv.push(plan.tmux_name.clone());
-    argv.push("remain-on-exit".into());
-    argv.push("on".into());
-    argv
-}
-
-/// `tmux set-environment -t <name> <key> <value>`. The value is the logical
-/// metadata string, single-quoted as a literal (no tilde expansion — the
-/// stored value must round-trip via stage-6 `show-environment`).
-fn set_environment_argv(host: &SshHost, tmux_name: &str, key: &str, value: &str) -> Vec<String> {
-    let mut argv = ssh_base_argv(host, false);
-    argv.push("tmux".into());
-    argv.push("set-environment".into());
-    argv.push("-t".into());
-    argv.push(tmux_name.into());
-    argv.push(key.into());
-    argv.push(shell_quote(value));
-    argv
-}
-
-/// `tmux list-sessions -F '#{session_name}'`. The format string is
-/// shell-quoted: a bare `#` would start a comment in the remote login shell.
-fn list_sessions_argv(host: &SshHost) -> Vec<String> {
-    let mut argv = ssh_base_argv(host, false);
-    argv.push("tmux".into());
-    argv.push("list-sessions".into());
-    argv.push("-F".into());
-    argv.push(shell_quote("#{session_name}"));
-    argv
-}
-
-/// `tmux show-environment -t <name>` — reads one session's env metadata.
-fn show_environment_query_argv(host: &SshHost, tmux_name: &str) -> Vec<String> {
-    let mut argv = ssh_base_argv(host, false);
-    argv.push("tmux".into());
-    argv.push("show-environment".into());
-    argv.push("-t".into());
-    argv.push(tmux_name.into());
-    argv
-}
-
-/// `git -C <project-path> worktree list --porcelain`.
-fn worktree_list_argv(host: &SshHost, project_path: &str) -> Vec<String> {
-    let mut argv = ssh_base_argv(host, false);
-    argv.push("git".into());
-    argv.push("-C".into());
-    argv.push(quote_remote_path(project_path));
-    argv.push("worktree".into());
-    argv.push("list".into());
-    argv.push("--porcelain".into());
-    argv
-}
-
-/// `test -d <dir>` — the respawn preflight that the worktree directory still
-/// exists. `git worktree list` is the wrong probe here: it reports git's
-/// admin entry, which survives a bare `rm -rf` of the worktree, so it would
-/// pass for exactly the vanished-directory case we must reject. `test` writes
-/// nothing to stderr, so a non-zero exit with empty stderr means "dir gone"
-/// while a non-zero exit with stderr means the probe itself failed (the
-/// remote shell or ssh transport), which we keep as a `Transport` error.
-fn dir_exists_argv(host: &SshHost, dir: &str) -> Vec<String> {
-    let mut argv = ssh_base_argv(host, false);
-    argv.push("test".into());
-    argv.push("-d".into());
-    argv.push(quote_remote_path(dir));
     argv
 }
 
@@ -378,8 +150,8 @@ fn classify_worktree_add_failure(
 /// `tmux new-session -d` — the atomic creation lock. `Ok` on success;
 /// `Err(SessionExists)` on a duplicate name (case-insensitive); otherwise
 /// `Err(Transport)`. Opens no channel.
-fn create_session(exec: &dyn RemoteExec, host: &SshHost, plan: &SpawnPlan) -> Result<(), SourceError> {
-    let out = exec.run(&new_session_argv(host, plan))?;
+fn create_session(exec: &dyn RemoteExec, plan: &SpawnPlan) -> Result<(), SourceError> {
+    let out = exec.run(&new_session_tokens(plan))?;
     if out.success {
         Ok(())
     } else {
@@ -398,20 +170,10 @@ fn create_session(exec: &dyn RemoteExec, host: &SshHost, plan: &SpawnPlan) -> Re
 /// (a bad start dir, a missing agent binary) is retained before it can
 /// self-destruct the session, instead of racing these env-var round-trips and
 /// turning the follow-up attach into a spurious `SessionNotFound` (#28).
-fn write_metadata(exec: &dyn RemoteExec, host: &SshHost, plan: &SpawnPlan) {
+fn write_metadata(exec: &dyn RemoteExec, plan: &SpawnPlan) {
     for (key, value) in &plan.env {
-        let _ = exec.run(&set_environment_argv(host, &plan.tmux_name, key, value));
+        let _ = exec.run(&set_environment_tokens(&plan.tmux_name, key, value));
     }
-}
-
-/// `tmux has-session -t <name>` — the liveness preflight for `attach`.
-fn has_session_argv(host: &SshHost, tmux_name: &str) -> Vec<String> {
-    let mut argv = ssh_base_argv(host, false);
-    argv.push("tmux".into());
-    argv.push("has-session".into());
-    argv.push("-t".into());
-    argv.push(tmux_name.into());
-    argv
 }
 
 /// Whether a failed `has-session`/`new-session` stderr positively means the
@@ -429,25 +191,17 @@ fn stderr_signals_session_absent(stderr: &str) -> bool {
 
 /// Opens the PTY attach channel to an existing session (no liveness
 /// preflight — callers that need one do it first; see `SshSource::attach`).
-fn attach_channel(
-    exec: &dyn RemoteExec,
-    host: &SshHost,
-    tmux_name: &str,
-) -> Result<SessionChannel, SourceError> {
-    exec.open_channel(&attach_argv(host, tmux_name))
+fn attach_channel(exec: &dyn RemoteExec, tmux_name: &str) -> Result<SessionChannel, SourceError> {
+    exec.open_channel(&attach_tokens(tmux_name))
 }
 
 /// Orchestrates the full spawn sequence: optional worktree creation, tmux
 /// new-session (the atomic lock, which also applies `remain-on-exit`), env
 /// metadata, then attach. Each step crosses the `SshExec` seam so tests can
 /// inject a `FakeExec` without touching the network.
-fn run_spawn(
-    exec: &dyn RemoteExec,
-    host: &SshHost,
-    plan: &SpawnPlan,
-) -> Result<SessionChannel, SourceError> {
+fn run_spawn(exec: &dyn RemoteExec, plan: &SpawnPlan) -> Result<SessionChannel, SourceError> {
     if plan.branch.is_some() {
-        let out = exec.run(&worktree_add_argv(host, plan))?;
+        let out = exec.run(&worktree_add_tokens(plan))?;
         if !out.success {
             return Err(classify_worktree_add_failure(
                 &out.stderr,
@@ -457,7 +211,7 @@ fn run_spawn(
         }
     }
 
-    if let Err(err) = create_session(exec, host, plan) {
+    if let Err(err) = create_session(exec, plan) {
         // A non-duplicate failure usually means no session was created, so the
         // worktree we just made is orphaned — best-effort remove it so the slot
         // stays retryable. A duplicate means a live session already owns it.
@@ -475,18 +229,18 @@ fn run_spawn(
             // false)`, not `Err`). Only a known tmux "no such session" stderr is
             // safe to clean up on; treat anything ambiguous as "leave it".
             let session_absent = exec
-                .run(&has_session_argv(host, &plan.tmux_name))
+                .run(&has_session_tokens(&plan.tmux_name))
                 .map(|out| !out.success && stderr_signals_session_absent(&out.stderr))
                 .unwrap_or(false);
             if session_absent {
-                let _ = exec.run(&worktree_remove_argv(host, plan));
+                let _ = exec.run(&worktree_remove_tokens(plan));
             }
         }
         return Err(err);
     }
 
-    write_metadata(exec, host, plan);
-    attach_channel(exec, host, &plan.tmux_name)
+    write_metadata(exec, plan);
+    attach_channel(exec, &plan.tmux_name)
 }
 
 /// Re-creates a stopped session's tmux session and attaches. Unlike spawn:
@@ -500,15 +254,11 @@ fn run_spawn(
 /// vanished start directory across tmux versions (the pane can chdir-fail and
 /// exit, self-destructing the session), so a gone worktree surfaces here as
 /// `SessionNotFound` rather than a confusing post-attach channel death.
-fn run_respawn(
-    exec: &dyn RemoteExec,
-    host: &SshHost,
-    plan: &SpawnPlan,
-) -> Result<SessionChannel, SourceError> {
+fn run_respawn(exec: &dyn RemoteExec, plan: &SpawnPlan) -> Result<SessionChannel, SourceError> {
     if plan.branch.is_none() {
         return Err(PlanError::NotWorktreeProject(plan.project_id.clone()).into());
     }
-    let probe = exec.run(&dir_exists_argv(host, &plan.dir))?;
+    let probe = exec.run(&dir_exists_tokens(&plan.dir))?;
     if !probe.success {
         // `test -d` is silent; empty stderr means the dir is gone (nothing to
         // respawn), non-empty means the probe itself couldn't run.
@@ -521,13 +271,13 @@ fn run_respawn(
             Err(SourceError::Transport(probe.stderr))
         };
     }
-    match create_session(exec, host, plan) {
+    match create_session(exec, plan) {
         Ok(()) => {
-            write_metadata(exec, host, plan);
-            attach_channel(exec, host, &plan.tmux_name)
+            write_metadata(exec, plan);
+            attach_channel(exec, &plan.tmux_name)
         }
         // Concurrent respawner already created it: attach to the live session.
-        Err(SourceError::SessionExists { .. }) => attach_channel(exec, host, &plan.tmux_name),
+        Err(SourceError::SessionExists { .. }) => attach_channel(exec, &plan.tmux_name),
         Err(err) => Err(err),
     }
 }
@@ -538,12 +288,11 @@ fn run_respawn(
 /// read flake). The target name is rebuilt from validated ids.
 fn read_environment(
     exec: &dyn RemoteExec,
-    host: &SshHost,
     project: &ProjectId,
     session: &SessionId,
 ) -> DiscoveredEnv {
     let tmux_name = tmux_session_name(project, session);
-    match exec.run(&show_environment_query_argv(host, &tmux_name)) {
+    match exec.run(&show_environment_query_tokens(&tmux_name)) {
         Ok(out) if out.success => discovery::parse_session_environment(&out.stdout),
         _ => DiscoveredEnv::default(),
     }
@@ -552,12 +301,8 @@ fn read_environment(
 /// Discovers sessions on the host and joins them to local config. Config-
 /// scoped throughout (R1): the live set keeps only configured projects, and
 /// the stopped scan runs only for configured worktree-mode projects.
-fn run_list(
-    exec: &dyn RemoteExec,
-    host: &SshHost,
-    config: &Config,
-) -> Result<Vec<SessionMeta>, SourceError> {
-    let names = classify_list_sessions(&exec.run(&list_sessions_argv(host))?)?;
+fn run_list(exec: &dyn RemoteExec, config: &Config) -> Result<Vec<SessionMeta>, SourceError> {
+    let names = classify_list_sessions(&exec.run(&list_sessions_tokens())?)?;
 
     let mut live = Vec::new();
     for name in &names {
@@ -567,7 +312,7 @@ fn run_list(
         if !config.projects.contains_key(&project) {
             continue; // R1: configured projects only
         }
-        let env = read_environment(exec, host, &project, &session);
+        let env = read_environment(exec, &project, &session);
         live.push((project, session, env));
     }
 
@@ -578,7 +323,7 @@ fn run_list(
         }
         // A failure for one project (bad path, not a repo) yields empty for
         // that project, never a failed discovery (decision 8).
-        if let Ok(out) = exec.run(&worktree_list_argv(host, &project.path)) {
+        if let Ok(out) = exec.run(&worktree_list_tokens(&project.path)) {
             if out.success {
                 for (session, path) in discovery::parse_worktree_list(&out.stdout, project_id) {
                     stopped.push((project_id.clone(), session, path));
@@ -598,8 +343,7 @@ impl SessionSource for SshSource {
     async fn spawn(&self, spec: SpawnSpec) -> Result<SessionChannel, SourceError> {
         let plan = plan_spawn(&self.config, &spec)?;
         let exec = Arc::clone(&self.exec);
-        let host = self.host.clone();
-        tokio::task::spawn_blocking(move || run_spawn(exec.as_ref(), &host, &plan))
+        tokio::task::spawn_blocking(move || run_spawn(exec.as_ref(), &plan))
             .await
             .map_err(|e| SourceError::Transport(format!("spawn task: {e}")))?
     }
@@ -617,18 +361,17 @@ impl SessionSource for SshSource {
     ) -> Result<SessionChannel, SourceError> {
         let tmux_name = tmux_session_name(project_id, session_id);
         let exec = Arc::clone(&self.exec);
-        let host = self.host.clone();
         let project_id = project_id.clone();
         let session_id = session_id.clone();
         tokio::task::spawn_blocking(move || {
-            let out = exec.run(&has_session_argv(&host, &tmux_name))?;
+            let out = exec.run(&has_session_tokens(&tmux_name))?;
             if !out.success {
                 return Err(SourceError::SessionNotFound {
                     project_id,
                     session_id,
                 });
             }
-            attach_channel(exec.as_ref(), &host, &tmux_name)
+            attach_channel(exec.as_ref(), &tmux_name)
         })
         .await
         .map_err(|e| SourceError::Transport(format!("attach task: {e}")))?
@@ -637,9 +380,8 @@ impl SessionSource for SshSource {
     /// Discovers sessions on the host and joins them to local config.
     async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
         let exec = Arc::clone(&self.exec);
-        let host = self.host.clone();
         let config = Arc::clone(&self.config);
-        tokio::task::spawn_blocking(move || run_list(exec.as_ref(), &host, &config))
+        tokio::task::spawn_blocking(move || run_list(exec.as_ref(), &config))
             .await
             .map_err(|e| SourceError::Transport(format!("list task: {e}")))?
     }
@@ -660,8 +402,7 @@ impl SessionSource for SshSource {
         };
         let plan = plan_spawn(&self.config, &spec)?;
         let exec = Arc::clone(&self.exec);
-        let host = self.host.clone();
-        tokio::task::spawn_blocking(move || run_respawn(exec.as_ref(), &host, &plan))
+        tokio::task::spawn_blocking(move || run_respawn(exec.as_ref(), &plan))
             .await
             .map_err(|e| SourceError::Transport(format!("respawn task: {e}")))?
     }
@@ -670,6 +411,7 @@ impl SessionSource for SshSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::remote::{join_agent_command, quote_remote_path, shell_quote, wrap_with_shell_fallback};
     use crate::config::WorkspaceMode;
     use crate::spawn_plan::SpawnPlan;
     use crate::SessionSource;
@@ -804,8 +546,8 @@ mod tests {
     }
 
     #[test]
-    fn argv_minimal_host_has_keepalive_no_dashdash() {
-        let argv = attach_argv(&host("devbox", None, None), "remora_api_fix-login");
+    fn ssh_compose_attach_minimal_host_has_keepalive_no_dashdash() {
+        let argv = ssh_compose(&host("devbox", None, None), true, &attach_tokens("remora_api_fix-login"));
         assert_eq!(
             argv,
             vec![
@@ -829,8 +571,12 @@ mod tests {
     }
 
     #[test]
-    fn argv_inserts_port_then_user_before_host() {
-        let argv = attach_argv(&host("devbox", Some("dev"), Some(2222)), "remora_api_s");
+    fn ssh_compose_inserts_port_then_user_before_host() {
+        let argv = ssh_compose(
+            &host("devbox", Some("dev"), Some(2222)),
+            true,
+            &attach_tokens("remora_api_s"),
+        );
         // Order: ...keepalive, -p <port>, -l <user>, <host>, remote cmd.
         let host_idx = argv
             .iter()
@@ -845,15 +591,15 @@ mod tests {
     }
 
     #[test]
-    fn argv_omits_absent_optional_flags() {
-        let argv = attach_argv(&host("devbox", None, None), "remora_api_s");
+    fn ssh_compose_omits_absent_optional_flags() {
+        let argv = ssh_compose(&host("devbox", None, None), true, &attach_tokens("remora_api_s"));
         assert!(!argv.iter().any(|a| a == "-p"), "no port flag");
         assert!(!argv.iter().any(|a| a == "-l"), "no user flag");
     }
 
     #[test]
-    fn argv_carries_tmux_name_and_eviction_flags() {
-        let argv = attach_argv(&host("devbox", None, None), "remora_web_zeta");
+    fn ssh_compose_attach_carries_tmux_name_and_eviction_flags() {
+        let argv = ssh_compose(&host("devbox", None, None), true, &attach_tokens("remora_web_zeta"));
         assert_eq!(argv.last().map(String::as_str), Some("remora_web_zeta"));
         assert!(argv.iter().any(|a| a == "-tt"), "forces remote PTY");
         // `-d` is the tmux eviction flag, positioned after attach-session.
@@ -925,9 +671,9 @@ mod tests {
     }
 
     #[test]
-    fn worktree_add_argv_builds_git_command() {
+    fn ssh_compose_worktree_add_builds_git_command() {
         let plan = worktree_plan();
-        let argv = worktree_add_argv(&host("devbox", None, None), &plan);
+        let argv = ssh_compose(&host("devbox", None, None), false, &worktree_add_tokens(&plan));
         let g = argv.iter().position(|a| a == "git").expect("git");
         assert_eq!(argv[g + 1], "-C");
         assert_eq!(argv[g + 2], "/home/dev/api");
@@ -940,9 +686,9 @@ mod tests {
     }
 
     #[test]
-    fn new_session_argv_is_the_lock_with_no_env_trailer() {
+    fn ssh_compose_new_session_is_the_lock_with_no_env_trailer() {
         let plan = worktree_plan();
-        let argv = new_session_argv(&host("devbox", None, None), &plan);
+        let argv = ssh_compose(&host("devbox", None, None), false, &new_session_tokens(&plan));
         let n = argv
             .iter()
             .position(|a| a == "new-session")
@@ -967,12 +713,12 @@ mod tests {
     }
 
     #[test]
-    fn new_session_argv_applies_remain_on_exit_atomically() {
+    fn ssh_compose_new_session_applies_remain_on_exit_atomically() {
         // #28: remain-on-exit must land in the SAME tmux invocation as
         // new-session, via tmux's own argv command separator, so a fast-exiting
         // agent's pane is retained before it can self-destruct the session.
         let plan = worktree_plan();
-        let argv = new_session_argv(&host("devbox", None, None), &plan);
+        let argv = ssh_compose(&host("devbox", None, None), false, &new_session_tokens(&plan));
         // The separator is a shell-quoted `;` (`';'`) so the remote login shell
         // hands it to tmux as a literal separator token instead of eating it as
         // a shell statement separator.
@@ -996,27 +742,6 @@ mod tests {
     }
 
     #[test]
-    fn wrap_with_shell_fallback_gates_on_clean_exit_codes() {
-        let wrapped = wrap_with_shell_fallback("claude --continue");
-        // The agent runs first; `$?` is captured IMMEDIATELY after (nothing may
-        // run between the agent and the capture or it records the wrong code).
-        assert!(
-            wrapped.starts_with("claude --continue; __remora_rc=$?;"),
-            "got: {wrapped}"
-        );
-        // Graceful (0), SIGINT/Ctrl-C (130), SIGTERM (143) drop to a login shell.
-        assert!(
-            wrapped.contains(r#"0|130|143) exec "${SHELL:-/bin/sh}" -l ;;"#),
-            "got: {wrapped}"
-        );
-        // Any other code propagates so `remain-on-exit` keeps the dead pane (#28).
-        assert!(
-            wrapped.contains(r#"*) exit "$__remora_rc" ;;"#),
-            "got: {wrapped}"
-        );
-    }
-
-    #[test]
     fn agent_command_survives_the_double_shell() {
         // An agent arg containing a space must survive BOTH the ssh login shell
         // and tmux's `sh -c` re-parse — now wrapped in the shell-fallback compound.
@@ -1028,7 +753,7 @@ mod tests {
             ],
             ..worktree_plan()
         };
-        let argv = new_session_argv(&host("devbox", None, None), &plan);
+        let argv = ssh_compose(&host("devbox", None, None), false, &new_session_tokens(&plan));
         let n = argv
             .iter()
             .position(|a| a == "new-session")
@@ -1050,12 +775,15 @@ mod tests {
     }
 
     #[test]
-    fn set_environment_argv_quotes_logical_value() {
-        let argv = set_environment_argv(
+    fn ssh_compose_set_environment_quotes_logical_value() {
+        let argv = ssh_compose(
             &host("devbox", None, None),
-            "remora_api_fix-login",
-            "REMORA_WORKSPACE",
-            "~/.remora/worktrees/api/fix-login",
+            false,
+            &set_environment_tokens(
+                "remora_api_fix-login",
+                "REMORA_WORKSPACE",
+                "~/.remora/worktrees/api/fix-login",
+            ),
         );
         let s = argv
             .iter()
@@ -1144,7 +872,7 @@ mod tests {
             // Only new-session should fire; all other run() calls succeed by default.
             Ok(FakeExec::ok()),
         ]);
-        let result = run_spawn(&fake, &host("devbox", None, None), &plan);
+        let result = run_spawn(&fake, &plan);
         assert!(result.is_ok(), "{result:?}");
         // First call must be new-session (no worktree-add).
         let calls = fake.calls.lock().expect("lock");
@@ -1160,7 +888,7 @@ mod tests {
     fn existing_worktree_aborts_before_create() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![Ok(FakeExec::fail("fatal: '<path>' already exists"))]);
-        let err = run_spawn(&fake, &host("devbox", None, None), &plan)
+        let err = run_spawn(&fake, &plan)
             .expect_err("worktree already exists");
         assert!(matches!(err, SourceError::SessionExists { .. }), "{err}");
         // Exactly 1 call (worktree-add), no channel opened.
@@ -1178,7 +906,7 @@ mod tests {
             Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
         ]);
         let err =
-            run_spawn(&fake, &host("devbox", None, None), &plan).expect_err("duplicate session");
+            run_spawn(&fake, &plan).expect_err("duplicate session");
         assert!(matches!(err, SourceError::SessionExists { .. }), "{err}");
         assert_eq!(fake.opened.lock().expect("lock").len(), 0);
     }
@@ -1187,7 +915,7 @@ mod tests {
     fn run_spawn_opens_exactly_one_channel_on_success() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![]);
-        let result = run_spawn(&fake, &host("devbox", None, None), &plan);
+        let result = run_spawn(&fake, &plan);
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(fake.opened.lock().expect("lock").len(), 1);
     }
@@ -1196,7 +924,7 @@ mod tests {
     fn run_spawn_attach_argv_ends_with_tmux_name() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![]);
-        let _ = run_spawn(&fake, &host("devbox", None, None), &plan);
+        let _ = run_spawn(&fake, &plan);
         let opened = fake.opened.lock().expect("lock");
         let attach_argv = &opened[0];
         assert_eq!(
@@ -1215,7 +943,7 @@ mod tests {
             Ok(FakeExec::ok()),
             Ok(FakeExec::ok()),
         ]);
-        let result = run_spawn(&fake, &host("devbox", None, None), &plan);
+        let result = run_spawn(&fake, &plan);
         assert!(result.is_ok());
         let calls = fake.calls.lock().expect("lock");
         // worktree add, new-session (remain-on-exit folded in atomically), then
@@ -1247,7 +975,7 @@ mod tests {
             Err(SourceError::Transport("net".into())), // REMORA_WORKSPACE — tolerated
             Ok(FakeExec::ok()), // REMORA_CREATED_AT
         ]);
-        let result = run_spawn(&fake, &host("devbox", None, None), &plan);
+        let result = run_spawn(&fake, &plan);
         assert!(
             result.is_ok(),
             "metadata failures must not fail a live session"
@@ -1287,7 +1015,7 @@ mod tests {
             Ok(FakeExec::fail("no server running")), // new-session: generic failure
             Ok(FakeExec::fail("no server running")), // has-session: confirms no session
         ]);
-        let err = run_spawn(&fake, &host("devbox", None, None), &plan).expect_err("should fail");
+        let err = run_spawn(&fake, &plan).expect_err("should fail");
         assert!(matches!(err, SourceError::Transport(_)));
         assert!(fake.opened.lock().expect("lock").is_empty());
         // The orphaned worktree is cleaned up so the slot stays retryable.
@@ -1311,7 +1039,7 @@ mod tests {
             Ok(FakeExec::ok()), // has-session: the session IS live
         ]);
         let err =
-            run_spawn(&fake, &host("devbox", None, None), &plan).expect_err("transport error");
+            run_spawn(&fake, &plan).expect_err("transport error");
         assert!(matches!(err, SourceError::Transport(_)), "{err}");
         let calls = fake.calls.lock().expect("lock");
         assert!(
@@ -1336,7 +1064,7 @@ mod tests {
             )), // has-session probe itself failed
         ]);
         let err =
-            run_spawn(&fake, &host("devbox", None, None), &plan).expect_err("transport error");
+            run_spawn(&fake, &plan).expect_err("transport error");
         assert!(matches!(err, SourceError::Transport(_)), "{err}");
         let calls = fake.calls.lock().expect("lock");
         assert!(
@@ -1353,7 +1081,7 @@ mod tests {
             Ok(FakeExec::ok()), // worktree add
             Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
         ]);
-        let err = run_spawn(&fake, &host("devbox", None, None), &plan).expect_err("dup");
+        let err = run_spawn(&fake, &plan).expect_err("dup");
         assert!(matches!(err, SourceError::SessionExists { .. }));
         let calls = fake.calls.lock().expect("lock");
         assert!(
@@ -1531,8 +1259,12 @@ mod tests {
     }
 
     #[test]
-    fn has_session_argv_targets_the_name() {
-        let argv = has_session_argv(&host("devbox", None, None), "remora_api_fix-login");
+    fn ssh_compose_has_session_targets_the_name() {
+        let argv = ssh_compose(
+            &host("devbox", None, None),
+            false,
+            &has_session_tokens("remora_api_fix-login"),
+        );
         let h = argv
             .iter()
             .position(|a| a == "has-session")
@@ -1542,8 +1274,8 @@ mod tests {
     }
 
     #[test]
-    fn list_sessions_argv_quotes_the_format_string() {
-        let argv = list_sessions_argv(&host("devbox", None, None));
+    fn ssh_compose_list_sessions_quotes_the_format_string() {
+        let argv = ssh_compose(&host("devbox", None, None), false, &list_sessions_tokens());
         // `#{session_name}` MUST be shell-quoted: a bare `#` starts a comment
         // in the remote login shell and would swallow the format argument.
         assert_eq!(argv.last().map(String::as_str), Some("'#{session_name}'"));
