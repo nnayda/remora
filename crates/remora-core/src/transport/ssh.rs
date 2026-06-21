@@ -7,14 +7,12 @@ use async_trait::async_trait;
 use remora_protocol::{ProjectId, SessionId, SessionMeta, SpawnSpec};
 
 use super::remote::{
-    attach_tokens, capture, dir_exists_tokens, has_session_tokens, list_sessions_tokens,
-    new_session_tokens, open_pty, set_environment_tokens, show_environment_query_tokens,
-    worktree_add_tokens, worktree_list_tokens, worktree_remove_tokens, RemoteExec, RemoteOutput,
+    attach_channel, capture, has_session_tokens, open_pty, run_list, run_respawn, run_spawn,
+    RemoteExec, RemoteOutput,
 };
-use crate::config::{Config, SshHost, WorkspaceMode};
-use crate::discovery::{self, DiscoveredEnv};
-use crate::naming::{parse_tmux_session_name, tmux_session_name};
-use crate::spawn_plan::{plan_spawn, PlanError, SpawnPlan};
+use crate::config::{Config, SshHost};
+use crate::naming::tmux_session_name;
+use crate::spawn_plan::plan_spawn;
 use crate::{SessionChannel, SessionSource, SourceError};
 
 /// Builds the full ssh argv: connection flags + the logical remote tokens.
@@ -92,254 +90,11 @@ fn ssh_base_argv(host: &SshHost, interactive: bool) -> Vec<String> {
     argv
 }
 
-/// Classifies `tmux list-sessions`: success → session-name lines; a
-/// no-server / no-sessions stderr → empty (the normal cold state, decision 9,
-/// matched case-insensitively); any other failure → `Transport`.
-fn classify_list_sessions(out: &RemoteOutput) -> Result<Vec<String>, SourceError> {
-    if out.success {
-        return Ok(out.stdout.lines().map(str::to_string).collect());
-    }
-    let lower = out.stderr.to_ascii_lowercase();
-    if lower.contains("no server running") || lower.contains("no sessions") {
-        Ok(Vec::new())
-    } else {
-        Err(SourceError::Transport(out.stderr.clone()))
-    }
-}
-
-/// Maps a failed `tmux new-session` to a `SourceError`. tmux prints
-/// `duplicate session: NAME` and exits non-zero when the name is taken; the
-/// match is case-insensitive on `duplicate` so a non-English `LC_MESSAGES`
-/// still trips the fail-closed lock. Called only on non-success.
-fn classify_new_session_failure(
-    stderr: &str,
-    project_id: &ProjectId,
-    session_id: &SessionId,
-) -> SourceError {
-    if stderr.to_ascii_lowercase().contains("duplicate session") {
-        SourceError::SessionExists {
-            project_id: project_id.clone(),
-            session_id: session_id.clone(),
-        }
-    } else {
-        SourceError::Transport(stderr.to_string())
-    }
-}
-
-/// Maps a failed `git worktree add` to a `SourceError`. A leftover worktree
-/// dir or branch (from a prior stopped session) surfaces as `SessionExists`
-/// — an actionable "already exists" rather than raw git stderr — keeping ssh
-/// consistent with the fake. Reclaim/respawn is stage 6. Called only on
-/// non-success.
-fn classify_worktree_add_failure(
-    stderr: &str,
-    project_id: &ProjectId,
-    session_id: &SessionId,
-) -> SourceError {
-    let lower = stderr.to_ascii_lowercase();
-    if lower.contains("already exists") || lower.contains("already checked out") {
-        SourceError::SessionExists {
-            project_id: project_id.clone(),
-            session_id: session_id.clone(),
-        }
-    } else {
-        SourceError::Transport(stderr.to_string())
-    }
-}
-
-/// `tmux new-session -d` — the atomic creation lock. `Ok` on success;
-/// `Err(SessionExists)` on a duplicate name (case-insensitive); otherwise
-/// `Err(Transport)`. Opens no channel.
-fn create_session(exec: &dyn RemoteExec, plan: &SpawnPlan) -> Result<(), SourceError> {
-    let out = exec.run(&new_session_tokens(plan))?;
-    if out.success {
-        Ok(())
-    } else {
-        Err(classify_new_session_failure(
-            &out.stderr,
-            &plan.project_id,
-            &plan.session_id,
-        ))
-    }
-}
-
-/// Writes the `REMORA_*` env metadata. Every call is tolerated: a metadata
-/// failure must never fail an already-live session (env is untrusted/display-
-/// only — ADR-0004). `remain-on-exit` is no longer written here — it is applied
-/// atomically inside `new_session_argv` so a pane whose process exits at startup
-/// (a bad start dir, a missing agent binary) is retained before it can
-/// self-destruct the session, instead of racing these env-var round-trips and
-/// turning the follow-up attach into a spurious `SessionNotFound` (#28).
-fn write_metadata(exec: &dyn RemoteExec, plan: &SpawnPlan) {
-    for (key, value) in &plan.env {
-        let _ = exec.run(&set_environment_tokens(&plan.tmux_name, key, value));
-    }
-}
-
-/// Whether a failed `has-session`/`new-session` stderr positively means the
-/// session does not exist (server up but name unknown, or no server at all),
-/// as opposed to an ambiguous transport failure (ssh/auth/network) that also
-/// exits non-zero. Matched case-insensitively to survive a non-English
-/// `LC_MESSAGES`. Mirrors the cold-state phrases in `classify_list_sessions`,
-/// plus has-session's own `can't find session`.
-fn stderr_signals_session_absent(stderr: &str) -> bool {
-    let lower = stderr.to_ascii_lowercase();
-    lower.contains("can't find session")
-        || lower.contains("no server running")
-        || lower.contains("no sessions")
-}
-
-/// Opens the PTY attach channel to an existing session (no liveness
-/// preflight — callers that need one do it first; see `SshSource::attach`).
-fn attach_channel(exec: &dyn RemoteExec, tmux_name: &str) -> Result<SessionChannel, SourceError> {
-    exec.open_channel(&attach_tokens(tmux_name))
-}
-
-/// Orchestrates the full spawn sequence: optional worktree creation, tmux
-/// new-session (the atomic lock, which also applies `remain-on-exit`), env
-/// metadata, then attach. Each step crosses the `SshExec` seam so tests can
-/// inject a `FakeExec` without touching the network.
-fn run_spawn(exec: &dyn RemoteExec, plan: &SpawnPlan) -> Result<SessionChannel, SourceError> {
-    if plan.branch.is_some() {
-        let out = exec.run(&worktree_add_tokens(plan))?;
-        if !out.success {
-            return Err(classify_worktree_add_failure(
-                &out.stderr,
-                &plan.project_id,
-                &plan.session_id,
-            ));
-        }
-    }
-
-    if let Err(err) = create_session(exec, plan) {
-        // A non-duplicate failure usually means no session was created, so the
-        // worktree we just made is orphaned — best-effort remove it so the slot
-        // stays retryable. A duplicate means a live session already owns it.
-        //
-        // But the lock command is `new-session ';' set-option` sharing one exit
-        // code (#28): a non-zero exit can also mean the session WAS created and
-        // only the trailing set-option failed. Force-removing the worktree then
-        // would yank a LIVE session's cwd out from under it. So gate the cleanup
-        // on a has-session probe and remove only once it confirms no session
-        // exists; if the probe can't run, leave the worktree (better an orphan
-        // than a nuked live session).
-        if plan.branch.is_some() && !matches!(err, SourceError::SessionExists { .. }) {
-            // A non-zero `has-session` does NOT by itself mean "absent": an
-            // ssh/auth/network failure also exits non-zero (as `Ok(success=
-            // false)`, not `Err`). Only a known tmux "no such session" stderr is
-            // safe to clean up on; treat anything ambiguous as "leave it".
-            let session_absent = exec
-                .run(&has_session_tokens(&plan.tmux_name))
-                .map(|out| !out.success && stderr_signals_session_absent(&out.stderr))
-                .unwrap_or(false);
-            if session_absent {
-                let _ = exec.run(&worktree_remove_tokens(plan));
-            }
-        }
-        return Err(err);
-    }
-
-    write_metadata(exec, plan);
-    attach_channel(exec, &plan.tmux_name)
-}
-
-/// Re-creates a stopped session's tmux session and attaches. Unlike spawn:
-/// no `worktree add` (the worktree survives), and a duplicate name means a
-/// concurrent respawner already won — attach to the live session instead of
-/// erroring (ADR-0004). Requires worktree mode (R5): a shared-mode plan can't
-/// claim a worktree, so it errors before any remote command.
-///
-/// A `test -d` preflight confirms the worktree directory still exists before
-/// any tmux command: `tmux new-session -c <dir>` does not fail-closed on a
-/// vanished start directory across tmux versions (the pane can chdir-fail and
-/// exit, self-destructing the session), so a gone worktree surfaces here as
-/// `SessionNotFound` rather than a confusing post-attach channel death.
-fn run_respawn(exec: &dyn RemoteExec, plan: &SpawnPlan) -> Result<SessionChannel, SourceError> {
-    if plan.branch.is_none() {
-        return Err(PlanError::NotWorktreeProject(plan.project_id.clone()).into());
-    }
-    let probe = exec.run(&dir_exists_tokens(&plan.dir))?;
-    if !probe.success {
-        // `test -d` is silent; empty stderr means the dir is gone (nothing to
-        // respawn), non-empty means the probe itself couldn't run.
-        return if probe.stderr.trim().is_empty() {
-            Err(SourceError::SessionNotFound {
-                project_id: plan.project_id.clone(),
-                session_id: plan.session_id.clone(),
-            })
-        } else {
-            Err(SourceError::Transport(probe.stderr))
-        };
-    }
-    match create_session(exec, plan) {
-        Ok(()) => {
-            write_metadata(exec, plan);
-            attach_channel(exec, &plan.tmux_name)
-        }
-        // Concurrent respawner already created it: attach to the live session.
-        Err(SourceError::SessionExists { .. }) => attach_channel(exec, &plan.tmux_name),
-        Err(err) => Err(err),
-    }
-}
-
-/// Reads a live session's metadata; a failed `show-environment` (race: the
-/// session died after `list-sessions`) yields empty metadata — the session is
-/// still listed `Live` (don't downgrade a known-live session on a metadata
-/// read flake). The target name is rebuilt from validated ids.
-fn read_environment(
-    exec: &dyn RemoteExec,
-    project: &ProjectId,
-    session: &SessionId,
-) -> DiscoveredEnv {
-    let tmux_name = tmux_session_name(project, session);
-    match exec.run(&show_environment_query_tokens(&tmux_name)) {
-        Ok(out) if out.success => discovery::parse_session_environment(&out.stdout),
-        _ => DiscoveredEnv::default(),
-    }
-}
-
-/// Discovers sessions on the host and joins them to local config. Config-
-/// scoped throughout (R1): the live set keeps only configured projects, and
-/// the stopped scan runs only for configured worktree-mode projects.
-fn run_list(exec: &dyn RemoteExec, config: &Config) -> Result<Vec<SessionMeta>, SourceError> {
-    let names = classify_list_sessions(&exec.run(&list_sessions_tokens())?)?;
-
-    let mut live = Vec::new();
-    for name in &names {
-        let Some((project, session)) = parse_tmux_session_name(name) else {
-            continue; // forged / non-remora name dropped
-        };
-        if !config.projects.contains_key(&project) {
-            continue; // R1: configured projects only
-        }
-        let env = read_environment(exec, &project, &session);
-        live.push((project, session, env));
-    }
-
-    let mut stopped = Vec::new();
-    for (project_id, project) in &config.projects {
-        if project.workspace != WorkspaceMode::Worktree {
-            continue; // shared projects have no surviving worktree
-        }
-        // A failure for one project (bad path, not a repo) yields empty for
-        // that project, never a failed discovery (decision 8).
-        if let Ok(out) = exec.run(&worktree_list_tokens(&project.path)) {
-            if out.success {
-                for (session, path) in discovery::parse_worktree_list(&out.stdout, project_id) {
-                    stopped.push((project_id.clone(), session, path));
-                }
-            }
-        }
-    }
-
-    Ok(discovery::join(live, stopped))
-}
-
 #[async_trait]
 impl SessionSource for SshSource {
     /// Resolves the spawn plan from config, then runs the full spawn
     /// orchestration (worktree add → tmux new-session → env metadata →
-    /// attach) via the injectable `SshExec` seam.
+    /// attach) via the injectable `RemoteExec` seam.
     async fn spawn(&self, spec: SpawnSpec) -> Result<SessionChannel, SourceError> {
         let plan = plan_spawn(&self.config, &spec)?;
         let exec = Arc::clone(&self.exec);
@@ -410,12 +165,19 @@ impl SessionSource for SshSource {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use super::super::remote::tests::{test_config, FakeExec};
+    use super::super::remote::{
+        attach_tokens, has_session_tokens, list_sessions_tokens, new_session_tokens,
+        set_environment_tokens, worktree_add_tokens,
+    };
+    use super::super::remote::{join_agent_command, shell_quote, wrap_with_shell_fallback};
     use super::*;
-    use super::super::remote::{join_agent_command, quote_remote_path, shell_quote, wrap_with_shell_fallback};
     use crate::config::WorkspaceMode;
-    use crate::spawn_plan::SpawnPlan;
+    use crate::spawn_plan::{PlanError, SpawnPlan};
     use crate::SessionSource;
-    use remora_protocol::SessionState;
+    use remora_protocol::{AgentId, ProjectId, SessionId, SessionState, SpawnSpec};
 
     fn host(host: &str, user: Option<&str>, port: Option<u16>) -> SshHost {
         SshHost {
@@ -434,28 +196,11 @@ mod tests {
     }
 
     fn spec() -> SpawnSpec {
-        use remora_protocol::AgentId;
         SpawnSpec {
             project_id: ProjectId::new("api").expect("slug"),
             session_id: SessionId::new("fix-login").expect("slug"),
             agent: Some(AgentId::new("claude").expect("slug")),
         }
-    }
-
-    fn test_config() -> Arc<Config> {
-        let toml = r#"
-            [hosts.devbox]
-            transport = "ssh"
-            host = "devbox"
-            [projects.api]
-            host = "devbox"
-            path = "/home/dev/api"
-            workspace = "worktree"
-            agent = "claude"
-            [agents.claude]
-            command = ["claude"]
-        "#;
-        Arc::new(Config::from_toml_str(toml).expect("config"))
     }
 
     /// Config with two agents: default "claude" for the api project, and a
@@ -478,76 +223,38 @@ mod tests {
         Arc::new(Config::from_toml_str(toml).expect("config"))
     }
 
-    /// Scripted executor: returns queued `run` results in order, records every
-    /// argv, and hands back a dead `SessionChannel` for `open_channel`.
-    struct FakeExec {
-        results: std::sync::Mutex<std::collections::VecDeque<Result<RemoteOutput, SourceError>>>,
-        calls: std::sync::Mutex<Vec<Vec<String>>>,
-        opened: std::sync::Mutex<Vec<Vec<String>>>,
-    }
-
-    impl FakeExec {
-        fn new(results: Vec<Result<RemoteOutput, SourceError>>) -> Self {
-            Self {
-                results: std::sync::Mutex::new(results.into_iter().collect()),
-                calls: std::sync::Mutex::new(Vec::new()),
-                opened: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-        fn ok() -> RemoteOutput {
-            RemoteOutput {
-                success: true,
-                stdout: String::new(),
-                stderr: String::new(),
-            }
-        }
-        fn out(stdout: &str) -> RemoteOutput {
-            RemoteOutput {
-                success: true,
-                stdout: stdout.into(),
-                stderr: String::new(),
-            }
-        }
-        fn fail(stderr: &str) -> RemoteOutput {
-            RemoteOutput {
-                success: false,
-                stdout: String::new(),
-                stderr: stderr.into(),
-            }
-        }
-
-        /// Returns the first recorded argv that contains the given substring.
-        /// Panics if no call contains the substring.
-        fn recorded_argv_containing(&self, needle: &str) -> Vec<String> {
-            self.calls
-                .lock()
-                .expect("lock")
-                .iter()
-                .find(|argv| argv.iter().any(|a| a.contains(needle)))
-                .cloned()
-                .unwrap_or_else(|| panic!("no recorded argv contains {needle:?}"))
+    fn worktree_plan() -> SpawnPlan {
+        SpawnPlan {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("fix-login").expect("slug"),
+            tmux_name: "remora_api_fix-login".into(),
+            workspace: WorkspaceMode::Worktree,
+            project_path: "/home/dev/api".into(),
+            dir: "~/.remora/worktrees/api/fix-login".into(),
+            branch: Some("remora/fix-login".into()),
+            env: vec![
+                ("REMORA_AGENT".into(), "claude".into()),
+                (
+                    "REMORA_WORKSPACE".into(),
+                    "~/.remora/worktrees/api/fix-login".into(),
+                ),
+                ("REMORA_CREATED_AT".into(), "1700000000".into()),
+            ],
+            agent_argv: vec!["claude".into(), "--continue".into()],
         }
     }
 
-    impl RemoteExec for FakeExec {
-        fn run(&self, argv: &[String]) -> Result<RemoteOutput, SourceError> {
-            self.calls.lock().expect("lock").push(argv.to_vec());
-            self.results
-                .lock()
-                .expect("lock")
-                .pop_front()
-                .unwrap_or_else(|| Ok(FakeExec::ok()))
-        }
-        fn open_channel(&self, argv: &[String]) -> Result<SessionChannel, SourceError> {
-            self.opened.lock().expect("lock").push(argv.to_vec());
-            let (channel, _rx, _tx) = SessionChannel::pair();
-            Ok(channel)
-        }
-    }
+    // -----------------------------------------------------------------------
+    // ssh_compose tests: pin the exact ssh argv shape
+    // -----------------------------------------------------------------------
 
     #[test]
     fn ssh_compose_attach_minimal_host_has_keepalive_no_dashdash() {
-        let argv = ssh_compose(&host("devbox", None, None), true, &attach_tokens("remora_api_fix-login"));
+        let argv = ssh_compose(
+            &host("devbox", None, None),
+            true,
+            &attach_tokens("remora_api_fix-login"),
+        );
         assert_eq!(
             argv,
             vec![
@@ -592,14 +299,22 @@ mod tests {
 
     #[test]
     fn ssh_compose_omits_absent_optional_flags() {
-        let argv = ssh_compose(&host("devbox", None, None), true, &attach_tokens("remora_api_s"));
+        let argv = ssh_compose(
+            &host("devbox", None, None),
+            true,
+            &attach_tokens("remora_api_s"),
+        );
         assert!(!argv.iter().any(|a| a == "-p"), "no port flag");
         assert!(!argv.iter().any(|a| a == "-l"), "no user flag");
     }
 
     #[test]
     fn ssh_compose_attach_carries_tmux_name_and_eviction_flags() {
-        let argv = ssh_compose(&host("devbox", None, None), true, &attach_tokens("remora_web_zeta"));
+        let argv = ssh_compose(
+            &host("devbox", None, None),
+            true,
+            &attach_tokens("remora_web_zeta"),
+        );
         assert_eq!(argv.last().map(String::as_str), Some("remora_web_zeta"));
         assert!(argv.iter().any(|a| a == "-tt"), "forces remote PTY");
         // `-d` is the tmux eviction flag, positioned after attach-session.
@@ -610,70 +325,14 @@ mod tests {
         assert_eq!(argv[attach + 1], "-d");
     }
 
-    #[tokio::test]
-    async fn spawn_unknown_project_is_a_plan_error() {
-        let source = SshSource::new(host("devbox", None, None), Arc::new(Config::default()));
-        let err = source.spawn(spec()).await.expect_err("no such project");
-        assert!(matches!(err, SourceError::Plan(_)), "{err}");
-    }
-
-    #[tokio::test]
-    async fn usable_through_dyn_session_source() {
-        let source: Box<dyn SessionSource> = Box::new(SshSource::new(
-            host("devbox", None, None),
-            Arc::new(Config::default()),
-        ));
-        assert!(source.spawn(spec()).await.is_err());
-    }
-
-    #[test]
-    fn shell_quote_leaves_simple_tokens_and_quotes_spaces() {
-        assert_eq!(shell_quote("claude"), "claude");
-        assert_eq!(shell_quote("--continue"), "--continue");
-        assert_eq!(shell_quote("a b"), "'a b'");
-        assert_eq!(shell_quote(""), "''");
-    }
-
-    #[test]
-    fn quote_remote_path_expands_tilde_via_home() {
-        // `~/x` -> $HOME stays expandable; the remainder has no shell-special
-        // chars so shlex returns it bare (slug/path chars are safe).
-        assert_eq!(quote_remote_path("~/api"), "\"$HOME\"/api");
-        assert_eq!(quote_remote_path("~"), "\"$HOME\"");
-        // absolute path: all safe chars, returned bare (no quoting needed).
-        assert_eq!(quote_remote_path("/home/dev/api"), "/home/dev/api");
-        // a space in a path WOULD force quoting (defensive, not expected for slugs).
-        assert_eq!(quote_remote_path("/a b"), "'/a b'");
-        // `~/` + a space: $HOME stays unquoted, the remainder is quoted, and
-        // the remote shell concatenates the two adjacent segments into one word.
-        assert_eq!(quote_remote_path("~/a b"), "\"$HOME\"'/a b'");
-    }
-
-    fn worktree_plan() -> SpawnPlan {
-        SpawnPlan {
-            project_id: ProjectId::new("api").expect("slug"),
-            session_id: SessionId::new("fix-login").expect("slug"),
-            tmux_name: "remora_api_fix-login".into(),
-            workspace: WorkspaceMode::Worktree,
-            project_path: "/home/dev/api".into(),
-            dir: "~/.remora/worktrees/api/fix-login".into(),
-            branch: Some("remora/fix-login".into()),
-            env: vec![
-                ("REMORA_AGENT".into(), "claude".into()),
-                (
-                    "REMORA_WORKSPACE".into(),
-                    "~/.remora/worktrees/api/fix-login".into(),
-                ),
-                ("REMORA_CREATED_AT".into(), "1700000000".into()),
-            ],
-            agent_argv: vec!["claude".into(), "--continue".into()],
-        }
-    }
-
     #[test]
     fn ssh_compose_worktree_add_builds_git_command() {
         let plan = worktree_plan();
-        let argv = ssh_compose(&host("devbox", None, None), false, &worktree_add_tokens(&plan));
+        let argv = ssh_compose(
+            &host("devbox", None, None),
+            false,
+            &worktree_add_tokens(&plan),
+        );
         let g = argv.iter().position(|a| a == "git").expect("git");
         assert_eq!(argv[g + 1], "-C");
         assert_eq!(argv[g + 2], "/home/dev/api");
@@ -688,7 +347,11 @@ mod tests {
     #[test]
     fn ssh_compose_new_session_is_the_lock_with_no_env_trailer() {
         let plan = worktree_plan();
-        let argv = ssh_compose(&host("devbox", None, None), false, &new_session_tokens(&plan));
+        let argv = ssh_compose(
+            &host("devbox", None, None),
+            false,
+            &new_session_tokens(&plan),
+        );
         let n = argv
             .iter()
             .position(|a| a == "new-session")
@@ -718,7 +381,11 @@ mod tests {
         // new-session, via tmux's own argv command separator, so a fast-exiting
         // agent's pane is retained before it can self-destruct the session.
         let plan = worktree_plan();
-        let argv = ssh_compose(&host("devbox", None, None), false, &new_session_tokens(&plan));
+        let argv = ssh_compose(
+            &host("devbox", None, None),
+            false,
+            &new_session_tokens(&plan),
+        );
         // The separator is a shell-quoted `;` (`';'`) so the remote login shell
         // hands it to tmux as a literal separator token instead of eating it as
         // a shell statement separator.
@@ -742,39 +409,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_command_survives_the_double_shell() {
-        // An agent arg containing a space must survive BOTH the ssh login shell
-        // and tmux's `sh -c` re-parse — now wrapped in the shell-fallback compound.
-        let plan = SpawnPlan {
-            agent_argv: vec![
-                "claude".into(),
-                "--append-system-prompt".into(),
-                "Be concise".into(),
-            ],
-            ..worktree_plan()
-        };
-        let argv = ssh_compose(&host("devbox", None, None), false, &new_session_tokens(&plan));
-        let n = argv
-            .iter()
-            .position(|a| a == "new-session")
-            .expect("new-session");
-        // Still exactly one agent-command arg after `-c <dir>` (wrapped, not
-        // per-token), followed only by the 6-token remain-on-exit trailer.
-        assert_eq!(argv.len(), n + 7 + 6);
-        // The inner string the ssh login shell yields (tmux's `sh -c` re-parses
-        // it) is the wrapped compound built from the joined agent fragment.
-        let fragment = join_agent_command(&plan.agent_argv);
-        let inner = wrap_with_shell_fallback(&fragment);
-        assert_eq!(argv[n + 6], shell_quote(&inner));
-        // The agent fragment keeps its per-token quoting inside the compound, so
-        // the spaced arg stays a single shell word ahead of the gate.
-        assert!(
-            inner.starts_with("claude --append-system-prompt 'Be concise';"),
-            "got: {inner}"
-        );
-    }
-
-    #[test]
     fn ssh_compose_set_environment_quotes_logical_value() {
         let argv = ssh_compose(
             &host("devbox", None, None),
@@ -793,469 +427,6 @@ mod tests {
         assert_eq!(argv[s + 2], "remora_api_fix-login");
         assert_eq!(argv[s + 3], "REMORA_WORKSPACE");
         assert_eq!(argv[s + 4], "'~/.remora/worktrees/api/fix-login'");
-    }
-
-    fn ids() -> (ProjectId, SessionId) {
-        (
-            ProjectId::new("api").expect("slug"),
-            SessionId::new("fix-login").expect("slug"),
-        )
-    }
-
-    #[test]
-    fn dup_new_session_maps_to_session_exists_case_insensitive() {
-        let (p, s) = ids();
-        let err = classify_new_session_failure("duplicate session: remora_api_fix-login\n", &p, &s);
-        assert!(matches!(err, SourceError::SessionExists { .. }));
-        let err = classify_new_session_failure("DUPLICATE SESSION", &p, &s);
-        assert!(matches!(err, SourceError::SessionExists { .. }));
-    }
-
-    #[test]
-    fn stderr_signals_session_absent_only_for_known_tmux_phrases() {
-        // Positive: tmux's "no such session" phrasings (case-insensitive).
-        assert!(stderr_signals_session_absent(
-            "can't find session: remora_api_x"
-        ));
-        assert!(stderr_signals_session_absent(
-            "no server running on /tmp/tmux-1000/default"
-        ));
-        assert!(stderr_signals_session_absent("CAN'T FIND SESSION"));
-        // Negative: ambiguous transport failures must NOT read as absent.
-        assert!(!stderr_signals_session_absent(
-            "ssh: connect to host devbox port 22: Connection refused"
-        ));
-        assert!(!stderr_signals_session_absent(
-            "Permission denied (publickey)"
-        ));
-        assert!(!stderr_signals_session_absent(""));
-    }
-
-    #[test]
-    fn other_new_session_failure_is_transport() {
-        let (p, s) = ids();
-        let err = classify_new_session_failure("no server running on /tmp/tmux", &p, &s);
-        assert!(matches!(err, SourceError::Transport(_)));
-    }
-
-    #[test]
-    fn existing_worktree_maps_to_session_exists() {
-        let (p, s) = ids();
-        let err = classify_worktree_add_failure("fatal: '<path>' already exists", &p, &s);
-        assert!(matches!(err, SourceError::SessionExists { .. }));
-        let err = classify_worktree_add_failure(
-            "fatal: 'remora/fix-login' is already checked out at '<path>'",
-            &p,
-            &s,
-        );
-        assert!(matches!(err, SourceError::SessionExists { .. }));
-    }
-
-    #[test]
-    fn other_worktree_failure_is_transport() {
-        let (p, s) = ids();
-        let err = classify_worktree_add_failure("fatal: not a git repository", &p, &s);
-        assert!(matches!(err, SourceError::Transport(_)));
-    }
-
-    // --- run_spawn orchestration tests ---
-
-    #[test]
-    fn shared_spawn_skips_worktree_add() {
-        let plan = SpawnPlan {
-            branch: None,
-            workspace: WorkspaceMode::Shared,
-            dir: "/home/dev/api".into(),
-            ..worktree_plan()
-        };
-        let fake = FakeExec::new(vec![
-            // Only new-session should fire; all other run() calls succeed by default.
-            Ok(FakeExec::ok()),
-        ]);
-        let result = run_spawn(&fake, &plan);
-        assert!(result.is_ok(), "{result:?}");
-        // First call must be new-session (no worktree-add).
-        let calls = fake.calls.lock().expect("lock");
-        assert!(
-            calls[0].iter().any(|a| a == "new-session"),
-            "first call is new-session"
-        );
-        assert!(!calls[0].iter().any(|a| a == "worktree"), "no worktree-add");
-        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
-    }
-
-    #[test]
-    fn existing_worktree_aborts_before_create() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![Ok(FakeExec::fail("fatal: '<path>' already exists"))]);
-        let err = run_spawn(&fake, &plan)
-            .expect_err("worktree already exists");
-        assert!(matches!(err, SourceError::SessionExists { .. }), "{err}");
-        // Exactly 1 call (worktree-add), no channel opened.
-        assert_eq!(fake.calls.lock().expect("lock").len(), 1);
-        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
-    }
-
-    #[test]
-    fn duplicate_session_does_not_open_a_channel() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            // worktree add succeeds
-            Ok(FakeExec::ok()),
-            // new-session fails with duplicate
-            Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
-        ]);
-        let err =
-            run_spawn(&fake, &plan).expect_err("duplicate session");
-        assert!(matches!(err, SourceError::SessionExists { .. }), "{err}");
-        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
-    }
-
-    #[test]
-    fn run_spawn_opens_exactly_one_channel_on_success() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![]);
-        let result = run_spawn(&fake, &plan);
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
-    }
-
-    #[test]
-    fn run_spawn_attach_argv_ends_with_tmux_name() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![]);
-        let _ = run_spawn(&fake, &plan);
-        let opened = fake.opened.lock().expect("lock");
-        let attach_argv = &opened[0];
-        assert_eq!(
-            attach_argv.last().map(String::as_str),
-            Some("remora_api_fix-login")
-        );
-    }
-
-    #[test]
-    fn worktree_spawn_runs_add_create_metadata_then_attaches_in_order() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),
-            Ok(FakeExec::ok()),
-            Ok(FakeExec::ok()),
-            Ok(FakeExec::ok()),
-            Ok(FakeExec::ok()),
-        ]);
-        let result = run_spawn(&fake, &plan);
-        assert!(result.is_ok());
-        let calls = fake.calls.lock().expect("lock");
-        // worktree add, new-session (remain-on-exit folded in atomically), then
-        // 3x set-environment = 5 blocking cmds — there is no separate set-option.
-        assert_eq!(calls.len(), 5);
-        assert!(calls[0].iter().any(|a| a == "worktree"));
-        assert!(calls[1].iter().any(|a| a == "new-session"));
-        // remain-on-exit rides on the new-session call, not a follow-up exec:
-        // its `set-option` lives inside calls[1], never as a standalone call.
-        assert!(calls[1].iter().any(|a| a == "set-option"));
-        assert!(calls[1].iter().any(|a| a == "remain-on-exit"));
-        assert!(calls[2].iter().any(|a| a == "set-environment"));
-        assert!(
-            !calls[2..]
-                .iter()
-                .any(|c| c.iter().any(|a| a == "set-option")),
-            "remain-on-exit is not a standalone follow-up call"
-        );
-        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
-    }
-
-    #[test]
-    fn metadata_failure_is_tolerated_and_still_attaches() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                        // worktree add
-            Ok(FakeExec::ok()), // new-session (live! remain-on-exit folded in)
-            Ok(FakeExec::fail("set-env boom")), // REMORA_AGENT — tolerated
-            Err(SourceError::Transport("net".into())), // REMORA_WORKSPACE — tolerated
-            Ok(FakeExec::ok()), // REMORA_CREATED_AT
-        ]);
-        let result = run_spawn(&fake, &plan);
-        assert!(
-            result.is_ok(),
-            "metadata failures must not fail a live session"
-        );
-        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
-    }
-
-    #[tokio::test]
-    async fn spawn_through_fake_exec_attaches() {
-        let config = test_config();
-        let fake = Arc::new(FakeExec::new(vec![]));
-        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
-        let result = source.spawn(spec()).await;
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
-        // The plan's tmux name and env reached the recorded argv (not just
-        // that the wiring dispatched).
-        let calls = fake.calls.lock().expect("lock");
-        assert!(
-            calls.iter().any(|c| c.iter().any(|a| a == "new-session"))
-                && calls
-                    .iter()
-                    .any(|c| c.iter().any(|a| a == "remora_api_fix-login")),
-            "new-session argv carries the planned tmux name"
-        );
-        assert!(
-            calls.iter().any(|c| c.iter().any(|a| a == "REMORA_AGENT")),
-            "metadata was written via set-environment"
-        );
-    }
-
-    #[test]
-    fn new_session_generic_failure_is_transport_and_opens_no_channel() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                      // worktree add
-            Ok(FakeExec::fail("no server running")), // new-session: generic failure
-            Ok(FakeExec::fail("no server running")), // has-session: confirms no session
-        ]);
-        let err = run_spawn(&fake, &plan).expect_err("should fail");
-        assert!(matches!(err, SourceError::Transport(_)));
-        assert!(fake.opened.lock().expect("lock").is_empty());
-        // The orphaned worktree is cleaned up so the slot stays retryable.
-        let calls = fake.calls.lock().expect("lock");
-        assert!(
-            calls.last().expect("a call").iter().any(|a| a == "remove"),
-            "non-duplicate failure removes the orphaned worktree"
-        );
-    }
-
-    #[test]
-    fn live_session_worktree_is_not_removed_when_set_option_fails() {
-        // The atomic new-session+set-option command shares one exit code (#28):
-        // a non-zero exit can mean the session WAS created but the trailing
-        // set-option failed. The session is then live, so its worktree must NOT
-        // be force-removed. A has-session probe gates the orphan cleanup.
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                                               // worktree add
-            Ok(FakeExec::fail("set-option: unknown option: remain-on-exit")), // created, set-option failed
-            Ok(FakeExec::ok()), // has-session: the session IS live
-        ]);
-        let err =
-            run_spawn(&fake, &plan).expect_err("transport error");
-        assert!(matches!(err, SourceError::Transport(_)), "{err}");
-        let calls = fake.calls.lock().expect("lock");
-        assert!(
-            !calls.iter().any(|c| c.iter().any(|a| a == "remove")),
-            "a live session's worktree must never be force-removed"
-        );
-    }
-
-    #[test]
-    fn ambiguous_has_session_probe_failure_does_not_remove_the_worktree() {
-        // An ssh/network/auth failure surfaces as a non-zero remote command
-        // (`Ok(success=false)`), NOT as `Err`. A bare `!success` probe would
-        // read that as "session absent" and remove a possibly-live worktree.
-        // Only known tmux "absent" stderr is safe to clean up on; anything
-        // ambiguous leaves the worktree.
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                                               // worktree add
-            Ok(FakeExec::fail("set-option: unknown option: remain-on-exit")), // created, set-option failed
-            Ok(FakeExec::fail(
-                "ssh: connect to host devbox port 22: Connection refused",
-            )), // has-session probe itself failed
-        ]);
-        let err =
-            run_spawn(&fake, &plan).expect_err("transport error");
-        assert!(matches!(err, SourceError::Transport(_)), "{err}");
-        let calls = fake.calls.lock().expect("lock");
-        assert!(
-            !calls.iter().any(|c| c.iter().any(|a| a == "remove")),
-            "an ambiguous probe failure must not trigger worktree removal"
-        );
-    }
-
-    #[test]
-    fn duplicate_session_does_not_remove_the_worktree() {
-        // A duplicate means a LIVE session owns the worktree — never remove it.
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()), // worktree add
-            Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
-        ]);
-        let err = run_spawn(&fake, &plan).expect_err("dup");
-        assert!(matches!(err, SourceError::SessionExists { .. }));
-        let calls = fake.calls.lock().expect("lock");
-        assert!(
-            !calls.iter().any(|c| c.iter().any(|a| a == "remove")),
-            "must not remove a live session's worktree"
-        );
-    }
-
-    #[tokio::test]
-    async fn list_joins_live_metadata_stopped_and_filters_unconfigured() {
-        // Config has project `api` (worktree). `ghost` is NOT configured.
-        let config = test_config();
-        // Scripted exec, in call order:
-        //  1) list-sessions -> api (configured) + ghost (unconfigured) +
-        //     `main` & `remora__bad` (unparseable) — only api survives.
-        //  2) show-environment for api/fix-login -> metadata
-        //  3) git worktree list for api -> fix-login (live) + add-tests (stopped)
-        let fake = Arc::new(FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\nremora_ghost_x\nmain\nremora__bad\n")),
-            Ok(FakeExec::out("REMORA_AGENT=claude\nREMORA_CREATED_AT=1765500000\n")),
-            Ok(FakeExec::out(
-                "worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n\n\
-                 worktree /home/dev/.remora/worktrees/api/add-tests\nbranch refs/heads/remora/add-tests\n",
-            )),
-        ]));
-        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
-        let metas = source.list().await.expect("list");
-
-        // ghost filtered out (R1). api/add-tests is Stopped; api/fix-login is Live.
-        let keys: Vec<(&str, &str, SessionState)> = metas
-            .iter()
-            .map(|m| (m.project_id.as_str(), m.session_id.as_str(), m.state))
-            .collect();
-        assert_eq!(
-            keys,
-            vec![
-                ("api", "add-tests", SessionState::Stopped),
-                ("api", "fix-login", SessionState::Live),
-            ]
-        );
-        let live = &metas[1];
-        assert_eq!(live.agent.as_deref(), Some("claude"));
-        // Stopped carries the real discovered worktree path (R6).
-        assert_eq!(
-            metas[0].workspace_path.as_deref(),
-            Some("/home/dev/.remora/worktrees/api/add-tests")
-        );
-    }
-
-    #[tokio::test]
-    async fn list_treats_no_server_as_empty() {
-        let config = test_config();
-        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::fail(
-            "no server running on /tmp/tmux-1000/default",
-        ))]));
-        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
-        assert!(source.list().await.expect("list").is_empty());
-    }
-
-    #[tokio::test]
-    async fn list_keeps_session_live_when_show_environment_fails() {
-        // The session is listed live, but its show-environment read flakes
-        // (race: it could die between list-sessions and the metadata read).
-        // The session must stay Live with empty metadata, not be downgraded.
-        let config = test_config();
-        let fake = Arc::new(FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")), // list-sessions
-            Ok(FakeExec::fail("connection reset")),      // show-environment flakes
-            Ok(FakeExec::out("")),                       // worktree list: empty
-        ]));
-        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
-        let metas = source.list().await.expect("list");
-        assert_eq!(metas.len(), 1);
-        assert_eq!(metas[0].state, SessionState::Live);
-        assert_eq!(metas[0].agent, None);
-        assert_eq!(metas[0].created_at, None);
-    }
-
-    #[tokio::test]
-    async fn list_survives_worktree_list_failure_per_decision_8() {
-        // A failed `git worktree list` for one project yields empty for that
-        // project, never a failed discovery (decision 8): the live session
-        // still lists, just with no Stopped twin.
-        let config = test_config();
-        let fake = Arc::new(FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")), // list-sessions
-            Ok(FakeExec::out("REMORA_AGENT=claude\n")),  // show-environment
-            Ok(FakeExec::fail("fatal: not a git repository")), // worktree list fails
-        ]));
-        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
-        let metas = source.list().await.expect("list must not fail");
-        assert_eq!(metas.len(), 1);
-        assert_eq!(metas[0].session_id.as_str(), "fix-login");
-        assert_eq!(metas[0].state, SessionState::Live);
-        assert!(metas.iter().all(|m| m.state == SessionState::Live));
-    }
-
-    #[test]
-    fn classify_list_sessions_maps_no_sessions_to_empty() {
-        // The second cold-state phrase tmux emits (server up, zero sessions).
-        let out = RemoteOutput {
-            success: false,
-            stdout: String::new(),
-            stderr: "no sessions".into(),
-        };
-        assert_eq!(
-            classify_list_sessions(&out).expect("ok"),
-            Vec::<String>::new()
-        );
-    }
-
-    #[test]
-    fn classify_list_sessions_maps_no_server_to_empty() {
-        let empty = RemoteOutput {
-            success: false,
-            stdout: String::new(),
-            stderr: "no server running on /tmp/tmux".into(),
-        };
-        assert_eq!(
-            classify_list_sessions(&empty).expect("ok"),
-            Vec::<String>::new()
-        );
-
-        let ok = RemoteOutput {
-            success: true,
-            stdout: "remora_api_x\nremora_api_y\n".into(),
-            stderr: String::new(),
-        };
-        assert_eq!(
-            classify_list_sessions(&ok).expect("ok"),
-            vec!["remora_api_x", "remora_api_y"]
-        );
-
-        let boom = RemoteOutput {
-            success: false,
-            stdout: String::new(),
-            stderr: "permission denied".into(),
-        };
-        assert!(matches!(
-            classify_list_sessions(&boom),
-            Err(SourceError::Transport(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn attach_returns_not_found_when_session_is_absent() {
-        let config = test_config();
-        // has-session preflight fails (no such session) -> SessionNotFound,
-        // and NO channel is opened.
-        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::fail(
-            "can't find session",
-        ))]));
-        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
-        let (project, session) = (
-            ProjectId::new("api").expect("slug"),
-            SessionId::new("fix-login").expect("slug"),
-        );
-        let err = source.attach(&project, &session).await.expect_err("absent");
-        assert!(matches!(err, SourceError::SessionNotFound { .. }), "{err}");
-        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
-    }
-
-    #[tokio::test]
-    async fn attach_opens_channel_when_session_is_live() {
-        let config = test_config();
-        // has-session succeeds -> channel opened.
-        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::ok())]));
-        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
-        let (project, session) = (
-            ProjectId::new("api").expect("slug"),
-            SessionId::new("fix-login").expect("slug"),
-        );
-        source.attach(&project, &session).await.expect("attach");
-        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
     }
 
     #[test]
@@ -1286,6 +457,188 @@ mod tests {
         assert_eq!(argv[l + 1], "-F");
     }
 
+    #[test]
+    fn agent_command_survives_the_double_shell() {
+        // An agent arg containing a space must survive BOTH the ssh login shell
+        // and tmux's `sh -c` re-parse — now wrapped in the shell-fallback compound.
+        let plan = SpawnPlan {
+            agent_argv: vec![
+                "claude".into(),
+                "--append-system-prompt".into(),
+                "Be concise".into(),
+            ],
+            ..worktree_plan()
+        };
+        let argv = ssh_compose(
+            &host("devbox", None, None),
+            false,
+            &new_session_tokens(&plan),
+        );
+        let n = argv
+            .iter()
+            .position(|a| a == "new-session")
+            .expect("new-session");
+        // Still exactly one agent-command arg after `-c <dir>` (wrapped, not
+        // per-token), followed only by the 6-token remain-on-exit trailer.
+        assert_eq!(argv.len(), n + 7 + 6);
+        // The inner string the ssh login shell yields (tmux's `sh -c` re-parses
+        // it) is the wrapped compound built from the joined agent fragment.
+        let fragment = join_agent_command(&plan.agent_argv);
+        let inner = wrap_with_shell_fallback(&fragment);
+        assert_eq!(argv[n + 6], shell_quote(&inner));
+        // The agent fragment keeps its per-token quoting inside the compound, so
+        // the spaced arg stays a single shell word ahead of the gate.
+        assert!(
+            inner.starts_with("claude --append-system-prompt 'Be concise';"),
+            "got: {inner}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SshSource wiring tests (use FakeExec from remote::tests)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn spawn_unknown_project_is_a_plan_error() {
+        let source = SshSource::new(host("devbox", None, None), Arc::new(Config::default()));
+        let err = source.spawn(spec()).await.expect_err("no such project");
+        assert!(matches!(err, SourceError::Plan(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn usable_through_dyn_session_source() {
+        let source: Box<dyn SessionSource> = Box::new(SshSource::new(
+            host("devbox", None, None),
+            Arc::new(Config::default()),
+        ));
+        assert!(source.spawn(spec()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn spawn_through_fake_exec_attaches() {
+        let config = test_config();
+        let fake = Arc::new(FakeExec::new(vec![]));
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        let result = source.spawn(spec()).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+        // The plan's tmux name and env reached the recorded argv (not just
+        // that the wiring dispatched).
+        let calls = fake.calls.lock().expect("lock");
+        assert!(
+            calls.iter().any(|c| c.iter().any(|a| a == "new-session"))
+                && calls
+                    .iter()
+                    .any(|c| c.iter().any(|a| a == "remora_api_fix-login")),
+            "new-session argv carries the planned tmux name"
+        );
+        assert!(
+            calls.iter().any(|c| c.iter().any(|a| a == "REMORA_AGENT")),
+            "metadata was written via set-environment"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_joins_live_metadata_stopped_and_filters_unconfigured() {
+        // Config has project `api` (worktree). `ghost` is NOT configured.
+        let config = test_config();
+        let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::out(
+                "remora_api_fix-login\nremora_ghost_x\nmain\nremora__bad\n",
+            )),
+            Ok(FakeExec::out("REMORA_AGENT=claude\nREMORA_CREATED_AT=1765500000\n")),
+            Ok(FakeExec::out(
+                "worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n\n\
+                 worktree /home/dev/.remora/worktrees/api/add-tests\nbranch refs/heads/remora/add-tests\n",
+            )),
+        ]));
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        let metas = source.list().await.expect("list");
+
+        let keys: Vec<(&str, &str, SessionState)> = metas
+            .iter()
+            .map(|m| (m.project_id.as_str(), m.session_id.as_str(), m.state))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("api", "add-tests", SessionState::Stopped),
+                ("api", "fix-login", SessionState::Live),
+            ]
+        );
+        let live = &metas[1];
+        assert_eq!(live.agent.as_deref(), Some("claude"));
+        assert_eq!(
+            metas[0].workspace_path.as_deref(),
+            Some("/home/dev/.remora/worktrees/api/add-tests")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_treats_no_server_as_empty() {
+        let config = test_config();
+        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::fail(
+            "no server running on /tmp/tmux-1000/default",
+        ))]));
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        assert!(source.list().await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_keeps_session_live_when_show_environment_fails() {
+        let config = test_config();
+        let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::out("remora_api_fix-login\n")),
+            Ok(FakeExec::fail("connection reset")),
+            Ok(FakeExec::out("")),
+        ]));
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        let metas = source.list().await.expect("list");
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].state, SessionState::Live);
+        assert_eq!(metas[0].agent, None);
+        assert_eq!(metas[0].created_at, None);
+    }
+
+    #[tokio::test]
+    async fn list_survives_worktree_list_failure_per_decision_8() {
+        let config = test_config();
+        let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::out("remora_api_fix-login\n")),
+            Ok(FakeExec::out("REMORA_AGENT=claude\n")),
+            Ok(FakeExec::fail("fatal: not a git repository")),
+        ]));
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        let metas = source.list().await.expect("list must not fail");
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].session_id.as_str(), "fix-login");
+        assert_eq!(metas[0].state, SessionState::Live);
+        assert!(metas.iter().all(|m| m.state == SessionState::Live));
+    }
+
+    #[tokio::test]
+    async fn attach_returns_not_found_when_session_is_absent() {
+        let config = test_config();
+        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::fail(
+            "can't find session",
+        ))]));
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        let (project, session) = (pid("api"), sid("fix-login"));
+        let err = source.attach(&project, &session).await.expect_err("absent");
+        assert!(matches!(err, SourceError::SessionNotFound { .. }), "{err}");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn attach_opens_channel_when_session_is_live() {
+        let config = test_config();
+        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::ok())]));
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        let (project, session) = (pid("api"), sid("fix-login"));
+        source.attach(&project, &session).await.expect("attach");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
     #[tokio::test]
     async fn respawn_creates_without_worktree_add_and_attaches() {
         let config = test_config(); // api is worktree-mode
@@ -1294,10 +647,7 @@ mod tests {
             Ok(FakeExec::ok()), // new-session ok
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
-        let (project, session) = (
-            ProjectId::new("api").expect("slug"),
-            SessionId::new("fix-login").expect("slug"),
-        );
+        let (project, session) = (pid("api"), sid("fix-login"));
         source
             .respawn(&project, &session, None)
             .await
@@ -1314,17 +664,12 @@ mod tests {
     #[tokio::test]
     async fn respawn_duplicate_attaches_to_live_session() {
         let config = test_config();
-        // Preflight passes, then new-session reports duplicate -> respawn
-        // attaches to the live session instead of erroring.
         let fake = Arc::new(FakeExec::new(vec![
             Ok(FakeExec::ok()), // test -d preflight: dir exists
             Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
-        let (project, session) = (
-            ProjectId::new("api").expect("slug"),
-            SessionId::new("fix-login").expect("slug"),
-        );
+        let (project, session) = (pid("api"), sid("fix-login"));
         source
             .respawn(&project, &session, None)
             .await
@@ -1334,16 +679,10 @@ mod tests {
 
     #[tokio::test]
     async fn respawn_of_vanished_worktree_is_not_found() {
-        // The worktree directory was removed out from under the stopped
-        // session: `test -d` fails with empty stderr -> SessionNotFound, and
-        // NO tmux command runs (no new-session, no channel).
         let config = test_config();
         let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::fail(""))]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
-        let (project, session) = (
-            ProjectId::new("api").expect("slug"),
-            SessionId::new("fix-login").expect("slug"),
-        );
+        let (project, session) = (pid("api"), sid("fix-login"));
         let err = source
             .respawn(&project, &session, None)
             .await
@@ -1357,17 +696,12 @@ mod tests {
 
     #[tokio::test]
     async fn respawn_preflight_probe_failure_is_transport() {
-        // The probe itself could not run (ssh/transport): non-empty stderr ->
-        // Transport, distinct from a vanished worktree.
         let config = test_config();
         let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::fail(
             "ssh: connect to host devbox port 22: Connection refused",
         ))]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
-        let (project, session) = (
-            ProjectId::new("api").expect("slug"),
-            SessionId::new("fix-login").expect("slug"),
-        );
+        let (project, session) = (pid("api"), sid("fix-login"));
         let err = source
             .respawn(&project, &session, None)
             .await
@@ -1378,18 +712,13 @@ mod tests {
 
     #[tokio::test]
     async fn respawn_generic_new_session_failure_is_transport_and_opens_no_channel() {
-        // Preflight passes; new-session fails non-duplicate -> Transport, no
-        // channel (the `Err(err) => Err(err)` arm of run_respawn).
         let config = test_config();
         let fake = Arc::new(FakeExec::new(vec![
             Ok(FakeExec::ok()),                      // test -d preflight: dir exists
             Ok(FakeExec::fail("no server running")), // new-session: generic failure
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
-        let (project, session) = (
-            ProjectId::new("api").expect("slug"),
-            SessionId::new("fix-login").expect("slug"),
-        );
+        let (project, session) = (pid("api"), sid("fix-login"));
         let err = source
             .respawn(&project, &session, None)
             .await
@@ -1400,8 +729,6 @@ mod tests {
 
     #[tokio::test]
     async fn respawn_of_shared_project_errors_before_any_remote_call() {
-        // A shared-mode project resolves to branch=None -> NotWorktreeProject,
-        // and no remote command runs.
         let toml = r#"
             [hosts.devbox]
             transport = "ssh"
@@ -1417,10 +744,7 @@ mod tests {
         let config = Arc::new(Config::from_toml_str(toml).expect("config"));
         let fake = Arc::new(FakeExec::new(vec![]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
-        let (project, session) = (
-            ProjectId::new("scratch").expect("slug"),
-            SessionId::new("s1").expect("slug"),
-        );
+        let (project, session) = (pid("scratch"), sid("s1"));
         let err = source
             .respawn(&project, &session, None)
             .await
@@ -1437,7 +761,6 @@ mod tests {
 
     #[tokio::test]
     async fn respawn_uses_the_supplied_agent_not_the_project_default() {
-        use remora_protocol::AgentId;
         // Project default is "claude"; respawn with "codex" must launch codex.
         let fake = Arc::new(FakeExec::new(vec![
             Ok(FakeExec::ok()), // test -d preflight: dir exists
