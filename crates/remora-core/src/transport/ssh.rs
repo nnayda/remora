@@ -4,10 +4,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use portable_pty::CommandBuilder;
 use remora_protocol::{ProjectId, SessionId, SessionMeta, SpawnSpec};
 
-use super::pty_process::spawn_pty_channel;
+use super::remote::{capture, open_pty, RemoteExec, RemoteOutput};
 use crate::config::{Config, SshHost, WorkspaceMode};
 use crate::discovery::{self, DiscoveredEnv};
 use crate::naming::{parse_tmux_session_name, tmux_session_name};
@@ -40,37 +39,26 @@ fn quote_remote_path(path: &str) -> String {
     }
 }
 
-/// Result of a blocking remote command: success, captured stdout, and stderr.
-pub(crate) struct RemoteOutput {
-    pub success: bool,
-    pub stdout: String,
-    pub stderr: String,
+/// Builds the full ssh argv: connection flags + the logical remote tokens.
+/// `interactive` adds `-tt`. This is the single place ssh argvs are composed,
+/// so the byte-for-byte shape the tests pin lives here.
+fn ssh_compose(host: &SshHost, interactive: bool, tokens: &[String]) -> Vec<String> {
+    let mut argv = ssh_base_argv(host, interactive);
+    argv.extend_from_slice(tokens);
+    argv
 }
 
-/// The executor seam every spawn/attach step crosses.
-pub(crate) trait SshExec: Send + Sync {
-    fn run(&self, argv: &[String]) -> Result<RemoteOutput, SourceError>;
-    fn open_channel(&self, argv: &[String]) -> Result<SessionChannel, SourceError>;
+struct RealSshExec {
+    host: SshHost,
 }
 
-struct RealSshExec;
-
-impl SshExec for RealSshExec {
-    fn run(&self, argv: &[String]) -> Result<RemoteOutput, SourceError> {
-        debug_assert!(!argv.is_empty(), "argv must contain at least the program");
-        let output = std::process::Command::new(&argv[0])
-            .args(&argv[1..])
-            .output()
-            .map_err(|e| SourceError::Transport(format!("ssh exec: {e}")))?;
-        Ok(RemoteOutput {
-            success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
+impl RemoteExec for RealSshExec {
+    fn run(&self, remote: &[String]) -> Result<RemoteOutput, SourceError> {
+        capture(&ssh_compose(&self.host, false, remote))
     }
 
-    fn open_channel(&self, argv: &[String]) -> Result<SessionChannel, SourceError> {
-        spawn_pty_channel(command_from_argv(argv))
+    fn open_channel(&self, remote: &[String]) -> Result<SessionChannel, SourceError> {
+        open_pty(&ssh_compose(&self.host, true, remote))
     }
 }
 
@@ -79,21 +67,21 @@ impl SshExec for RealSshExec {
 pub struct SshSource {
     host: SshHost,
     config: Arc<Config>,
-    exec: Arc<dyn SshExec>,
+    exec: Arc<dyn RemoteExec>,
 }
 
 impl SshSource {
     /// Wraps a configured ssh host as a transport.
     pub fn new(host: SshHost, config: Arc<Config>) -> Self {
         Self {
-            host,
+            host: host.clone(),
             config,
-            exec: Arc::new(RealSshExec),
+            exec: Arc::new(RealSshExec { host }),
         }
     }
 
     #[cfg(test)]
-    fn with_exec(host: SshHost, config: Arc<Config>, exec: Arc<dyn SshExec>) -> Self {
+    fn with_exec(host: SshHost, config: Arc<Config>, exec: Arc<dyn RemoteExec>) -> Self {
         Self { host, config, exec }
     }
 }
@@ -387,27 +375,10 @@ fn classify_worktree_add_failure(
     }
 }
 
-/// Turns a pure argv into a `CommandBuilder` (program = argv[0]).
-///
-/// Precondition: `argv` is non-empty. Callers feed it [`attach_argv`]
-/// (via [`RealSshExec::open_channel`]), which always yields the `ssh`
-/// program plus its args.
-fn command_from_argv(argv: &[String]) -> CommandBuilder {
-    debug_assert!(!argv.is_empty(), "argv must contain at least the program");
-    let mut cmd = CommandBuilder::new(&argv[0]);
-    cmd.args(&argv[1..]);
-    // The terminal is xterm.js (xterm-256color). Pin it so the remote tmux
-    // resolves terminfo regardless of the launching shell's $TERM (#26);
-    // ssh forwards this to the remote PTY. .env() overrides only TERM, the
-    // rest of the environment is still inherited.
-    cmd.env("TERM", "xterm-256color");
-    cmd
-}
-
 /// `tmux new-session -d` — the atomic creation lock. `Ok` on success;
 /// `Err(SessionExists)` on a duplicate name (case-insensitive); otherwise
 /// `Err(Transport)`. Opens no channel.
-fn create_session(exec: &dyn SshExec, host: &SshHost, plan: &SpawnPlan) -> Result<(), SourceError> {
+fn create_session(exec: &dyn RemoteExec, host: &SshHost, plan: &SpawnPlan) -> Result<(), SourceError> {
     let out = exec.run(&new_session_argv(host, plan))?;
     if out.success {
         Ok(())
@@ -427,7 +398,7 @@ fn create_session(exec: &dyn SshExec, host: &SshHost, plan: &SpawnPlan) -> Resul
 /// (a bad start dir, a missing agent binary) is retained before it can
 /// self-destruct the session, instead of racing these env-var round-trips and
 /// turning the follow-up attach into a spurious `SessionNotFound` (#28).
-fn write_metadata(exec: &dyn SshExec, host: &SshHost, plan: &SpawnPlan) {
+fn write_metadata(exec: &dyn RemoteExec, host: &SshHost, plan: &SpawnPlan) {
     for (key, value) in &plan.env {
         let _ = exec.run(&set_environment_argv(host, &plan.tmux_name, key, value));
     }
@@ -459,7 +430,7 @@ fn stderr_signals_session_absent(stderr: &str) -> bool {
 /// Opens the PTY attach channel to an existing session (no liveness
 /// preflight — callers that need one do it first; see `SshSource::attach`).
 fn attach_channel(
-    exec: &dyn SshExec,
+    exec: &dyn RemoteExec,
     host: &SshHost,
     tmux_name: &str,
 ) -> Result<SessionChannel, SourceError> {
@@ -471,7 +442,7 @@ fn attach_channel(
 /// metadata, then attach. Each step crosses the `SshExec` seam so tests can
 /// inject a `FakeExec` without touching the network.
 fn run_spawn(
-    exec: &dyn SshExec,
+    exec: &dyn RemoteExec,
     host: &SshHost,
     plan: &SpawnPlan,
 ) -> Result<SessionChannel, SourceError> {
@@ -530,7 +501,7 @@ fn run_spawn(
 /// exit, self-destructing the session), so a gone worktree surfaces here as
 /// `SessionNotFound` rather than a confusing post-attach channel death.
 fn run_respawn(
-    exec: &dyn SshExec,
+    exec: &dyn RemoteExec,
     host: &SshHost,
     plan: &SpawnPlan,
 ) -> Result<SessionChannel, SourceError> {
@@ -566,7 +537,7 @@ fn run_respawn(
 /// still listed `Live` (don't downgrade a known-live session on a metadata
 /// read flake). The target name is rebuilt from validated ids.
 fn read_environment(
-    exec: &dyn SshExec,
+    exec: &dyn RemoteExec,
     host: &SshHost,
     project: &ProjectId,
     session: &SessionId,
@@ -582,7 +553,7 @@ fn read_environment(
 /// scoped throughout (R1): the live set keeps only configured projects, and
 /// the stopped scan runs only for configured worktree-mode projects.
 fn run_list(
-    exec: &dyn SshExec,
+    exec: &dyn RemoteExec,
     host: &SshHost,
     config: &Config,
 ) -> Result<Vec<SessionMeta>, SourceError> {
@@ -816,7 +787,7 @@ mod tests {
         }
     }
 
-    impl SshExec for FakeExec {
+    impl RemoteExec for FakeExec {
         fn run(&self, argv: &[String]) -> Result<RemoteOutput, SourceError> {
             self.calls.lock().expect("lock").push(argv.to_vec());
             self.results
@@ -1568,14 +1539,6 @@ mod tests {
             .expect("has-session");
         assert_eq!(argv[h + 1], "-t");
         assert_eq!(argv[h + 2], "remora_api_fix-login");
-    }
-
-    #[test]
-    fn interactive_command_pins_term_to_xterm_256color() {
-        // xterm.js (the app's emulator) speaks xterm-256color; the remote tmux
-        // must see that, not whatever TERM the app process inherited.
-        let cmd = command_from_argv(&["ssh".to_string(), "host".to_string()]);
-        assert_eq!(cmd.get_env("TERM"), Some("xterm-256color".as_ref()));
     }
 
     #[test]
