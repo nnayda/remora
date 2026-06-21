@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use remora_protocol::{ProjectId, SessionId, SessionMeta, SpawnSpec};
 
 use super::remote::{
-    attach_channel, capture, has_session_tokens, open_pty, run_list, run_respawn, run_spawn,
-    RemoteExec, RemoteOutput,
+    attach_channel, capture, has_session_tokens, open_pty, run_list, run_remove, run_respawn,
+    run_spawn, run_stop, RemoteExec, RemoteOutput,
 };
 use crate::config::{Config, SshHost};
 use crate::naming::tmux_session_name;
@@ -160,6 +160,33 @@ impl SessionSource for SshSource {
         tokio::task::spawn_blocking(move || run_respawn(exec.as_ref(), &plan))
             .await
             .map_err(|e| SourceError::Transport(format!("respawn task: {e}")))?
+    }
+
+    async fn stop(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<(), SourceError> {
+        let exec = Arc::clone(&self.exec);
+        let config = Arc::clone(&self.config);
+        let (p, s) = (project_id.clone(), session_id.clone());
+        tokio::task::spawn_blocking(move || run_stop(exec.as_ref(), &config, &p, &s))
+            .await
+            .map_err(|e| SourceError::Transport(format!("stop task: {e}")))?
+    }
+
+    async fn remove(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        force: bool,
+    ) -> Result<(), SourceError> {
+        let exec = Arc::clone(&self.exec);
+        let config = Arc::clone(&self.config);
+        let (p, s) = (project_id.clone(), session_id.clone());
+        tokio::task::spawn_blocking(move || run_remove(exec.as_ref(), &config, &p, &s, force))
+            .await
+            .map_err(|e| SourceError::Transport(format!("remove task: {e}")))?
     }
 }
 

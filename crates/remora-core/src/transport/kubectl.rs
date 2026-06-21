@@ -12,8 +12,8 @@ use async_trait::async_trait;
 use remora_protocol::{ProjectId, SessionId, SessionMeta, SpawnSpec};
 
 use super::remote::{
-    attach_channel, capture, has_session_tokens, open_pty, run_list, run_respawn, run_spawn,
-    RemoteExec, RemoteOutput,
+    attach_channel, capture, has_session_tokens, open_pty, run_list, run_remove, run_respawn,
+    run_spawn, run_stop, RemoteExec, RemoteOutput,
 };
 use crate::config::{Config, KubectlHost};
 use crate::naming::tmux_session_name;
@@ -185,6 +185,33 @@ impl SessionSource for KubectlSource {
             .await
             .map_err(|e| SourceError::Transport(format!("respawn task: {e}")))?
     }
+
+    async fn stop(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<(), SourceError> {
+        let exec = Arc::clone(&self.exec);
+        let config = Arc::clone(&self.config);
+        let (p, s) = (project_id.clone(), session_id.clone());
+        tokio::task::spawn_blocking(move || run_stop(exec.as_ref(), &config, &p, &s))
+            .await
+            .map_err(|e| SourceError::Transport(format!("stop task: {e}")))?
+    }
+
+    async fn remove(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        force: bool,
+    ) -> Result<(), SourceError> {
+        let exec = Arc::clone(&self.exec);
+        let config = Arc::clone(&self.config);
+        let (p, s) = (project_id.clone(), session_id.clone());
+        tokio::task::spawn_blocking(move || run_remove(exec.as_ref(), &config, &p, &s, force))
+            .await
+            .map_err(|e| SourceError::Transport(format!("remove task: {e}")))?
+    }
 }
 
 #[cfg(test)]
@@ -220,6 +247,14 @@ mod tests {
                 success: false,
                 stdout: String::new(),
                 stderr: stderr.into(),
+            }
+        }
+
+        fn out(stdout: &str) -> RemoteOutput {
+            RemoteOutput {
+                success: true,
+                stdout: stdout.into(),
+                stderr: String::new(),
             }
         }
     }
@@ -452,5 +487,69 @@ mod tests {
         let pid = ProjectId::new("api").expect("slug");
         let project = config.projects.get(&pid).expect("api project");
         assert_eq!(project.workspace, WorkspaceMode::Worktree);
+    }
+
+    // -----------------------------------------------------------------------
+    // stop/remove delegation smoke tests: prove KubectlSource wires through
+    // to run_stop / run_remove the same way SshSource does (parallel pattern).
+    // -----------------------------------------------------------------------
+
+    fn kubectl_host() -> KubectlHost {
+        KubectlHost {
+            pod: "sandbox-0".into(),
+            namespace: None,
+            context: None,
+            container: None,
+        }
+    }
+
+    fn pid(s: &str) -> ProjectId {
+        ProjectId::new(s).expect("slug")
+    }
+
+    fn sid(s: &str) -> SessionId {
+        SessionId::new(s).expect("slug")
+    }
+
+    #[tokio::test]
+    async fn stop_delegates_to_run_stop_via_spawn_blocking() {
+        // kill-session succeeds → stop is Ok.
+        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::ok())]));
+        let source = KubectlSource::with_exec(kubectl_host(), test_config(), fake.clone());
+        source
+            .stop(&pid("api"), &sid("fix-login"))
+            .await
+            .expect("stop");
+        let calls = fake.calls.lock().expect("lock");
+        assert!(
+            calls.iter().any(|c| c.iter().any(|a| a == "kill-session")),
+            "stop must issue kill-session; got: {calls:?}"
+        );
+        // No worktree-remove or branch-delete (stop is tmux-only).
+        assert!(
+            !calls.iter().any(|c| c.iter().any(|a| a == "remove")),
+            "stop must not touch the worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_delegates_to_run_remove_via_spawn_blocking() {
+        // For a worktree project: probe (clean) → kill → worktree remove → branch -D.
+        let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::out("")),    // status --porcelain (clean)
+            Ok(FakeExec::out("0\n")), // rev-list (on remote)
+            Ok(FakeExec::ok()),       // kill-session
+            Ok(FakeExec::ok()),       // worktree remove
+            Ok(FakeExec::ok()),       // branch -D
+        ]));
+        let source = KubectlSource::with_exec(kubectl_host(), test_config(), fake.clone());
+        source
+            .remove(&pid("api"), &sid("fix-login"), false)
+            .await
+            .expect("remove");
+        let calls = fake.calls.lock().expect("lock");
+        assert!(calls.iter().any(|c| c.iter().any(|a| a == "kill-session")));
+        assert!(calls.iter().any(|c| c.iter().any(|a| a == "remove")));
+        assert!(calls.iter().any(|c| c.iter().any(|a| a == "-D")));
     }
 }
