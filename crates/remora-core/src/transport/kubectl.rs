@@ -13,7 +13,7 @@ use remora_protocol::{ProjectId, SessionId, SessionMeta, SpawnSpec};
 
 use super::remote::{
     attach_channel, capture, has_session_tokens, open_pty, run_list, run_remove, run_respawn,
-    run_spawn, run_stop, RemoteExec, RemoteOutput,
+    run_spawn, run_stop, stderr_signals_session_absent, RemoteExec, RemoteOutput,
 };
 use crate::config::{Config, KubectlHost};
 use crate::naming::tmux_session_name;
@@ -94,9 +94,18 @@ fn probe_pod(exec: &dyn RemoteExec) -> Result<(), SourceError> {
                  command -v \"$b\" >/dev/null 2>&1 || { echo \"$b\"; exit 1; }; done";
     let out = exec.run(&[probe.to_string()])?;
     if out.success {
-        Ok(())
+        return Ok(());
+    }
+    // The loop echoes the missing binary name to stdout and exits 1. But a
+    // kubectl-level failure (auth, RBAC, API server unreachable, missing pod)
+    // fails *before* the loop runs: stdout is empty and stderr carries the real
+    // cause. Only a non-empty stdout is a genuine missing-binary report; an
+    // empty stdout means the probe itself never ran, so surface the transport
+    // stderr instead of masking it as a phantom missing binary.
+    let missing = out.stdout.trim();
+    if missing.is_empty() {
+        Err(SourceError::Transport(out.stderr.trim().to_string()))
     } else {
-        let missing = out.stdout.trim();
         Err(SourceError::Transport(format!(
             "kubectl pod missing required binary `{missing}` (need sh, tmux, git)"
         )))
@@ -149,10 +158,18 @@ impl SessionSource for KubectlSource {
         tokio::task::spawn_blocking(move || {
             let out = exec.run(&has_session_tokens(&tmux_name))?;
             if !out.success {
-                return Err(SourceError::SessionNotFound {
-                    project_id,
-                    session_id,
-                });
+                // A non-zero `has-session` only means "absent" for a known tmux
+                // no-such-session stderr; a kubectl/auth/network failure also
+                // exits non-zero and must surface as Transport, not as a
+                // misleading SessionNotFound (mirrors the run_spawn cleanup gate).
+                return if stderr_signals_session_absent(&out.stderr) {
+                    Err(SourceError::SessionNotFound {
+                        project_id,
+                        session_id,
+                    })
+                } else {
+                    Err(SourceError::Transport(out.stderr))
+                };
             }
             attach_channel(exec.as_ref(), &tmux_name)
         })
@@ -419,6 +436,26 @@ mod tests {
     }
 
     #[test]
+    fn probe_pod_kubectl_failure_surfaces_stderr_not_phantom_binary() {
+        // kubectl exec fails before the probe loop runs (auth/RBAC/API/pod):
+        // stdout is empty, stderr carries the cause. The error must preserve
+        // that cause, never a misleading missing-binary message.
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "Error from server (Forbidden): pods \"sandbox-0\" is forbidden".into(),
+        })]);
+        let err = probe_pod(&fake).expect_err("kubectl forbidden");
+        match err {
+            SourceError::Transport(msg) => {
+                assert!(msg.contains("Forbidden"), "got: {msg}");
+                assert!(!msg.contains("missing required binary"), "got: {msg}");
+            }
+            other => panic!("expected Transport, got {other}"),
+        }
+    }
+
+    #[test]
     fn probe_loop_fails_closed_on_missing_binary() {
         // Real local sh: the loop must exit non-zero and name the absent binary,
         // independent of FakeExec. Proves the shell construct itself works.
@@ -477,6 +514,37 @@ mod tests {
         let source = KubectlSource::with_exec(kh, test_config(), fake.clone());
         let err = source.list().await.expect_err("connection error");
         assert!(matches!(err, SourceError::Transport(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn attach_absent_session_is_not_found() {
+        // tmux's own "can't find session" stderr → SessionNotFound.
+        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::fail(
+            "can't find session: remora_api_fix-login",
+        ))]));
+        let source = KubectlSource::with_exec(kubectl_host(), test_config(), fake.clone());
+        let err = source
+            .attach(&pid("api"), &sid("fix-login"))
+            .await
+            .expect_err("absent");
+        assert!(matches!(err, SourceError::SessionNotFound { .. }), "{err}");
+        assert_eq!(*fake.opened.lock().expect("lock"), 0);
+    }
+
+    #[tokio::test]
+    async fn attach_kubectl_failure_is_transport_not_not_found() {
+        // A kubectl/auth/API failure on has-session must surface as Transport,
+        // never be misclassified as a missing session.
+        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::fail(
+            "Unable to connect to the server: dial tcp: lookup api timed out",
+        ))]));
+        let source = KubectlSource::with_exec(kubectl_host(), test_config(), fake.clone());
+        let err = source
+            .attach(&pid("api"), &sid("fix-login"))
+            .await
+            .expect_err("transport failure");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
+        assert_eq!(*fake.opened.lock().expect("lock"), 0);
     }
 
     #[test]

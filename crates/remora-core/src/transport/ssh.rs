@@ -8,7 +8,7 @@ use remora_protocol::{ProjectId, SessionId, SessionMeta, SpawnSpec};
 
 use super::remote::{
     attach_channel, capture, has_session_tokens, open_pty, run_list, run_remove, run_respawn,
-    run_spawn, run_stop, RemoteExec, RemoteOutput,
+    run_spawn, run_stop, stderr_signals_session_absent, RemoteExec, RemoteOutput,
 };
 use crate::config::{Config, SshHost};
 use crate::naming::tmux_session_name;
@@ -107,8 +107,11 @@ impl SessionSource for SshSource {
     ///
     /// A `tmux has-session` preflight returns `SessionNotFound` for a missing
     /// or stopped session (honoring the trait contract stage 4 deferred); a
-    /// dead-pane session still exists and is attachable. The TOCTOU window
-    /// (session dies between preflight and attach) degrades to channel death.
+    /// dead-pane session still exists and is attachable. A failed preflight is
+    /// only treated as absent for a known tmux no-such-session stderr — an
+    /// ssh/auth/network failure also exits non-zero and surfaces as `Transport`
+    /// rather than a misleading `SessionNotFound`. The TOCTOU window (session
+    /// dies between preflight and attach) degrades to channel death.
     async fn attach(
         &self,
         project_id: &ProjectId,
@@ -121,10 +124,14 @@ impl SessionSource for SshSource {
         tokio::task::spawn_blocking(move || {
             let out = exec.run(&has_session_tokens(&tmux_name))?;
             if !out.success {
-                return Err(SourceError::SessionNotFound {
-                    project_id,
-                    session_id,
-                });
+                return if stderr_signals_session_absent(&out.stderr) {
+                    Err(SourceError::SessionNotFound {
+                        project_id,
+                        session_id,
+                    })
+                } else {
+                    Err(SourceError::Transport(out.stderr))
+                };
             }
             attach_channel(exec.as_ref(), &tmux_name)
         })
@@ -653,6 +660,23 @@ mod tests {
         let (project, session) = (pid("api"), sid("fix-login"));
         let err = source.attach(&project, &session).await.expect_err("absent");
         assert!(matches!(err, SourceError::SessionNotFound { .. }), "{err}");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn attach_ssh_failure_is_transport_not_not_found() {
+        // An ssh/auth/network failure on has-session must surface as Transport,
+        // never be misclassified as a missing session.
+        let config = test_config();
+        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::fail(
+            "ssh: connect to host devbox port 22: Connection refused",
+        ))]));
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        let err = source
+            .attach(&pid("api"), &sid("fix-login"))
+            .await
+            .expect_err("transport failure");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
         assert_eq!(fake.opened.lock().expect("lock").len(), 0);
     }
 
