@@ -1044,10 +1044,11 @@ mod tests {
         let ConfigError::Invalid(issues) = &err else {
             panic!("expected Invalid, got: {err}");
         };
-        // telnet transport, relative path, empty command [] (which is valid
-        // for plain shell) — and the project's host reference stays valid
-        // because `devbox` *is* configured, just broken: a broken host must
-        // not cascade into phantom unknown-host errors.
+        // telnet transport, relative path, and a blank command element
+        // (`command = [""]` — a hole in a non-empty argv, distinct from the now
+        // valid empty `[]` plain shell) — and the project's host reference stays
+        // valid because `devbox` *is* configured, just broken: a broken host
+        // must not cascade into phantom unknown-host errors.
         assert_eq!(issues.len(), 3, "{issues:?}");
         let msg = err.to_string();
         assert!(msg.contains("3 problems"), "{msg}");
