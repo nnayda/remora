@@ -83,24 +83,22 @@ impl RemoteExec for RealKubectlExec {
     }
 }
 
-/// Pod-requirements preflight (Finding 7). Runs `command -v sh tmux git`;
-/// a missing binary surfaces as a clear error instead of a downstream
-/// `command not found`. Only the spawn path probes — respawn reuses an
-/// existing worktree and surfaces a missing binary the same way ssh does.
+/// Pod-requirements preflight (Finding 7). POSIX `command -v` only checks its
+/// first argument, so we loop and fail closed on the first missing binary,
+/// echoing its name so the error can name it. Only `spawn` probes — respawn
+/// reuses an existing (already-probed) pod + worktree.
 fn probe_pod(exec: &dyn RemoteExec) -> Result<(), SourceError> {
-    let out = exec.run(&[
-        "command".into(),
-        "-v".into(),
-        "sh".into(),
-        "tmux".into(),
-        "git".into(),
-    ])?;
+    // One shell command, run in-container via `sh -c`. Single token so the
+    // RemoteExec space-join is a no-op.
+    let probe = "for b in sh tmux git; do \
+                 command -v \"$b\" >/dev/null 2>&1 || { echo \"$b\"; exit 1; }; done";
+    let out = exec.run(&[probe.to_string()])?;
     if out.success {
         Ok(())
     } else {
+        let missing = out.stdout.trim();
         Err(SourceError::Transport(format!(
-            "kubectl pod missing a required binary (need sh, tmux, git): {}",
-            out.stderr.trim()
+            "kubectl pod missing required binary `{missing}` (need sh, tmux, git)"
         )))
     }
 }
@@ -356,28 +354,45 @@ mod tests {
     fn probe_pod_ok_when_binaries_present() {
         let fake = FakeExec::new(vec![Ok(FakeExec::ok())]);
         assert!(probe_pod(&fake).is_ok());
-        // The probe runs `command -v sh tmux git`.
+        // The probe is a single loop token — assert the real payload was sent.
         let call = &fake.calls.lock().expect("lock")[0];
-        assert!(
-            call.iter()
-                .any(|a| a.contains("command -v") || a == "command")
-                && call.iter().any(|a| a.contains("tmux"))
-        );
+        assert_eq!(call.len(), 1, "probe must be a single token");
+        let token = &call[0];
+        assert!(token.contains("for b in"), "got: {token}");
+        assert!(token.contains("tmux"), "got: {token}");
+        assert!(token.contains("git"), "got: {token}");
     }
 
     #[test]
     fn probe_pod_missing_binary_is_clear_transport_error() {
-        let fake = FakeExec::new(vec![Ok(FakeExec::fail("sh: tmux: not found"))]);
+        // The loop echoes the missing binary name to stdout and exits 1.
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: false,
+            stdout: "tmux\n".into(),
+            stderr: String::new(),
+        })]);
         let err = probe_pod(&fake).expect_err("missing tmux");
         match err {
             SourceError::Transport(msg) => {
                 assert!(
-                    msg.contains("pod") && msg.contains("required"),
+                    msg.contains("tmux") && msg.contains("required"),
                     "got: {msg}"
                 )
             }
             other => panic!("expected Transport, got {other}"),
         }
+    }
+
+    #[test]
+    fn probe_loop_fails_closed_on_missing_binary() {
+        // Real local sh: the loop must exit non-zero and name the absent binary,
+        // independent of FakeExec. Proves the shell construct itself works.
+        let snippet = "for b in sh remora-not-a-real-binary-zzz; do \
+                       command -v \"$b\" >/dev/null 2>&1 || { echo \"$b\"; exit 1; }; done";
+        let out = crate::transport::remote::capture(&["sh".into(), "-c".into(), snippet.into()])
+            .expect("capture runs");
+        assert!(!out.success, "loop must fail closed on a missing binary");
+        assert_eq!(out.stdout.trim(), "remora-not-a-real-binary-zzz");
     }
 
     #[tokio::test]
@@ -402,9 +417,12 @@ mod tests {
         };
         source.spawn(spec).await.expect("spawn");
         assert_eq!(*fake.opened.lock().expect("lock"), 1);
-        // First call is the probe, second is the worktree add.
+        // First call is the probe (single loop token), second is the worktree add.
         let calls = fake.calls.lock().expect("lock");
-        assert!(calls[0].iter().any(|a| a == "command"));
+        assert!(
+            calls[0].len() == 1 && calls[0][0].contains("for b in"),
+            "first call must be the probe loop token"
+        );
         assert!(calls[1].iter().any(|a| a == "worktree"));
     }
 
