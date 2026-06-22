@@ -119,17 +119,19 @@ pub(crate) fn join_agent_command(argv: &[String]) -> String {
 /// `/bin/sh`; `-l` for a login shell. Used verbatim instead of the agent-exit
 /// `wrap_with_shell_fallback` so the pane is the shell directly, and instead of
 /// omitting the command (which would delegate to the host tmux's
-/// `default-command`). It is the same shell `wrap_with_shell_fallback` execs on
-/// a clean agent exit (#30/#44), so a plain-shell session and a finished-agent
-/// session are identical.
+/// `default-command`). `wrap_with_shell_fallback` execs this same constant on a
+/// clean agent exit (#30/#44), so a plain-shell session and a finished-agent
+/// session land in an identical shell by construction, not by coincidence.
 pub(crate) const PLAIN_SHELL_COMMAND: &str = r#""${SHELL:-/bin/sh}" -l"#;
 
 /// Wraps the joined agent command so a clean / user-interrupted exit
-/// (0 graceful, 130 SIGINT/Ctrl-C, 143 SIGTERM) execs an interactive login
-/// shell in the same dir, keeping the pane alive with a real prompt (#30); any
-/// other non-zero exit propagates so `remain-on-exit` retains the dead pane and
-/// its error for inspection (#28). `${SHELL:-/bin/sh}` defends against an unset
-/// SHELL in the pane environment.
+/// (0 graceful, 130 SIGINT/Ctrl-C, 143 SIGTERM) execs [`PLAIN_SHELL_COMMAND`]
+/// (an interactive login shell) in the same dir, keeping the pane alive with a
+/// real prompt (#30); any other non-zero exit propagates so `remain-on-exit`
+/// retains the dead pane and its error for inspection (#28). Reusing the
+/// constant guarantees this fallback shell is identical to a no-agent pane;
+/// its `${SHELL:-/bin/sh}` defends against an unset SHELL in the pane
+/// environment.
 ///
 /// `__remora_rc=$?` MUST be the first statement after the agent command —
 /// nothing may run between the agent and the `$?` capture or it records the
@@ -144,7 +146,7 @@ pub(crate) const PLAIN_SHELL_COMMAND: &str = r#""${SHELL:-/bin/sh}" -l"#;
 /// ```
 pub(crate) fn wrap_with_shell_fallback(agent_command: &str) -> String {
     format!(
-        r#"{agent_command}; __remora_rc=$?; case "$__remora_rc" in 0|130|143) exec "${{SHELL:-/bin/sh}}" -l ;; *) exit "$__remora_rc" ;; esac"#
+        r#"{agent_command}; __remora_rc=$?; case "$__remora_rc" in 0|130|143) exec {PLAIN_SHELL_COMMAND} ;; *) exit "$__remora_rc" ;; esac"#
     )
 }
 

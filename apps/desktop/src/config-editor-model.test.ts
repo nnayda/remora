@@ -272,9 +272,10 @@ describe("agent form", () => {
   });
 
   it("seeds plainShell from an empty dto command", () => {
-    expect(agentFormFromDto({ id: "shell", command: [] }).plainShell).toBe(
-      true,
-    );
+    const shell = agentFormFromDto({ id: "shell", command: [] });
+    expect(shell.plainShell).toBe(true);
+    // One editable row is restored so unchecking the toggle has something to show.
+    expect(shell.command).toEqual([""]);
     expect(
       agentFormFromDto({ id: "claude", command: ["claude"] }).plainShell,
     ).toBe(false);
@@ -286,8 +287,11 @@ describe("agent form", () => {
     expect(toAgentInput(form)).toEqual({ command: [] });
   });
 
-  it("still rejects an all-blank command when not a plain shell", () => {
-    const form = { id: "ok", command: ["", "  "], plainShell: false };
-    expect(validateAgentForm(form, "create")).toMatch(/command/i);
+  it("accepts all-blank rows when plain shell and saves []", () => {
+    // The same rows that are rejected above are fine once the toggle is on —
+    // they collapse to an empty command instead of failing validation.
+    const form = { id: "ok", command: ["", "  "], plainShell: true };
+    expect(validateAgentForm(form, "create")).toBeNull();
+    expect(toAgentInput(form)).toEqual({ command: [] });
   });
 });
