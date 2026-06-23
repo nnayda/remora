@@ -133,6 +133,8 @@ host = "hermes"            # any ssh destination, including a ~/.ssh/config alia
 command = ["claude"]
 [agents.codex]
 command = ["codex"]
+[agents.shell]
+command = []               # no agent: an empty command is a plain login shell
 
 [projects.<id>]
 host = "hermes"
@@ -141,9 +143,9 @@ workspace = "worktree"     # fresh worktree + branch per session
 agent = "claude"           # overridable per session
 ```
 
-The host needs only `tmux`, `git`, and the agent CLI on `PATH`. With no hosts
-configured the sidebar shows the empty state — there is no in-app fake at
-runtime (the fake is test-only).
+The host needs only `tmux`, `git`, and the agent CLI on `PATH` (a plain-shell
+agent needs no CLI at all). With no hosts configured the sidebar shows the
+empty state — there is no in-app fake at runtime (the fake is test-only).
 
 ## Releases
 
