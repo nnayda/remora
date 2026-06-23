@@ -73,14 +73,25 @@ export function AgentForm({
           />
         </label>
       )}
+      <label className="checkbox-row">
+        <input
+          type="checkbox"
+          checked={form.plainShell}
+          onChange={(e) =>
+            setForm((f) => ({ ...f, plainShell: e.target.checked }))
+          }
+        />
+        No command (plain shell)
+      </label>
       <span className="dialog-label">Command</span>
-      <ul className="argv-editor">
+      <ul className="argv-editor" aria-disabled={form.plainShell}>
         {form.command.map((arg, i) => (
           // biome-ignore lint/suspicious/noArrayIndexKey: argv rows are positional
           <li key={i} className="argv-row">
             <input
               aria-label={`argument ${i + 1}`}
               value={arg}
+              disabled={form.plainShell}
               onChange={(e) =>
                 setCommand(setArg(form.command, i, e.target.value))
               }
@@ -89,7 +100,7 @@ export function AgentForm({
             <button
               type="button"
               aria-label={`move argument ${i + 1} up`}
-              disabled={i === 0}
+              disabled={i === 0 || form.plainShell}
               onClick={() => setCommand(moveArg(form.command, i, -1))}
             >
               ↑
@@ -97,7 +108,7 @@ export function AgentForm({
             <button
               type="button"
               aria-label={`move argument ${i + 1} down`}
-              disabled={i === form.command.length - 1}
+              disabled={i === form.command.length - 1 || form.plainShell}
               onClick={() => setCommand(moveArg(form.command, i, 1))}
             >
               ↓
@@ -105,7 +116,7 @@ export function AgentForm({
             <button
               type="button"
               aria-label={`remove argument ${i + 1}`}
-              disabled={form.command.length === 1}
+              disabled={form.command.length === 1 || form.plainShell}
               onClick={() => setCommand(removeArg(form.command, i))}
             >
               ✕
@@ -116,6 +127,7 @@ export function AgentForm({
       <button
         type="button"
         className="argv-add"
+        disabled={form.plainShell}
         onClick={() => setCommand(addArg(form.command))}
       >
         + Add argument

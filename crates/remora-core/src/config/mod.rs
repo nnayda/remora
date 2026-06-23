@@ -591,10 +591,14 @@ impl Config {
         }
 
         for (id, agent) in &raw.agents {
-            let reason = if agent.command.is_empty()
-                || agent.command.iter().any(|arg| arg.trim().is_empty())
+            // An empty argv (`command = []`) is the explicit "no agent / plain
+            // shell" case (#35) and is allowed. A *non-empty* command with a
+            // blank/whitespace element is still a typo (a hole in a real
+            // command), and control characters are always rejected.
+            let reason = if !agent.command.is_empty()
+                && agent.command.iter().any(|arg| arg.trim().is_empty())
             {
-                Some("must be a non-empty argv array without blank elements")
+                Some("must not contain blank elements (use an empty array `[]` for a plain shell)")
             } else if agent
                 .command
                 .iter()
@@ -996,15 +1000,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_agent_command() {
-        let issues = issues_of("[agents.claude]\ncommand = []\n");
-        assert_eq!(issues.len(), 1);
-        assert!(issues[0].to_string().contains("claude"), "{issues:?}");
+    fn allows_empty_command_as_plain_shell() {
+        // An empty argv is the explicit "no agent / plain shell" case (#35).
+        let cfg = Config::from_toml_str("[agents.shell]\ncommand = []\n")
+            .expect("empty command is a valid plain shell");
+        let shell_id = AgentId::new("shell").expect("valid agent id");
+        assert!(cfg.agents.contains_key(&shell_id));
+        assert!(cfg.agents[&shell_id].command.is_empty());
+    }
 
+    #[test]
+    fn rejects_blank_elements_in_a_nonempty_command() {
+        // A hole in an otherwise-real command is a typo, not a plain shell.
         let issues = issues_of("[agents.claude]\ncommand = [\"\"]\n");
         assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].to_string().contains("claude"), "{issues:?}");
 
-        // An empty element anywhere in the argv is a config mistake too.
+        let issues = issues_of("[agents.claude]\ncommand = [\"  \"]\n");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+
         let issues = issues_of("[agents.claude]\ncommand = [\"claude\", \"\", \"--continue\"]\n");
         assert_eq!(issues.len(), 1, "{issues:?}");
     }
@@ -1023,17 +1037,18 @@ mod tests {
             agent = "claude"
 
             [agents.claude]
-            command = []
+            command = [""]
             "#,
         )
         .expect_err("config should be invalid");
         let ConfigError::Invalid(issues) = &err else {
             panic!("expected Invalid, got: {err}");
         };
-        // telnet transport, relative path, empty command — and the project's
-        // host reference stays valid because `devbox` *is* configured, just
-        // broken: a broken host must not cascade into phantom unknown-host
-        // errors.
+        // telnet transport, relative path, and a blank command element
+        // (`command = [""]` — a hole in a non-empty argv, distinct from the now
+        // valid empty `[]` plain shell) — and the project's host reference stays
+        // valid because `devbox` *is* configured, just broken: a broken host
+        // must not cascade into phantom unknown-host errors.
         assert_eq!(issues.len(), 3, "{issues:?}");
         let msg = err.to_string();
         assert!(msg.contains("3 problems"), "{msg}");
@@ -1123,7 +1138,7 @@ mod tests {
 
     #[test]
     fn rejects_blank_agent_command_elements() {
-        // Whitespace-only argv elements are as broken as empty ones.
+        // Whitespace-only argv elements are invalid in command arrays.
         let issues = issues_of("[agents.claude]\ncommand = [\"   \"]\n");
         assert_eq!(issues.len(), 1, "{issues:?}");
 

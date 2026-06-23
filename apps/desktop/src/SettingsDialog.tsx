@@ -320,7 +320,7 @@ function SettingsList({
           <EntityRow
             key={a.id}
             label={a.id}
-            badge={a.command[0] ?? ""}
+            badge={a.command.length === 0 ? "(plain shell)" : a.command[0]}
             onEdit={() => onEditAgent(a)}
             onRemove={() => onRemoveAgent(a.id)}
           />

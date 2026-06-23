@@ -127,6 +127,9 @@ mod tests {
 
             [agents.codex]
             command = ["codex"]
+
+            [agents.shell]
+            command = []
         "#;
         Config::from_toml_str(toml).expect("valid config")
     }
@@ -187,5 +190,20 @@ mod tests {
         let err = plan_spawn(&config(), &spec("api", "s1", Some("nope"))).expect_err("err");
         assert!(matches!(err, PlanError::UnknownAgent(_)));
         assert!(err.to_string().contains("nope"));
+    }
+
+    #[test]
+    fn empty_command_agent_yields_a_plain_shell_plan() {
+        let plan = plan_spawn(&config(), &spec("api", "s1", Some("shell"))).expect("plan");
+        // No agent to launch: empty argv is the in-band "plain shell" signal.
+        assert!(plan.agent_argv.is_empty());
+        // The plain-shell agent is still a configured agent, so its id rides in
+        // REMORA_AGENT and round-trips through discovery for a live session.
+        let env: std::collections::HashMap<_, _> = plan
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(env[ENV_AGENT], "shell");
     }
 }
