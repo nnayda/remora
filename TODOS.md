@@ -369,3 +369,25 @@ up cold.
   already covers the explicit case; this is the live-reload polish, deferred to
   its own focused change.
 - **Depends on:** stage 10 `config_get` merged.
+
+## Guard a project default that points at an empty-command (plain-shell) agent
+
+- **What:** Warn (or block) in config validation when a project's `agent`
+  (its default) resolves to an agent whose `command` is `[]` (a plain-shell
+  agent, introduced for issue #35).
+- **Why:** New sessions in that project intentionally default to a shell, but
+  a *stopped* session that lost its tmux env (e.g. after a pod/app restart,
+  when discovery carries no `REMORA_AGENT`) respawns as the project default —
+  which would now be a plain shell instead of the agent it originally ran.
+  Surprising for a project whose real default *should* be an agent.
+- **Pros:** Catches an easy-to-miss footgun at config time, not at respawn
+  time when the user is confused why their agent didn't come back.
+- **Cons:** Extra validation branch + tests; risk of false-positive warnings
+  for users who genuinely want a shell-default project.
+- **Context:** Raised in the #35 (no-agent / plain shell) eng review as a
+  deliberately-deferred edge. The core feature (empty-command agent → plain
+  shell) does not need this guard to work; it only affects the respawn-after-
+  restart path for stopped sessions, which already loses agent identity for
+  every project (stopped sessions carry no env). This guard would make the
+  shell-default case explicit rather than silent.
+- **Depends on:** the #35 empty-command-agent feature landing first.

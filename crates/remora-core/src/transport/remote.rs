@@ -114,12 +114,24 @@ pub(crate) fn join_agent_command(argv: &[String]) -> String {
     shlex::try_join(argv.iter().map(String::as_str)).expect("config bans control/nul characters")
 }
 
+/// The pane command for a no-agent (plain shell) session (#35): an explicit
+/// login shell. Double-quoted `$SHELL` so an unset SHELL falls back to
+/// `/bin/sh`; `-l` for a login shell. Used verbatim instead of the agent-exit
+/// `wrap_with_shell_fallback` so the pane is the shell directly, and instead of
+/// omitting the command (which would delegate to the host tmux's
+/// `default-command`). `wrap_with_shell_fallback` execs this same constant on a
+/// clean agent exit (#30/#44), so a plain-shell session and a finished-agent
+/// session land in an identical shell by construction, not by coincidence.
+pub(crate) const PLAIN_SHELL_COMMAND: &str = r#""${SHELL:-/bin/sh}" -l"#;
+
 /// Wraps the joined agent command so a clean / user-interrupted exit
-/// (0 graceful, 130 SIGINT/Ctrl-C, 143 SIGTERM) execs an interactive login
-/// shell in the same dir, keeping the pane alive with a real prompt (#30); any
-/// other non-zero exit propagates so `remain-on-exit` retains the dead pane and
-/// its error for inspection (#28). `${SHELL:-/bin/sh}` defends against an unset
-/// SHELL in the pane environment.
+/// (0 graceful, 130 SIGINT/Ctrl-C, 143 SIGTERM) execs [`PLAIN_SHELL_COMMAND`]
+/// (an interactive login shell) in the same dir, keeping the pane alive with a
+/// real prompt (#30); any other non-zero exit propagates so `remain-on-exit`
+/// retains the dead pane and its error for inspection (#28). Reusing the
+/// constant guarantees this fallback shell is identical to a no-agent pane;
+/// its `${SHELL:-/bin/sh}` defends against an unset SHELL in the pane
+/// environment.
 ///
 /// `__remora_rc=$?` MUST be the first statement after the agent command —
 /// nothing may run between the agent and the `$?` capture or it records the
@@ -134,7 +146,7 @@ pub(crate) fn join_agent_command(argv: &[String]) -> String {
 /// ```
 pub(crate) fn wrap_with_shell_fallback(agent_command: &str) -> String {
     format!(
-        r#"{agent_command}; __remora_rc=$?; case "$__remora_rc" in 0|130|143) exec "${{SHELL:-/bin/sh}}" -l ;; *) exit "$__remora_rc" ;; esac"#
+        r#"{agent_command}; __remora_rc=$?; case "$__remora_rc" in 0|130|143) exec {PLAIN_SHELL_COMMAND} ;; *) exit "$__remora_rc" ;; esac"#
     )
 }
 
@@ -248,6 +260,16 @@ pub(crate) fn branch_delete_tokens(project_path: &str, branch: &str) -> Vec<Stri
 /// separator — this is tmux's argv `;`, distinct from ADR-0004's un-batching of
 /// shell-`;`-joined remote commands.
 pub(crate) fn new_session_tokens(plan: &SpawnPlan) -> Vec<String> {
+    // A no-agent plan (#35) renders an explicit login shell; a normal agent is
+    // wrapped so a clean/interrupted exit drops to a shell (#30) while a crash
+    // is retained (#28).
+    let pane_command = if plan.agent_argv.is_empty() {
+        shell_quote(PLAIN_SHELL_COMMAND)
+    } else {
+        shell_quote(&wrap_with_shell_fallback(&join_agent_command(
+            &plan.agent_argv,
+        )))
+    };
     vec![
         "tmux".into(),
         "new-session".into(),
@@ -256,9 +278,7 @@ pub(crate) fn new_session_tokens(plan: &SpawnPlan) -> Vec<String> {
         plan.tmux_name.clone(),
         "-c".into(),
         quote_remote_path(&plan.dir),
-        shell_quote(&wrap_with_shell_fallback(&join_agent_command(
-            &plan.agent_argv,
-        ))),
+        pane_command,
         shell_quote(";"),
         "set-option".into(),
         "-t".into(),
@@ -1101,6 +1121,36 @@ pub(crate) mod tests {
             inner.starts_with("claude --append-system-prompt 'Be concise';"),
             "got: {inner}"
         );
+    }
+
+    #[test]
+    fn new_session_tokens_no_agent_runs_a_login_shell() {
+        // An empty agent_argv (#35: plain shell) renders an explicit login
+        // shell, NOT the agent-exit fallback wrapper, and NOT an omitted
+        // command (which would delegate to the host's tmux default-command).
+        let plan = SpawnPlan {
+            agent_argv: vec![],
+            ..worktree_plan()
+        };
+        let tokens = new_session_tokens(&plan);
+        let n = tokens
+            .iter()
+            .position(|a| a == "new-session")
+            .expect("new-session");
+        // -d -s <name> -c <dir> <cmd> ; set-option -t <name> remain-on-exit on
+        assert_eq!(tokens[n + 4], "-c");
+        assert_eq!(tokens[n + 6], shell_quote(PLAIN_SHELL_COMMAND));
+        // Same tmux argv shape as an agent spawn: command token + 6-token trailer.
+        assert_eq!(tokens.len(), n + 1 + 6 + 6);
+        // The agent-exit wrapper must NOT appear for a no-agent pane.
+        assert!(
+            !tokens.iter().any(|t| t.contains("__remora_rc")),
+            "no shell-fallback wrapper for a plain shell: {tokens:?}"
+        );
+        // remain-on-exit trailer is still present and atomic.
+        let sep = tokens.iter().position(|a| a == "';'").expect("separator");
+        assert_eq!(tokens[sep + 4], "remain-on-exit");
+        assert_eq!(tokens[sep + 5], "on");
     }
 
     // -----------------------------------------------------------------------

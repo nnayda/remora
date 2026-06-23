@@ -126,7 +126,9 @@ Refinements to the stage-9 spawn flow:
   the config model to change.
 - **#34** — choose worktree-vs-shared at spawn time (currently fixed per
   project in config).
-- **#35** — spawn with *no* agent: just a plain shell.
+- **#35** ✅ — spawn with *no* agent: a plain shell, modeled as an agent with an
+  empty command (`command = []`), rendered as a deterministic login shell. See
+  [ADR-0007](adr/0007-no-agent-plain-shell.md).
 
 New capability / larger:
 

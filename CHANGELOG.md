@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **No-agent / plain-shell sessions** (#35): an agent configured with an empty
+  command (`command = []`) opens a session that is just a login shell
+  (`${SHELL:-/bin/sh} -l`), no agent launched — over both ssh and kubectl. The
+  agent form gains a "No command (plain shell)" toggle. Config validation now
+  accepts an empty command (still rejecting blank elements in a non-empty
+  command). See [ADR-0007](docs/adr/0007-no-agent-plain-shell.md).
 - **kubectl exec transport** (core): a second `SessionSource` backend that runs
   sessions in a Kubernetes pod over `kubectl exec`, alongside ssh (stage 12).
   To prove the transport seam isn't ssh-shaped, the transport-neutral logic —

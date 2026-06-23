@@ -251,8 +251,9 @@ pub struct AgentInputDto {
 }
 
 impl AgentInputDto {
-    /// Infallible: argv shape (non-empty, no blank elements) is validated by the
-    /// core's re-validation at save time.
+    /// Infallible: argv shape (no blank elements in a non-empty command; an
+    /// empty command is a valid plain shell) is validated by the core's
+    /// re-validation at save time.
     pub fn into_agent(self) -> Agent {
         Agent {
             command: self.command,
