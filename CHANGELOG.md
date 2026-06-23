@@ -193,6 +193,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Agent launch arguments that use a Unicode dash (e.g.
+  `—dangerously-skip-permissions`, where autocorrect or a "prettifying" paste
+  turned `--` into an em-dash) are now rejected at config time instead of
+  silently misbehaving at runtime. An agent CLI only recognizes ASCII
+  hyphen-minus, so a leading Unicode dash is parsed as a positional prompt
+  rather than a flag — the flag text ends up typed into the agent's prompt box.
+  Config validation in `remora-core` now flags any argv element whose first
+  non-whitespace character is a Unicode `Dash_Punctuation` code point (ASCII `-`
+  excluded), and the desktop agent form mirrors the same guard so the mistake is
+  caught before save. The launch path itself was already correct (the flag was
+  passed verbatim); this closes the silent-acceptance gap that made the failure
+  baffling.
 - The stopped-session screen now names the cause (closes #28). When a tab lands
   on the in-tab Respawn screen — e.g. an agent that exited immediately and whose
   tmux session is then gone — the overlay reads "Session stopped: claude:

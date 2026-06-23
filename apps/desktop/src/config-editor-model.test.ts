@@ -265,4 +265,23 @@ describe("agent form", () => {
     expect(validateAgentForm(form, "create")).toBeNull();
     expect(toAgentInput(form)).toEqual({ command: ["claude", "-r"] });
   });
+
+  it("rejects an argv row starting with a Unicode dash", () => {
+    // Autocorrect/paste turns `--flag` into `—flag` (em-dash); the agent CLI
+    // only knows ASCII `-`, so it'd be swallowed as a prompt. Catch it early.
+    for (const dash of ["—", "–", "‒", "‐", "―"]) {
+      const form = { id: "claude", command: ["claude", `${dash}dangerously`] };
+      expect(validateAgentForm(form, "create")).toMatch(/dash/i);
+    }
+    // ASCII flags stay valid; a non-leading dash is left alone.
+    expect(
+      validateAgentForm(
+        { id: "claude", command: ["claude", "--dangerously", "-r"] },
+        "create",
+      ),
+    ).toBeNull();
+    expect(
+      validateAgentForm({ id: "claude", command: ["claude", "a—b"] }, "create"),
+    ).toBeNull();
+  });
 });
