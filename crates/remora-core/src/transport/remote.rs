@@ -661,12 +661,14 @@ fn read_capped(reader: &mut impl Read, cap: usize) -> (String, bool) {
         match reader.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
+                // `over` means MORE than `cap` bytes were actually produced:
+                // exactly `cap` bytes total must never trip it (off-by-one).
+                if kept.len() + n > cap {
+                    over = true;
+                }
                 if kept.len() < cap {
                     let take = (cap - kept.len()).min(n);
                     kept.extend_from_slice(&chunk[..take]);
-                }
-                if kept.len() >= cap && n > 0 {
-                    over = true;
                 }
             }
             Err(_) => break,
@@ -675,8 +677,35 @@ fn read_capped(reader: &mut impl Read, cap: usize) -> (String, bool) {
     (String::from_utf8_lossy(&kept).into_owned(), over)
 }
 
+/// SIGKILLs the `child`'s entire process group. On Unix the child is the leader
+/// of its own group (pgid == child pid), so this also kills pipeline members
+/// (`kubectl`, `head`) and backgrounded descendants that outlived `sh` while
+/// holding the stdout/stderr pipe open — closing the pipe write-ends so the
+/// reader threads hit EOF and their joins return instead of blocking forever.
+/// `ESRCH` (group already empty) is the expected no-op, so the Result is
+/// ignored. Does NOT reap `sh` itself; the caller `wait`s for that.
+#[cfg(unix)]
+fn reap_group(child: &std::process::Child) {
+    let pgid = nix::unistd::Pid::from_raw(child.id() as i32);
+    let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+}
+
+/// Non-Unix fallback: no process groups, so kill only the child. (The whole
+/// function assumes `sh`, so Unix is the real target; this just keeps a
+/// non-unix `cargo check` compiling.)
+#[cfg(not(unix))]
+fn reap_group(child: &mut std::process::Child) {
+    let _ = child.kill();
+}
+
 /// Spawns `sh -c command` with bounded time and output. Reader threads prevent
-/// pipe-buffer deadlock; a poll loop enforces the timeout and kills on expiry.
+/// pipe-buffer deadlock; a poll loop enforces the timeout. On both timeout AND
+/// normal exit the child's whole process group is SIGKILLed (on Unix) before
+/// the reader threads are joined: pipeline members and backgrounded
+/// descendants can outlive `sh` and keep the stdout pipe open, which would
+/// otherwise block the reader-thread joins indefinitely (leaking threads/FDs/
+/// processes on every discovery poll). Reaping the group closes those
+/// write-ends so the joins always return.
 fn run_shell_bounded(
     command: &str,
     timeout: Duration,
@@ -684,12 +713,21 @@ fn run_shell_bounded(
 ) -> Result<RemoteOutput, SourceError> {
     use std::process::{Command, Stdio};
 
-    let mut child = Command::new("sh")
+    let mut builder = Command::new("sh");
+    builder
         .arg("-c")
         .arg(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Put the child in its own process group (pgid == child pid) so `reap_group`
+    // can SIGKILL the whole pipeline, not just `sh`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        builder.process_group(0);
+    }
+    let mut child = builder
         .spawn()
         .map_err(|e| SourceError::Transport(format!("resolve: spawn sh: {e}")))?;
 
@@ -699,26 +737,44 @@ fn run_shell_bounded(
     let err_handle = std::thread::spawn(move || read_capped(&mut stderr_pipe, max_output));
 
     let deadline = Instant::now() + timeout;
-    let status = loop {
+    let outcome = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => break Ok(Some(status)),
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(SourceError::Transport(format!(
-                        "resolution command timed out after {}s",
-                        timeout.as_secs()
-                    )));
+                    break Ok(None); // timed out
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(e) => return Err(SourceError::Transport(format!("resolve: wait: {e}"))),
+            Err(e) => break Err(e),
         }
     };
 
+    // ALWAYS kill the group, then `wait` for `sh`, BEFORE joining the readers:
+    // on timeout this kills the hung pipeline; on normal exit it reaps any
+    // backgrounded descendant still holding the pipe (harmless if the group is
+    // already empty). Either way the pipe write-ends close → readers hit EOF →
+    // joins return promptly.
+    #[cfg(unix)]
+    reap_group(&child);
+    #[cfg(not(unix))]
+    reap_group(&mut child);
+    let _ = child.wait();
+
     let (stdout, stdout_over) = out_handle.join().unwrap_or_else(|_| (String::new(), false));
     let (stderr, _) = err_handle.join().unwrap_or_else(|_| (String::new(), false));
+
+    let status = match outcome {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            return Err(SourceError::Transport(format!(
+                "resolution command timed out after {}s",
+                timeout.as_secs()
+            )));
+        }
+        Err(e) => return Err(SourceError::Transport(format!("resolve: wait: {e}"))),
+    };
+
     if stdout_over {
         return Err(SourceError::Transport(format!(
             "resolution command produced more than {max_output} bytes"
@@ -2022,5 +2078,32 @@ pub(crate) mod tests {
         let err = resolve_local_command(&runner, "pod", "yes | head -c 200000")
             .expect_err("must exceed the cap");
         assert!(format!("{err}").contains("bytes"), "{err}");
+    }
+
+    #[test]
+    fn run_shell_bounded_does_not_hang_on_backgrounded_pipe_holder() {
+        // `sleep 30 &` inherits the stdout pipe and outlives sh. Without the
+        // process-group kill, the reader-thread join blocks ~30s (leak). With it,
+        // the group is reaped and the call returns promptly with the real output.
+        let runner = ShellRunner::with_limits(std::time::Duration::from_secs(5), 64 * 1024);
+        let out = resolve_local_command(&runner, "pod", "sleep 30 & printf sandbox-1")
+            .expect("returns promptly with output, not a 30s hang");
+        assert_eq!(out, "sandbox-1");
+    }
+
+    #[test]
+    fn read_capped_exactly_at_cap_is_not_flagged() {
+        let data = vec![b'x'; 8];
+        let (s, over) = read_capped(&mut data.as_slice(), 8);
+        assert_eq!(s.len(), 8);
+        assert!(!over, "exactly cap must not be flagged as over");
+    }
+
+    #[test]
+    fn read_capped_over_cap_is_flagged_and_truncates() {
+        let data = vec![b'x'; 9];
+        let (s, over) = read_capped(&mut data.as_slice(), 8);
+        assert_eq!(s.len(), 8);
+        assert!(over);
     }
 }

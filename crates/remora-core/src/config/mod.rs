@@ -1484,6 +1484,27 @@ mod tests {
     }
 
     #[test]
+    fn kubectl_command_table_duplicate_command_key_is_rejected() {
+        // TOML likely rejects the duplicate key before serde sees it; either way
+        // the diagnostic must name `command`. (The Visitor's `duplicate_field`
+        // branch stays as defensive coverage for non-TOML deserializers.)
+        let err = Config::from_toml_str(
+            "[hosts.k]\ntransport = \"kubectl\"\npod = { command = \"x\", command = \"y\" }\n",
+        )
+        .expect_err("duplicate inner key rejected");
+        assert!(format!("{err}").contains("command"), "{err}");
+    }
+
+    #[test]
+    fn kubectl_command_with_control_char_is_rejected() {
+        let err = Config::from_toml_str(
+            "[hosts.k]\ntransport = \"kubectl\"\npod = { command = \"kubectl\\u0007get\" }\n",
+        )
+        .expect_err("control char in command rejected");
+        assert!(format!("{err}").contains("control"), "{err}");
+    }
+
+    #[test]
     fn kubectl_command_table_missing_command_is_rejected() {
         let err = Config::from_toml_str("[hosts.k]\ntransport = \"kubectl\"\npod = {}\n")
             .expect_err("empty table rejected");

@@ -23,6 +23,7 @@ use crate::{SessionChannel, SessionSource, SourceError};
 
 /// A `KubectlHost` with every field resolved to a literal string, ready to drop
 /// into the kubectl argv. Produced once per `SessionSource` method.
+#[derive(Debug)]
 struct ResolvedKubectlHost {
     pod: String,
     namespace: Option<String>,
@@ -792,5 +793,20 @@ mod tests {
         assert_eq!(resolved.namespace.as_deref(), Some("ns"));
         assert_eq!(resolved.context, None);
         assert_eq!(resolved.container.as_deref(), Some("c0"));
+    }
+
+    #[test]
+    fn resolve_host_aborts_when_a_later_field_command_fails() {
+        // A later-field command failure (here `namespace`) must abort the whole
+        // resolve, not silently drop the field.
+        let runner = crate::transport::remote::ShellRunner::new();
+        let kh = KubectlHost {
+            pod: KubectlField::Command("echo p0".into()),
+            namespace: Some(KubectlField::Command("exit 1".into())),
+            context: None,
+            container: None,
+        };
+        let err = resolve_host(&kh, &runner).expect_err("later-field failure aborts resolve");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
     }
 }
