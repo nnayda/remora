@@ -239,6 +239,7 @@ impl ProjectInputDto {
             path: self.path,
             workspace: self.workspace.into(),
             agent: AgentId::new(self.agent).map_err(invalid)?,
+            base: None,
         })
     }
 }
@@ -336,6 +337,7 @@ mod tests {
                 path: "/srv/api".into(),
                 workspace: WorkspaceMode::Worktree,
                 agent: AgentId::new("claude").expect("id"),
+                base: None,
             },
         );
         config.agents.insert(
