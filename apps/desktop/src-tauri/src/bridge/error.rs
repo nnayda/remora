@@ -2,6 +2,8 @@
 use remora_core::SourceError;
 use remora_protocol::{SessionMeta, SessionState};
 
+use crate::bridge::editor_dto::WorkspaceModeDto;
+
 #[derive(Clone, Copy, Debug, serde::Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub enum DirtyReasonDto {
@@ -118,6 +120,9 @@ pub struct SessionMetaDto {
     /// Workspace path the sandbox advertises. Untrusted, display-only (same
     /// rule as `agent`).
     pub workspace_path: Option<String>,
+    /// Effective workspace mode discovered for this session (real state), or
+    /// null from an older sender. Drives sidebar/tab gating.
+    pub workspace: Option<WorkspaceModeDto>,
 }
 
 impl From<SessionMeta> for SessionMetaDto {
@@ -129,6 +134,7 @@ impl From<SessionMeta> for SessionMetaDto {
             agent: m.agent,
             created_at: m.created_at,
             workspace_path: m.workspace_path,
+            workspace: m.workspace.map(Into::into),
         }
     }
 }
@@ -192,11 +198,12 @@ mod tests {
             agent: Some("claude".into()),
             created_at: Some(1_765_500_000),
             workspace_path: None,
-            workspace: None,
+            workspace: Some(remora_protocol::WorkspaceMode::Worktree),
         };
         let dto = SessionMetaDto::from(meta);
         let json = serde_json::to_string(&dto).expect("serialize");
         assert!(json.contains(r#""projectId":"api""#));
         assert!(json.contains(r#""state":"stopped""#));
+        assert!(json.contains(r#""workspace":"worktree""#));
     }
 }

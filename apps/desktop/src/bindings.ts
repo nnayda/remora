@@ -22,9 +22,9 @@ async configGet() : Promise<Result<ConfigDto, BridgeError>> {
     else return { status: "error", error: e  as any };
 }
 },
-async sessionSpawn(projectId: string, sessionId: string, agent: string | null, onOutput: TAURI_CHANNEL<BridgeOutput>) : Promise<Result<ChannelHandle, BridgeError>> {
+async sessionSpawn(projectId: string, sessionId: string, agent: string | null, workspace: WorkspaceModeDto | null, onOutput: TAURI_CHANNEL<BridgeOutput>) : Promise<Result<ChannelHandle, BridgeError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("session_spawn", { projectId, sessionId, agent, onOutput }) };
+    return { status: "ok", data: await TAURI_INVOKE("session_spawn", { projectId, sessionId, agent, workspace, onOutput }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -295,7 +295,12 @@ agent: string | null; createdAt: number | null;
  * Workspace path the sandbox advertises. Untrusted, display-only (same
  * rule as `agent`).
  */
-workspacePath: string | null }
+workspacePath: string | null; 
+/**
+ * Effective workspace mode discovered for this session (real state), or
+ * null from an older sender. Drives sidebar/tab gating.
+ */
+workspace: WorkspaceModeDto | null }
 export type SessionStateDto = "live" | "stopped"
 /**
  * Transport + connection details, shared by the read projection and the write
