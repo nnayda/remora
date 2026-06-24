@@ -39,6 +39,7 @@ const spec = (p: string, s: string, a: string | null = null) => ({
   projectId: p,
   sessionId: s,
   agent: a,
+  base: null,
   workspace: "worktree" as const,
 });
 
@@ -268,7 +269,13 @@ describe("SessionStore workspace threading", () => {
   it("spawn opener receives the chosen workspace and stores it on the tab", async () => {
     const calls: string[] = [];
     const store = new SessionStore({
-      spawn: (_p: string, _s: string, _a: string | null, w: string) => {
+      spawn: (
+        _p: string,
+        _s: string,
+        _a: string | null,
+        _b: string | null,
+        w: string,
+      ) => {
         calls.push(w);
         return Promise.resolve({
           connection: fakeConn().conn,
@@ -285,6 +292,7 @@ describe("SessionStore workspace threading", () => {
       projectId: "api",
       sessionId: "s1",
       agent: null,
+      base: null,
       workspace: "shared",
     });
     expect(calls).toEqual(["shared"]);
@@ -362,6 +370,7 @@ describe("SessionStore reconnect machine", () => {
       projectId: "p",
       sessionId: "s",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     expect(store.getSnapshot().tabs[0].status).toBe("live");
@@ -376,6 +385,7 @@ describe("SessionStore reconnect machine", () => {
       projectId: "p",
       sessionId: "s",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     spawned.die();
@@ -398,6 +408,7 @@ describe("SessionStore reconnect machine", () => {
       projectId: "p",
       sessionId: "s",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     spawned.die();
@@ -421,6 +432,7 @@ describe("SessionStore reconnect machine", () => {
       projectId: "p",
       sessionId: "s",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     spawned.die();
@@ -440,6 +452,7 @@ describe("SessionStore reconnect machine", () => {
       projectId: "p",
       sessionId: "s",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     spawned.die();
@@ -466,6 +479,7 @@ describe("SessionStore reconnect machine", () => {
       projectId: "p",
       sessionId: "s",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     spawned.die();
@@ -506,6 +520,7 @@ describe("SessionStore reconnect machine", () => {
       projectId: "p",
       sessionId: "s",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
 
@@ -566,6 +581,7 @@ describe("SessionStore reconnect machine", () => {
       projectId: "p",
       sessionId: "s",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     spawned.die();
@@ -628,6 +644,7 @@ describe("SessionStore reconnect token-refetch race", () => {
       projectId: "p",
       sessionId: "s",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
 
@@ -677,6 +694,7 @@ describe("SessionStore reconnectAll/Stale", () => {
       projectId: "p",
       sessionId: "s",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     await store.reconnectAll();
@@ -701,6 +719,7 @@ describe("SessionStore reconnectAll/Stale", () => {
       projectId: "p",
       sessionId: "s",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     spawned.die();
@@ -739,12 +758,14 @@ describe("SessionStore reconnectAll/Stale", () => {
       projectId: "p",
       sessionId: "s1",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     await store.openSession({
       projectId: "p",
       sessionId: "s2",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     expect(store.getSnapshot().tabs).toHaveLength(2);
@@ -879,6 +900,7 @@ describe("SessionStore openViaRespawn", () => {
       projectId: "p",
       sessionId: "s",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     spawned.die();
@@ -921,6 +943,7 @@ describe("SessionStore openViaRespawn", () => {
       projectId: "p",
       sessionId: "s",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     die2(); // trigger death
@@ -979,12 +1002,14 @@ describe("SessionStore Fix D coverage", () => {
       projectId: "p",
       sessionId: "live",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     await store.openSession({
       projectId: "p",
       sessionId: "stopped",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
 
@@ -1055,6 +1080,7 @@ describe("SessionStore Fix D coverage", () => {
       projectId: "p",
       sessionId: "recon",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     spawnedRecon.die();
@@ -1070,6 +1096,7 @@ describe("SessionStore Fix D coverage", () => {
       projectId: "p",
       sessionId: "live",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     expect(
@@ -1110,6 +1137,7 @@ describe("SessionStore Fix D coverage", () => {
       projectId: "p",
       sessionId: "s",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     spawned.die();
@@ -1144,6 +1172,7 @@ describe("SessionStore Fix D coverage", () => {
       projectId: "p",
       sessionId: "s",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     initialConn.die();
@@ -1190,6 +1219,7 @@ describe("SessionStore Fix D coverage", () => {
       projectId: "p",
       sessionId: "s",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     initialConn.die();
@@ -1221,6 +1251,7 @@ describe("SessionStore Fix D coverage", () => {
       projectId: "p",
       sessionId: "s",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     spawned.die();
@@ -1250,6 +1281,7 @@ describe("SessionStore Fix D coverage", () => {
       projectId: "api",
       sessionId: "x",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     const r = await store.stop("api", "x");
@@ -1265,6 +1297,7 @@ describe("SessionStore Fix D coverage", () => {
       projectId: "api",
       sessionId: "x",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     const r = await store.remove("api", "x", false);
@@ -1316,6 +1349,7 @@ describe("SessionStore Fix D coverage", () => {
       projectId: "p",
       sessionId: "s",
       agent: null,
+      base: null,
       workspace: "worktree" as const,
     });
     spawned.die();

@@ -87,6 +87,7 @@ function App() {
         projectId: node.projectId,
         sessionId: node.sessionId,
         agent: node.agent,
+        base: null,
         workspace: node.workspace ?? "worktree",
       })
         .then((r) => {
@@ -110,6 +111,7 @@ function App() {
       projectId: node.projectId,
       sessionId: node.sessionId,
       agent: node.agent,
+      base: null,
       workspace: node.workspace ?? "worktree",
     })
       .then((result) => {

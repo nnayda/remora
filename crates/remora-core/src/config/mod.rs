@@ -165,6 +165,10 @@ pub struct Project {
     pub workspace: WorkspaceMode,
     /// Default agent adapter; must reference a configured agent.
     pub agent: AgentId,
+    /// Optional default git start-point for new worktrees (#54), e.g.
+    /// `origin/develop`. Omitted = detect the remote default branch.
+    #[serde(default)]
+    pub base: Option<String>,
 }
 
 /// Per-agent adapter data (ADR-0003): data, never code paths.
@@ -730,6 +734,24 @@ impl Config {
                     field: "name",
                     reason,
                 });
+            }
+            if let Some(base) = project.base.as_deref() {
+                let reason = if base.trim().is_empty() {
+                    Some("must not be empty (omit the key instead)")
+                } else if base.chars().any(char::is_control) {
+                    Some("must not contain control characters")
+                } else if base.trim_start().starts_with('-') {
+                    Some("must not start with `-`")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    issues.push(ValidationIssue::InvalidProjectField {
+                        project: id.clone(),
+                        field: "base",
+                        reason,
+                    });
+                }
             }
         }
 
@@ -1511,6 +1533,33 @@ mod tests {
             "{msg}"
         );
         assert!(matches!(err, ConfigError::Io { .. }));
+    }
+
+    #[test]
+    fn project_base_parses_and_is_optional() {
+        let cfg = Config::from_toml_str(
+            "[hosts.devbox]\ntransport = \"ssh\"\nhost = \"devbox\"\n\
+             [projects.api]\nhost = \"devbox\"\npath = \"/api\"\nworkspace = \"worktree\"\n\
+             agent = \"claude\"\nbase = \"origin/develop\"\n\
+             [agents.claude]\ncommand = [\"claude\"]\n",
+        )
+        .expect("valid");
+        let api = &cfg.projects[&ProjectId::new("api").expect("slug")];
+        assert_eq!(api.base.as_deref(), Some("origin/develop"));
+    }
+
+    #[test]
+    fn rejects_invalid_project_base() {
+        for bad in ["\"\"", "\"  \"", "\"-x\"", "\" -x\"", "\"a\\nb\""] {
+            let issues = issues_of(&format!(
+                "[hosts.devbox]\ntransport = \"ssh\"\nhost = \"devbox\"\n\
+                 [projects.api]\nhost = \"devbox\"\npath = \"/api\"\nworkspace = \"worktree\"\n\
+                 agent = \"claude\"\nbase = {bad}\n\
+                 [agents.claude]\ncommand = [\"claude\"]\n"
+            ));
+            assert_eq!(issues.len(), 1, "base {bad}: {issues:?}");
+            assert!(issues[0].to_string().contains("base"), "{issues:?}");
+        }
     }
 
     #[test]

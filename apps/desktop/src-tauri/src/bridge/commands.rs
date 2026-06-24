@@ -32,6 +32,7 @@ async fn session_spawn(
     project_id: String,
     session_id: String,
     agent: Option<String>,
+    base: Option<String>,
     workspace: Option<WorkspaceModeDto>,
     on_output: Channel<BridgeOutput>,
 ) -> Result<ChannelHandle, BridgeError> {
@@ -40,6 +41,7 @@ async fn session_spawn(
             project_id,
             session_id,
             agent,
+            base,
             workspace.map(Into::into),
             Arc::new(ChannelSink(on_output)),
         )

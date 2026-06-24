@@ -142,6 +142,7 @@ pub struct EditorProjectDto {
     pub path: String,
     pub workspace: WorkspaceModeDto,
     pub agent: String,
+    pub base: Option<String>,
 }
 
 /// Workspace mode, shared by the read projection and the write inputs.
@@ -258,6 +259,8 @@ pub struct ProjectInputDto {
     pub path: String,
     pub workspace: WorkspaceModeDto,
     pub agent: String,
+    #[serde(default)]
+    pub base: Option<String>,
 }
 
 impl ProjectInputDto {
@@ -274,6 +277,7 @@ impl ProjectInputDto {
             path: self.path,
             workspace: self.workspace.into(),
             agent: AgentId::new(self.agent).map_err(invalid)?,
+            base: self.base,
         })
     }
 }
@@ -321,6 +325,7 @@ fn editor_project_dto(id: &str, project: Project) -> EditorProjectDto {
         path: project.path,
         workspace: project.workspace.into(),
         agent: project.agent.as_str().to_owned(),
+        base: project.base,
     }
 }
 
@@ -372,6 +377,7 @@ mod tests {
                 path: "/srv/api".into(),
                 workspace: WorkspaceMode::Worktree,
                 agent: AgentId::new("claude").expect("id"),
+                base: None,
             },
         );
         config.agents.insert(
@@ -484,6 +490,33 @@ mod tests {
             matches!(err, crate::bridge::error::BridgeError::InvalidId { .. }),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn project_base_survives_dto_round_trip() {
+        let project = Project {
+            name: Some("API".into()),
+            host: HostId::new("ssh-box").expect("id"),
+            path: "/srv/api".into(),
+            workspace: WorkspaceMode::Worktree,
+            agent: AgentId::new("claude").expect("id"),
+            base: Some("origin/develop".into()),
+        };
+        // out to the form…
+        let out = editor_project_dto("api", project);
+        assert_eq!(out.base.as_deref(), Some("origin/develop"));
+        // …and back from the form must NOT drop base.
+        let back = ProjectInputDto {
+            name: out.name,
+            host_id: out.host_id,
+            path: out.path,
+            workspace: out.workspace,
+            agent: out.agent,
+            base: out.base,
+        }
+        .into_project()
+        .expect("into_project");
+        assert_eq!(back.base.as_deref(), Some("origin/develop"));
     }
 
     #[test]

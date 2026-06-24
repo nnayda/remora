@@ -311,6 +311,7 @@ impl SessionSource for KubectlSource {
             project_id: project_id.clone(),
             session_id: session_id.clone(),
             agent,
+            base: None,
             // Respawn only ever targets a session whose worktree survived, so
             // plan worktree mode regardless of the project's current default.
             // The `test -d` preflight in run_respawn maps a gone worktree to
@@ -625,11 +626,14 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_through_fake_exec_probes_then_attaches() {
-        // probe ok, worktree add ok, new-session ok, 3x set-env ok -> attach.
+        // probe ok, fetch ok, symbolic-ref ok, verify ok, worktree add ok, new-session ok, 3x set-env ok -> attach.
         let fake = Arc::new(FakeExec::new(vec![
-            Ok(FakeExec::ok()), // probe
-            Ok(FakeExec::ok()), // worktree add
-            Ok(FakeExec::ok()), // new-session
+            Ok(FakeExec::ok()),                 // probe (binary check)
+            Ok(FakeExec::ok()),                 // fetch
+            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
+            Ok(FakeExec::ok()),                 // verify
+            Ok(FakeExec::ok()),                 // worktree add
+            Ok(FakeExec::ok()),                 // new-session
         ]));
         let kh = KubectlHost {
             pod: KubectlField::Literal("sandbox-0".into()),
@@ -642,17 +646,27 @@ mod tests {
             project_id: ProjectId::new("api").expect("slug"),
             session_id: SessionId::new("fix-login").expect("slug"),
             agent: Some(remora_protocol::AgentId::new("claude").expect("slug")),
+            base: None,
             workspace: None,
         };
         source.spawn(spec).await.expect("spawn");
         assert_eq!(*fake.opened.lock().expect("lock"), 1);
-        // First call is the probe (single loop token), second is the worktree add.
+        // First call is the probe (single loop token); fetch follows; then worktree add.
         let calls = fake.calls.lock().expect("lock");
         assert!(
             calls[0].len() == 1 && calls[0][0].contains("for b in"),
             "first call must be the probe loop token"
         );
-        assert!(calls[1].iter().any(|a| a == "worktree"));
+        // #54: the probe loop stays first; fetch is issued before worktree add.
+        let fetch_i = calls
+            .iter()
+            .position(|a| a.iter().any(|t| t == "fetch"))
+            .expect("fetch");
+        let add_i = calls
+            .iter()
+            .position(|a| a.iter().any(|t| t == "worktree"))
+            .expect("add");
+        assert!(calls[0][0].contains("for b in") && fetch_i < add_i);
     }
 
     #[tokio::test]
@@ -803,6 +817,7 @@ mod tests {
             project_id: ProjectId::new("api").expect("slug"),
             session_id: SessionId::new("fix-login").expect("slug"),
             agent: Some(remora_protocol::AgentId::new("claude").expect("slug")),
+            base: None,
             workspace: None,
         };
         source.spawn(spec).await.expect("spawn resolves + attaches");
@@ -823,6 +838,7 @@ mod tests {
             project_id: ProjectId::new("api").expect("slug"),
             session_id: SessionId::new("fix-login").expect("slug"),
             agent: Some(remora_protocol::AgentId::new("claude").expect("slug")),
+            base: None,
             workspace: None,
         };
         let err = source.spawn(spec).await.expect_err("resolution fails");

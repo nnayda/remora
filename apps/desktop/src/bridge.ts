@@ -127,11 +127,13 @@ export async function removeAgent(id: string): Promise<void> {
 }
 
 /** Spawn a new session and open its channel; `onOutput` receives the stream.
- * `agent` of `null` uses the project's default agent. */
+ * `agent` of `null` uses the project's default agent; `base` of `null` resolves
+ * the project default / detected base (#54). */
 export async function spawnSession(
   projectId: string,
   sessionId: string,
   agent: string | null,
+  base: string | null,
   workspace: WorkspaceModeDto,
   onOutput: OnOutput,
 ): Promise<ChannelHandle> {
@@ -140,6 +142,7 @@ export async function spawnSession(
       projectId,
       sessionId,
       agent,
+      base,
       workspace,
       makeChannel(onOutput),
     ),

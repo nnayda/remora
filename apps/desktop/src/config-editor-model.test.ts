@@ -190,6 +190,7 @@ describe("project form", () => {
       path: "/srv/api",
       workspace: "shared",
       agent: "claude",
+      base: null,
     });
     expect(form.id).toBe("api");
     expect(form.path).toBe("/srv/api");
@@ -226,7 +227,26 @@ describe("project form", () => {
       path: "/srv/api",
       workspace: "worktree",
       agent: "claude",
+      base: null,
     });
+  });
+
+  it("round-trips project base through the form, blank -> null", () => {
+    const dto = {
+      id: "api",
+      name: null,
+      hostId: "h",
+      path: "/p",
+      workspace: "worktree",
+      agent: "claude",
+      base: "origin/dev",
+    } as import("./bindings").EditorProjectDto;
+    const form = projectFormFromDto(dto);
+    expect(form.base).toBe("origin/dev");
+    expect(toProjectInput(form).base).toBe("origin/dev");
+
+    const blank = { ...form, base: "  " };
+    expect(toProjectInput(blank).base).toBeNull();
   });
 });
 

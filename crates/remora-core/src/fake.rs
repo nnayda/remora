@@ -321,6 +321,7 @@ mod tests {
             project_id: ProjectId::new(project).expect("valid slug"),
             session_id: SessionId::new(session).expect("valid slug"),
             agent: Some(AgentId::new("claude").expect("valid slug")),
+            base: None,
             workspace: None,
         }
     }

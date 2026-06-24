@@ -22,9 +22,9 @@ async configGet() : Promise<Result<ConfigDto, BridgeError>> {
     else return { status: "error", error: e  as any };
 }
 },
-async sessionSpawn(projectId: string, sessionId: string, agent: string | null, workspace: WorkspaceModeDto | null, onOutput: TAURI_CHANNEL<BridgeOutput>) : Promise<Result<ChannelHandle, BridgeError>> {
+async sessionSpawn(projectId: string, sessionId: string, agent: string | null, base: string | null, workspace: WorkspaceModeDto | null, onOutput: TAURI_CHANNEL<BridgeOutput>) : Promise<Result<ChannelHandle, BridgeError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("session_spawn", { projectId, sessionId, agent, workspace, onOutput }) };
+    return { status: "ok", data: await TAURI_INVOKE("session_spawn", { projectId, sessionId, agent, base, workspace, onOutput }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -254,7 +254,7 @@ export type EditorHostDto = { id: string; name: string | null; transport: Transp
  * A project with every editable field, including the on-host `path` and
  * `workspace` mode that the display `ProjectDto` omits.
  */
-export type EditorProjectDto = { id: string; name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string }
+export type EditorProjectDto = { id: string; name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string; base: string | null }
 /**
  * A configured host, label-only. The `transport` discriminant is all the UI
  * needs (an icon/badge); the connection details never cross.
@@ -289,7 +289,7 @@ export type ProjectDto = { id: string; name: string | null; hostId: string; work
  * Form payload for create/edit of a project. `host_id` and `agent` are
  * references to existing entries; converting parses them into ids.
  */
-export type ProjectInputDto = { name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string }
+export type ProjectInputDto = { name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string; base?: string | null }
 export type SessionMetaDto = { projectId: string; sessionId: string; state: SessionStateDto; 
 /**
  * Agent id the sandbox advertises for this session. Untrusted,

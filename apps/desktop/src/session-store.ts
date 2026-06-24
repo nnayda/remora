@@ -26,6 +26,7 @@ export interface SpawnInput {
   projectId: string;
   sessionId: string;
   agent: string | null;
+  base: string | null;
   workspace: WorkspaceModeDto;
 }
 
@@ -54,6 +55,7 @@ export interface StoreOpeners {
     projectId: string,
     sessionId: string,
     agent: string | null,
+    base: string | null,
     workspace: WorkspaceModeDto,
   ): Promise<{ connection: SessionConnection; attached: boolean }>;
   attach(projectId: string, sessionId: string): Promise<SessionConnection>;
@@ -261,6 +263,7 @@ export class SessionStore {
       p: string,
       s: string,
       a: string | null,
+      b: string | null,
       w: WorkspaceModeDto,
     ) => Promise<{ connection: SessionConnection; attached: boolean }>,
   ): Promise<OpenResult> {
@@ -280,6 +283,7 @@ export class SessionStore {
         input.projectId,
         input.sessionId,
         input.agent,
+        input.base,
         input.workspace,
       );
     } catch (error) {
@@ -328,7 +332,9 @@ export class SessionStore {
       return { ok: true, attached: existing.attached };
     }
 
-    return this.openTab(input, (p, s, a, w) => this.openers.spawn(p, s, a, w));
+    return this.openTab(input, (p, s, a, b, w) =>
+      this.openers.spawn(p, s, a, b, w),
+    );
   };
 
   /** Close a tab: cancel an in-flight open/reconnect if any, else close the
@@ -416,7 +422,7 @@ export class SessionStore {
       return { ok: true, attached: false };
     }
 
-    return this.openTab(input, (p, s, a, _w) =>
+    return this.openTab(input, (p, s, a, _b, _w) =>
       this.openers
         .respawn(p, s, a)
         .then((connection) => ({ connection, attached: false })),

@@ -83,6 +83,10 @@ pub struct SpawnSpec {
     pub session_id: SessionId,
     /// Agent adapter to launch; `None` uses the project's default agent.
     pub agent: Option<AgentId>,
+    /// Per-session git start-point override for a new worktree (#54). `None`
+    /// or empty falls through to the project default / detection. Raw here;
+    /// `spawn_plan::normalize_base` trims and validates it.
+    pub base: Option<String>,
     /// Per-session workspace-mode override; `None` uses the project's default.
     /// Always serialized (mirrors `agent`); an absent key deserializes to
     /// `None`, so older peers stay compatible without a `PROTOCOL_VERSION` bump.
@@ -173,13 +177,30 @@ mod tests {
             project_id: ProjectId::new("api").expect("valid slug"),
             session_id: SessionId::new("fix-login").expect("valid slug"),
             agent: Some(AgentId::new("claude").expect("valid slug")),
+            base: None,
             workspace: None,
         };
         let json = serde_json::to_string(&spec).expect("serialize");
         assert_eq!(
             json,
-            r#"{"project_id":"api","session_id":"fix-login","agent":"claude","workspace":null}"#
+            r#"{"project_id":"api","session_id":"fix-login","agent":"claude","base":null,"workspace":null}"#
         );
+        let back: SpawnSpec = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(spec, back);
+    }
+
+    #[test]
+    fn spawn_spec_carries_optional_base() {
+        let spec = SpawnSpec {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("s1").expect("slug"),
+            agent: None,
+            base: Some("origin/main".to_string()),
+            workspace: None,
+        };
+        assert_eq!(spec.base.as_deref(), Some("origin/main"));
+        let json = serde_json::to_string(&spec).expect("serialize");
+        assert!(json.contains(r#""base":"origin/main""#));
         let back: SpawnSpec = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(spec, back);
     }
@@ -203,6 +224,7 @@ mod tests {
             project_id: ProjectId::new("api").expect("slug"),
             session_id: SessionId::new("s1").expect("slug"),
             agent: None,
+            base: None,
             workspace: Some(WorkspaceMode::Shared),
         };
         let json = serde_json::to_string(&spec).expect("serialize");

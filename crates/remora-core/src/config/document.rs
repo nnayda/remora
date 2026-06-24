@@ -405,6 +405,9 @@ fn project_item(p: &Project) -> Item {
         WorkspaceMode::Shared => "shared",
     });
     t["agent"] = value(p.agent.as_str());
+    if let Some(base) = &p.base {
+        t["base"] = value(base);
+    }
     Item::Table(t)
 }
 
@@ -520,6 +523,7 @@ mod tests {
             path: "/x".into(),
             workspace: WorkspaceMode::Worktree,
             agent: aid("nope"),
+            base: None,
         };
         let err = doc
             .insert_project(&pid("api"), &bad)
@@ -738,6 +742,7 @@ mod tests {
             path: "/x".into(),
             workspace: WorkspaceMode::Worktree,
             agent: aid("nope"),
+            base: None,
         };
         let err = doc
             .insert_project(&pid("api2"), &dangling)
@@ -864,6 +869,7 @@ mod tests {
                 path: "/srv/api".into(),
                 workspace: WorkspaceMode::Worktree,
                 agent: aid("claude"),
+                base: None,
             },
         )
         .expect("project");
@@ -885,6 +891,32 @@ mod tests {
                 .command
                 .is_empty(),
             "command survives the round-trip as empty",
+        );
+    }
+
+    #[test]
+    fn project_item_writes_and_omits_base() {
+        let mut doc =
+            ConfigDocument::parse("[hosts.h]\ntransport = \"ssh\"\nhost = \"h\"\n").expect("doc");
+        doc.insert_agent(&aid("claude"), &claude_agent())
+            .expect("agent");
+        let proj = Project {
+            name: None,
+            host: hid("h"),
+            path: "/p".into(),
+            workspace: WorkspaceMode::Worktree,
+            agent: aid("claude"),
+            base: Some("origin/develop".into()),
+        };
+        doc.insert_project(&pid("api"), &proj).expect("insert");
+        let toml = doc.to_toml();
+        assert!(toml.contains("base = \"origin/develop\""), "{toml}");
+
+        let cleared = Project { base: None, ..proj };
+        doc.update_project(&pid("api"), &cleared).expect("update");
+        assert!(
+            !doc.to_toml().contains("base ="),
+            "cleared base must be omitted"
         );
     }
 }

@@ -162,6 +162,7 @@ mod tests {
                 path: "/srv/api".into(),
                 workspace: WorkspaceMode::Worktree,
                 agent: AgentId::new("claude").expect("id"),
+                base: None,
             },
         );
         config.agents.insert(
@@ -227,6 +228,7 @@ mod tests {
                 path: "/p".into(),
                 workspace: WorkspaceMode::Shared,
                 agent: AgentId::new("claude").expect("id"),
+                base: None,
             },
         );
         let dto = ConfigDto::from(config);

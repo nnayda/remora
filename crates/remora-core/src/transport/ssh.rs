@@ -174,6 +174,7 @@ impl SessionSource for SshSource {
             project_id: project_id.clone(),
             session_id: session_id.clone(),
             agent,
+            base: None,
             // Respawn only ever targets a session whose worktree survived, so
             // plan worktree mode regardless of the project's current default.
             // The `test -d` preflight in run_respawn maps a gone worktree to
@@ -252,6 +253,7 @@ mod tests {
             project_id: ProjectId::new("api").expect("slug"),
             session_id: SessionId::new("fix-login").expect("slug"),
             agent: Some(AgentId::new("claude").expect("slug")),
+            base: None,
             workspace: None,
         }
     }
@@ -285,6 +287,7 @@ mod tests {
             project_path: "/home/dev/api".into(),
             dir: "~/.remora/worktrees/api/fix-login".into(),
             branch: Some("remora/fix-login".into()),
+            base: None,
             env: vec![
                 ("REMORA_AGENT".into(), "claude".into()),
                 (
@@ -409,7 +412,7 @@ mod tests {
         let argv = ssh_compose(
             &host("devbox", None, None),
             false,
-            &worktree_add_tokens(&plan),
+            &worktree_add_tokens(&plan, None),
         );
         let g = argv.iter().position(|a| a == "git").expect("git");
         assert_eq!(argv[g + 1], "-C");
