@@ -264,3 +264,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-runnable. Any other non-zero exit (a real crash, bad flag, or
   `command not found`) still propagates so `remain-on-exit` keeps the dead pane
   and its error inspectable (preserving #28).
+- The sidebar Settings control is now a properly sized icon-button instead of a
+  bare gear glyph (closes #77). It previously borrowed the `.sidebar-refresh`
+  text-button style of the adjacent Refresh button, so it rendered tiny and was
+  hard to tell apart from Refresh. It now has a dedicated `.sidebar-settings`
+  class — a 28×28 bordered, rounded hit area with a larger gear and a hover
+  state, wired into the existing focus-visible outline. Visual-only; the button
+  kept its `aria-label`/`title="Settings"`, so accessibility is unchanged.
