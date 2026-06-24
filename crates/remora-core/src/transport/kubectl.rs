@@ -216,6 +216,7 @@ impl SessionSource for KubectlSource {
             project_id: project_id.clone(),
             session_id: session_id.clone(),
             agent,
+            base: None,
         };
         let plan = plan_spawn(&self.config, &spec)?;
         let exec = Arc::clone(&self.exec);
@@ -527,6 +528,7 @@ mod tests {
             project_id: ProjectId::new("api").expect("slug"),
             session_id: SessionId::new("fix-login").expect("slug"),
             agent: Some(remora_protocol::AgentId::new("claude").expect("slug")),
+            base: None,
         };
         source.spawn(spec).await.expect("spawn");
         assert_eq!(*fake.opened.lock().expect("lock"), 1);
