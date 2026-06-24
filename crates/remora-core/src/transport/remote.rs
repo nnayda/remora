@@ -1802,6 +1802,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn resolve_base_swallows_fetch_nonzero_exit() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::fail("error: could not fetch origin")), // fetch Ok(non-zero) -> swallowed
+            Ok(FakeExec::out("origin/main\n")),                  // symbolic-ref
+            Ok(FakeExec::ok()),                                  // verify refs/remotes/origin/main^{commit}
+        ]);
+        assert_eq!(resolve_base(&fake, &plan).expect("ok").as_deref(), Some("origin/main"));
+    }
+
+    #[test]
+    fn resolve_base_probes_master_when_main_absent() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),     // fetch
+            Ok(FakeExec::fail("")), // symbolic-ref: origin/HEAD unset (non-zero exit)
+            Ok(FakeExec::fail("")), // verify refs/remotes/origin/main -> absent
+            Ok(FakeExec::ok()),     // verify refs/remotes/origin/master -> resolves
+        ]);
+        assert_eq!(resolve_base(&fake, &plan).expect("ok").as_deref(), Some("origin/master"));
+    }
+
+    #[test]
     fn worktree_add_appends_quoted_start_point_last() {
         let plan = worktree_plan();
         let with = worktree_add_tokens(&plan, Some("origin/main"));
