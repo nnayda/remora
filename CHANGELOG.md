@@ -23,7 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every connect (never persisted), and is bounded by a 10s timeout + 64 KiB
   output cap with a process-group kill so a hung selector can't leak. The
   desktop config editor gains a per-field "resolve via command" toggle. See
-  [ADR-0008](docs/adr/0008-dynamic-kubectl-field-resolution.md).
+  [ADR-0009](docs/adr/0009-dynamic-kubectl-field-resolution.md).
+- **Per-session workspace mode** (#34): the new-session dialog gains a
+  Worktree/Shared picker that overrides the project's default for that one
+  session (`SpawnSpec.workspace`). To keep the choice coherent past spawn, a
+  session's *effective* mode is now discovered from real sandbox state (a
+  surviving git worktree ⇒ worktree) rather than re-derived from project config:
+  discovery scans worktrees for every project and stamps `SessionMeta.workspace`,
+  and teardown/respawn re-probe the worktree (`test -d`) instead of trusting
+  config or discovered metadata. This closes a silent leak where a worktree
+  session spawned on a shared-default project was undiscoverable and unremovable
+  through the UI. `WorkspaceMode` moved to `remora-protocol`; shared sessions
+  show no Respawn affordance (they have no worktree to revive). See
+  [ADR-0008](docs/adr/0008-per-session-workspace-override.md).
 - **No-agent / plain-shell sessions** (#35): an agent configured with an empty
   command (`command = []`) opens a session that is just a login shell
   (`${SHELL:-/bin/sh} -l`), no agent launched — over both ssh and kubectl. The

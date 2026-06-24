@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import type { SessionConnection } from "./connection";
 import type { StoreOpeners } from "./session-store";
-import { OPEN_CANCELLED, SessionStore, tabKey } from "./session-store";
+import {
+  canRespawn,
+  OPEN_CANCELLED,
+  SessionStore,
+  tabKey,
+} from "./session-store";
 
 function makeConn(): SessionConnection {
   return {
@@ -18,7 +23,10 @@ function makeConn(): SessionConnection {
 // An opener set that spawns immediately with a fresh connection.
 function instantOpeners(attached = false): StoreOpeners {
   return {
-    spawn: vi.fn(async () => ({ connection: makeConn(), attached })),
+    spawn: vi.fn(async (_p, _s, _a, _w) => ({
+      connection: makeConn(),
+      attached,
+    })),
     attach: vi.fn(async () => makeConn()),
     respawn: vi.fn(async () => makeConn()),
     schedule: vi.fn(),
@@ -31,6 +39,7 @@ const spec = (p: string, s: string, a: string | null = null) => ({
   projectId: p,
   sessionId: s,
   agent: a,
+  workspace: "worktree" as const,
 });
 
 describe("SessionStore", () => {
@@ -246,6 +255,43 @@ describe("SessionStore", () => {
   });
 });
 
+// ─── canRespawn + workspace threading ────────────────────────────────────────
+
+describe("canRespawn", () => {
+  it("canRespawn is false for shared, true for worktree", () => {
+    expect(canRespawn("shared")).toBe(false);
+    expect(canRespawn("worktree")).toBe(true);
+  });
+});
+
+describe("SessionStore workspace threading", () => {
+  it("spawn opener receives the chosen workspace and stores it on the tab", async () => {
+    const calls: string[] = [];
+    const store = new SessionStore({
+      spawn: (_p: string, _s: string, _a: string | null, w: string) => {
+        calls.push(w);
+        return Promise.resolve({
+          connection: fakeConn().conn,
+          attached: false,
+        });
+      },
+      attach: vi.fn(async () => fakeConn().conn),
+      respawn: vi.fn(async () => fakeConn().conn),
+      schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
+    } as any);
+    await store.openSession({
+      projectId: "api",
+      sessionId: "s1",
+      agent: null,
+      workspace: "shared",
+    });
+    expect(calls).toEqual(["shared"]);
+    expect(store.getSnapshot().tabs[0].workspace).toBe("shared");
+  });
+});
+
 // ─── Reconnect state machine tests ───────────────────────────────────────────
 
 // Minimal fake connection that lets the test drive death + capture close().
@@ -312,7 +358,12 @@ function makeStore(
 describe("SessionStore reconnect machine", () => {
   it("opens a tab as live", async () => {
     const { store } = makeStore();
-    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     expect(store.getSnapshot().tabs[0].status).toBe("live");
   });
 
@@ -321,7 +372,12 @@ describe("SessionStore reconnect machine", () => {
     const { store, spawned } = makeStore({
       attach: () => Promise.resolve(fresh.conn),
     });
-    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     spawned.die();
     // reconnect is async; the store sets reconnecting synchronously then swaps.
     expect(store.getSnapshot().tabs[0].status).toBe("reconnecting");
@@ -338,7 +394,12 @@ describe("SessionStore reconnect machine", () => {
       attach: () =>
         Promise.reject({ kind: "sessionNotFound", message: "gone" }),
     });
-    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     spawned.die();
     await Promise.resolve();
     await Promise.resolve();
@@ -356,7 +417,12 @@ describe("SessionStore reconnect machine", () => {
       },
       "claude: command not found",
     );
-    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     spawned.die();
     await Promise.resolve();
     await Promise.resolve();
@@ -370,7 +436,12 @@ describe("SessionStore reconnect machine", () => {
       attach: () =>
         Promise.reject({ kind: "config", message: "unknown host hermes" }),
     });
-    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     spawned.die();
     await Promise.resolve();
     await Promise.resolve();
@@ -391,7 +462,12 @@ describe("SessionStore reconnect machine", () => {
           : Promise.resolve(fresh.conn);
       },
     });
-    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     spawned.die();
     await Promise.resolve();
     await Promise.resolve();
@@ -426,7 +502,12 @@ describe("SessionStore reconnect machine", () => {
       },
     });
 
-    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      workspace: "worktree" as const,
+    });
 
     // Trigger death → store enters reconnecting
     spawned.die();
@@ -481,7 +562,12 @@ describe("SessionStore reconnect machine", () => {
       },
     });
 
-    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     spawned.die();
     await Promise.resolve();
     await Promise.resolve();
@@ -538,7 +624,12 @@ describe("SessionStore reconnect token-refetch race", () => {
       },
     });
 
-    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      workspace: "worktree" as const,
+    });
 
     // Death → loop A (token A): attach call 1 fails → a retry is scheduled.
     spawned.die();
@@ -582,7 +673,12 @@ describe("SessionStore reconnectAll/Stale", () => {
         return Promise.resolve(fresh.conn);
       },
     });
-    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     await store.reconnectAll();
     expect(attachCalls).toBe(1);
     expect(store.getSnapshot().tabs[0].connection).toBe(fresh.conn);
@@ -601,7 +697,12 @@ describe("SessionStore reconnectAll/Stale", () => {
           : Promise.resolve(fresh.conn);
       },
     });
-    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     spawned.die();
     await Promise.resolve();
     await Promise.resolve();
@@ -634,8 +735,18 @@ describe("SessionStore reconnectAll/Stale", () => {
     });
 
     // Open two live tabs with different keys.
-    await store.openSession({ projectId: "p", sessionId: "s1", agent: null });
-    await store.openSession({ projectId: "p", sessionId: "s2", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s1",
+      agent: null,
+      workspace: "worktree" as const,
+    });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s2",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     expect(store.getSnapshot().tabs).toHaveLength(2);
 
     // Start reconnectAll but do NOT await yet.
@@ -764,7 +875,12 @@ describe("SessionStore openViaRespawn", () => {
         Promise.reject({ kind: "sessionNotFound", message: "gone" }),
     });
     // Open a tab and drive it to stopped via death → sessionNotFound
-    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     spawned.die();
     await Promise.resolve();
     await Promise.resolve();
@@ -801,7 +917,12 @@ describe("SessionStore openViaRespawn", () => {
       connection: spawnConn2,
       attached: false,
     });
-    await store2.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store2.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     die2(); // trigger death
     await Promise.resolve();
     await Promise.resolve();
@@ -854,11 +975,17 @@ describe("SessionStore Fix D coverage", () => {
       remove: () => Promise.resolve(),
     };
     const store = new SessionStore(openers);
-    await store.openSession({ projectId: "p", sessionId: "live", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "live",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     await store.openSession({
       projectId: "p",
       sessionId: "stopped",
       agent: null,
+      workspace: "worktree" as const,
     });
 
     // Drive the second tab to stopped via death → sessionNotFound
@@ -928,6 +1055,7 @@ describe("SessionStore Fix D coverage", () => {
       projectId: "p",
       sessionId: "recon",
       agent: null,
+      workspace: "worktree" as const,
     });
     spawnedRecon.die();
     await Promise.resolve();
@@ -942,6 +1070,7 @@ describe("SessionStore Fix D coverage", () => {
       projectId: "p",
       sessionId: "live",
       agent: null,
+      workspace: "worktree" as const,
     });
     expect(
       store.getSnapshot().tabs.find((t) => t.key === "p/live")?.status,
@@ -977,7 +1106,12 @@ describe("SessionStore Fix D coverage", () => {
       attach: () =>
         Promise.reject({ kind: "sessionNotFound", message: "gone" }),
     });
-    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     spawned.die();
     await Promise.resolve();
     await Promise.resolve();
@@ -1006,7 +1140,12 @@ describe("SessionStore Fix D coverage", () => {
       connection: initialConn.conn,
       attached: false,
     });
-    await store2.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store2.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     initialConn.die();
     await Promise.resolve();
     await Promise.resolve();
@@ -1047,7 +1186,12 @@ describe("SessionStore Fix D coverage", () => {
       attached: false,
     });
     const store = new SessionStore(openers);
-    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     initialConn.die();
     await Promise.resolve();
     await Promise.resolve();
@@ -1073,7 +1217,12 @@ describe("SessionStore Fix D coverage", () => {
       },
     });
 
-    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     spawned.die();
 
     // Run 5 attempts (attempts 0–4): each fails with transport → schedules retry
@@ -1097,7 +1246,12 @@ describe("SessionStore Fix D coverage", () => {
 
   it("stop sets the open tab to stopped and cancels reconnect", async () => {
     const { store } = makeStore({ stop: vi.fn().mockResolvedValue(undefined) });
-    await store.openSession({ projectId: "api", sessionId: "x", agent: null });
+    await store.openSession({
+      projectId: "api",
+      sessionId: "x",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     const r = await store.stop("api", "x");
     expect(r).toEqual({ ok: true });
     expect(store.getSnapshot().tabs[0].status).toBe("stopped");
@@ -1107,7 +1261,12 @@ describe("SessionStore Fix D coverage", () => {
     const { store } = makeStore({
       remove: vi.fn().mockResolvedValue(undefined),
     });
-    await store.openSession({ projectId: "api", sessionId: "x", agent: null });
+    await store.openSession({
+      projectId: "api",
+      sessionId: "x",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     const r = await store.remove("api", "x", false);
     expect(r).toEqual({ ok: true });
     expect(store.getSnapshot().tabs).toHaveLength(0);
@@ -1153,7 +1312,12 @@ describe("SessionStore Fix D coverage", () => {
       schedule: clock.schedule,
     });
 
-    await store.openSession({ projectId: "p", sessionId: "s", agent: null });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      workspace: "worktree" as const,
+    });
     spawned.die();
     await Promise.resolve();
     await Promise.resolve();

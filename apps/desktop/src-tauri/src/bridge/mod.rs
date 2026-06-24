@@ -109,6 +109,7 @@ impl Bridge {
         project_id: String,
         session_id: String,
         agent: Option<String>,
+        workspace: Option<remora_protocol::WorkspaceMode>,
         sink: Arc<dyn OutputSink>,
     ) -> Result<ChannelHandle, BridgeError> {
         let spec = SpawnSpec {
@@ -120,6 +121,7 @@ impl Bridge {
                 .map_err(|e| BridgeError::InvalidId {
                     message: e.to_string(),
                 })?,
+            workspace,
         };
         let source = self.resolve_for(&spec.project_id)?;
         let channel = source.spawn(spec).await?;
@@ -689,7 +691,7 @@ mod tests {
         let b = bridge(Arc::new(FakeSessionSource::new()));
         let (s, mut rx) = sink();
         let h = b
-            .spawn("api".into(), "fix".into(), Some("claude".into()), s)
+            .spawn("api".into(), "fix".into(), Some("claude".into()), None, s)
             .await
             .expect("spawn");
         b.write(h, b"hello".to_vec()).await.expect("write");
@@ -701,7 +703,7 @@ mod tests {
         let src = Arc::new(FakeSessionSource::new());
         let (s0, _r0) = sink();
         bridge(src.clone())
-            .spawn("api".into(), "x".into(), None, s0)
+            .spawn("api".into(), "x".into(), None, None, s0)
             .await
             .expect("spawn");
         let b = bridge(src);
@@ -717,7 +719,7 @@ mod tests {
         let b = bridge(Arc::new(FakeSessionSource::new()));
         let (s, mut rx) = sink();
         let h = b
-            .spawn("api".into(), "x".into(), None, s)
+            .spawn("api".into(), "x".into(), None, None, s)
             .await
             .expect("spawn");
         b.close(h);
@@ -743,7 +745,7 @@ mod tests {
         let b = bridge(Arc::new(FakeSessionSource::new()));
         let (s, rx) = sink();
         let h = b
-            .spawn("api".into(), "x".into(), None, s)
+            .spawn("api".into(), "x".into(), None, None, s)
             .await
             .expect("spawn");
         drop(rx); // frontend gone
@@ -758,7 +760,7 @@ mod tests {
         let b = bridge(Arc::new(FakeSessionSource::new()));
         let (s, _rx) = sink();
         let h = b
-            .spawn("api".into(), "x".into(), None, s)
+            .spawn("api".into(), "x".into(), None, None, s)
             .await
             .expect("spawn");
         assert!(matches!(
@@ -785,7 +787,7 @@ mod tests {
         let b = bridge(Arc::new(FakeSessionSource::new()));
         let (s, _rx) = sink();
         assert!(matches!(
-            b.spawn("API".into(), "x".into(), None, s).await,
+            b.spawn("API".into(), "x".into(), None, None, s).await,
             Err(BridgeError::InvalidId { .. })
         ));
     }
@@ -795,12 +797,14 @@ mod tests {
         let src = Arc::new(FakeSessionSource::new());
         let (s1, _r1) = sink();
         bridge(src.clone())
-            .spawn("api".into(), "x".into(), None, s1)
+            .spawn("api".into(), "x".into(), None, None, s1)
             .await
             .expect("spawn");
         let (s2, _r2) = sink();
         assert!(matches!(
-            bridge(src).spawn("api".into(), "x".into(), None, s2).await,
+            bridge(src)
+                .spawn("api".into(), "x".into(), None, None, s2)
+                .await,
             Err(BridgeError::SessionExists { .. })
         ));
     }
@@ -812,6 +816,7 @@ mod tests {
             project_id: pid("api"),
             session_id: sid("x"),
             agent: None,
+            workspace: None,
         })
         .await
         .expect("spawn");
@@ -863,6 +868,7 @@ mod tests {
                     agent: None,
                     created_at: None,
                     workspace_path: None,
+                    workspace: None,
                 },
                 SessionMeta {
                     project_id: pid("api"),
@@ -871,6 +877,7 @@ mod tests {
                     agent: None,
                     created_at: None,
                     workspace_path: None,
+                    workspace: None,
                 },
             ])
         }
@@ -925,7 +932,7 @@ mod tests {
         let (s, mut rx) = sink();
         let b = bridge(src.clone());
         let h = b
-            .spawn("api".into(), "x".into(), None, s)
+            .spawn("api".into(), "x".into(), None, None, s)
             .await
             .expect("spawn");
         src.stop_session(&pid("api"), &sid("x")); // kills the channel
@@ -976,7 +983,7 @@ mod tests {
             }),
         );
         let (s, _rx) = sink();
-        b.spawn("api".into(), "x".into(), None, s)
+        b.spawn("api".into(), "x".into(), None, None, s)
             .await
             .expect("spawn");
         assert_eq!(
@@ -1094,6 +1101,7 @@ mod tests {
             project_id: pid("api"),
             session_id: sid("x"),
             agent: None,
+            workspace: None,
         })
         .await
         .expect("spawn");
@@ -1470,6 +1478,7 @@ mod tests {
             project_id: pid("api"),
             session_id: sid("x"),
             agent: None,
+            workspace: None,
         })
         .await
         .expect("spawn");
@@ -1488,6 +1497,7 @@ mod tests {
             project_id: pid("api"),
             session_id: sid("x"),
             agent: None,
+            workspace: None,
         })
         .await
         .expect("spawn");
@@ -1505,6 +1515,7 @@ mod tests {
             project_id: pid("api"),
             session_id: sid("x"),
             agent: None,
+            workspace: None,
         })
         .await
         .expect("spawn");
@@ -1552,7 +1563,7 @@ mod tests {
             }),
         );
         let (s, _rx) = sink();
-        let result = b.spawn("ghost".into(), "x".into(), None, s).await;
+        let result = b.spawn("ghost".into(), "x".into(), None, None, s).await;
         std::fs::remove_file(&path).ok();
         assert!(matches!(result, Err(BridgeError::Config { .. })));
     }

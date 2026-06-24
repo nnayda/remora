@@ -37,6 +37,7 @@ const session = (
   agent,
   createdAt: null,
   workspacePath: null,
+  workspace: null,
 });
 
 const cfg = (
@@ -178,5 +179,56 @@ describe("buildTree", () => {
   it("carries null workspace for unconfigured-project sessions", () => {
     const tree = buildTree(cfg([], []), [session("ghost", "x")]);
     expect(tree[0].projects[0].sessions[0].workspace).toBeNull();
+  });
+
+  it("stamps node.workspace from discovered meta, overriding the project default", () => {
+    // project "scratch" configured shared; discovered session reports worktree
+    const tree = buildTree(
+      cfg(
+        [host("devbox", "ssh")],
+        [project("scratch", "devbox", "claude", null, "shared")],
+      ),
+      [
+        {
+          projectId: "scratch",
+          sessionId: "s1",
+          state: "stopped",
+          agent: null,
+          createdAt: null,
+          workspacePath: null,
+          workspace: "worktree",
+        },
+      ],
+    );
+    const node = tree
+      .flatMap((h) => h.projects)
+      .flatMap((p) => p.sessions)
+      .find((s) => s.sessionId === "s1");
+    expect(node?.workspace).toBe("worktree");
+  });
+
+  it("falls back to the project default when discovered workspace is null", () => {
+    const tree = buildTree(
+      cfg(
+        [host("devbox", "ssh")],
+        [project("api", "devbox", "claude", null, "worktree")],
+      ),
+      [
+        {
+          projectId: "api",
+          sessionId: "s1",
+          state: "live",
+          agent: null,
+          createdAt: null,
+          workspacePath: null,
+          workspace: null,
+        },
+      ],
+    );
+    const node = tree
+      .flatMap((h) => h.projects)
+      .flatMap((p) => p.sessions)
+      .find((s) => s.sessionId === "s1");
+    expect(node?.workspace).toBe("worktree"); // api is worktree-default
   });
 });

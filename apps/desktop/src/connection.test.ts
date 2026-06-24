@@ -247,7 +247,12 @@ describe("reconnectFate", () => {
 describe("connection.ts — openSession (spawn-first)", () => {
   it("spawns a fresh session and reports attached:false", async () => {
     b.spawnSession.mockResolvedValue(5);
-    const { connection, attached } = await openSession("p", "s", "claude");
+    const { connection, attached } = await openSession(
+      "p",
+      "s",
+      "claude",
+      "worktree",
+    );
     expect(attached).toBe(false);
     expect(connection.closed).toBe(false);
     expect(b.spawnSession).toHaveBeenCalledTimes(1);
@@ -255,6 +260,7 @@ describe("connection.ts — openSession (spawn-first)", () => {
       "p",
       "s",
       "claude",
+      "worktree",
       expect.anything(),
     );
     expect(b.attachSession).not.toHaveBeenCalled();
@@ -263,7 +269,7 @@ describe("connection.ts — openSession (spawn-first)", () => {
   it("attaches and reports attached:true when the session already exists", async () => {
     b.spawnSession.mockRejectedValueOnce({ kind: "sessionExists" });
     b.attachSession.mockResolvedValue(6);
-    const { attached } = await openSession("p", "s", null);
+    const { attached } = await openSession("p", "s", null, "worktree");
     expect(attached).toBe(true);
     expect(b.spawnSession).toHaveBeenCalledTimes(1);
     expect(b.attachSession).toHaveBeenCalledTimes(1);
@@ -271,9 +277,11 @@ describe("connection.ts — openSession (spawn-first)", () => {
 
   it("propagates unexpected spawn errors", async () => {
     b.spawnSession.mockRejectedValueOnce({ kind: "transport", message: "net" });
-    await expect(openSession("p", "s", null)).rejects.toMatchObject({
-      kind: "transport",
-    });
+    await expect(openSession("p", "s", null, "worktree")).rejects.toMatchObject(
+      {
+        kind: "transport",
+      },
+    );
     expect(b.attachSession).not.toHaveBeenCalled();
   });
 
@@ -283,9 +291,11 @@ describe("connection.ts — openSession (spawn-first)", () => {
       kind: "transport",
       message: "net",
     });
-    await expect(openSession("p", "s", null)).rejects.toMatchObject({
-      kind: "transport",
-    });
+    await expect(openSession("p", "s", null, "worktree")).rejects.toMatchObject(
+      {
+        kind: "transport",
+      },
+    );
     expect(b.attachSession).toHaveBeenCalledTimes(1);
   });
 });

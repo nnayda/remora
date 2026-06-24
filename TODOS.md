@@ -365,7 +365,7 @@ up cold.
   invalidation. A TTL memo ≠ the rejected cross-connect cache, but it's adjacent.
 - **Context:** Issue #52 eng review, Performance section (Issue 4). Deferred so
   the first cut stays minimal; revisit if dogfooding on hermes shows the poll
-  cost biting. See `docs/adr/0008-dynamic-kubectl-field-resolution.md`.
+  cost biting. See `docs/adr/0009-dynamic-kubectl-field-resolution.md`.
 - **Depends on:** the resolution seam (issue #52 PR).
 
 ## Enforce the command-field trust boundary for synced/relayed config
@@ -383,7 +383,7 @@ up cold.
   **Cons:** needs a provenance signal (which configs are "untrusted") and a
   strip/reject path with clear user feedback.
 - **Context:** Issue #52 eng review, outside-voice cross-model tension T2. The
-  documentation half landed with ADR-0008; only enforcement is deferred.
+  documentation half landed with ADR-0009; only enforcement is deferred.
 - **Depends on:** config sync / relay config distribution being designed.
 
 ## Re-resolve-on-vanish retry for command-form pods (TOCTOU)
@@ -426,7 +426,7 @@ up cold.
   of silently accepting whatever `head -n1` returns. E.g. detect a multi-line
   raw selector result before the user masks it with `head -n1`, or offer a
   strict non-`head` form.
-- **Why:** ADR-0008 documents the single-active-pod assumption, but the code
+- **Why:** ADR-0009 documents the single-active-pod assumption, but the code
   still lets a 3-pod match resolve to an arbitrary first pod with no warning —
   the ambiguity is masked, not detected. Worst at multi-replica/HPA.
 - **Pros:** Turns a silent footgun into a clear error. **Cons:** fights the

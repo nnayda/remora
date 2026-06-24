@@ -1,4 +1,4 @@
-# 0008. kubectl host fields may be resolved from a local shell command at connect time
+# 0009. kubectl host fields may be resolved from a local shell command at connect time
 
 - **Status:** Accepted
 - **Date:** 2026-06-24

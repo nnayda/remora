@@ -12,7 +12,7 @@ use portable_pty::CommandBuilder;
 use remora_protocol::{ProjectId, SessionId, SessionMeta};
 
 use super::pty_process::spawn_pty_channel;
-use crate::config::{Config, WorkspaceMode};
+use crate::config::Config;
 use crate::discovery::{self, DiscoveredEnv};
 use crate::naming::{branch_name, parse_tmux_session_name, tmux_session_name, worktree_path};
 use crate::spawn_plan::{PlanError, SpawnPlan};
@@ -624,7 +624,8 @@ pub(crate) fn read_environment(
 
 /// Discovers sessions on the host and joins them to local config. Config-
 /// scoped throughout (R1): the live set keeps only configured projects, and
-/// the stopped scan runs only for configured worktree-mode projects.
+/// the worktree scan runs for every configured project (a worktree-override
+/// session can live on a shared-default project).
 pub(crate) fn run_list(
     exec: &dyn RemoteExec,
     config: &Config,
@@ -643,23 +644,26 @@ pub(crate) fn run_list(
         live.push((project, session, env));
     }
 
-    let mut stopped = Vec::new();
+    let mut worktrees = Vec::new();
+    let mut scanned = std::collections::HashSet::new();
     for (project_id, project) in &config.projects {
-        if project.workspace != WorkspaceMode::Worktree {
-            continue; // shared projects have no surviving worktree
-        }
-        // A failure for one project (bad path, not a repo) yields empty for
-        // that project, never a failed discovery (decision 8).
+        // Scan EVERY project: a worktree-override session can live on a
+        // shared-default project. `parse_worktree_list` rejects the main
+        // checkout and foreign paths, so a project with no remora worktrees
+        // yields nothing. Record which projects scanned cleanly so `join` can
+        // tell "scanned, no worktree" (⇒ Shared) apart from "scan failed"
+        // (⇒ unknown), instead of conflating a transient failure with Shared.
         if let Ok(out) = exec.run(&worktree_list_tokens(&project.path)) {
             if out.success {
+                scanned.insert(project_id.clone());
                 for (session, path) in discovery::parse_worktree_list(&out.stdout, project_id) {
-                    stopped.push((project_id.clone(), session, path));
+                    worktrees.push((project_id.clone(), session, path));
                 }
             }
         }
     }
 
-    Ok(discovery::join(live, stopped))
+    Ok(discovery::join(live, worktrees, &scanned))
 }
 
 // ---------------------------------------------------------------------------
@@ -901,21 +905,20 @@ pub(crate) fn kill_session(exec: &dyn RemoteExec, tmux_name: &str) -> Result<(),
 }
 
 /// Paths derived from config needed for teardown. All fields are pure strings
-/// (no network round-trip): tmux name, project dir on the host, session
-/// worktree dir, optional branch (worktree-mode only).
+/// (no network round-trip): tmux name and project dir on the host. Worktree
+/// path and branch are now computed on-demand in `run_remove` (from ids, not
+/// config) to correctly handle worktree-override sessions on shared-default
+/// projects.
 #[derive(Debug)]
 struct TeardownPaths {
     tmux_name: String,
     project_path: String,
-    dir: String,
-    branch: Option<String>,
-    workspace: WorkspaceMode,
 }
 
 /// Resolves teardown paths from config for `(project_id, session_id)`.
 /// Returns `Transport` if the project is unknown (consistent with spawn
 /// behavior — unknown project is a config error, not a protocol error).
-/// Does NOT consult agents (D3): teardown needs only the project path and mode.
+/// Does NOT consult agents (D3): teardown needs only the project path.
 fn teardown_paths(
     config: &Config,
     project_id: &ProjectId,
@@ -926,20 +929,9 @@ fn teardown_paths(
         .get(project_id)
         .ok_or_else(|| SourceError::Transport(format!("unknown project `{project_id}`")))?;
     let tmux_name = tmux_session_name(project_id, session_id);
-    let (dir, branch) = if project.workspace == WorkspaceMode::Worktree {
-        (
-            worktree_path(project_id, session_id),
-            Some(branch_name(session_id)),
-        )
-    } else {
-        (project.path.clone(), None)
-    };
     Ok(TeardownPaths {
         tmux_name,
         project_path: project.path.clone(),
-        dir,
-        branch,
-        workspace: project.workspace,
     })
 }
 
@@ -1009,9 +1001,12 @@ pub(crate) fn run_stop(
     kill_session(exec, &paths.tmux_name)
 }
 
-/// Ends a session for good. Worktree mode: optional dirty gate (unless force) →
-/// kill tmux → idempotent worktree remove → idempotent branch delete. Shared
-/// mode: kill tmux only (never touches the project dir).
+/// Ends a session for good. Mode is determined from REAL remote state (not
+/// project config): a worktree-override session on a shared-default project
+/// must still be cleaned up. If the canonical worktree directory exists →
+/// worktree session: optional dirty gate (unless force) → kill tmux →
+/// idempotent worktree remove → idempotent branch delete. If not → kill tmux
+/// only (shared session, or worktree already gone).
 ///
 /// Accepted limitation: the dirty probe and the kill are separate round-trips,
 /// so a still-running agent could write new uncommitted work in the window
@@ -1029,10 +1024,24 @@ pub(crate) fn run_remove(
     force: bool,
 ) -> Result<(), SourceError> {
     let paths = teardown_paths(config, project_id, session_id)?;
-    let worktree = matches!(paths.workspace, WorkspaceMode::Worktree);
+    // Determine mode from REAL remote state, not project config: a per-session
+    // override means the project's default doesn't decide whether this session
+    // has a worktree. The canonical path is recomputed from validated ids
+    // (never from discovered metadata — ADR-0004).
+    let worktree_dir = worktree_path(project_id, session_id);
+    let probe = exec.run(&dir_exists_tokens(&worktree_dir))?;
+    // `test -d` is silent: a clean non-zero exit (empty stderr) means the dir is
+    // absent (shared session, or worktree already gone). A non-empty stderr
+    // means the probe itself couldn't run (ssh/kubectl/auth/shell error) — fail
+    // closed rather than mistaking a transport error for "no worktree" and
+    // orphaning a live worktree + branch (mirrors `run_respawn`).
+    if !probe.success && !probe.stderr.trim().is_empty() {
+        return Err(SourceError::Transport(probe.stderr));
+    }
+    let has_worktree = probe.success;
 
-    if worktree && !force {
-        if let Some(reason) = worktree_has_work(exec, &paths.dir)? {
+    if has_worktree && !force {
+        if let Some(reason) = worktree_has_work(exec, &worktree_dir)? {
             return Err(SourceError::WorkspaceDirty {
                 project_id: project_id.clone(),
                 session_id: session_id.clone(),
@@ -1043,12 +1052,13 @@ pub(crate) fn run_remove(
 
     kill_session(exec, &paths.tmux_name)?;
 
-    if let Some(branch) = paths.branch.as_deref() {
-        let rm = exec.run(&worktree_remove_tokens(&paths.project_path, &paths.dir))?;
+    if has_worktree {
+        let rm = exec.run(&worktree_remove_tokens(&paths.project_path, &worktree_dir))?;
         if !rm.success && !stderr_signals_worktree_absent(&rm.stderr) {
             return Err(SourceError::Transport(rm.stderr));
         }
-        let del = exec.run(&branch_delete_tokens(&paths.project_path, branch))?;
+        let branch = branch_name(session_id);
+        let del = exec.run(&branch_delete_tokens(&paths.project_path, &branch))?;
         if !del.success && !stderr_signals_branch_absent(&del.stderr) {
             return Err(SourceError::Transport(del.stderr));
         }
@@ -1858,6 +1868,60 @@ pub(crate) mod tests {
         assert!(metas.iter().all(|m| m.state == SessionState::Live));
     }
 
+    #[test]
+    fn list_discovers_worktree_session_on_shared_default_project() {
+        // Before the fix, the worktree scan was guarded by
+        // `project.workspace == WorkspaceMode::Worktree`, so a worktree-override
+        // session on a shared-default project was silently lost. This test is the
+        // RED proof: on the old code the assertion fails (session not discovered);
+        // on the new code it passes.
+        //
+        // Config: `api` (worktree-default) + `scratch` (shared-default).
+        // No live sessions. The `scratch` project has one surviving worktree at
+        // ~/.remora/worktrees/scratch/s1.
+        //
+        // FakeExec call order (config is a BTreeMap, sorted: api first, scratch second):
+        //   1) list-sessions        -> empty (no live sessions)
+        //   2) git worktree list for `api`     -> empty
+        //   3) git worktree list for `scratch` -> s1 worktree entry
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.api]
+            host = "devbox"
+            path = "/home/dev/api"
+            workspace = "worktree"
+            agent = "claude"
+            [projects.scratch]
+            host = "devbox"
+            path = "/home/dev/scratch"
+            workspace = "shared"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+        "#;
+        let config = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("")), // list-sessions: no live sessions
+            Ok(FakeExec::out("")), // worktree list for api: empty
+            Ok(FakeExec::out(
+                "worktree /home/dev/.remora/worktrees/scratch/s1\nbranch refs/heads/remora/s1\n",
+            )), // worktree list for scratch: one worktree session
+        ]);
+        let metas = run_list(&fake, &config).expect("list");
+        // The scratch/s1 worktree session must be discovered as Stopped + Worktree.
+        assert_eq!(
+            metas.len(),
+            1,
+            "expected one discovered session, got: {metas:?}"
+        );
+        assert_eq!(metas[0].project_id.as_str(), "scratch");
+        assert_eq!(metas[0].session_id.as_str(), "s1");
+        assert_eq!(metas[0].state, SessionState::Stopped);
+        assert_eq!(metas[0].workspace, Some(WorkspaceMode::Worktree));
+    }
+
     // -----------------------------------------------------------------------
     // teardown token-builder + orchestration tests (ported from #50 ssh.rs)
     // -----------------------------------------------------------------------
@@ -1916,13 +1980,10 @@ pub(crate) mod tests {
         let p = teardown_paths(&config, &pid("api"), &sid("fix-login")).expect("paths");
         assert_eq!(p.tmux_name, "remora_api_fix-login");
         assert_eq!(p.project_path, "/home/dev/api");
-        assert_eq!(p.dir, "~/.remora/worktrees/api/fix-login");
-        assert_eq!(p.branch.as_deref(), Some("remora/fix-login"));
-        assert_eq!(p.workspace, WorkspaceMode::Worktree);
     }
 
     #[test]
-    fn teardown_paths_shared_has_no_branch() {
+    fn teardown_paths_shared_resolves_project_path() {
         let toml = r#"
             [hosts.devbox]
             transport = "ssh"
@@ -1937,9 +1998,8 @@ pub(crate) mod tests {
         "#;
         let config = Arc::new(Config::from_toml_str(toml).expect("config"));
         let p = teardown_paths(&config, &pid("scratch"), &sid("s1")).expect("paths");
-        assert_eq!(p.dir, "~/scratch");
-        assert_eq!(p.branch, None);
-        assert_eq!(p.workspace, WorkspaceMode::Shared);
+        assert_eq!(p.project_path, "~/scratch");
+        assert_eq!(p.tmux_name, "remora_scratch_s1");
     }
 
     #[test]
@@ -2055,6 +2115,7 @@ pub(crate) mod tests {
     #[test]
     fn run_remove_clean_worktree_runs_probe_kill_remove_delete_in_order() {
         let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),       // test -d worktree probe: exists
             Ok(FakeExec::out("")),    // status --porcelain (clean)
             Ok(FakeExec::out("0\n")), // rev-list (on remote)
             Ok(FakeExec::ok()),       // kill-session
@@ -2063,16 +2124,18 @@ pub(crate) mod tests {
         ]);
         assert!(run_remove(&fake, &test_config(), &pid("api"), &sid("fix-login"), false).is_ok());
         let calls = fake.calls.lock().expect("lock");
-        assert!(calls[0].iter().any(|a| a == "status"));
-        assert!(calls[1].iter().any(|a| a == "rev-list"));
-        assert!(calls[2].iter().any(|a| a == "kill-session"));
-        assert!(calls[3].iter().any(|a| a == "remove")); // worktree remove
-        assert!(calls[4].iter().any(|a| a == "-D")); // branch -D
+        assert!(calls[0].iter().any(|a| a == "test") && calls[0].iter().any(|a| a == "-d"));
+        assert!(calls[1].iter().any(|a| a == "status"));
+        assert!(calls[2].iter().any(|a| a == "rev-list"));
+        assert!(calls[3].iter().any(|a| a == "kill-session"));
+        assert!(calls[4].iter().any(|a| a == "remove")); // worktree remove
+        assert!(calls[5].iter().any(|a| a == "-D")); // branch -D
     }
 
     #[test]
     fn run_remove_refuses_dirty_without_force_and_touches_nothing() {
         let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                 // test -d worktree probe: exists
             Ok(FakeExec::out(" M src/x.rs\n")), // status dirty
             Ok(FakeExec::out("0\n")),           // rev-list
         ]);
@@ -2090,8 +2153,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn run_remove_force_skips_the_probe() {
+    fn run_remove_force_skips_the_dirty_probe_but_still_probes_existence() {
+        // force=true skips the dirty-check (status/rev-list) but the `test -d`
+        // existence probe still runs — it decides whether to do worktree cleanup.
         let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()), // test -d worktree probe: exists
             Ok(FakeExec::ok()), // kill-session
             Ok(FakeExec::ok()), // worktree remove
             Ok(FakeExec::ok()), // branch -D
@@ -2106,6 +2172,7 @@ pub(crate) mod tests {
     #[test]
     fn run_remove_idempotent_when_worktree_and_branch_already_gone() {
         let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),       // test -d worktree probe: exists
             Ok(FakeExec::out("")),    // status --porcelain (clean)
             Ok(FakeExec::out("0\n")), // rev-list
             Ok(FakeExec::ok()),       // kill-session
@@ -2120,7 +2187,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn run_remove_shared_mode_skips_worktree_and_branch() {
+    fn run_remove_shared_session_skips_worktree_and_branch() {
+        // A genuinely shared session (no worktree dir on disk): `test -d` fails,
+        // so only kill-session runs — no worktree remove, no branch delete.
         let toml = r#"
             [hosts.devbox]
             transport = "ssh"
@@ -2135,11 +2204,14 @@ pub(crate) mod tests {
         "#;
         let config = Arc::new(Config::from_toml_str(toml).expect("config"));
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()), // kill-session only
+            Ok(FakeExec::fail("")), // test -d: no worktree dir
+            Ok(FakeExec::ok()),     // kill-session
         ]);
         assert!(run_remove(&fake, &config, &pid("scratch"), &sid("s1"), false).is_ok());
         assert_eq!(fake.count_calls_with("kill-session"), 1);
-        assert_eq!(fake.count_calls_with("worktree"), 0);
+        // Use "worktree remove" (the git subcommand pair) rather than the path
+        // substring "worktree", which also appears in the `test -d` probe argv.
+        assert_eq!(fake.count_calls_with("remove"), 0);
         assert_eq!(fake.count_calls_with("-D"), 0);
     }
 
@@ -2234,5 +2306,81 @@ pub(crate) mod tests {
         let (s, over) = read_capped(&mut data.as_slice(), 8);
         assert_eq!(s.len(), 8);
         assert!(over);
+    }
+
+    #[test]
+    fn run_remove_fails_closed_when_the_worktree_probe_errors() {
+        // The `test -d` probe fails with a non-empty stderr (ssh/auth/shell
+        // error, not a clean "dir absent"). run_remove must NOT mistake that for
+        // "no worktree" and proceed to kill tmux while skipping cleanup — that
+        // would orphan a live worktree + branch. It fails closed with Transport.
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.scratch]
+            host = "devbox"
+            path = "~/scratch"
+            workspace = "shared"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+        "#;
+        let config = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::fail("ssh: connect: connection refused")), // test -d: probe error
+        ]);
+        let err = run_remove(&fake, &config, &pid("scratch"), &sid("s1"), true).expect_err("err");
+        assert!(matches!(err, SourceError::Transport(_)));
+        // Failed closed: tmux was never killed, nothing cleaned up.
+        assert_eq!(fake.count_calls_with("kill-session"), 0);
+        assert_eq!(fake.count_calls_with("remove"), 0);
+    }
+
+    #[test]
+    fn run_remove_worktree_session_on_shared_config_project_cleans_up_worktree() {
+        // RED → GREEN: a worktree session spawned on a shared-default project
+        // must still be cleaned up. The probe (`test -d`) finds the worktree dir
+        // exists, so run_remove issues worktree remove + branch -D regardless of
+        // the project config's workspace setting.
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.scratch]
+            host = "devbox"
+            path = "~/scratch"
+            workspace = "shared"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+        "#;
+        let config = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()), // test -d: worktree dir EXISTS (override case)
+            // force=true: no dirty-check
+            Ok(FakeExec::ok()), // kill-session
+            Ok(FakeExec::ok()), // worktree remove
+            Ok(FakeExec::ok()), // branch -D
+        ]);
+        assert!(
+            run_remove(&fake, &config, &pid("scratch"), &sid("s1"), true).is_ok(),
+            "worktree session on shared-config project must be cleaned up"
+        );
+        assert_eq!(
+            fake.count_calls_with("kill-session"),
+            1,
+            "kill-session must run"
+        );
+        assert_eq!(
+            fake.count_calls_with("remove"),
+            1,
+            "worktree remove must run for an existing worktree dir"
+        );
+        assert_eq!(
+            fake.count_calls_with("-D"),
+            1,
+            "branch delete must run for an existing worktree"
+        );
     }
 }
