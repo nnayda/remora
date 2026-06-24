@@ -46,27 +46,48 @@ fn kubectl_base_argv(host: &KubectlHost, interactive: bool) -> Vec<String> {
     argv
 }
 
-/// Non-interactive: join the logical tokens into one `sh -c` string. No
-/// `--request-timeout` — for `kubectl exec` the streamed command is one long
-/// API request, so a connect-style timeout would sever a legitimately-slow
-/// `git worktree add` (Finding 1). Execution is unbounded, matching ssh.
-fn kubectl_run_argv(host: &KubectlHost, tokens: &[String]) -> Vec<String> {
-    let mut argv = kubectl_base_argv(host, false);
+/// In-container shell preamble prepended to every `sh -c` we run in the pod.
+///
+/// kubectl forwards none of the client's environment, and our `exec`s run a
+/// non-login, non-interactive shell that sources no profile — so the pod shell
+/// has no locale set. With no UTF-8 locale the session's tmux falls back to
+/// non-UTF-8 mode and mangles the agent's box-drawing output; every attached
+/// client then sees garbage (the desktop app and a bare `kubectl exec … tmux
+/// attach` alike), while a directly-run agent — no tmux to misparse it — is
+/// fine. Pin a UTF-8 locale so tmux (the server that parses the agent's bytes
+/// and every client that renders them) handles UTF-8. `C.UTF-8` is present
+/// without `locale-gen` on glibc and musl, and keeps diagnostics in English so
+/// it also satisfies the deferred `LC_ALL=C` stderr-hardening intent. `TERM`
+/// rides along for the interactive client (kubectl forwards no client TERM —
+/// Finding 9) and is inert for the non-interactive commands.
+///
+/// `export …;` — not `env … <cmd>` — so the preamble composes with shell
+/// constructs like the probe's `for` loop, which `env` would try to exec as a
+/// program.
+const POD_SHELL_PREAMBLE: &str = "export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=xterm-256color;";
+
+/// Wrap logical tokens into one in-container `sh -c` string behind the UTF-8
+/// locale preamble. `interactive` selects the kubectl PTY flags via
+/// [`kubectl_base_argv`]; the shell body is identical either way.
+fn kubectl_sh_argv(host: &KubectlHost, tokens: &[String], interactive: bool) -> Vec<String> {
+    let mut argv = kubectl_base_argv(host, interactive);
     argv.push("sh".into());
     argv.push("-c".into());
-    argv.push(tokens.join(" "));
+    argv.push(format!("{POD_SHELL_PREAMBLE} {}", tokens.join(" ")));
     argv
 }
 
-/// Interactive: same join, but prefix `env TERM=xterm-256color` inside the
-/// container so the pod's tmux deterministically sees xterm-256color (kubectl
-/// does not reliably forward the client TERM into the pod PTY — Finding 9).
+/// Non-interactive command. No `--request-timeout` — for `kubectl exec` the
+/// streamed command is one long API request, so a connect-style timeout would
+/// sever a legitimately-slow `git worktree add` (Finding 1). Execution is
+/// unbounded, matching ssh.
+fn kubectl_run_argv(host: &KubectlHost, tokens: &[String]) -> Vec<String> {
+    kubectl_sh_argv(host, tokens, false)
+}
+
+/// Interactive PTY channel (`-i -t`) for attaching to the session's tmux.
 fn kubectl_channel_argv(host: &KubectlHost, tokens: &[String]) -> Vec<String> {
-    let mut argv = kubectl_base_argv(host, true);
-    argv.push("sh".into());
-    argv.push("-c".into());
-    argv.push(format!("env TERM=xterm-256color {}", tokens.join(" ")));
-    argv
+    kubectl_sh_argv(host, tokens, true)
 }
 
 struct RealKubectlExec {
@@ -373,7 +394,8 @@ mod tests {
                 "--",
                 "sh",
                 "-c",
-                "tmux has-session -t remora_api_x",
+                "export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=xterm-256color; \
+                 tmux has-session -t remora_api_x",
             ]
         );
         assert!(
@@ -383,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_argv_wraps_term_in_container_and_is_interactive() {
+    fn channel_argv_sets_utf8_locale_and_term_in_container_and_is_interactive() {
         let tokens = vec!["tmux".to_string(), "attach-session".to_string()];
         let argv = kubectl_channel_argv(&host("p", None, None, None), &tokens);
         assert_eq!(
@@ -397,9 +419,28 @@ mod tests {
                 "--",
                 "sh",
                 "-c",
-                "env TERM=xterm-256color tmux attach-session",
+                "export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=xterm-256color; tmux attach-session",
             ]
         );
+    }
+
+    #[test]
+    fn both_paths_pin_a_utf8_locale_so_tmux_renders_utf8() {
+        // Regression: with no UTF-8 locale in the pod shell, the session's tmux
+        // runs non-UTF-8 and mangles the agent's box-drawing output. Both the
+        // session-creating run path (tmux server) and the attaching channel
+        // path (tmux client) must carry a UTF-8 locale.
+        let h = host("p", None, None, None);
+        for argv in [
+            kubectl_run_argv(&h, &["tmux".into(), "new-session".into()]),
+            kubectl_channel_argv(&h, &["tmux".into(), "attach-session".into()]),
+        ] {
+            let body = argv.last().expect("sh -c body");
+            assert!(
+                body.contains("LANG=C.UTF-8") && body.contains("LC_ALL=C.UTF-8"),
+                "missing UTF-8 locale: {body}"
+            );
+        }
     }
 
     #[test]

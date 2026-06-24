@@ -15,11 +15,24 @@ use crate::naming::tmux_session_name;
 use crate::spawn_plan::plan_spawn;
 use crate::{SessionChannel, SessionSource, SourceError};
 
-/// Builds the full ssh argv: connection flags + the logical remote tokens.
-/// `interactive` adds `-tt`. This is the single place ssh argvs are composed,
-/// so the byte-for-byte shape the tests pin lives here.
+/// Pins a UTF-8 locale on every remote command so the session's tmux runs in
+/// UTF-8 mode and doesn't mangle the agent's box-drawing output. ssh runs
+/// `$SHELL -c <cmd>` non-interactively (no profile sourced), so a locale
+/// reaches the remote only via `SendEnv LANG LC_*` locally **and** `AcceptEnv`
+/// on the server — a fragile default that silently no-ops when either is
+/// absent. Prefixing `env LANG=… LC_ALL=…` sets it unconditionally instead:
+/// the ssh analogue of the kubectl pod-shell preamble. `C.UTF-8` is present
+/// without `locale-gen` and keeps diagnostics English (so it also satisfies
+/// the deferred `LC_ALL=C` stderr-hardening intent). No `TERM` — ssh forwards
+/// the client TERM to the remote PTY on its own.
+const REMOTE_LOCALE_PREFIX: [&str; 3] = ["env", "LANG=C.UTF-8", "LC_ALL=C.UTF-8"];
+
+/// Builds the full ssh argv: connection flags + UTF-8 locale prefix + the
+/// logical remote tokens. `interactive` adds `-tt`. This is the single place
+/// ssh argvs are composed, so the byte-for-byte shape the tests pin lives here.
 fn ssh_compose(host: &SshHost, interactive: bool, tokens: &[String]) -> Vec<String> {
     let mut argv = ssh_base_argv(host, interactive);
+    argv.extend(REMOTE_LOCALE_PREFIX.iter().map(|s| (*s).to_string()));
     argv.extend_from_slice(tokens);
     argv
 }
@@ -301,6 +314,9 @@ mod tests {
                 "-o",
                 "ConnectTimeout=10",
                 "devbox",
+                "env",
+                "LANG=C.UTF-8",
+                "LC_ALL=C.UTF-8",
                 "tmux",
                 "attach-session",
                 "-d",
@@ -309,6 +325,28 @@ mod tests {
             ]
         );
         assert!(!argv.iter().any(|a| a == "--"), "no options terminator");
+    }
+
+    #[test]
+    fn ssh_compose_pins_utf8_locale_on_both_paths() {
+        // Regression: without a UTF-8 locale the remote tmux runs non-UTF-8 and
+        // mangles the agent's box-drawing output. ssh's non-interactive
+        // `$SHELL -c` sources no profile, and SendEnv/AcceptEnv is fragile, so
+        // every remote command — interactive attach and blocking setup alike —
+        // carries an `env LANG=… LC_ALL=…` prefix. The locale must precede the
+        // remote command so `env` execs it with the locale set.
+        for interactive in [true, false] {
+            let argv = ssh_compose(
+                &host("devbox", None, None),
+                interactive,
+                &new_session_tokens(&worktree_plan()),
+            );
+            let env = argv.iter().position(|a| a == "env").expect("env prefix");
+            assert_eq!(argv[env + 1], "LANG=C.UTF-8");
+            assert_eq!(argv[env + 2], "LC_ALL=C.UTF-8");
+            let tmux = argv.iter().position(|a| a == "tmux").expect("tmux");
+            assert!(env < tmux, "locale prefix precedes the remote command");
+        }
     }
 
     #[test]
@@ -420,26 +458,30 @@ mod tests {
             false,
             &new_session_tokens(&plan),
         );
+        // remain-on-exit lands as `';' set-option -t <name> remain-on-exit on`.
         // The separator is a shell-quoted `;` (`';'`) so the remote login shell
         // hands it to tmux as a literal separator token instead of eating it as
         // a shell statement separator.
-        let sep = argv
+        let r = argv
             .iter()
-            .position(|a| a == "';'")
-            .expect("shell-quoted tmux separator present");
-        // The set-option remain-on-exit on the same session immediately follows.
-        assert_eq!(argv[sep + 1], "set-option");
-        assert_eq!(argv[sep + 2], "-t");
-        assert_eq!(argv[sep + 3], "remora_api_fix-login");
-        assert_eq!(argv[sep + 4], "remain-on-exit");
-        assert_eq!(argv[sep + 5], "on");
-        // The separator comes AFTER the agent command (the new-session payload),
-        // so remain-on-exit is the trailer, not part of the launch.
+            .position(|a| a == "remain-on-exit")
+            .expect("remain-on-exit present");
+        assert_eq!(
+            argv[r - 4],
+            "';'",
+            "shell-quoted tmux separator precedes it"
+        );
+        assert_eq!(argv[r - 3], "set-option");
+        assert_eq!(argv[r - 2], "-t");
+        assert_eq!(argv[r - 1], "remora_api_fix-login");
+        assert_eq!(argv[r + 1], "on");
+        // remain-on-exit follows the agent command (the new-session payload),
+        // so it is a trailer, not part of the launch.
         let new_session = argv
             .iter()
             .position(|a| a == "new-session")
             .expect("new-session");
-        assert!(sep > new_session, "separator follows new-session");
+        assert!(r > new_session, "remain-on-exit follows new-session");
     }
 
     #[test]
@@ -513,8 +555,8 @@ mod tests {
             .position(|a| a == "new-session")
             .expect("new-session");
         // Still exactly one agent-command arg after `-c <dir>` (wrapped, not
-        // per-token), followed only by the 6-token remain-on-exit trailer.
-        assert_eq!(argv.len(), n + 7 + 6);
+        // per-token), followed by the mouse and remain-on-exit 6-token trailers.
+        assert_eq!(argv.len(), n + 7 + 6 + 6);
         // The inner string the ssh login shell yields (tmux's `sh -c` re-parses
         // it) is the wrapped compound built from the joined agent fragment.
         let fragment = join_agent_command(&plan.agent_argv);
