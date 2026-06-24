@@ -141,7 +141,10 @@ export function buildTree(
     const project = projectNodes.get(s.projectId);
     if (project) {
       project.sessions.push(
-        sessionNode(s, projectWorkspace.get(s.projectId) ?? null),
+        sessionNode(
+          s,
+          s.workspace ?? projectWorkspace.get(s.projectId) ?? null,
+        ),
       );
       continue;
     }
@@ -156,7 +159,7 @@ export function buildTree(
       unconfiguredProjects.set(s.projectId, synthetic);
       unconfigured.projects.push(synthetic);
     }
-    synthetic.sessions.push(sessionNode(s, null));
+    synthetic.sessions.push(sessionNode(s, s.workspace ?? null));
   }
 
   // 4. Attach configured projects to their hosts (config order preserved). A
