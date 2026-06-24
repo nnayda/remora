@@ -281,6 +281,7 @@ mod tests {
             project_path: "/home/dev/api".into(),
             dir: "~/.remora/worktrees/api/fix-login".into(),
             branch: Some("remora/fix-login".into()),
+            base: None,
             env: vec![
                 ("REMORA_AGENT".into(), "claude".into()),
                 (

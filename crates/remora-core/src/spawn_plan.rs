@@ -23,6 +23,8 @@ pub enum PlanError {
     UnknownAgent(AgentId),
     #[error("project `{0}` is not a worktree project; cannot respawn")]
     NotWorktreeProject(ProjectId),
+    #[error("invalid base ref: {0}")]
+    InvalidBase(&'static str),
 }
 
 /// A resolved spawn, transport-agnostic. All paths are *logical* (raw `/…`
@@ -40,6 +42,9 @@ pub struct SpawnPlan {
     pub dir: String,
     /// `remora/<session>` in worktree mode; `None` in shared mode.
     pub branch: Option<String>,
+    /// Resolved git start-point override (per-session, else per-project),
+    /// normalized; `None` in shared mode or when both are empty (#54).
+    pub base: Option<String>,
     /// `REMORA_*` session metadata, logical values.
     pub env: Vec<(String, String)>,
     /// Resolved agent launch command.
@@ -63,12 +68,20 @@ pub fn plan_spawn(config: &Config, spec: &SpawnSpec) -> Result<SpawnPlan, PlanEr
         .ok_or_else(|| PlanError::UnknownAgent(agent_id.clone()))?;
 
     let tmux_name = tmux_session_name(&spec.project_id, &spec.session_id);
-    let (dir, branch) = match project.workspace {
-        WorkspaceMode::Worktree => (
-            worktree_path(&spec.project_id, &spec.session_id),
-            Some(branch_name(&spec.session_id)),
-        ),
-        WorkspaceMode::Shared => (project.path.clone(), None),
+    let (dir, branch, base) = match project.workspace {
+        WorkspaceMode::Worktree => {
+            // Session override wins; empty falls through to the project default.
+            let base = match normalize_base(spec.base.clone())? {
+                Some(b) => Some(b),
+                None => normalize_base(project.base.clone())?,
+            };
+            (
+                worktree_path(&spec.project_id, &spec.session_id),
+                Some(branch_name(&spec.session_id)),
+                base,
+            )
+        }
+        WorkspaceMode::Shared => (project.path.clone(), None, None),
     };
 
     let env = vec![
@@ -85,9 +98,31 @@ pub fn plan_spawn(config: &Config, spec: &SpawnSpec) -> Result<SpawnPlan, PlanEr
         project_path: project.path.clone(),
         dir,
         branch,
+        base,
         env,
         agent_argv: agent.command.clone(),
     })
+}
+
+/// Normalizes a base override: trims, maps empty/whitespace to `None` (the
+/// cascade fall-through), and rejects a non-empty value that contains control
+/// characters or starts with `-` (a leading dash is read by `git worktree add`
+/// as a flag — quoting does not stop git's own arg parsing). #54.
+pub(crate) fn normalize_base(raw: Option<String>) -> Result<Option<String>, PlanError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(PlanError::InvalidBase("must not contain control characters"));
+    }
+    if trimmed.starts_with('-') {
+        return Err(PlanError::InvalidBase("must not start with `-`"));
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 /// Wall-clock unix seconds, client-stamped (display-only / untrusted per
@@ -206,5 +241,51 @@ mod tests {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         assert_eq!(env[ENV_AGENT], "shell");
+    }
+
+    #[test]
+    fn normalize_base_trims_and_empties_to_none() {
+        assert_eq!(normalize_base(None).expect("ok"), None);
+        assert_eq!(normalize_base(Some("   ".into())).expect("ok"), None);
+        assert_eq!(
+            normalize_base(Some("  origin/main ".into())).expect("ok"),
+            Some("origin/main".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_base_rejects_leading_dash_after_trim() {
+        assert!(matches!(
+            normalize_base(Some(" -x".into())),
+            Err(PlanError::InvalidBase(_))
+        ));
+    }
+
+    #[test]
+    fn normalize_base_rejects_control_chars() {
+        assert!(matches!(
+            normalize_base(Some("ma\nin".into())),
+            Err(PlanError::InvalidBase(_))
+        ));
+    }
+
+    #[test]
+    fn session_base_wins_then_falls_through_to_project() {
+        let cfg = config(); // existing helper; api project, worktree mode
+        let mut spec = spec("api", "s1", None);
+        spec.base = Some("origin/dev".into());
+        assert_eq!(
+            plan_spawn(&cfg, &spec).expect("plan").base.as_deref(),
+            Some("origin/dev")
+        );
+        // empty session base falls through (project has no base here) -> None
+        spec.base = Some("  ".into());
+        assert_eq!(plan_spawn(&cfg, &spec).expect("plan").base, None);
+    }
+
+    #[test]
+    fn shared_project_has_no_base() {
+        let plan = plan_spawn(&config(), &spec("scratch", "s1", None)).expect("plan");
+        assert_eq!(plan.base, None);
     }
 }
