@@ -65,8 +65,8 @@ only the first.
 
 **Resolution stays behind the `SessionSource` / `remote.rs` seam.**
 
-`resolve_local_command` lives in the Tauri shell's `remote.rs` and is called
-from `KubectlSource` before building the kubectl argv. The UI receives only the
+`resolve_local_command` lives in remora-core's `transport/remote.rs` and is
+called from `KubectlSource` before building the kubectl argv. The UI receives only the
 redacted display DTO; core and protocol have no knowledge of selectors or
 resolution. This preserves the ADR-0004 / AGENTS.md rule: UI code never talks to
 kubectl directly, and core/protocol treat the transport as opaque.
