@@ -117,7 +117,8 @@ fn project_dto(id: &str, project: Project) -> ProjectDto {
 mod tests {
     use super::*;
     use remora_core::config::{
-        Agent, Config, Host, HostId, KubectlHost, Project, SshHost, Transport, WorkspaceMode,
+        Agent, Config, Host, HostId, KubectlField, KubectlHost, Project, SshHost, Transport,
+        WorkspaceMode,
     };
     use remora_protocol::{AgentId, ProjectId};
 
@@ -136,10 +137,10 @@ mod tests {
         Host {
             name: None,
             transport: Transport::Kubectl(KubectlHost {
-                pod: "secret-pod".into(),
-                namespace: Some("secret-namespace".into()),
-                context: Some("secret-context".into()),
-                container: Some("secret-container".into()),
+                pod: KubectlField::Command("get-secret-command".into()),
+                namespace: Some(KubectlField::Literal("secret-namespace".into())),
+                context: Some(KubectlField::Literal("secret-context".into())),
+                container: Some(KubectlField::Literal("secret-container".into())),
             }),
         }
     }
@@ -253,7 +254,7 @@ mod tests {
             "secret-hostname",
             "rootuser",
             "2222",
-            "secret-pod",
+            "get-secret-command",
             "secret-namespace",
             "secret-context",
             "secret-container",
