@@ -285,6 +285,43 @@ describe("kubectl command-form fields", () => {
     };
     expect(validateHostForm(form, "create")).toBe("Pod is required.");
   });
+
+  it("an optional field toggled to command but left empty collapses to null", () => {
+    const form = {
+      ...emptyHostForm(),
+      id: "k",
+      kind: "kubectl" as const,
+      pod: "sandbox-0",
+      namespace: "",
+      namespaceIsCommand: true, // toggled on, value empty
+    };
+    const input = toHostInput(form);
+    // narrow to the kubectl transport shape
+    const t = input.transport as Extract<
+      typeof input.transport,
+      { kind: "kubectl" }
+    >;
+    expect(t.namespace).toBeNull();
+  });
+
+  it("hostFormFromDto maps the per-field IsCommand flags", () => {
+    const form = hostFormFromDto({
+      id: "kube",
+      name: null,
+      transport: {
+        kind: "kubectl",
+        pod: { command: true, value: "kubectl get pods -o name | head -n1" },
+        namespace: { command: false, value: "ns" },
+        context: null,
+        container: null,
+      },
+    });
+    expect(form.podIsCommand).toBe(true);
+    expect(form.pod).toBe("kubectl get pods -o name | head -n1");
+    expect(form.namespaceIsCommand).toBe(false);
+    expect(form.namespace).toBe("ns");
+    expect(form.contextIsCommand).toBe(false); // defaulted by emptyHostForm
+  });
 });
 
 describe("agent form", () => {
