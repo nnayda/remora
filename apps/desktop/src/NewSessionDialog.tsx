@@ -79,15 +79,22 @@ export function NewSessionDialog({
       setProjectId(sel.projectId);
       setAgent(sel.agent);
       setWorkspace(sel.workspace);
+      // Clear a typed base so a ref entered for the gone project isn't
+      // silently submitted against its replacement (empty → that project's
+      // configured/detected default).
+      setBase("");
     }
   }, [model, projectId]);
 
-  /** Switch the selected project and reset the agent and workspace to that project's defaults. */
+  /** Switch the selected project and reset the agent, workspace, and base to
+   * that project's defaults (an empty base falls through to the project's
+   * configured/detected default rather than carrying a stale ref across). */
   function selectProject(id: string) {
     const sel = resolveSelection(model, id);
     setProjectId(sel.projectId);
     setAgent(sel.agent);
     setWorkspace(sel.workspace);
+    setBase("");
   }
 
   /** Validate, open the session, and reflect the outcome (success closes the
