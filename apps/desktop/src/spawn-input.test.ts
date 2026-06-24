@@ -35,4 +35,13 @@ describe("normalizeSlugInput", () => {
     expect(normalizeSlugInput("Has Space")).toBe("has space");
     expect(normalizeSlugInput("Under_Score")).toBe("under_score");
   });
+
+  // The design leans on isValidSlug staying the authority: case-folding that
+  // expands to non-ASCII (e.g. "İ" → "i" + combining dot) must not slip a
+  // non-canonical id past the gate. Verify the normalized output is still
+  // rejected, so nothing out-of-grammar reaches the Rust bridge.
+  it("normalized non-canonical input is still rejected by isValidSlug", () => {
+    expect(isValidSlug(normalizeSlugInput("İstanbul"))).toBe(false);
+    expect(isValidSlug(normalizeSlugInput("My App"))).toBe(false);
+  });
 });
