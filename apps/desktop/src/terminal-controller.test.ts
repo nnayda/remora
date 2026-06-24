@@ -13,6 +13,7 @@ const xt = vi.hoisted(() => {
     cols = 80;
     written: Array<string | Uint8Array> = [];
     dataCb: ((d: string) => void) | null = null;
+    keyCb: ((e: KeyboardEvent) => boolean) | null = null;
     dataDispose = vi.fn();
     open = vi.fn();
     dispose = vi.fn();
@@ -27,6 +28,9 @@ const xt = vi.hoisted(() => {
     onData(cb: (d: string) => void) {
       this.dataCb = cb;
       return { dispose: this.dataDispose };
+    }
+    attachCustomKeyEventHandler(cb: (e: KeyboardEvent) => boolean) {
+      this.keyCb = cb;
     }
   }
   class FakeFit {
@@ -99,6 +103,28 @@ function fakeConn() {
 
 const el = {} as HTMLElement;
 
+// Minimal KeyboardEvent double: just the fields the key handler inspects.
+// `type` defaults to "keydown" since that's the event the handler acts on.
+function key(
+  k: string,
+  opts: {
+    shiftKey?: boolean;
+    ctrlKey?: boolean;
+    altKey?: boolean;
+    metaKey?: boolean;
+    type?: string;
+  },
+): KeyboardEvent {
+  return {
+    key: k,
+    type: opts.type ?? "keydown",
+    shiftKey: opts.shiftKey ?? false,
+    ctrlKey: opts.ctrlKey ?? false,
+    altKey: opts.altKey ?? false,
+    metaKey: opts.metaKey ?? false,
+  } as KeyboardEvent;
+}
+
 function term(): NonNullable<typeof xt.state.term> {
   const t = xt.state.term;
   if (!t) throw new Error("terminal not constructed");
@@ -118,6 +144,55 @@ describe("TerminalController", () => {
     new TerminalController(el, conn as unknown as SessionConnection);
     xt.state.term?.dataCb?.("hi");
     expect(conn.write).toHaveBeenCalledWith(new TextEncoder().encode("hi"));
+  });
+
+  it("forwards Shift+Enter as ESC+CR (soft return) and suppresses the default CR", () => {
+    const conn = fakeConn();
+    new TerminalController(el, conn as unknown as SessionConnection);
+    const handled = term().keyCb?.(key("Enter", { shiftKey: true }));
+    expect(conn.write).toHaveBeenCalledWith(new TextEncoder().encode("\x1b\r"));
+    expect(handled).toBe(false); // false = xterm must not also emit a plain CR
+  });
+
+  it("leaves a plain Enter to xterm's default handling", () => {
+    const conn = fakeConn();
+    new TerminalController(el, conn as unknown as SessionConnection);
+    const handled = term().keyCb?.(key("Enter", {}));
+    expect(handled).toBe(true);
+    expect(conn.write).not.toHaveBeenCalled();
+  });
+
+  it("does not treat Ctrl/Alt/Meta+Enter as a soft return", () => {
+    const conn = fakeConn();
+    new TerminalController(el, conn as unknown as SessionConnection);
+    for (const mods of [
+      { ctrlKey: true },
+      { altKey: true },
+      { metaKey: true },
+    ]) {
+      expect(term().keyCb?.(key("Enter", { shiftKey: true, ...mods }))).toBe(
+        true,
+      );
+    }
+    expect(conn.write).not.toHaveBeenCalled();
+  });
+
+  it("ignores non-keydown Shift+Enter events (keyup/keypress)", () => {
+    const conn = fakeConn();
+    new TerminalController(el, conn as unknown as SessionConnection);
+    expect(
+      term().keyCb?.(key("Enter", { shiftKey: true, type: "keyup" })),
+    ).toBe(true);
+    expect(conn.write).not.toHaveBeenCalled();
+  });
+
+  it("suppresses Shift+Enter after close without writing to a dead session", () => {
+    const conn = fakeConn();
+    new TerminalController(el, conn as unknown as SessionConnection);
+    conn.emit({ event: "closed" });
+    conn.write.mockClear();
+    expect(term().keyCb?.(key("Enter", { shiftKey: true }))).toBe(false);
+    expect(conn.write).not.toHaveBeenCalled();
   });
 
   it("sends an initial resize once on construction", () => {
