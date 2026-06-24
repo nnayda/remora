@@ -47,11 +47,16 @@ any cached state; a renamed pod is picked up automatically with no config edit.
 **Single-active-pod assumption.**
 
 A `{ command }` selector is expected to resolve to exactly one pod name. The
-current implementation takes the first line of output (`head -n 1`) when multiple
-lines are returned, masking ambiguity rather than surfacing it. Multi-replica and
-HPA scenarios — where a selector might legitimately match N pods — are
-unsupported; which pod is targeted is the user's responsibility. Active ambiguity
-detection (rejecting multi-line output) is a tracked TODO.
+resolver fails *closed* on ambiguity: raw multi-line stdout is rejected by the
+re-validation guard (`literal_field_problem` treats the embedded newline as a
+control character), so a selector that matches N pods errors out unless the user
+explicitly collapses it to one line (e.g. piping through `head -n1`). Ambiguity
+is therefore only masked when the user opts into `head -n1` themselves; the
+implementation never silently picks a pod from multi-line output. Multi-replica
+and HPA scenarios — where a selector might legitimately match N pods — are
+unsupported; which pod a `head -n1` lands on is the user's responsibility.
+Surfacing a clearer "matched N pods, expected 1" error (instead of the generic
+control-character rejection) is a tracked TODO.
 
 **Pod-replacement recovery requires resolution + respawn + a persistent worktree.**
 
@@ -66,10 +71,13 @@ only the first.
 **Resolution stays behind the `SessionSource` / `remote.rs` seam.**
 
 `resolve_local_command` lives in remora-core's `transport/remote.rs` and is
-called from `KubectlSource` before building the kubectl argv. The UI receives only the
-redacted display DTO; core and protocol have no knowledge of selectors or
-resolution. This preserves the ADR-0004 / AGENTS.md rule: UI code never talks to
-kubectl directly, and core/protocol treat the transport as opaque.
+called from `KubectlSource` before building the kubectl argv — so resolution is a
+transport-internal concern. The UI and the protocol crate have no knowledge of
+selectors or resolution: the UI receives only the redacted display DTO, and
+`SessionSource` consumers see an opaque transport. (remora-core's transport layer
+necessarily *does* know — that is where `resolve_local_command` runs.) This
+preserves the ADR-0004 / AGENTS.md rule: UI code never talks to kubectl directly,
+and the agent/session abstraction stays selector-unaware.
 
 **Trust boundary.**
 

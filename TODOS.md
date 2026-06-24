@@ -368,25 +368,23 @@ up cold.
   cost biting. See `docs/adr/0008-dynamic-kubectl-field-resolution.md`.
 - **Depends on:** the resolution seam (issue #52 PR).
 
-## Document the command-field trust model (local code execution on poll)
+## Enforce the command-field trust boundary for synced/relayed config
 
-- **What:** Write up, in ADR-0008 (or ARCHITECTURE.md), that a command-form
-  kubectl field executes a local shell command with the user's privileges, and
-  that the discovery poll re-runs it every ~4s — so merely opening the app runs
-  that code repeatedly. State the safety basis (config is local + self-authored,
-  ADR-0004) and that syncing/relaying a config containing command fields is
-  explicitly out of trust scope until revisited.
-- **Why:** The outside voice flagged that command fields turn nominally
-  read-only `list()` polling into repeated local code execution. Today that's
-  safe because you author your own local config, but Remora's vision includes
-  relay/multi-device where config could one day sync — at which point an
-  attacker-authored command field would be RCE-on-open.
-- **Pros:** Makes the trust assumption explicit before config-sync lands.
-  **Cons:** docs-only; no enforcement.
-- **Context:** Issue #52 eng review, outside-voice cross-model tension T2.
-  Chosen as a tracked follow-up rather than ADR-at-build-time.
-- **Depends on:** revisit when/if config sync or relay config distribution is
-  designed.
+- **What:** Reject or strip `{ command }` kubectl fields from any config that did
+  not originate as the local user's self-authored file — i.e. when config sync or
+  a relay-distributed config lands. The trust model itself is now *documented*
+  (ADR-0008 "Trust boundary" section); this is the remaining *enforcement* work.
+- **Why:** A command field executes local code with the user's privileges on
+  every ~4s discovery poll. Today that's safe because the config is local and
+  self-authored (ADR-0004). The moment Remora's relay/multi-device vision lets a
+  config cross a device boundary, an attacker-authored command field becomes
+  RCE-on-open — so the synced path must drop/reject command fields.
+- **Pros:** Closes the RCE-on-sync hole before config distribution ships.
+  **Cons:** needs a provenance signal (which configs are "untrusted") and a
+  strip/reject path with clear user feedback.
+- **Context:** Issue #52 eng review, outside-voice cross-model tension T2. The
+  documentation half landed with ADR-0008; only enforcement is deferred.
+- **Depends on:** config sync / relay config distribution being designed.
 
 ## Re-resolve-on-vanish retry for command-form pods (TOCTOU)
 
