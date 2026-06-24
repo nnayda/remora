@@ -237,6 +237,7 @@ describe("TerminalController", () => {
     expect(disconnectSpy).toHaveBeenCalled();
     expect(conn.unsubscribe).toHaveBeenCalled();
     expect(xt.state.term?.dataDispose).toHaveBeenCalled();
+    expect(xt.state.term?.oscDispose).toHaveBeenCalled();
     expect(xt.state.term?.dispose).toHaveBeenCalled();
   });
 
