@@ -147,6 +147,14 @@ export function ProjectForm({
           ))}
         </select>
       </label>
+      <label>
+        Base (optional)
+        <input
+          value={form.base}
+          placeholder="origin/main (auto-detected if empty)"
+          onChange={(e) => set("base", e.target.value)}
+        />
+      </label>
       {error && (
         <p className="dialog-error" role="alert">
           {error}

@@ -144,6 +144,7 @@ export interface ProjectFormState {
   path: string;
   workspace: WorkspaceModeDto;
   agent: string;
+  base: string;
 }
 
 /** A blank project form, preselecting the first existing host and agent so the
@@ -159,6 +160,7 @@ export function emptyProjectForm(
     path: "",
     workspace: "worktree",
     agent: agentIds[0] ?? "",
+    base: "",
   };
 }
 
@@ -170,6 +172,7 @@ export function projectFormFromDto(dto: EditorProjectDto): ProjectFormState {
     path: dto.path,
     workspace: dto.workspace,
     agent: dto.agent,
+    base: dto.base ?? "",
   };
 }
 
@@ -196,6 +199,7 @@ export function toProjectInput(form: ProjectFormState): ProjectInputDto {
     path: form.path.trim(),
     workspace: form.workspace,
     agent: form.agent,
+    base: blankToNull(form.base),
   };
 }
 
