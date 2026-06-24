@@ -30,6 +30,7 @@ async fn session_spawn(
     project_id: String,
     session_id: String,
     agent: Option<String>,
+    base: Option<String>,
     on_output: Channel<BridgeOutput>,
 ) -> Result<ChannelHandle, BridgeError> {
     bridge
@@ -37,6 +38,7 @@ async fn session_spawn(
             project_id,
             session_id,
             agent,
+            base,
             Arc::new(ChannelSink(on_output)),
         )
         .await
