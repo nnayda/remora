@@ -513,12 +513,12 @@ mod tests {
     async fn spawn_through_fake_exec_probes_then_attaches() {
         // probe ok, fetch ok, symbolic-ref ok, verify ok, worktree add ok, new-session ok, 3x set-env ok -> attach.
         let fake = Arc::new(FakeExec::new(vec![
-            Ok(FakeExec::ok()),                // probe (binary check)
-            Ok(FakeExec::ok()),                // fetch
+            Ok(FakeExec::ok()),                 // probe (binary check)
+            Ok(FakeExec::ok()),                 // fetch
             Ok(FakeExec::out("origin/main\n")), // symbolic-ref
-            Ok(FakeExec::ok()),                // verify
-            Ok(FakeExec::ok()),                // worktree add
-            Ok(FakeExec::ok()),                // new-session
+            Ok(FakeExec::ok()),                 // verify
+            Ok(FakeExec::ok()),                 // worktree add
+            Ok(FakeExec::ok()),                 // new-session
         ]));
         let kh = KubectlHost {
             pod: "sandbox-0".into(),
@@ -542,8 +542,14 @@ mod tests {
             "first call must be the probe loop token"
         );
         // #54: the probe loop stays first; fetch is issued before worktree add.
-        let fetch_i = calls.iter().position(|a| a.iter().any(|t| t == "fetch")).expect("fetch");
-        let add_i = calls.iter().position(|a| a.iter().any(|t| t == "worktree")).expect("add");
+        let fetch_i = calls
+            .iter()
+            .position(|a| a.iter().any(|t| t == "fetch"))
+            .expect("fetch");
+        let add_i = calls
+            .iter()
+            .position(|a| a.iter().any(|t| t == "worktree"))
+            .expect("add");
         assert!(calls[0][0].contains("for b in") && fetch_i < add_i);
     }
 

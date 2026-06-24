@@ -804,7 +804,9 @@ mod tests {
             .expect("spawn");
         let (s2, _r2) = sink();
         assert!(matches!(
-            bridge(src).spawn("api".into(), "x".into(), None, None, s2).await,
+            bridge(src)
+                .spawn("api".into(), "x".into(), None, None, s2)
+                .await,
             Err(BridgeError::SessionExists { .. })
         ));
     }
@@ -1010,7 +1012,10 @@ mod tests {
     #[async_trait]
     impl SessionSource for SpecRecordingSource {
         async fn spawn(&self, spec: SpawnSpec) -> Result<SessionChannel, SourceError> {
-            *self.last_spec.lock().unwrap_or_else(PoisonError::into_inner) = Some(spec.clone());
+            *self
+                .last_spec
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(spec.clone());
             self.inner.spawn(spec).await
         }
         async fn attach(
@@ -1045,13 +1050,7 @@ mod tests {
         let b = bridge(Arc::new(src));
         let (s, _rx) = sink();
         let _ = b
-            .spawn(
-                "api".into(),
-                "x".into(),
-                None,
-                Some("origin/dev".into()),
-                s,
-            )
+            .spawn("api".into(), "x".into(), None, Some("origin/dev".into()), s)
             .await;
         assert_eq!(
             recorded

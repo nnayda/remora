@@ -865,10 +865,8 @@ mod tests {
 
     #[test]
     fn project_item_writes_and_omits_base() {
-        let mut doc = ConfigDocument::parse(
-            "[hosts.h]\ntransport = \"ssh\"\nhost = \"h\"\n",
-        )
-        .expect("doc");
+        let mut doc =
+            ConfigDocument::parse("[hosts.h]\ntransport = \"ssh\"\nhost = \"h\"\n").expect("doc");
         doc.insert_agent(&aid("claude"), &claude_agent())
             .expect("agent");
         let proj = Project {
@@ -885,6 +883,9 @@ mod tests {
 
         let cleared = Project { base: None, ..proj };
         doc.update_project(&pid("api"), &cleared).expect("update");
-        assert!(!doc.to_toml().contains("base ="), "cleared base must be omitted");
+        assert!(
+            !doc.to_toml().contains("base ="),
+            "cleared base must be omitted"
+        );
     }
 }

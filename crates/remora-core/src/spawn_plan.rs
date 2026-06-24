@@ -117,7 +117,9 @@ pub(crate) fn normalize_base(raw: Option<String>) -> Result<Option<String>, Plan
         return Ok(None);
     }
     if trimmed.chars().any(char::is_control) {
-        return Err(PlanError::InvalidBase("must not contain control characters"));
+        return Err(PlanError::InvalidBase(
+            "must not contain control characters",
+        ));
     }
     if trimmed.starts_with('-') {
         return Err(PlanError::InvalidBase("must not start with `-`"));

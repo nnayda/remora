@@ -584,7 +584,11 @@ pub(crate) fn resolve_base(
     if head.success {
         let candidate = head.stdout.trim();
         if !candidate.is_empty()
-            && ref_resolves(exec, &plan.project_path, &format!("refs/remotes/{candidate}"))?
+            && ref_resolves(
+                exec,
+                &plan.project_path,
+                &format!("refs/remotes/{candidate}"),
+            )?
         {
             return Ok(Some(candidate.to_string()));
         }
@@ -608,7 +612,9 @@ fn ref_resolves(
     project_path: &str,
     git_ref: &str,
 ) -> Result<bool, SourceError> {
-    Ok(exec.run(&verify_commit_tokens(project_path, git_ref))?.success)
+    Ok(exec
+        .run(&verify_commit_tokens(project_path, git_ref))?
+        .success)
 }
 
 /// Orchestrates the full spawn sequence: optional worktree creation, tmux
@@ -1475,10 +1481,10 @@ pub(crate) mod tests {
     fn existing_worktree_aborts_before_create() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                                        // fetch
-            Ok(FakeExec::out("origin/main\n")),                        // symbolic-ref
-            Ok(FakeExec::ok()),                                        // verify
-            Ok(FakeExec::fail("fatal: '<path>' already exists")),      // worktree add FAILS
+            Ok(FakeExec::ok()),                                   // fetch
+            Ok(FakeExec::out("origin/main\n")),                   // symbolic-ref
+            Ok(FakeExec::ok()),                                   // verify
+            Ok(FakeExec::fail("fatal: '<path>' already exists")), // worktree add FAILS
         ]);
         let err = run_spawn(&fake, &plan).expect_err("worktree already exists");
         assert!(matches!(err, SourceError::SessionExists { .. }), "{err}");
@@ -1565,10 +1571,10 @@ pub(crate) mod tests {
     fn metadata_failure_is_tolerated_and_still_attaches() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                 // fetch
-            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
-            Ok(FakeExec::ok()),                 // verify
-            Ok(FakeExec::ok()),                 // worktree add
+            Ok(FakeExec::ok()),                        // fetch
+            Ok(FakeExec::out("origin/main\n")),        // symbolic-ref
+            Ok(FakeExec::ok()),                        // verify
+            Ok(FakeExec::ok()),                        // worktree add
             Ok(FakeExec::ok()), // new-session (live! remain-on-exit folded in)
             Ok(FakeExec::fail("set-env boom")), // REMORA_AGENT — tolerated
             Err(SourceError::Transport("net".into())), // REMORA_WORKSPACE — tolerated
@@ -1586,9 +1592,9 @@ pub(crate) mod tests {
     fn new_session_generic_failure_is_transport_and_opens_no_channel() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                 // fetch
-            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
-            Ok(FakeExec::ok()),                 // verify
+            Ok(FakeExec::ok()),                      // fetch
+            Ok(FakeExec::out("origin/main\n")),      // symbolic-ref
+            Ok(FakeExec::ok()),                      // verify
             Ok(FakeExec::ok()),                      // worktree add
             Ok(FakeExec::fail("no server running")), // new-session: generic failure
             Ok(FakeExec::fail("no server running")), // has-session: confirms no session
@@ -1612,9 +1618,9 @@ pub(crate) mod tests {
         // be force-removed. A has-session probe gates the orphan cleanup.
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                 // fetch
-            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
-            Ok(FakeExec::ok()),                 // verify
+            Ok(FakeExec::ok()),                                               // fetch
+            Ok(FakeExec::out("origin/main\n")),                               // symbolic-ref
+            Ok(FakeExec::ok()),                                               // verify
             Ok(FakeExec::ok()),                                               // worktree add
             Ok(FakeExec::fail("set-option: unknown option: remain-on-exit")), // created, set-option failed
             Ok(FakeExec::ok()), // has-session: the session IS live
@@ -1637,9 +1643,9 @@ pub(crate) mod tests {
         // ambiguous leaves the worktree.
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                 // fetch
-            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
-            Ok(FakeExec::ok()),                 // verify
+            Ok(FakeExec::ok()),                                               // fetch
+            Ok(FakeExec::out("origin/main\n")),                               // symbolic-ref
+            Ok(FakeExec::ok()),                                               // verify
             Ok(FakeExec::ok()),                                               // worktree add
             Ok(FakeExec::fail("set-option: unknown option: remain-on-exit")), // created, set-option failed
             Ok(FakeExec::fail(
@@ -1663,7 +1669,7 @@ pub(crate) mod tests {
             Ok(FakeExec::ok()),                 // fetch
             Ok(FakeExec::out("origin/main\n")), // symbolic-ref
             Ok(FakeExec::ok()),                 // verify
-            Ok(FakeExec::ok()), // worktree add
+            Ok(FakeExec::ok()),                 // worktree add
             Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
         ]);
         let err = run_spawn(&fake, &plan).expect_err("dup");
@@ -1736,7 +1742,10 @@ pub(crate) mod tests {
 
     #[test]
     fn resolve_base_uses_explicit_plan_base_without_detection() {
-        let plan = SpawnPlan { base: Some("origin/dev".into()), ..worktree_plan() };
+        let plan = SpawnPlan {
+            base: Some("origin/dev".into()),
+            ..worktree_plan()
+        };
         let fake = FakeExec::new(vec![Ok(FakeExec::ok())]); // only the fetch
         let got = resolve_base(&fake, &plan).expect("ok");
         assert_eq!(got.as_deref(), Some("origin/dev"));
@@ -1749,11 +1758,14 @@ pub(crate) mod tests {
     fn resolve_base_detects_origin_head_when_verified() {
         let plan = worktree_plan(); // base: None
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),            // fetch
+            Ok(FakeExec::ok()),                 // fetch
             Ok(FakeExec::out("origin/main\n")), // symbolic-ref
-            Ok(FakeExec::ok()),            // verify refs/remotes/origin/main^{commit}
+            Ok(FakeExec::ok()),                 // verify refs/remotes/origin/main^{commit}
         ]);
-        assert_eq!(resolve_base(&fake, &plan).expect("ok").as_deref(), Some("origin/main"));
+        assert_eq!(
+            resolve_base(&fake, &plan).expect("ok").as_deref(),
+            Some("origin/main")
+        );
     }
 
     #[test]
@@ -1765,7 +1777,10 @@ pub(crate) mod tests {
             Ok(FakeExec::fail("")),             // verify origin/gone -> dangling
             Ok(FakeExec::ok()),                 // verify refs/remotes/origin/main -> ok
         ]);
-        assert_eq!(resolve_base(&fake, &plan).expect("ok").as_deref(), Some("origin/main"));
+        assert_eq!(
+            resolve_base(&fake, &plan).expect("ok").as_deref(),
+            Some("origin/main")
+        );
     }
 
     #[test]
@@ -1784,10 +1799,13 @@ pub(crate) mod tests {
     fn resolve_base_propagates_detection_transport_error() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                                  // fetch
-            Err(SourceError::Transport("ssh down".into())),      // symbolic-ref Err
+            Ok(FakeExec::ok()),                             // fetch
+            Err(SourceError::Transport("ssh down".into())), // symbolic-ref Err
         ]);
-        assert!(matches!(resolve_base(&fake, &plan), Err(SourceError::Transport(_))));
+        assert!(matches!(
+            resolve_base(&fake, &plan),
+            Err(SourceError::Transport(_))
+        ));
     }
 
     #[test]
@@ -1798,7 +1816,10 @@ pub(crate) mod tests {
             Ok(FakeExec::out("origin/main\n")),            // symbolic-ref
             Ok(FakeExec::ok()),                            // verify
         ]);
-        assert_eq!(resolve_base(&fake, &plan).expect("ok").as_deref(), Some("origin/main"));
+        assert_eq!(
+            resolve_base(&fake, &plan).expect("ok").as_deref(),
+            Some("origin/main")
+        );
     }
 
     #[test]
@@ -1807,9 +1828,12 @@ pub(crate) mod tests {
         let fake = FakeExec::new(vec![
             Ok(FakeExec::fail("error: could not fetch origin")), // fetch Ok(non-zero) -> swallowed
             Ok(FakeExec::out("origin/main\n")),                  // symbolic-ref
-            Ok(FakeExec::ok()),                                  // verify refs/remotes/origin/main^{commit}
+            Ok(FakeExec::ok()), // verify refs/remotes/origin/main^{commit}
         ]);
-        assert_eq!(resolve_base(&fake, &plan).expect("ok").as_deref(), Some("origin/main"));
+        assert_eq!(
+            resolve_base(&fake, &plan).expect("ok").as_deref(),
+            Some("origin/main")
+        );
     }
 
     #[test]
@@ -1821,16 +1845,25 @@ pub(crate) mod tests {
             Ok(FakeExec::fail("")), // verify refs/remotes/origin/main -> absent
             Ok(FakeExec::ok()),     // verify refs/remotes/origin/master -> resolves
         ]);
-        assert_eq!(resolve_base(&fake, &plan).expect("ok").as_deref(), Some("origin/master"));
+        assert_eq!(
+            resolve_base(&fake, &plan).expect("ok").as_deref(),
+            Some("origin/master")
+        );
     }
 
     #[test]
     fn worktree_add_appends_quoted_start_point_last() {
         let plan = worktree_plan();
         let with = worktree_add_tokens(&plan, Some("origin/main"));
-        assert_eq!(with.last().map(String::as_str), Some(shell_quote("origin/main").as_str()));
+        assert_eq!(
+            with.last().map(String::as_str),
+            Some(shell_quote("origin/main").as_str())
+        );
         let without = worktree_add_tokens(&plan, None);
-        assert_eq!(without.last().map(String::as_str), Some("\"$HOME\"/.remora/worktrees/api/fix-login"));
+        assert_eq!(
+            without.last().map(String::as_str),
+            Some("\"$HOME\"/.remora/worktrees/api/fix-login")
+        );
     }
 
     #[test]
@@ -1845,8 +1878,14 @@ pub(crate) mod tests {
         ]);
         let _ = run_spawn(&fake, &plan);
         let calls = fake.calls.lock().expect("lock");
-        let fetch_i = calls.iter().position(|a| a.iter().any(|t| t == "fetch")).expect("fetch");
-        let add_i = calls.iter().position(|a| a.iter().any(|t| t == "worktree")).expect("add");
+        let fetch_i = calls
+            .iter()
+            .position(|a| a.iter().any(|t| t == "fetch"))
+            .expect("fetch");
+        let add_i = calls
+            .iter()
+            .position(|a| a.iter().any(|t| t == "worktree"))
+            .expect("add");
         assert!(fetch_i < add_i, "fetch must precede worktree add");
     }
 
