@@ -666,6 +666,224 @@ pub(crate) fn run_list(
     Ok(discovery::join(live, worktrees, &scanned))
 }
 
+// ---------------------------------------------------------------------------
+// Local command resolution (opt-in crossing of ADR-0004 for `{ command }` fields)
+// ---------------------------------------------------------------------------
+
+use std::io::Read;
+use std::time::{Duration, Instant};
+
+/// Wall-clock and output bounds for a local resolution command. A hung
+/// selector (e.g. `kubectl get` against an unreachable API) must NOT block the
+/// discovery poll forever, and runaway output must not exhaust memory.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+const RESOLVE_MAX_OUTPUT: usize = 64 * 1024;
+
+/// Seam for running a user-authored command line LOCALLY. Behind a trait so the
+/// timeout / output-cap / exit-status paths are testable deterministically and
+/// transport tests can resolve through a real (or scripted) runner without the
+/// kubectl exec tail.
+pub(crate) trait LocalRunner: Send + Sync {
+    fn run_local(&self, command: &str) -> Result<RemoteOutput, SourceError>;
+}
+
+/// The real runner: `sh -c <command>` with a timeout and an output cap.
+pub(crate) struct ShellRunner {
+    timeout: Duration,
+    max_output: usize,
+}
+
+impl ShellRunner {
+    pub(crate) fn new() -> Self {
+        Self {
+            timeout: RESOLVE_TIMEOUT,
+            max_output: RESOLVE_MAX_OUTPUT,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits(timeout: Duration, max_output: usize) -> Self {
+        Self {
+            timeout,
+            max_output,
+        }
+    }
+}
+
+impl LocalRunner for ShellRunner {
+    fn run_local(&self, command: &str) -> Result<RemoteOutput, SourceError> {
+        run_shell_bounded(command, self.timeout, self.max_output)
+    }
+}
+
+/// Reads to EOF, retaining at most `cap` bytes but always draining the pipe so
+/// the child can't deadlock on a full buffer after we stop retaining. Returns
+/// (lossy string, whether the cap was exceeded).
+fn read_capped(reader: &mut impl Read, cap: usize) -> (String, bool) {
+    let mut kept: Vec<u8> = Vec::new();
+    let mut over = false;
+    let mut chunk = [0u8; 4096];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                // `over` means MORE than `cap` bytes were actually produced:
+                // exactly `cap` bytes total must never trip it (off-by-one).
+                if kept.len() + n > cap {
+                    over = true;
+                }
+                if kept.len() < cap {
+                    let take = (cap - kept.len()).min(n);
+                    kept.extend_from_slice(&chunk[..take]);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    (String::from_utf8_lossy(&kept).into_owned(), over)
+}
+
+/// SIGKILLs the `child`'s entire process group. On Unix the child is the leader
+/// of its own group (pgid == child pid), so this also kills pipeline members
+/// (`kubectl`, `head`) and backgrounded descendants that outlived `sh` while
+/// holding the stdout/stderr pipe open — closing the pipe write-ends so the
+/// reader threads hit EOF and their joins return instead of blocking forever.
+/// `ESRCH` (group already empty) is the expected no-op, so the Result is
+/// ignored. Does NOT reap `sh` itself; the caller `wait`s for that.
+#[cfg(unix)]
+fn reap_group(child: &std::process::Child) {
+    let pgid = nix::unistd::Pid::from_raw(child.id() as i32);
+    let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+}
+
+/// Non-Unix fallback: no process groups, so kill only the child. (The whole
+/// function assumes `sh`, so Unix is the real target; this just keeps a
+/// non-unix `cargo check` compiling.)
+#[cfg(not(unix))]
+fn reap_group(child: &mut std::process::Child) {
+    let _ = child.kill();
+}
+
+/// Spawns `sh -c command` with bounded time and output. Reader threads prevent
+/// pipe-buffer deadlock; a poll loop enforces the timeout. On both timeout AND
+/// normal exit the child's whole process group is SIGKILLed (on Unix) before
+/// the reader threads are joined: pipeline members and backgrounded
+/// descendants can outlive `sh` and keep the stdout pipe open, which would
+/// otherwise block the reader-thread joins indefinitely (leaking threads/FDs/
+/// processes on every discovery poll). Reaping the group closes those
+/// write-ends so the joins always return.
+fn run_shell_bounded(
+    command: &str,
+    timeout: Duration,
+    max_output: usize,
+) -> Result<RemoteOutput, SourceError> {
+    use std::process::{Command, Stdio};
+
+    let mut builder = Command::new("sh");
+    builder
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Put the child in its own process group (pgid == child pid) so `reap_group`
+    // can SIGKILL the whole pipeline, not just `sh`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        builder.process_group(0);
+    }
+    let mut child = builder
+        .spawn()
+        .map_err(|e| SourceError::Transport(format!("resolve: spawn sh: {e}")))?;
+
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let out_handle = std::thread::spawn(move || read_capped(&mut stdout_pipe, max_output));
+    let err_handle = std::thread::spawn(move || read_capped(&mut stderr_pipe, max_output));
+
+    let deadline = Instant::now() + timeout;
+    let outcome = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(Some(status)),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    break Ok(None); // timed out
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => break Err(e),
+        }
+    };
+
+    // ALWAYS kill the group, then `wait` for `sh`, BEFORE joining the readers:
+    // on timeout this kills the hung pipeline; on normal exit it reaps any
+    // backgrounded descendant still holding the pipe (harmless if the group is
+    // already empty). Either way the pipe write-ends close → readers hit EOF →
+    // joins return promptly.
+    #[cfg(unix)]
+    reap_group(&child);
+    #[cfg(not(unix))]
+    reap_group(&mut child);
+    let _ = child.wait();
+
+    let (stdout, stdout_over) = out_handle.join().unwrap_or_else(|_| (String::new(), false));
+    let (stderr, _) = err_handle.join().unwrap_or_else(|_| (String::new(), false));
+
+    let status = match outcome {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            return Err(SourceError::Transport(format!(
+                "resolution command timed out after {}s",
+                timeout.as_secs()
+            )));
+        }
+        Err(e) => return Err(SourceError::Transport(format!("resolve: wait: {e}"))),
+    };
+
+    if stdout_over {
+        return Err(SourceError::Transport(format!(
+            "resolution command produced more than {max_output} bytes"
+        )));
+    }
+    Ok(RemoteOutput {
+        success: status.success(),
+        stdout,
+        stderr,
+    })
+}
+
+/// Resolves a user-authored command line LOCALLY and returns its trimmed
+/// stdout. The deliberate, opt-in crossing of ADR-0004's never-shell-evaluate
+/// line. Nonzero exit, empty output, or output that fails the literal-field
+/// guard (control chars, embedded newline, leading `-`, edge whitespace) is a
+/// hard error — never silently target "".
+pub(crate) fn resolve_local_command(
+    runner: &dyn LocalRunner,
+    field: &str,
+    command: &str,
+) -> Result<String, SourceError> {
+    let out = runner.run_local(command)?;
+    if !out.success {
+        return Err(SourceError::Transport(format!(
+            "kubectl `{field}` resolution command failed: {}",
+            out.stderr.trim()
+        )));
+    }
+    let value = out.stdout.trim();
+    if value.is_empty() {
+        return Err(SourceError::Transport(format!(
+            "kubectl `{field}` resolution command produced no output"
+        )));
+    }
+    if let Some(reason) = crate::config::literal_field_problem(value) {
+        return Err(SourceError::Transport(format!(
+            "kubectl `{field}` resolved value {reason}"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
 /// Whether a failed `tmux kill-session` stderr positively signals the session
 /// was already absent (server gone, or session not found) — tolerating this as
 /// success makes `stop` and `remove` idempotent.
@@ -1995,6 +2213,99 @@ pub(crate) mod tests {
         // substring "worktree", which also appears in the `test -d` probe argv.
         assert_eq!(fake.count_calls_with("remove"), 0);
         assert_eq!(fake.count_calls_with("-D"), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // LocalRunner / ShellRunner / resolve_local_command tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_local_command_trims_and_returns_stdout() {
+        let runner = ShellRunner::new();
+        let pod = resolve_local_command(&runner, "pod", "echo sandbox-7").expect("ok");
+        assert_eq!(pod, "sandbox-7");
+    }
+
+    #[test]
+    fn resolve_local_command_rejects_multiline_output() {
+        let runner = ShellRunner::new();
+        let err = resolve_local_command(&runner, "pod", "printf 'a\\nb\\n'")
+            .expect_err("embedded newline is a control char");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
+    }
+
+    #[test]
+    fn resolve_local_command_rejects_empty_output() {
+        let runner = ShellRunner::new();
+        let err = resolve_local_command(&runner, "pod", "true").expect_err("no output");
+        assert!(format!("{err}").contains("no output"), "{err}");
+    }
+
+    #[test]
+    fn resolve_local_command_nonzero_exit_is_transport_error() {
+        let runner = ShellRunner::new();
+        let err = resolve_local_command(&runner, "pod", "echo boom >&2; exit 1")
+            .expect_err("nonzero exit");
+        assert!(format!("{err}").contains("boom"), "{err}");
+    }
+
+    #[test]
+    fn resolve_local_command_rejects_leading_dash() {
+        let runner = ShellRunner::new();
+        let err = resolve_local_command(&runner, "pod", "echo -- -bad | tr -d ' '")
+            .expect_err("leading dash would be a flag");
+        // Simpler, deterministic form:
+        let err2 =
+            resolve_local_command(&runner, "pod", "printf -- '-bad'").expect_err("leading dash");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
+        assert!(matches!(err2, SourceError::Transport(_)), "{err2}");
+    }
+
+    #[test]
+    fn shell_runner_times_out_and_kills() {
+        // Tiny timeout so the test is fast; sleep would otherwise hang.
+        // 500ms (not 50ms) stays well clear of process-spawn jitter on a loaded
+        // CI runner while remaining 10x under `sleep 5`, so the kill-on-timeout
+        // path fires deterministically without flaking.
+        let runner = ShellRunner::with_limits(std::time::Duration::from_millis(500), 64 * 1024);
+        let err = resolve_local_command(&runner, "pod", "sleep 5").expect_err("must time out");
+        assert!(format!("{err}").contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn shell_runner_caps_output() {
+        // 200 KB of output against a 1 KB cap. `yes | head -c` terminates.
+        let runner = ShellRunner::with_limits(std::time::Duration::from_secs(5), 1024);
+        let err = resolve_local_command(&runner, "pod", "yes | head -c 200000")
+            .expect_err("must exceed the cap");
+        assert!(format!("{err}").contains("bytes"), "{err}");
+    }
+
+    #[test]
+    fn run_shell_bounded_does_not_hang_on_backgrounded_pipe_holder() {
+        // `sleep 30 &` inherits the stdout pipe and outlives sh. Without the
+        // process-group kill, the reader-thread join blocks ~30s (leak). With it,
+        // the group is reaped and the call returns promptly with the real output.
+        let runner = ShellRunner::with_limits(std::time::Duration::from_secs(5), 64 * 1024);
+        let out = resolve_local_command(&runner, "pod", "sleep 30 & printf sandbox-1")
+            .expect("returns promptly with output, not a 30s hang");
+        assert_eq!(out, "sandbox-1");
+    }
+
+    #[test]
+    fn read_capped_exactly_at_cap_is_not_flagged() {
+        let data = vec![b'x'; 8];
+        let (s, over) = read_capped(&mut data.as_slice(), 8);
+        assert_eq!(s.len(), 8);
+        assert!(!over, "exactly cap must not be flagged as over");
+    }
+
+    #[test]
+    fn read_capped_over_cap_is_flagged_and_truncates() {
+        let data = vec![b'x'; 9];
+        let (s, over) = read_capped(&mut data.as_slice(), 8);
+        assert_eq!(s.len(), 8);
+        assert!(over);
     }
 
     #[test]

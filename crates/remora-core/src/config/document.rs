@@ -15,7 +15,7 @@ use tempfile::NamedTempFile;
 use toml_edit::{value, Array, DocumentMut, Item, Table};
 
 use super::{
-    Agent, AgentId, Config, ConfigError, Host, HostId, Project, ProjectId, Transport,
+    Agent, AgentId, Config, ConfigError, Host, HostId, KubectlField, Project, ProjectId, Transport,
     ValidationIssue,
 };
 
@@ -344,6 +344,21 @@ fn remove_entry(
     Ok(())
 }
 
+/// Converts a `KubectlField` to a `toml_edit::Item`:
+/// - `Literal` becomes a plain string value.
+/// - `Command` becomes an inline table `{ command = "…" }`.
+fn kubectl_field_item(field: &KubectlField) -> Item {
+    use toml_edit::InlineTable;
+    match field {
+        KubectlField::Literal(v) => value(v.as_str()),
+        KubectlField::Command(c) => {
+            let mut inline = InlineTable::new();
+            inline.insert("command", c.as_str().into());
+            Item::Value(toml_edit::Value::InlineTable(inline))
+        }
+    }
+}
+
 fn host_item(host: &Host) -> Item {
     let mut t = Table::new();
     if let Some(name) = &host.name {
@@ -362,15 +377,15 @@ fn host_item(host: &Host) -> Item {
         }
         Transport::Kubectl(k) => {
             t["transport"] = value("kubectl");
-            t["pod"] = value(&k.pod);
+            t["pod"] = kubectl_field_item(&k.pod);
             if let Some(ns) = &k.namespace {
-                t["namespace"] = value(ns);
+                t["namespace"] = kubectl_field_item(ns);
             }
             if let Some(ctx) = &k.context {
-                t["context"] = value(ctx);
+                t["context"] = kubectl_field_item(ctx);
             }
             if let Some(c) = &k.container {
-                t["container"] = value(c);
+                t["container"] = kubectl_field_item(c);
             }
         }
     }
@@ -579,7 +594,7 @@ mod tests {
             &Host {
                 name: None,
                 transport: Transport::Kubectl(KubectlHost {
-                    pod: "p".into(),
+                    pod: KubectlField::Literal("p".into()),
                     namespace: None,
                     context: None,
                     container: None,
@@ -816,6 +831,22 @@ mod tests {
         assert!(matches!(err, ConfigError::Io { .. }), "{err:?}");
         // No partial file left at the target.
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn command_form_kubectl_host_round_trips() {
+        let toml = "[hosts.staging]\ntransport = \"kubectl\"\npod = { command = \"kubectl -n sb get pods -o name | head -n1\" }\nnamespace = \"sb\"\n";
+        let original = crate::config::Config::from_toml_str(toml).expect("valid");
+
+        // Rewrite the document from the parsed config, then reparse and compare.
+        let doc = ConfigDocument::parse(toml).expect("doc");
+        let rewritten = doc.to_toml();
+        let reparsed = crate::config::Config::from_toml_str(&rewritten).expect("reparse");
+        assert_eq!(original, reparsed, "command-form host must round-trip");
+        assert!(
+            rewritten.contains("command ="),
+            "command field must serialize as an inline table: {rewritten}"
+        );
     }
 
     #[test]

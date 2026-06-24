@@ -12,17 +12,62 @@ use async_trait::async_trait;
 use remora_protocol::{ProjectId, SessionId, SessionMeta, SpawnSpec};
 
 use super::remote::{
-    attach_channel, capture, has_session_tokens, open_pty, run_list, run_remove, run_respawn,
-    run_spawn, run_stop, stderr_signals_session_absent, RemoteExec, RemoteOutput,
+    attach_channel, capture, has_session_tokens, open_pty, resolve_local_command, run_list,
+    run_remove, run_respawn, run_spawn, run_stop, stderr_signals_session_absent, LocalRunner,
+    RemoteExec, RemoteOutput, ShellRunner,
 };
-use crate::config::{Config, KubectlHost};
+use crate::config::{Config, KubectlField, KubectlHost};
 use crate::naming::tmux_session_name;
 use crate::spawn_plan::plan_spawn;
 use crate::{SessionChannel, SessionSource, SourceError};
 
+/// A `KubectlHost` with every field resolved to a literal string, ready to drop
+/// into the kubectl argv. Produced once per `SessionSource` method.
+#[derive(Debug)]
+struct ResolvedKubectlHost {
+    pod: String,
+    namespace: Option<String>,
+    context: Option<String>,
+    container: Option<String>,
+}
+
+fn resolve_field(
+    name: &str,
+    field: &KubectlField,
+    runner: &dyn LocalRunner,
+) -> Result<String, SourceError> {
+    match field {
+        KubectlField::Literal(v) => Ok(v.clone()),
+        KubectlField::Command(c) => resolve_local_command(runner, name, c),
+    }
+}
+
+fn resolve_opt(
+    name: &str,
+    field: Option<&KubectlField>,
+    runner: &dyn LocalRunner,
+) -> Result<Option<String>, SourceError> {
+    field.map(|f| resolve_field(name, f, runner)).transpose()
+}
+
+/// Resolves every field once. A single `spawn` issues several kubectl exec
+/// sub-commands; they must all target the SAME resolved pod, so resolution
+/// happens here, once, not per sub-command.
+fn resolve_host(
+    host: &KubectlHost,
+    runner: &dyn LocalRunner,
+) -> Result<ResolvedKubectlHost, SourceError> {
+    Ok(ResolvedKubectlHost {
+        pod: resolve_field("pod", &host.pod, runner)?,
+        namespace: resolve_opt("namespace", host.namespace.as_ref(), runner)?,
+        context: resolve_opt("context", host.context.as_ref(), runner)?,
+        container: resolve_opt("container", host.container.as_ref(), runner)?,
+    })
+}
+
 /// `kubectl [--context X] [-n NS] exec [-c C] [-i -t] <pod> --` — the
 /// connection prefix. Globals precede `exec`; exec-local flags follow it.
-fn kubectl_base_argv(host: &KubectlHost, interactive: bool) -> Vec<String> {
+fn kubectl_base_argv(host: &ResolvedKubectlHost, interactive: bool) -> Vec<String> {
     let mut argv: Vec<String> = vec!["kubectl".into()];
     if let Some(ctx) = &host.context {
         argv.push("--context".into());
@@ -68,8 +113,13 @@ const POD_SHELL_PREAMBLE: &str = "export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=xterm-
 
 /// Wrap logical tokens into one in-container `sh -c` string behind the UTF-8
 /// locale preamble. `interactive` selects the kubectl PTY flags via
-/// [`kubectl_base_argv`]; the shell body is identical either way.
-fn kubectl_sh_argv(host: &KubectlHost, tokens: &[String], interactive: bool) -> Vec<String> {
+/// [`kubectl_base_argv`]; the shell body is identical either way. Takes the
+/// already-resolved host (resolution ran once per SessionSource method).
+fn kubectl_sh_argv(
+    host: &ResolvedKubectlHost,
+    tokens: &[String],
+    interactive: bool,
+) -> Vec<String> {
     let mut argv = kubectl_base_argv(host, interactive);
     argv.push("sh".into());
     argv.push("-c".into());
@@ -81,17 +131,17 @@ fn kubectl_sh_argv(host: &KubectlHost, tokens: &[String], interactive: bool) -> 
 /// streamed command is one long API request, so a connect-style timeout would
 /// sever a legitimately-slow `git worktree add` (Finding 1). Execution is
 /// unbounded, matching ssh.
-fn kubectl_run_argv(host: &KubectlHost, tokens: &[String]) -> Vec<String> {
+fn kubectl_run_argv(host: &ResolvedKubectlHost, tokens: &[String]) -> Vec<String> {
     kubectl_sh_argv(host, tokens, false)
 }
 
 /// Interactive PTY channel (`-i -t`) for attaching to the session's tmux.
-fn kubectl_channel_argv(host: &KubectlHost, tokens: &[String]) -> Vec<String> {
+fn kubectl_channel_argv(host: &ResolvedKubectlHost, tokens: &[String]) -> Vec<String> {
     kubectl_sh_argv(host, tokens, true)
 }
 
 struct RealKubectlExec {
-    host: KubectlHost,
+    host: ResolvedKubectlHost,
 }
 
 impl RemoteExec for RealKubectlExec {
@@ -133,10 +183,24 @@ fn probe_pod(exec: &dyn RemoteExec) -> Result<(), SourceError> {
     }
 }
 
-/// One instance = one configured kubectl host.
+/// How a method turns a resolved host into a remote exec. `Real` builds the
+/// kubectl exec; `Fake` (tests) ignores the resolved host and uses an injected
+/// exec — resolution still runs, so the resolve->build wiring is exercised.
+#[derive(Clone)]
+enum ExecFactory {
+    Real,
+    // Constructed only in #[cfg(test)] via `with_exec`; the non-test build
+    // sees it as dead but it is the primary injection point for unit tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Fake(Arc<dyn RemoteExec>),
+}
+
+/// One instance = one configured kubectl host (unresolved).
 pub struct KubectlSource {
     config: Arc<Config>,
-    exec: Arc<dyn RemoteExec>,
+    host: KubectlHost,
+    runner: Arc<dyn LocalRunner>,
+    exec_factory: ExecFactory,
 }
 
 impl KubectlSource {
@@ -144,22 +208,45 @@ impl KubectlSource {
     pub fn new(host: KubectlHost, config: Arc<Config>) -> Self {
         Self {
             config,
-            exec: Arc::new(RealKubectlExec { host }),
+            host,
+            runner: Arc::new(ShellRunner::new()),
+            exec_factory: ExecFactory::Real,
         }
     }
 
     #[cfg(test)]
-    fn with_exec(_host: KubectlHost, config: Arc<Config>, exec: Arc<dyn RemoteExec>) -> Self {
-        Self { config, exec }
+    fn with_exec(host: KubectlHost, config: Arc<Config>, exec: Arc<dyn RemoteExec>) -> Self {
+        Self {
+            config,
+            host,
+            runner: Arc::new(ShellRunner::new()),
+            exec_factory: ExecFactory::Fake(exec),
+        }
     }
+}
+
+/// Resolves the host (running local commands) then materializes the exec.
+fn build_exec(
+    host: &KubectlHost,
+    runner: &dyn LocalRunner,
+    factory: &ExecFactory,
+) -> Result<Arc<dyn RemoteExec>, SourceError> {
+    let resolved = resolve_host(host, runner)?;
+    Ok(match factory {
+        ExecFactory::Real => Arc::new(RealKubectlExec { host: resolved }),
+        ExecFactory::Fake(exec) => Arc::clone(exec),
+    })
 }
 
 #[async_trait]
 impl SessionSource for KubectlSource {
     async fn spawn(&self, spec: SpawnSpec) -> Result<SessionChannel, SourceError> {
         let plan = plan_spawn(&self.config, &spec)?;
-        let exec = Arc::clone(&self.exec);
+        let host = self.host.clone();
+        let runner = Arc::clone(&self.runner);
+        let factory = self.exec_factory.clone();
         tokio::task::spawn_blocking(move || {
+            let exec = build_exec(&host, runner.as_ref(), &factory)?;
             probe_pod(exec.as_ref())?;
             run_spawn(exec.as_ref(), &plan)
         })
@@ -173,10 +260,13 @@ impl SessionSource for KubectlSource {
         session_id: &SessionId,
     ) -> Result<SessionChannel, SourceError> {
         let tmux_name = tmux_session_name(project_id, session_id);
-        let exec = Arc::clone(&self.exec);
+        let host = self.host.clone();
+        let runner = Arc::clone(&self.runner);
+        let factory = self.exec_factory.clone();
         let project_id = project_id.clone();
         let session_id = session_id.clone();
         tokio::task::spawn_blocking(move || {
+            let exec = build_exec(&host, runner.as_ref(), &factory)?;
             let out = exec.run(&has_session_tokens(&tmux_name))?;
             if !out.success {
                 // A non-zero `has-session` only means "absent" for a known tmux
@@ -199,11 +289,16 @@ impl SessionSource for KubectlSource {
     }
 
     async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
-        let exec = Arc::clone(&self.exec);
+        let host = self.host.clone();
+        let runner = Arc::clone(&self.runner);
+        let factory = self.exec_factory.clone();
         let config = Arc::clone(&self.config);
-        tokio::task::spawn_blocking(move || run_list(exec.as_ref(), &config))
-            .await
-            .map_err(|e| SourceError::Transport(format!("list task: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            let exec = build_exec(&host, runner.as_ref(), &factory)?;
+            run_list(exec.as_ref(), &config)
+        })
+        .await
+        .map_err(|e| SourceError::Transport(format!("list task: {e}")))?
     }
 
     async fn respawn(
@@ -223,10 +318,15 @@ impl SessionSource for KubectlSource {
             workspace: Some(remora_protocol::WorkspaceMode::Worktree),
         };
         let plan = plan_spawn(&self.config, &spec)?;
-        let exec = Arc::clone(&self.exec);
-        tokio::task::spawn_blocking(move || run_respawn(exec.as_ref(), &plan))
-            .await
-            .map_err(|e| SourceError::Transport(format!("respawn task: {e}")))?
+        let host = self.host.clone();
+        let runner = Arc::clone(&self.runner);
+        let factory = self.exec_factory.clone();
+        tokio::task::spawn_blocking(move || {
+            let exec = build_exec(&host, runner.as_ref(), &factory)?;
+            run_respawn(exec.as_ref(), &plan)
+        })
+        .await
+        .map_err(|e| SourceError::Transport(format!("respawn task: {e}")))?
     }
 
     async fn stop(
@@ -234,12 +334,17 @@ impl SessionSource for KubectlSource {
         project_id: &ProjectId,
         session_id: &SessionId,
     ) -> Result<(), SourceError> {
-        let exec = Arc::clone(&self.exec);
+        let host = self.host.clone();
+        let runner = Arc::clone(&self.runner);
+        let factory = self.exec_factory.clone();
         let config = Arc::clone(&self.config);
         let (p, s) = (project_id.clone(), session_id.clone());
-        tokio::task::spawn_blocking(move || run_stop(exec.as_ref(), &config, &p, &s))
-            .await
-            .map_err(|e| SourceError::Transport(format!("stop task: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            let exec = build_exec(&host, runner.as_ref(), &factory)?;
+            run_stop(exec.as_ref(), &config, &p, &s)
+        })
+        .await
+        .map_err(|e| SourceError::Transport(format!("stop task: {e}")))?
     }
 
     async fn remove(
@@ -248,12 +353,17 @@ impl SessionSource for KubectlSource {
         session_id: &SessionId,
         force: bool,
     ) -> Result<(), SourceError> {
-        let exec = Arc::clone(&self.exec);
+        let host = self.host.clone();
+        let runner = Arc::clone(&self.runner);
+        let factory = self.exec_factory.clone();
         let config = Arc::clone(&self.config);
         let (p, s) = (project_id.clone(), session_id.clone());
-        tokio::task::spawn_blocking(move || run_remove(exec.as_ref(), &config, &p, &s, force))
-            .await
-            .map_err(|e| SourceError::Transport(format!("remove task: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            let exec = build_exec(&host, runner.as_ref(), &factory)?;
+            run_remove(exec.as_ref(), &config, &p, &s, force)
+        })
+        .await
+        .map_err(|e| SourceError::Transport(format!("remove task: {e}")))?
     }
 }
 
@@ -323,8 +433,8 @@ mod tests {
         ns: Option<&str>,
         ctx: Option<&str>,
         container: Option<&str>,
-    ) -> KubectlHost {
-        KubectlHost {
+    ) -> ResolvedKubectlHost {
+        ResolvedKubectlHost {
             pod: pod.into(),
             namespace: ns.map(String::from),
             context: ctx.map(String::from),
@@ -522,7 +632,7 @@ mod tests {
             Ok(FakeExec::ok()), // new-session
         ]));
         let kh = KubectlHost {
-            pod: "sandbox-0".into(),
+            pod: KubectlField::Literal("sandbox-0".into()),
             namespace: None,
             context: None,
             container: None,
@@ -553,7 +663,7 @@ mod tests {
             "Unable to connect to the server: dial tcp: lookup api timed out",
         ))]));
         let kh = KubectlHost {
-            pod: "sandbox-0".into(),
+            pod: KubectlField::Literal("sandbox-0".into()),
             namespace: None,
             context: None,
             container: None,
@@ -611,7 +721,7 @@ mod tests {
 
     fn kubectl_host() -> KubectlHost {
         KubectlHost {
-            pod: "sandbox-0".into(),
+            pod: KubectlField::Literal("sandbox-0".into()),
             namespace: None,
             context: None,
             container: None,
@@ -667,5 +777,91 @@ mod tests {
         assert!(calls.iter().any(|c| c.iter().any(|a| a == "kill-session")));
         assert!(calls.iter().any(|c| c.iter().any(|a| a == "remove")));
         assert!(calls.iter().any(|c| c.iter().any(|a| a == "-D")));
+    }
+
+    // -----------------------------------------------------------------------
+    // New Task 4 tests: resolve_host wiring
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn spawn_resolves_command_form_pod_through_real_runner() {
+        // pod is a COMMAND; resolution runs the real local runner (`echo`), and the
+        // remote kubectl exec is faked. Proves resolve->build runs per method.
+        let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::ok()), // probe
+            Ok(FakeExec::ok()), // worktree add
+            Ok(FakeExec::ok()), // new-session
+        ]));
+        let kh = KubectlHost {
+            pod: KubectlField::Command("echo sandbox-9".into()),
+            namespace: None,
+            context: None,
+            container: None,
+        };
+        let source = KubectlSource::with_exec(kh, test_config(), fake.clone());
+        let spec = SpawnSpec {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("fix-login").expect("slug"),
+            agent: Some(remora_protocol::AgentId::new("claude").expect("slug")),
+            workspace: None,
+        };
+        source.spawn(spec).await.expect("spawn resolves + attaches");
+        assert_eq!(*fake.opened.lock().expect("lock"), 1);
+    }
+
+    #[tokio::test]
+    async fn spawn_aborts_when_pod_command_fails() {
+        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::ok())]));
+        let kh = KubectlHost {
+            pod: KubectlField::Command("exit 1".into()),
+            namespace: None,
+            context: None,
+            container: None,
+        };
+        let source = KubectlSource::with_exec(kh, test_config(), fake.clone());
+        let spec = SpawnSpec {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("fix-login").expect("slug"),
+            agent: Some(remora_protocol::AgentId::new("claude").expect("slug")),
+            workspace: None,
+        };
+        let err = source.spawn(spec).await.expect_err("resolution fails");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
+        assert_eq!(
+            *fake.opened.lock().expect("lock"),
+            0,
+            "no exec after a failed resolve"
+        );
+    }
+
+    #[test]
+    fn resolve_host_maps_literal_and_command() {
+        let runner = crate::transport::remote::ShellRunner::new();
+        let kh = KubectlHost {
+            pod: KubectlField::Command("echo p0".into()),
+            namespace: Some(KubectlField::Literal("ns".into())),
+            context: None,
+            container: Some(KubectlField::Command("echo c0".into())),
+        };
+        let resolved = resolve_host(&kh, &runner).expect("resolve");
+        assert_eq!(resolved.pod, "p0");
+        assert_eq!(resolved.namespace.as_deref(), Some("ns"));
+        assert_eq!(resolved.context, None);
+        assert_eq!(resolved.container.as_deref(), Some("c0"));
+    }
+
+    #[test]
+    fn resolve_host_aborts_when_a_later_field_command_fails() {
+        // A later-field command failure (here `namespace`) must abort the whole
+        // resolve, not silently drop the field.
+        let runner = crate::transport::remote::ShellRunner::new();
+        let kh = KubectlHost {
+            pod: KubectlField::Command("echo p0".into()),
+            namespace: Some(KubectlField::Command("exit 1".into())),
+            context: None,
+            container: None,
+        };
+        let err = resolve_host(&kh, &runner).expect_err("later-field failure aborts resolve");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
     }
 }

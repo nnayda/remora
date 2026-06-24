@@ -18,17 +18,25 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
-use remora_core::config::{Config, KubectlHost};
+use remora_core::config::{Config, KubectlField, KubectlHost};
 use remora_core::{
     ChannelOutput, KubectlSource, ProjectId, SessionChannel, SessionId, SessionSource, TerminalSize,
 };
 
 fn e2e_host() -> KubectlHost {
     KubectlHost {
-        pod: std::env::var("REMORA_E2E_KUBECTL_POD").expect("REMORA_E2E_KUBECTL_POD"),
-        namespace: std::env::var("REMORA_E2E_KUBECTL_NAMESPACE").ok(),
-        context: std::env::var("REMORA_E2E_KUBECTL_CONTEXT").ok(),
-        container: std::env::var("REMORA_E2E_KUBECTL_CONTAINER").ok(),
+        pod: KubectlField::Literal(
+            std::env::var("REMORA_E2E_KUBECTL_POD").expect("REMORA_E2E_KUBECTL_POD"),
+        ),
+        namespace: std::env::var("REMORA_E2E_KUBECTL_NAMESPACE")
+            .ok()
+            .map(KubectlField::Literal),
+        context: std::env::var("REMORA_E2E_KUBECTL_CONTEXT")
+            .ok()
+            .map(KubectlField::Literal),
+        container: std::env::var("REMORA_E2E_KUBECTL_CONTAINER")
+            .ok()
+            .map(KubectlField::Literal),
     }
 }
 
@@ -41,20 +49,22 @@ fn e2e_host() -> KubectlHost {
 fn kubectl_exec_in_pod(args: &[&str]) {
     let host = e2e_host();
     let mut argv: Vec<String> = Vec::new();
-    if let Some(ctx) = &host.context {
+    if let Some(KubectlField::Literal(ctx)) = &host.context {
         argv.push("--context".into());
         argv.push(ctx.clone());
     }
-    if let Some(ns) = &host.namespace {
+    if let Some(KubectlField::Literal(ns)) = &host.namespace {
         argv.push("-n".into());
         argv.push(ns.clone());
     }
     argv.push("exec".into());
-    if let Some(container) = &host.container {
+    if let Some(KubectlField::Literal(container)) = &host.container {
         argv.push("-c".into());
         argv.push(container.clone());
     }
-    argv.push(host.pod.clone());
+    if let KubectlField::Literal(pod) = &host.pod {
+        argv.push(pod.clone());
+    }
     argv.push("--".into());
     argv.extend(args.iter().map(|s| (*s).to_string()));
 

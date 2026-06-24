@@ -13,8 +13,8 @@
 //! enforces the split.
 
 use remora_core::config::{
-    Agent, Config, Host, HostId, KubectlHost, PresentIds, Project, SshHost, Transport,
-    WorkspaceMode,
+    Agent, Config, Host, HostId, KubectlField, KubectlHost, PresentIds, Project, SshHost,
+    Transport, WorkspaceMode,
 };
 use remora_protocol::AgentId;
 
@@ -77,6 +77,41 @@ pub struct EditorHostDto {
     pub transport: TransportDto,
 }
 
+/// A kubectl connection field for the editor: `command = false` is a literal
+/// value, `command = true` means `value` is a shell command line resolved at
+/// connect time. Flat + form-friendly for the TS toggle.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct KubectlFieldDto {
+    pub command: bool,
+    pub value: String,
+}
+
+impl From<KubectlField> for KubectlFieldDto {
+    fn from(field: KubectlField) -> Self {
+        match field {
+            KubectlField::Literal(value) => Self {
+                command: false,
+                value,
+            },
+            KubectlField::Command(value) => Self {
+                command: true,
+                value,
+            },
+        }
+    }
+}
+
+impl From<KubectlFieldDto> for KubectlField {
+    fn from(dto: KubectlFieldDto) -> Self {
+        if dto.command {
+            KubectlField::Command(dto.value)
+        } else {
+            KubectlField::Literal(dto.value)
+        }
+    }
+}
+
 /// Transport + connection details, shared by the read projection and the write
 /// inputs (it round-trips: what the form shows is what it submits). Internally
 /// tagged on `kind` so the TS side discriminates on a single field.
@@ -89,10 +124,10 @@ pub enum TransportDto {
         port: Option<u16>,
     },
     Kubectl {
-        pod: String,
-        namespace: Option<String>,
-        context: Option<String>,
-        container: Option<String>,
+        pod: KubectlFieldDto,
+        namespace: Option<KubectlFieldDto>,
+        context: Option<KubectlFieldDto>,
+        container: Option<KubectlFieldDto>,
     },
 }
 
@@ -169,10 +204,10 @@ impl From<Transport> for TransportDto {
                 port: ssh.port,
             },
             Transport::Kubectl(k) => TransportDto::Kubectl {
-                pod: k.pod,
-                namespace: k.namespace,
-                context: k.context,
-                container: k.container,
+                pod: k.pod.into(),
+                namespace: k.namespace.map(Into::into),
+                context: k.context.map(Into::into),
+                container: k.container.map(Into::into),
             },
         }
     }
@@ -200,10 +235,10 @@ impl HostInputDto {
                 context,
                 container,
             } => Transport::Kubectl(KubectlHost {
-                pod,
-                namespace,
-                context,
-                container,
+                pod: pod.into(),
+                namespace: namespace.map(Into::into),
+                context: context.map(Into::into),
+                container: container.map(Into::into),
             }),
         };
         Host {
@@ -293,7 +328,8 @@ fn editor_project_dto(id: &str, project: Project) -> EditorProjectDto {
 mod tests {
     use super::*;
     use remora_core::config::{
-        Agent, Config, Host, HostId, KubectlHost, Project, SshHost, Transport, WorkspaceMode,
+        Agent, Config, Host, HostId, KubectlField, KubectlHost, Project, SshHost, Transport,
+        WorkspaceMode,
     };
     use remora_protocol::{AgentId, ProjectId};
 
@@ -312,10 +348,10 @@ mod tests {
         Host {
             name: None,
             transport: Transport::Kubectl(KubectlHost {
-                pod: "secret-pod".into(),
-                namespace: Some("secret-namespace".into()),
-                context: Some("secret-context".into()),
-                container: Some("secret-container".into()),
+                pod: KubectlField::Literal("secret-pod".into()),
+                namespace: Some(KubectlField::Literal("secret-namespace".into())),
+                context: Some(KubectlField::Literal("secret-context".into())),
+                container: Some(KubectlField::Literal("secret-container".into())),
             }),
         }
     }
@@ -409,13 +445,13 @@ mod tests {
     #[test]
     fn host_input_converts_to_kubectl_host() {
         let input: HostInputDto = serde_json::from_str(
-            r#"{"name":null,"transport":{"kind":"kubectl","pod":"p","namespace":"ns","context":null,"container":null}}"#,
+            r#"{"name":null,"transport":{"kind":"kubectl","pod":{"command":false,"value":"p"},"namespace":{"command":false,"value":"ns"},"context":null,"container":null}}"#,
         )
         .expect("deserialize kubectl input");
         match input.into_host().transport {
             Transport::Kubectl(k) => {
-                assert_eq!(k.pod, "p");
-                assert_eq!(k.namespace.as_deref(), Some("ns"));
+                assert_eq!(k.pod, KubectlField::Literal("p".into()));
+                assert_eq!(k.namespace, Some(KubectlField::Literal("ns".into())));
                 assert_eq!(k.context, None);
             }
             other => panic!("expected kubectl, got {other:?}"),
@@ -455,6 +491,39 @@ mod tests {
         let input: AgentInputDto =
             serde_json::from_str(r#"{"command":["claude","--flag"]}"#).expect("deserialize");
         assert_eq!(input.into_agent().command, vec!["claude", "--flag"]);
+    }
+
+    #[test]
+    fn editor_dto_round_trips_command_form_kubectl_fields() {
+        let host = Host {
+            name: None,
+            transport: Transport::Kubectl(KubectlHost {
+                pod: KubectlField::Command("kubectl get pods -o name | head -n1".into()),
+                namespace: Some(KubectlField::Literal("sb".into())),
+                context: None,
+                container: None,
+            }),
+        };
+        let dto = TransportDto::from(host.transport.clone());
+        let TransportDto::Kubectl {
+            ref pod,
+            ref namespace,
+            ..
+        } = dto
+        else {
+            panic!("expected kubectl");
+        };
+        assert!(pod.command, "pod is a command");
+        assert_eq!(pod.value, "kubectl get pods -o name | head -n1");
+        assert_eq!(namespace.as_ref().map(|f| f.command), Some(false));
+
+        // Round-trips back to the same Host.
+        let back = HostInputDto {
+            name: None,
+            transport: dto,
+        }
+        .into_host();
+        assert_eq!(back, host);
     }
 
     #[test]
