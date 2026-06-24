@@ -199,6 +199,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Creating a session through the New Session dialog now focuses its terminal, so
+  you can type the first prompt without clicking into the pane first (closes
+  #78). A successful spawn previously restored focus to the **+ New session**
+  button; it now routes into the same focus path a tab/sidebar selection uses
+  (arming `focusOnSelect` so the activeKey effect focuses the terminal once it's
+  live). Attach, cancel, and open-failure keep focus on the + button — there's no
+  fresh terminal to type into in those cases.
 - Terminal rendering is no longer corrupted when an agent draws box-drawing or
   other multibyte UTF-8 (e.g. claude-code's logo rendered as underscores/garbage
   over a kubectl pod). The session's tmux was running in non-UTF-8 mode: kubectl
