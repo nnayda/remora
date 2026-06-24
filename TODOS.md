@@ -117,28 +117,6 @@ up cold.
   optimized anyway. See `docs/superpowers/specs/2026-06-15-session-discovery-design.md`.
 - **Depends on:** stage 6 (`list`) merged; pairs with ControlMaster.
 
-## `LC_ALL=C` locale hardening for remote-command stderr classification
-
-- **What:** Force a C locale on the remote tmux/git commands whose stderr we
-  pattern-match (`tmux new-session` "duplicate session", `tmux list-sessions`
-  "no server running" / "no sessions"), so the English-substring matches are
-  reliable regardless of the sandbox's `LC_MESSAGES`.
-- **Why:** Today classification matches English diagnostics case-insensitively.
-  A non-English remote locale prints e.g. "kein Server", so a "no sessions"
-  state would be misclassified as a `Transport` error (scary error where the
-  truth is "zero live sessions"), and a duplicate-session race could slip the
-  fail-closed lock.
-- **Pros:** Robust classification independent of remote locale; one consistent
-  rule across spawn (stage 5) and discovery (stage 6).
-- **Cons:** Threading `LC_ALL=C` through the remote command (a shell-assignment
-  prefix vs argv token) needs care so it survives ssh's remote-shell parse;
-  small cross-cutting change to `ssh_base_argv`/command construction.
-- **Context:** Stage-6 eng review (decision 9 / Codex #9). Accepted the
-  English-match fragility for stage 6 to keep the diff small; retroactively
-  covers stage-5's `classify_new_session_failure`.
-- **Depends on:** none; cheapest done alongside ControlMaster's `ssh_base_argv`
-  rework.
-
 ## Bound captured output at the `SshExec` seam (memory)
 
 - **What:** Cap the bytes `RealSshExec::run` reads from a remote command.
@@ -387,12 +365,12 @@ up cold.
   invalidation. A TTL memo ≠ the rejected cross-connect cache, but it's adjacent.
 - **Context:** Issue #52 eng review, Performance section (Issue 4). Deferred so
   the first cut stays minimal; revisit if dogfooding on hermes shows the poll
-  cost biting. See `docs/adr/0007-dynamic-kubectl-field-resolution.md`.
+  cost biting. See `docs/adr/0008-dynamic-kubectl-field-resolution.md`.
 - **Depends on:** the resolution seam (issue #52 PR).
 
 ## Document the command-field trust model (local code execution on poll)
 
-- **What:** Write up, in ADR-0007 (or ARCHITECTURE.md), that a command-form
+- **What:** Write up, in ADR-0008 (or ARCHITECTURE.md), that a command-form
   kubectl field executes a local shell command with the user's privileges, and
   that the discovery poll re-runs it every ~4s — so merely opening the app runs
   that code repeatedly. State the safety basis (config is local + self-authored,
@@ -450,7 +428,7 @@ up cold.
   of silently accepting whatever `head -n1` returns. E.g. detect a multi-line
   raw selector result before the user masks it with `head -n1`, or offer a
   strict non-`head` form.
-- **Why:** ADR-0007 documents the single-active-pod assumption, but the code
+- **Why:** ADR-0008 documents the single-active-pod assumption, but the code
   still lets a 3-pod match resolve to an arbitrary first pod with no warning —
   the ambiguity is masked, not detected. Worst at multi-replica/HPA.
 - **Pros:** Turns a silent footgun into a clear error. **Cons:** fights the
@@ -458,3 +436,24 @@ up cold.
 - **Context:** Issue #52 eng review, outside voice (Codex pt 5) + semantics
   section (T3, option not taken). ADR note ships now; active detection deferred.
 - **Depends on:** the resolution seam (issue #52 PR).
+## Guard a project default that points at an empty-command (plain-shell) agent
+
+- **What:** Warn (or block) in config validation when a project's `agent`
+  (its default) resolves to an agent whose `command` is `[]` (a plain-shell
+  agent, introduced for issue #35).
+- **Why:** New sessions in that project intentionally default to a shell, but
+  a *stopped* session that lost its tmux env (e.g. after a pod/app restart,
+  when discovery carries no `REMORA_AGENT`) respawns as the project default —
+  which would now be a plain shell instead of the agent it originally ran.
+  Surprising for a project whose real default *should* be an agent.
+- **Pros:** Catches an easy-to-miss footgun at config time, not at respawn
+  time when the user is confused why their agent didn't come back.
+- **Cons:** Extra validation branch + tests; risk of false-positive warnings
+  for users who genuinely want a shell-default project.
+- **Context:** Raised in the #35 (no-agent / plain shell) eng review as a
+  deliberately-deferred edge. The core feature (empty-command agent → plain
+  shell) does not need this guard to work; it only affects the respawn-after-
+  restart path for stopped sessions, which already loses agent identity for
+  every project (stopped sessions carry no env). This guard would make the
+  shell-default case explicit rather than silent.
+- **Depends on:** the #35 empty-command-agent feature landing first.

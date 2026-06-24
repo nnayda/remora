@@ -327,6 +327,7 @@ describe("kubectl command-form fields", () => {
 describe("agent form", () => {
   it("starts with a single empty argv row", () => {
     expect(emptyAgentForm().command).toEqual([""]);
+    expect(emptyAgentForm().plainShell).toBe(false);
   });
 
   it("prefills argv from a dto", () => {
@@ -350,13 +351,71 @@ describe("agent form", () => {
   });
 
   it("rejects an all-blank command", () => {
-    const blank = { id: "ok", command: ["", "  "] };
+    const blank = { id: "ok", command: ["", "  "], plainShell: false };
     expect(validateAgentForm(blank, "create")).toMatch(/command/i);
   });
 
   it("builds an input trimming and dropping blank rows", () => {
-    const form = { id: "ok", command: [" claude ", "", "-r"] };
+    const form = {
+      id: "ok",
+      command: [" claude ", "", "-r"],
+      plainShell: false,
+    };
     expect(validateAgentForm(form, "create")).toBeNull();
     expect(toAgentInput(form)).toEqual({ command: ["claude", "-r"] });
+  });
+
+  it("rejects an argv row starting with a Unicode dash", () => {
+    // Autocorrect/paste turns `--flag` into `—flag` (em-dash); the agent CLI
+    // only knows ASCII `-`, so it'd be swallowed as a prompt. Catch it early.
+    for (const dash of ["—", "–", "‒", "‐", "―"]) {
+      const form = {
+        id: "claude",
+        command: ["claude", `${dash}dangerously`],
+        plainShell: false,
+      };
+      expect(validateAgentForm(form, "create")).toMatch(/dash/i);
+    }
+    // ASCII flags stay valid; a non-leading dash is left alone.
+    expect(
+      validateAgentForm(
+        {
+          id: "claude",
+          command: ["claude", "--dangerously", "-r"],
+          plainShell: false,
+        },
+        "create",
+      ),
+    ).toBeNull();
+    expect(
+      validateAgentForm(
+        { id: "claude", command: ["claude", "a—b"], plainShell: false },
+        "create",
+      ),
+    ).toBeNull();
+  });
+
+  it("seeds plainShell from an empty dto command", () => {
+    const shell = agentFormFromDto({ id: "shell", command: [] });
+    expect(shell.plainShell).toBe(true);
+    // One editable row is restored so unchecking the toggle has something to show.
+    expect(shell.command).toEqual([""]);
+    expect(
+      agentFormFromDto({ id: "claude", command: ["claude"] }).plainShell,
+    ).toBe(false);
+  });
+
+  it("plain shell is valid with an empty command and saves []", () => {
+    const form = { id: "shell", command: ["claude"], plainShell: true };
+    expect(validateAgentForm(form, "create")).toBeNull();
+    expect(toAgentInput(form)).toEqual({ command: [] });
+  });
+
+  it("accepts all-blank rows when plain shell and saves []", () => {
+    // The same rows that are rejected above are fine once the toggle is on —
+    // they collapse to an empty command instead of failing validation.
+    const form = { id: "ok", command: ["", "  "], plainShell: true };
+    expect(validateAgentForm(form, "create")).toBeNull();
+    expect(toAgentInput(form)).toEqual({ command: [] });
   });
 });

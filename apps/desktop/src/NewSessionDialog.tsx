@@ -9,7 +9,7 @@ import type { ConfigDto } from "./bindings";
 import { buildNewSessionModel, resolveSelection } from "./new-session-model";
 import type { OpenResult, SpawnInput } from "./session-store";
 import { OPEN_CANCELLED } from "./session-store";
-import { isValidSlug } from "./spawn-input";
+import { isValidSlug, normalizeSlugInput } from "./spawn-input";
 
 interface NewSessionDialogProps {
   /** Per-device config; drives the project and agent pickers. */
@@ -198,7 +198,9 @@ export function NewSessionDialog({
               Session
               <input
                 value={sessionId}
-                onChange={(e) => setSessionId(e.target.value)}
+                onChange={(e) =>
+                  setSessionId(normalizeSlugInput(e.target.value))
+                }
               />
             </label>
             <label>

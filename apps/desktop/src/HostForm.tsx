@@ -8,6 +8,7 @@ import {
   validateHostForm,
 } from "./config-editor-model";
 import { formErrorMessage } from "./form-error";
+import { normalizeSlugInput } from "./spawn-input";
 
 interface HostFormProps {
   mode: FormMode;
@@ -61,7 +62,7 @@ export function HostForm({ mode, initial, onSubmit, onCancel }: HostFormProps) {
           Id
           <input
             value={form.id}
-            onChange={(e) => set("id", e.target.value)}
+            onChange={(e) => set("id", normalizeSlugInput(e.target.value))}
             placeholder="devbox"
             // biome-ignore lint/a11y/noAutofocus: first field of an opened form
             autoFocus

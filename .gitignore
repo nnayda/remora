@@ -12,6 +12,16 @@ apps/desktop/src-tauri/gen/schemas
 .DS_Store
 *.swp
 .idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Build / test artifacts
+coverage/
+*.tsbuildinfo
+
+# Env / secrets
+.env
+*.local
 
 # Logs
 *.log
@@ -19,4 +29,7 @@ apps/desktop/src-tauri/gen/schemas
 # Local notes / agent session artifacts (not published)
 notes/
 docs/superpowers/
+.superpowers/
 spikes/
+.gstack/
+.playwright-mcp/

@@ -166,6 +166,10 @@ async fn attaches_to_a_live_remote_tmux_session() {
 #[tokio::test]
 #[ignore = "needs a real kubectl-reachable pod + tmux; see module docs"]
 async fn e2e_spawn_shared_session_runs_and_blocks_duplicate() {
+    // Note: end-to-end no-agent (command = []) plain-shell render is covered
+    // by the unit test `remote.rs::new_session_tokens_no_agent_runs_a_login_shell`.
+    // This suite has no fake-exec seam to capture tmux tokens, so we don't
+    // duplicate that assertion here.
     let pod = match std::env::var("REMORA_E2E_KUBECTL_POD") {
         Ok(p) => p,
         Err(_) => return,

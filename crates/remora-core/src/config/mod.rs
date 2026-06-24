@@ -470,6 +470,43 @@ fn check_display_name(name: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// Whether an argv element begins with a Unicode dash that *isn't* ASCII
+/// hyphen-minus — the autocorrect/paste hazard that turns `--flag` into
+/// `—flag`. Covers the Unicode `Dash_Punctuation` (Pd) code points an editor
+/// or keyboard is plausibly substituting for `-`; ASCII `-` (U+002D) is
+/// deliberately excluded so real flags pass. std exposes no Unicode-category
+/// query, so the set is enumerated explicitly (Pd is small and stable).
+fn starts_with_unicode_dash(arg: &str) -> bool {
+    matches!(
+        arg.trim_start().chars().next(),
+        Some(
+            '\u{058A}' // ARMENIAN HYPHEN
+                | '\u{05BE}' // HEBREW PUNCTUATION MAQAF
+                | '\u{1400}' // CANADIAN SYLLABICS HYPHEN
+                | '\u{1806}' // MONGOLIAN TODO SOFT HYPHEN
+                | '\u{2010}' // HYPHEN
+                | '\u{2011}' // NON-BREAKING HYPHEN
+                | '\u{2012}' // FIGURE DASH
+                | '\u{2013}' // EN DASH
+                | '\u{2014}' // EM DASH
+                | '\u{2015}' // HORIZONTAL BAR
+                | '\u{2E17}' // DOUBLE OBLIQUE HYPHEN
+                | '\u{2E1A}' // HYPHEN WITH DIAERESIS
+                | '\u{2E3A}' // TWO-EM DASH
+                | '\u{2E3B}' // THREE-EM DASH
+                | '\u{2E40}' // DOUBLE HYPHEN
+                | '\u{301C}' // WAVE DASH
+                | '\u{3030}' // WAVY DASH
+                | '\u{30A0}' // KATAKANA-HIRAGANA DOUBLE HYPHEN
+                | '\u{FE31}' // PRESENTATION FORM FOR VERTICAL EM DASH
+                | '\u{FE32}' // PRESENTATION FORM FOR VERTICAL EN DASH
+                | '\u{FE58}' // SMALL EM DASH
+                | '\u{FE63}' // SMALL HYPHEN-MINUS
+                | '\u{FF0D}' // FULLWIDTH HYPHEN-MINUS
+        )
+    )
+}
+
 /// Records an issue for every field that is present but doesn't belong to
 /// the declared transport.
 fn reject_foreign(
@@ -708,16 +745,31 @@ impl Config {
         }
 
         for (id, agent) in &raw.agents {
-            let reason = if agent.command.is_empty()
-                || agent.command.iter().any(|arg| arg.trim().is_empty())
+            // An empty argv (`command = []`) is the explicit "no agent / plain
+            // shell" case (#35) and is allowed. A *non-empty* command with a
+            // blank/whitespace element is still a typo (a hole in a real
+            // command), and control characters are always rejected.
+            let reason = if !agent.command.is_empty()
+                && agent.command.iter().any(|arg| arg.trim().is_empty())
             {
-                Some("must be a non-empty argv array without blank elements")
+                Some("must not contain blank elements (use an empty array `[]` for a plain shell)")
             } else if agent
                 .command
                 .iter()
                 .any(|arg| arg.chars().any(char::is_control))
             {
                 Some("must not contain control characters")
+            } else if agent
+                .command
+                .iter()
+                .any(|arg| starts_with_unicode_dash(arg))
+            {
+                // Autocorrect/paste turns `--flag` into `—flag` (em-dash). The
+                // agent CLI only recognizes ASCII hyphen-minus, so a leading
+                // Unicode dash is silently swallowed as a prompt instead of a
+                // flag. Reject it here rather than let it surface as the
+                // baffling "the flag became my prompt" runtime symptom.
+                Some("must use ASCII `-`/`--` for flags, not a Unicode dash (e.g. — or –)")
             } else {
                 None
             };
@@ -1116,15 +1168,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_agent_command() {
-        let issues = issues_of("[agents.claude]\ncommand = []\n");
-        assert_eq!(issues.len(), 1);
-        assert!(issues[0].to_string().contains("claude"), "{issues:?}");
+    fn allows_empty_command_as_plain_shell() {
+        // An empty argv is the explicit "no agent / plain shell" case (#35).
+        let cfg = Config::from_toml_str("[agents.shell]\ncommand = []\n")
+            .expect("empty command is a valid plain shell");
+        let shell_id = AgentId::new("shell").expect("valid agent id");
+        assert!(cfg.agents.contains_key(&shell_id));
+        assert!(cfg.agents[&shell_id].command.is_empty());
+    }
 
+    #[test]
+    fn rejects_blank_elements_in_a_nonempty_command() {
+        // A hole in an otherwise-real command is a typo, not a plain shell.
         let issues = issues_of("[agents.claude]\ncommand = [\"\"]\n");
         assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].to_string().contains("claude"), "{issues:?}");
 
-        // An empty element anywhere in the argv is a config mistake too.
+        let issues = issues_of("[agents.claude]\ncommand = [\"  \"]\n");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+
         let issues = issues_of("[agents.claude]\ncommand = [\"claude\", \"\", \"--continue\"]\n");
         assert_eq!(issues.len(), 1, "{issues:?}");
     }
@@ -1143,17 +1205,18 @@ mod tests {
             agent = "claude"
 
             [agents.claude]
-            command = []
+            command = [""]
             "#,
         )
         .expect_err("config should be invalid");
         let ConfigError::Invalid(issues) = &err else {
             panic!("expected Invalid, got: {err}");
         };
-        // telnet transport, relative path, empty command — and the project's
-        // host reference stays valid because `devbox` *is* configured, just
-        // broken: a broken host must not cascade into phantom unknown-host
-        // errors.
+        // telnet transport, relative path, and a blank command element
+        // (`command = [""]` — a hole in a non-empty argv, distinct from the now
+        // valid empty `[]` plain shell) — and the project's host reference stays
+        // valid because `devbox` *is* configured, just broken: a broken host
+        // must not cascade into phantom unknown-host errors.
         assert_eq!(issues.len(), 3, "{issues:?}");
         let msg = err.to_string();
         assert!(msg.contains("3 problems"), "{msg}");
@@ -1243,7 +1306,7 @@ mod tests {
 
     #[test]
     fn rejects_blank_agent_command_elements() {
-        // Whitespace-only argv elements are as broken as empty ones.
+        // Whitespace-only argv elements are invalid in command arrays.
         let issues = issues_of("[agents.claude]\ncommand = [\"   \"]\n");
         assert_eq!(issues.len(), 1, "{issues:?}");
 
@@ -1251,6 +1314,35 @@ mod tests {
         let issues = issues_of("[agents.claude]\ncommand = [\"claude\\n--evil\"]\n");
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert!(issues[0].to_string().contains("control"), "{issues:?}");
+    }
+
+    #[test]
+    fn rejects_argv_element_starting_with_a_unicode_dash() {
+        // Autocorrect/paste turns `--flag` into `—flag` (em-dash, U+2014). The
+        // agent CLI's parser only recognizes ASCII hyphen-minus, so a leading
+        // Unicode dash is silently taken as the prompt, not the flag. Catch it
+        // at config time instead of as a baffling runtime symptom.
+        for dash in ["\u{2014}", "\u{2013}", "\u{2012}", "\u{2010}", "\u{2015}"] {
+            let toml =
+                format!("[agents.claude]\ncommand = [\"claude\", \"{dash}dangerously-skip\"]\n");
+            let issues = issues_of(&toml);
+            assert_eq!(issues.len(), 1, "{dash:?}: {issues:?}");
+            assert!(
+                issues[0].to_string().contains("Unicode dash"),
+                "{dash:?}: {issues:?}"
+            );
+        }
+
+        // ASCII flags stay valid — the guard must not flag legitimate `--`/`-`.
+        Config::from_toml_str(
+            "[agents.claude]\ncommand = [\"claude\", \"--dangerously-skip\", \"-r\"]\n",
+        )
+        .expect("ASCII flags are valid");
+
+        // A Unicode dash mid-token (not the flag prefix) is left alone — the bug
+        // is specifically a confusable *leading* dash misread as a flag start.
+        Config::from_toml_str("[agents.claude]\ncommand = [\"claude\", \"a\u{2014}b\"]\n")
+            .expect("a non-leading dash is not a flag confusable");
     }
 
     #[test]

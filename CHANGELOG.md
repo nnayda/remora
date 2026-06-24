@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **No-agent / plain-shell sessions** (#35): an agent configured with an empty
+  command (`command = []`) opens a session that is just a login shell
+  (`${SHELL:-/bin/sh} -l`), no agent launched — over both ssh and kubectl. The
+  agent form gains a "No command (plain shell)" toggle. Config validation now
+  accepts an empty command (still rejecting blank elements in a non-empty
+  command). See [ADR-0007](docs/adr/0007-no-agent-plain-shell.md).
 - **kubectl exec transport** (core): a second `SessionSource` backend that runs
   sessions in a Kubernetes pod over `kubectl exec`, alongside ssh (stage 12).
   To prove the transport seam isn't ssh-shaped, the transport-neutral logic —
@@ -193,6 +199,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Session, project, host, and agent ids now accept uppercase letters and
+  canonicalize them to lowercase as you type, instead of rejecting them (closes
+  #80). Ids must be lowercase `[a-z0-9-]` slugs (ADR-0004), so a keyboard that
+  autocapitalizes the first character (mobile/touch, macOS autocaps) forced a
+  manual correction on every creation. The new-session dialog and the
+  host/project/agent config forms now run typed id input through a
+  `normalizeSlugInput` lowercaser at the field's `onChange`, so `MyApp` becomes
+  `myapp` and the input visibly shows the canonical form. Only case is
+  canonicalized — other out-of-grammar characters still surface validation
+  feedback, and the protocol grammar (`ProjectId`/`SessionId::new`) and tmux
+  `remora_<project>_<session>` name format stay strict and unchanged, with the
+  Rust bridge remaining the authority.
+- Terminal rendering is no longer corrupted when an agent draws box-drawing or
+  other multibyte UTF-8 (e.g. claude-code's logo rendered as underscores/garbage
+  over a kubectl pod). The session's tmux was running in non-UTF-8 mode: kubectl
+  forwards none of the client's environment and our `exec`s run a non-login,
+  non-interactive shell that sources no profile, so the pod shell had no locale
+  and tmux fell back to mangling the agent's bytes — every attached client then
+  saw garbage, while a directly-run agent (no tmux to misparse it) looked fine,
+  which is what made it baffling. Both transports now pin a UTF-8 locale on every
+  remote command: the kubectl adapter prepends an `export LANG=C.UTF-8
+  LC_ALL=C.UTF-8 TERM=xterm-256color;` preamble inside its `sh -c` body (replacing
+  the narrower `env TERM=…` wrap, and using `export …;` so it composes with shell
+  constructs like the pod preflight's `for` loop), and the ssh adapter prepends an
+  `env LANG=C.UTF-8 LC_ALL=C.UTF-8` prefix (ssh's non-interactive `$SHELL -c`
+  sources no profile and `SendEnv`/`AcceptEnv` is a fragile default). `C.UTF-8` is
+  present without `locale-gen` on glibc and musl and keeps diagnostics in English.
+- Mouse-wheel scrolling now drives tmux's scrollback instead of being translated
+  into arrow keys, and scrollback is deepened to 50000 lines for long agent
+  output (closes #53). The session-creation command sets `mouse on` and a global
+  `history-limit 50000` in the same atomic `tmux` invocation as `new-session`
+  (history-limit leads, because tmux applies it only to windows created after it
+  is set). `remain-on-exit` is ordered ahead of `mouse on` so that a `mouse`
+  failure on tmux < 2.1 (where the option didn't exist) can't abort the chain and
+  strip the load-bearing #28 self-destruct guard. Mouse mode applies to
+  newly-created sessions only.
+- Agent launch arguments that use a Unicode dash (e.g.
+  `—dangerously-skip-permissions`, where autocorrect or a "prettifying" paste
+  turned `--` into an em-dash) are now rejected at config time instead of
+  silently misbehaving at runtime. An agent CLI only recognizes ASCII
+  hyphen-minus, so a leading Unicode dash is parsed as a positional prompt
+  rather than a flag — the flag text ends up typed into the agent's prompt box.
+  Config validation in `remora-core` now flags any argv element whose first
+  non-whitespace character is a Unicode `Dash_Punctuation` code point (ASCII `-`
+  excluded), and the desktop agent form mirrors the same guard so the mistake is
+  caught before save. The launch path itself was already correct (the flag was
+  passed verbatim); this closes the silent-acceptance gap that made the failure
+  baffling.
 - The stopped-session screen now names the cause (closes #28). When a tab lands
   on the in-tab Respawn screen — e.g. an agent that exited immediately and whose
   tmux session is then gone — the overlay reads "Session stopped: claude:
@@ -222,3 +276,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-runnable. Any other non-zero exit (a real crash, bad flag, or
   `command not found`) still propagates so `remain-on-exit` keeps the dead pane
   and its error inspectable (preserving #28).
+- The sidebar Settings control is now a properly sized icon-button instead of a
+  bare gear glyph (closes #77). It previously borrowed the `.sidebar-refresh`
+  text-button style of the adjacent Refresh button, so it rendered tiny and was
+  hard to tell apart from Refresh. It now has a dedicated `.sidebar-settings`
+  class — a 28×28 bordered, rounded hit area with a larger gear and a hover
+  state, wired into the existing focus-visible outline. Visual-only; the button
+  kept its `aria-label`/`title="Settings"`, so accessibility is unchanged.
