@@ -69,7 +69,6 @@ pub struct SpawnSpec {
     /// Per-session git start-point override for a new worktree (#54). `None`
     /// or empty falls through to the project default / detection. Raw here;
     /// `spawn_plan::normalize_base` trims and validates it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
 }
 
@@ -161,7 +160,7 @@ mod tests {
         let json = serde_json::to_string(&spec).expect("serialize");
         assert_eq!(
             json,
-            r#"{"project_id":"api","session_id":"fix-login","agent":"claude"}"#
+            r#"{"project_id":"api","session_id":"fix-login","agent":"claude","base":null}"#
         );
         let back: SpawnSpec = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(spec, back);
@@ -176,6 +175,10 @@ mod tests {
             base: Some("origin/main".to_string()),
         };
         assert_eq!(spec.base.as_deref(), Some("origin/main"));
+        let json = serde_json::to_string(&spec).expect("serialize");
+        assert!(json.contains(r#""base":"origin/main""#));
+        let back: SpawnSpec = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(spec, back);
     }
 
     #[test]
