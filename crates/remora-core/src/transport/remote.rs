@@ -645,13 +645,17 @@ pub(crate) fn run_list(
     }
 
     let mut worktrees = Vec::new();
+    let mut scanned = std::collections::HashSet::new();
     for (project_id, project) in &config.projects {
         // Scan EVERY project: a worktree-override session can live on a
         // shared-default project. `parse_worktree_list` rejects the main
         // checkout and foreign paths, so a project with no remora worktrees
-        // yields nothing.
+        // yields nothing. Record which projects scanned cleanly so `join` can
+        // tell "scanned, no worktree" (⇒ Shared) apart from "scan failed"
+        // (⇒ unknown), instead of conflating a transient failure with Shared.
         if let Ok(out) = exec.run(&worktree_list_tokens(&project.path)) {
             if out.success {
+                scanned.insert(project_id.clone());
                 for (session, path) in discovery::parse_worktree_list(&out.stdout, project_id) {
                     worktrees.push((project_id.clone(), session, path));
                 }
@@ -659,7 +663,7 @@ pub(crate) fn run_list(
         }
     }
 
-    Ok(discovery::join(live, worktrees))
+    Ok(discovery::join(live, worktrees, &scanned))
 }
 
 /// Whether a failed `tmux kill-session` stderr positively signals the session
@@ -807,7 +811,16 @@ pub(crate) fn run_remove(
     // has a worktree. The canonical path is recomputed from validated ids
     // (never from discovered metadata — ADR-0004).
     let worktree_dir = worktree_path(project_id, session_id);
-    let has_worktree = exec.run(&dir_exists_tokens(&worktree_dir))?.success;
+    let probe = exec.run(&dir_exists_tokens(&worktree_dir))?;
+    // `test -d` is silent: a clean non-zero exit (empty stderr) means the dir is
+    // absent (shared session, or worktree already gone). A non-empty stderr
+    // means the probe itself couldn't run (ssh/kubectl/auth/shell error) — fail
+    // closed rather than mistaking a transport error for "no worktree" and
+    // orphaning a live worktree + branch (mirrors `run_respawn`).
+    if !probe.success && !probe.stderr.trim().is_empty() {
+        return Err(SourceError::Transport(probe.stderr));
+    }
+    let has_worktree = probe.success;
 
     if has_worktree && !force {
         if let Some(reason) = worktree_has_work(exec, &worktree_dir)? {
@@ -1982,6 +1995,35 @@ pub(crate) mod tests {
         // substring "worktree", which also appears in the `test -d` probe argv.
         assert_eq!(fake.count_calls_with("remove"), 0);
         assert_eq!(fake.count_calls_with("-D"), 0);
+    }
+
+    #[test]
+    fn run_remove_fails_closed_when_the_worktree_probe_errors() {
+        // The `test -d` probe fails with a non-empty stderr (ssh/auth/shell
+        // error, not a clean "dir absent"). run_remove must NOT mistake that for
+        // "no worktree" and proceed to kill tmux while skipping cleanup — that
+        // would orphan a live worktree + branch. It fails closed with Transport.
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.scratch]
+            host = "devbox"
+            path = "~/scratch"
+            workspace = "shared"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+        "#;
+        let config = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::fail("ssh: connect: connection refused")), // test -d: probe error
+        ]);
+        let err = run_remove(&fake, &config, &pid("scratch"), &sid("s1"), true).expect_err("err");
+        assert!(matches!(err, SourceError::Transport(_)));
+        // Failed closed: tmux was never killed, nothing cleaned up.
+        assert_eq!(fake.count_calls_with("kill-session"), 0);
+        assert_eq!(fake.count_calls_with("remove"), 0);
     }
 
     #[test]
