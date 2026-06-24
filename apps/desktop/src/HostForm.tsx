@@ -117,33 +117,74 @@ export function HostForm({ mode, initial, onSubmit, onCancel }: HostFormProps) {
         <>
           <label>
             Pod
+            <label className="field-toggle">
+              <input
+                type="checkbox"
+                checked={form.podIsCommand}
+                onChange={(e) => set("podIsCommand", e.target.checked)}
+              />
+              resolve via command
+            </label>
             <input
               value={form.pod}
               onChange={(e) => set("pod", e.target.value)}
+              placeholder={
+                form.podIsCommand ? "kubectl … -o name | head -n1" : "pod name"
+              }
             />
           </label>
           <label>
             Namespace
+            <label className="field-toggle">
+              <input
+                type="checkbox"
+                checked={form.namespaceIsCommand}
+                onChange={(e) => set("namespaceIsCommand", e.target.checked)}
+              />
+              resolve via command
+            </label>
             <input
               value={form.namespace}
               onChange={(e) => set("namespace", e.target.value)}
-              placeholder="optional"
+              placeholder={
+                form.namespaceIsCommand ? "shell command…" : "optional"
+              }
             />
           </label>
           <label>
             Context
+            <label className="field-toggle">
+              <input
+                type="checkbox"
+                checked={form.contextIsCommand}
+                onChange={(e) => set("contextIsCommand", e.target.checked)}
+              />
+              resolve via command
+            </label>
             <input
               value={form.context}
               onChange={(e) => set("context", e.target.value)}
-              placeholder="optional"
+              placeholder={
+                form.contextIsCommand ? "shell command…" : "optional"
+              }
             />
           </label>
           <label>
             Container
+            <label className="field-toggle">
+              <input
+                type="checkbox"
+                checked={form.containerIsCommand}
+                onChange={(e) => set("containerIsCommand", e.target.checked)}
+              />
+              resolve via command
+            </label>
             <input
               value={form.container}
               onChange={(e) => set("container", e.target.value)}
-              placeholder="optional"
+              placeholder={
+                form.containerIsCommand ? "shell command…" : "optional"
+              }
             />
           </label>
         </>
