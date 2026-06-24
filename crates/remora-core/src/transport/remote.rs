@@ -62,8 +62,9 @@ pub(crate) fn open_pty(argv: &[String]) -> Result<SessionChannel, SourceError> {
 /// Turns a pure argv into a `CommandBuilder` (program = argv[0]) with `TERM`
 /// pinned so a remote tmux resolves terminfo for xterm.js regardless of the
 /// launching shell's `$TERM` (#26). ssh forwards this to the remote PTY; the
-/// kubectl transport additionally wraps `env TERM=…` in-container because
-/// kubectl does not reliably forward the client TERM into the pod PTY.
+/// kubectl transport instead pins `TERM` (and a UTF-8 locale) in-container via
+/// its own shell preamble because kubectl forwards neither the client TERM nor
+/// a locale into the pod.
 ///
 /// Precondition: `argv` is non-empty.
 pub(crate) fn command_from_argv(argv: &[String]) -> CommandBuilder {
@@ -250,10 +251,29 @@ pub(crate) fn branch_delete_tokens(project_path: &str, branch: &str) -> Vec<Stri
     ]
 }
 
-/// Tokens for `tmux new-session -d -s <name> -c <dir> <agent…> ';' set-option
-/// -t <name> remain-on-exit on` — the atomic creation lock, with
-/// `remain-on-exit` applied in the **same tmux invocation** via tmux's own
-/// argv command separator.
+/// Tokens for the atomic session-creation command — a single `tmux` invocation
+/// chaining, via tmux's own argv `;` separator:
+///
+/// ```text
+/// set-option -g history-limit 50000              (deep scrollback, #53)
+///   ';' new-session -d -s <name> -c <dir> <agent…>   (creation + the lock)
+///   ';' set-option -t <name> remain-on-exit on   (retain a dead pane, #28)
+///   ';' set-option -t <name> mouse on            (wheel → scrollback, #53)
+/// ```
+///
+/// `history-limit` leads and is **global** (`-g`): tmux applies it only to
+/// windows created *after* it is set, and the agent's window is created by the
+/// chained `new-session`, so the limit must already be in effect — and the
+/// session it would `-t` doesn't exist yet. The bump hits the tmux server
+/// Remora owns, so a global default is benign. `remain-on-exit` and `mouse` are
+/// live session options applied after creation, targeted by `-t <name>`.
+/// `remain-on-exit` (the #28 self-destruct guard) comes BEFORE `mouse` on
+/// purpose: a failing mid-chain `set-option` aborts the rest of the invocation,
+/// and `mouse on` can fail on tmux < 2.1 (the option didn't exist yet), so
+/// ordering the load-bearing guard ahead of the cosmetic option keeps a mouse
+/// failure from stripping it. Chaining keeps every option in the SAME
+/// invocation as the lock so none can land in a separate, failure-prone
+/// round-trip.
 ///
 /// The `;` is **shell-quoted** (`';'`) so the remote login shell passes it to
 /// tmux as a literal separator token rather than eating it as a shell statement
@@ -270,8 +290,16 @@ pub(crate) fn new_session_tokens(plan: &SpawnPlan) -> Vec<String> {
             &plan.agent_argv,
         )))
     };
+    let sep = shell_quote(";");
     vec![
         "tmux".into(),
+        // Deep scrollback for the agent's long output — must precede the window
+        // `new-session` creates (#53).
+        "set-option".into(),
+        "-g".into(),
+        "history-limit".into(),
+        "50000".into(),
+        sep.clone(),
         "new-session".into(),
         "-d".into(),
         "-s".into(),
@@ -279,11 +307,25 @@ pub(crate) fn new_session_tokens(plan: &SpawnPlan) -> Vec<String> {
         "-c".into(),
         quote_remote_path(&plan.dir),
         pane_command,
-        shell_quote(";"),
+        sep.clone(),
+        // remain-on-exit MUST precede mouse: a failing mid-chain set-option
+        // aborts the rest of the tmux invocation, and remain-on-exit is the
+        // load-bearing #28 guard (retains a pane whose process exits at startup
+        // before it can self-destruct the session). `mouse on` is cosmetic and
+        // can fail on tmux < 2.1 (the option didn't exist), so it rides LAST —
+        // a mouse failure then can't strip the guard.
         "set-option".into(),
         "-t".into(),
         plan.tmux_name.clone(),
         "remain-on-exit".into(),
+        "on".into(),
+        sep,
+        // Mouse mode: the scroll wheel drives tmux copy-mode/scrollback instead
+        // of being translated into arrow keys (#53).
+        "set-option".into(),
+        "-t".into(),
+        plan.tmux_name.clone(),
+        "mouse".into(),
         "on".into(),
     ]
 }
@@ -495,9 +537,9 @@ pub(crate) fn run_spawn(
         // worktree we just made is orphaned — best-effort remove it so the slot
         // stays retryable. A duplicate means a live session already owns it.
         //
-        // But the lock command is `new-session ';' set-option` sharing one exit
-        // code (#28): a non-zero exit can also mean the session WAS created and
-        // only the trailing set-option failed. Force-removing the worktree then
+        // But the lock command chains `new-session ';' set-option …` under one
+        // exit code (#28, #53): a non-zero exit can also mean the session WAS
+        // created and only a trailing set-option failed. Force-removing the worktree then
         // would yank a LIVE session's cwd out from under it. So gate the cleanup
         // on a has-session probe and remove only once it confirms no session
         // exists; if the probe can't run, leave the worktree (better an orphan
@@ -1040,20 +1082,54 @@ pub(crate) mod tests {
     fn new_session_tokens_applies_remain_on_exit_atomically() {
         let plan = worktree_plan();
         let tokens = new_session_tokens(&plan);
-        let sep = tokens
+        // remain-on-exit rides the SAME invocation as new-session, after a
+        // shell-quoted separator, as `set-option -t <name> remain-on-exit on`.
+        let r = tokens
             .iter()
-            .position(|a| a == "';'")
-            .expect("shell-quoted tmux separator");
-        assert_eq!(tokens[sep + 1], "set-option");
-        assert_eq!(tokens[sep + 2], "-t");
-        assert_eq!(tokens[sep + 3], "remora_api_fix-login");
-        assert_eq!(tokens[sep + 4], "remain-on-exit");
-        assert_eq!(tokens[sep + 5], "on");
+            .position(|a| a == "remain-on-exit")
+            .expect("remain-on-exit");
+        assert_eq!(tokens[r - 4], "';'");
+        assert_eq!(tokens[r - 3], "set-option");
+        assert_eq!(tokens[r - 2], "-t");
+        assert_eq!(tokens[r - 1], "remora_api_fix-login");
+        assert_eq!(tokens[r + 1], "on");
         let new_session = tokens
             .iter()
             .position(|a| a == "new-session")
             .expect("new-session");
-        assert!(sep > new_session, "separator follows new-session");
+        assert!(r > new_session, "remain-on-exit follows new-session");
+    }
+
+    #[test]
+    fn new_session_tokens_enables_mouse_and_deep_scrollback() {
+        // #53: the scroll wheel must drive tmux scrollback (mouse on), with a
+        // history-limit deep enough for long agent output.
+        let plan = worktree_plan();
+        let tokens = new_session_tokens(&plan);
+        let ns = tokens
+            .iter()
+            .position(|a| a == "new-session")
+            .expect("new-session");
+
+        // history-limit is set globally and BEFORE new-session: tmux applies it
+        // only to windows created afterward, and the target session/window does
+        // not exist yet.
+        let h = tokens
+            .iter()
+            .position(|a| a == "history-limit")
+            .expect("history-limit");
+        assert!(h < ns, "history-limit precedes new-session");
+        assert_eq!(tokens[h - 1], "-g", "global: no session to -t yet");
+        assert_eq!(tokens[h + 1], "50000");
+
+        // mouse on is a live option, applied after creation, targeted by name.
+        let m = tokens.iter().position(|a| a == "mouse").expect("mouse");
+        assert!(m > ns, "mouse follows new-session");
+        assert_eq!(tokens[m - 4], "';'");
+        assert_eq!(tokens[m - 3], "set-option");
+        assert_eq!(tokens[m - 2], "-t");
+        assert_eq!(tokens[m - 1], "remora_api_fix-login");
+        assert_eq!(tokens[m + 1], "on");
     }
 
     #[test]
@@ -1111,9 +1187,9 @@ pub(crate) mod tests {
             .position(|a| a == "new-session")
             .expect("new-session");
         // Still exactly one agent-command token after `-c <dir>` (wrapped, not
-        // per-token), followed only by the 6-token remain-on-exit trailer.
-        // tmux + new-session + 4 flags + dir + agent-cmd + sep + 5 set-option args = 14 tokens
-        assert_eq!(tokens.len(), n + 1 + 6 + 6);
+        // per-token), followed by two 6-token trailers (remain-on-exit, then
+        // mouse). new-session + 6 (down to agent-cmd) + 6 + 6.
+        assert_eq!(tokens.len(), n + 1 + 6 + 6 + 6);
         let fragment = join_agent_command(&plan.agent_argv);
         let inner = wrap_with_shell_fallback(&fragment);
         assert_eq!(tokens[n + 6], shell_quote(&inner));
@@ -1140,17 +1216,20 @@ pub(crate) mod tests {
         // -d -s <name> -c <dir> <cmd> ; set-option -t <name> remain-on-exit on
         assert_eq!(tokens[n + 4], "-c");
         assert_eq!(tokens[n + 6], shell_quote(PLAIN_SHELL_COMMAND));
-        // Same tmux argv shape as an agent spawn: command token + 6-token trailer.
-        assert_eq!(tokens.len(), n + 1 + 6 + 6);
+        // Same tmux argv shape as an agent spawn: command token + the
+        // remain-on-exit and mouse 6-token trailers.
+        assert_eq!(tokens.len(), n + 1 + 6 + 6 + 6);
         // The agent-exit wrapper must NOT appear for a no-agent pane.
         assert!(
             !tokens.iter().any(|t| t.contains("__remora_rc")),
             "no shell-fallback wrapper for a plain shell: {tokens:?}"
         );
         // remain-on-exit trailer is still present and atomic.
-        let sep = tokens.iter().position(|a| a == "';'").expect("separator");
-        assert_eq!(tokens[sep + 4], "remain-on-exit");
-        assert_eq!(tokens[sep + 5], "on");
+        let r = tokens
+            .iter()
+            .position(|a| a == "remain-on-exit")
+            .expect("remain-on-exit");
+        assert_eq!(tokens[r + 1], "on");
     }
 
     // -----------------------------------------------------------------------

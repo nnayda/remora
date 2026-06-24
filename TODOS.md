@@ -117,28 +117,6 @@ up cold.
   optimized anyway. See `docs/superpowers/specs/2026-06-15-session-discovery-design.md`.
 - **Depends on:** stage 6 (`list`) merged; pairs with ControlMaster.
 
-## `LC_ALL=C` locale hardening for remote-command stderr classification
-
-- **What:** Force a C locale on the remote tmux/git commands whose stderr we
-  pattern-match (`tmux new-session` "duplicate session", `tmux list-sessions`
-  "no server running" / "no sessions"), so the English-substring matches are
-  reliable regardless of the sandbox's `LC_MESSAGES`.
-- **Why:** Today classification matches English diagnostics case-insensitively.
-  A non-English remote locale prints e.g. "kein Server", so a "no sessions"
-  state would be misclassified as a `Transport` error (scary error where the
-  truth is "zero live sessions"), and a duplicate-session race could slip the
-  fail-closed lock.
-- **Pros:** Robust classification independent of remote locale; one consistent
-  rule across spawn (stage 5) and discovery (stage 6).
-- **Cons:** Threading `LC_ALL=C` through the remote command (a shell-assignment
-  prefix vs argv token) needs care so it survives ssh's remote-shell parse;
-  small cross-cutting change to `ssh_base_argv`/command construction.
-- **Context:** Stage-6 eng review (decision 9 / Codex #9). Accepted the
-  English-match fragility for stage 6 to keep the diff small; retroactively
-  covers stage-5's `classify_new_session_failure`.
-- **Depends on:** none; cheapest done alongside ControlMaster's `ssh_base_argv`
-  rework.
-
 ## Bound captured output at the `SshExec` seam (memory)
 
 - **What:** Cap the bytes `RealSshExec::run` reads from a remote command.

@@ -199,6 +199,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Terminal rendering is no longer corrupted when an agent draws box-drawing or
+  other multibyte UTF-8 (e.g. claude-code's logo rendered as underscores/garbage
+  over a kubectl pod). The session's tmux was running in non-UTF-8 mode: kubectl
+  forwards none of the client's environment and our `exec`s run a non-login,
+  non-interactive shell that sources no profile, so the pod shell had no locale
+  and tmux fell back to mangling the agent's bytes — every attached client then
+  saw garbage, while a directly-run agent (no tmux to misparse it) looked fine,
+  which is what made it baffling. Both transports now pin a UTF-8 locale on every
+  remote command: the kubectl adapter prepends an `export LANG=C.UTF-8
+  LC_ALL=C.UTF-8 TERM=xterm-256color;` preamble inside its `sh -c` body (replacing
+  the narrower `env TERM=…` wrap, and using `export …;` so it composes with shell
+  constructs like the pod preflight's `for` loop), and the ssh adapter prepends an
+  `env LANG=C.UTF-8 LC_ALL=C.UTF-8` prefix (ssh's non-interactive `$SHELL -c`
+  sources no profile and `SendEnv`/`AcceptEnv` is a fragile default). `C.UTF-8` is
+  present without `locale-gen` on glibc and musl and keeps diagnostics in English.
+- Mouse-wheel scrolling now drives tmux's scrollback instead of being translated
+  into arrow keys, and scrollback is deepened to 50000 lines for long agent
+  output (closes #53). The session-creation command sets `mouse on` and a global
+  `history-limit 50000` in the same atomic `tmux` invocation as `new-session`
+  (history-limit leads, because tmux applies it only to windows created after it
+  is set). `remain-on-exit` is ordered ahead of `mouse on` so that a `mouse`
+  failure on tmux < 2.1 (where the option didn't exist) can't abort the chain and
+  strip the load-bearing #28 self-destruct guard. Mouse mode applies to
+  newly-created sessions only.
 - Agent launch arguments that use a Unicode dash (e.g.
   `—dangerously-skip-permissions`, where autocorrect or a "prettifying" paste
   turned `--` into an em-dash) are now rejected at config time instead of
