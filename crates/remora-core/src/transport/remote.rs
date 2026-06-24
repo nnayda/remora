@@ -167,12 +167,12 @@ pub(crate) fn attach_tokens(tmux_name: &str) -> Vec<String> {
     ]
 }
 
-/// Tokens for `git -C <project> worktree add -b <branch> <worktree>`.
-/// Precondition: `plan.branch` is `Some` (worktree mode); the only caller
-/// checks. `git worktree add` creates leading directories.
-pub(crate) fn worktree_add_tokens(plan: &SpawnPlan) -> Vec<String> {
+/// Tokens for `git -C <project> worktree add -b <branch> <worktree> [<start>]`.
+/// `start_point` (a resolved base ref, #54) is appended last and shell-quoted
+/// when present; `None` reproduces the legacy local-HEAD behavior.
+pub(crate) fn worktree_add_tokens(plan: &SpawnPlan, start_point: Option<&str>) -> Vec<String> {
     let branch = plan.branch.as_deref().unwrap_or_default();
-    vec![
+    let mut tokens = vec![
         "git".into(),
         "-C".into(),
         quote_remote_path(&plan.project_path),
@@ -181,14 +181,17 @@ pub(crate) fn worktree_add_tokens(plan: &SpawnPlan) -> Vec<String> {
         "-b".into(),
         shell_quote(branch),
         quote_remote_path(&plan.dir),
-    ]
+    ];
+    if let Some(sp) = start_point {
+        tokens.push(shell_quote(sp));
+    }
+    tokens
 }
 
 /// Tokens for `git -C <project> fetch origin` — refreshes origin's
 /// remote-tracking refs before a new worktree is based off them (#54). Always
 /// origin: deriving a remote from a base ref's text is ambiguous, and
 /// multi-remote is out of scope.
-#[allow(dead_code)]
 pub(crate) fn fetch_tokens(project_path: &str) -> Vec<String> {
     vec![
         "git".into(),
@@ -201,7 +204,6 @@ pub(crate) fn fetch_tokens(project_path: &str) -> Vec<String> {
 
 /// Tokens for `git -C <project> symbolic-ref --short refs/remotes/origin/HEAD`
 /// — prints origin's default branch (e.g. `origin/main`).
-#[allow(dead_code)]
 pub(crate) fn remote_head_tokens(project_path: &str) -> Vec<String> {
     vec![
         "git".into(),
@@ -218,7 +220,6 @@ pub(crate) fn remote_head_tokens(project_path: &str) -> Vec<String> {
 /// plus the `^{commit}` peel defeats DWIM resolution against a tag like
 /// `refs/tags/origin/main` and rejects a dangling symbolic ref. The ref is
 /// shell-quoted because `^{}` are shell-special.
-#[allow(dead_code)]
 pub(crate) fn verify_commit_tokens(project_path: &str, git_ref: &str) -> Vec<String> {
     vec![
         "git".into(),
@@ -560,6 +561,56 @@ pub(crate) fn attach_channel(
     exec.open_channel(&attach_tokens(tmux_name))
 }
 
+/// Resolves the git start-point for a new worktree (#54): fetch origin
+/// (best-effort), then the cascade — explicit `plan.base` → detected
+/// `origin/HEAD` (verified) → `origin/main` → `origin/master` → `None` (omit
+/// the start-point, branch off local `HEAD`). Only the fetch swallows errors;
+/// a detection exec `Err` (transport down) propagates, while a non-zero exit
+/// (ref absent) falls through.
+pub(crate) fn resolve_base(
+    exec: &dyn RemoteExec,
+    plan: &SpawnPlan,
+) -> Result<Option<String>, SourceError> {
+    // 1. Fetch — best-effort: swallow both Err and a non-zero exit.
+    let _ = exec.run(&fetch_tokens(&plan.project_path));
+
+    // 2. Explicit per-session/per-project base wins; no detection round-trips.
+    if let Some(base) = &plan.base {
+        return Ok(Some(base.clone()));
+    }
+
+    // 3. origin/HEAD, verified to resolve to a commit (guards stale/dangling).
+    let head = exec.run(&remote_head_tokens(&plan.project_path))?;
+    if head.success {
+        let candidate = head.stdout.trim();
+        if !candidate.is_empty()
+            && ref_resolves(exec, &plan.project_path, &format!("refs/remotes/{candidate}"))?
+        {
+            return Ok(Some(candidate.to_string()));
+        }
+    }
+
+    // 4. Probe origin/main then origin/master (exact refspec, exit-only fall-through).
+    for short in ["origin/main", "origin/master"] {
+        if ref_resolves(exec, &plan.project_path, &format!("refs/remotes/{short}"))? {
+            return Ok(Some(short.to_string()));
+        }
+    }
+
+    // 5. Nothing resolved — omit the start-point (legacy local-HEAD base).
+    Ok(None)
+}
+
+/// Whether `git_ref^{commit}` resolves. Exec `Err` (transport) propagates; a
+/// non-zero exit (ref absent / dangling) is `false`.
+fn ref_resolves(
+    exec: &dyn RemoteExec,
+    project_path: &str,
+    git_ref: &str,
+) -> Result<bool, SourceError> {
+    Ok(exec.run(&verify_commit_tokens(project_path, git_ref))?.success)
+}
+
 /// Orchestrates the full spawn sequence: optional worktree creation, tmux
 /// new-session (the atomic lock, which also applies `remain-on-exit`), env
 /// metadata, then attach. Each step crosses the `RemoteExec` seam so tests can
@@ -569,7 +620,8 @@ pub(crate) fn run_spawn(
     plan: &SpawnPlan,
 ) -> Result<SessionChannel, SourceError> {
     if plan.branch.is_some() {
-        let out = exec.run(&worktree_add_tokens(plan))?;
+        let start_point = resolve_base(exec, plan)?;
+        let out = exec.run(&worktree_add_tokens(plan, start_point.as_deref()))?;
         if !out.success {
             return Err(classify_worktree_add_failure(
                 &out.stderr,
@@ -1091,7 +1143,7 @@ pub(crate) mod tests {
     #[test]
     fn worktree_add_tokens_builds_git_command() {
         let plan = worktree_plan();
-        let tokens = worktree_add_tokens(&plan);
+        let tokens = worktree_add_tokens(&plan, None);
         let g = tokens.iter().position(|a| a == "git").expect("git");
         assert_eq!(tokens[g + 1], "-C");
         assert_eq!(tokens[g + 2], "/home/dev/api");
@@ -1422,11 +1474,16 @@ pub(crate) mod tests {
     #[test]
     fn existing_worktree_aborts_before_create() {
         let plan = worktree_plan();
-        let fake = FakeExec::new(vec![Ok(FakeExec::fail("fatal: '<path>' already exists"))]);
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                                        // fetch
+            Ok(FakeExec::out("origin/main\n")),                        // symbolic-ref
+            Ok(FakeExec::ok()),                                        // verify
+            Ok(FakeExec::fail("fatal: '<path>' already exists")),      // worktree add FAILS
+        ]);
         let err = run_spawn(&fake, &plan).expect_err("worktree already exists");
         assert!(matches!(err, SourceError::SessionExists { .. }), "{err}");
-        // Exactly 1 call (worktree-add), no channel opened.
-        assert_eq!(fake.calls.lock().expect("lock").len(), 1);
+        // 4 calls: fetch + symbolic-ref + verify + worktree-add, no channel opened.
+        assert_eq!(fake.calls.lock().expect("lock").len(), 4);
         assert_eq!(fake.opened.lock().expect("lock").len(), 0);
     }
 
@@ -1434,6 +1491,9 @@ pub(crate) mod tests {
     fn duplicate_session_does_not_open_a_channel() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                 // fetch
+            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
+            Ok(FakeExec::ok()),                 // verify
             // worktree add succeeds
             Ok(FakeExec::ok()),
             // new-session fails with duplicate
@@ -1470,27 +1530,30 @@ pub(crate) mod tests {
     fn worktree_spawn_runs_add_create_metadata_then_attaches_in_order() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),
-            Ok(FakeExec::ok()),
-            Ok(FakeExec::ok()),
-            Ok(FakeExec::ok()),
-            Ok(FakeExec::ok()),
+            Ok(FakeExec::ok()),                 // fetch
+            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
+            Ok(FakeExec::ok()),                 // verify
+            Ok(FakeExec::ok()),                 // worktree add
+            Ok(FakeExec::ok()),                 // new-session
+            Ok(FakeExec::ok()),                 // set-environment REMORA_AGENT
+            Ok(FakeExec::ok()),                 // set-environment REMORA_WORKSPACE
+            Ok(FakeExec::ok()),                 // set-environment REMORA_CREATED_AT
         ]);
         let result = run_spawn(&fake, &plan);
         assert!(result.is_ok());
         let calls = fake.calls.lock().expect("lock");
-        // worktree add, new-session (remain-on-exit folded in atomically), then
-        // 3x set-environment = 5 blocking cmds — there is no separate set-option.
-        assert_eq!(calls.len(), 5);
-        assert!(calls[0].iter().any(|a| a == "worktree"));
-        assert!(calls[1].iter().any(|a| a == "new-session"));
+        // fetch + symbolic-ref + verify + worktree add + new-session
+        // (remain-on-exit folded in atomically) + 3x set-environment = 8 blocking cmds.
+        assert_eq!(calls.len(), 8);
+        assert!(calls[3].iter().any(|a| a == "worktree"));
+        assert!(calls[4].iter().any(|a| a == "new-session"));
         // remain-on-exit rides on the new-session call, not a follow-up exec:
-        // its `set-option` lives inside calls[1], never as a standalone call.
-        assert!(calls[1].iter().any(|a| a == "set-option"));
-        assert!(calls[1].iter().any(|a| a == "remain-on-exit"));
-        assert!(calls[2].iter().any(|a| a == "set-environment"));
+        // its `set-option` lives inside calls[4], never as a standalone call.
+        assert!(calls[4].iter().any(|a| a == "set-option"));
+        assert!(calls[4].iter().any(|a| a == "remain-on-exit"));
+        assert!(calls[5].iter().any(|a| a == "set-environment"));
         assert!(
-            !calls[2..]
+            !calls[5..]
                 .iter()
                 .any(|c| c.iter().any(|a| a == "set-option")),
             "remain-on-exit is not a standalone follow-up call"
@@ -1502,7 +1565,10 @@ pub(crate) mod tests {
     fn metadata_failure_is_tolerated_and_still_attaches() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                        // worktree add
+            Ok(FakeExec::ok()),                 // fetch
+            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
+            Ok(FakeExec::ok()),                 // verify
+            Ok(FakeExec::ok()),                 // worktree add
             Ok(FakeExec::ok()), // new-session (live! remain-on-exit folded in)
             Ok(FakeExec::fail("set-env boom")), // REMORA_AGENT — tolerated
             Err(SourceError::Transport("net".into())), // REMORA_WORKSPACE — tolerated
@@ -1520,6 +1586,9 @@ pub(crate) mod tests {
     fn new_session_generic_failure_is_transport_and_opens_no_channel() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                 // fetch
+            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
+            Ok(FakeExec::ok()),                 // verify
             Ok(FakeExec::ok()),                      // worktree add
             Ok(FakeExec::fail("no server running")), // new-session: generic failure
             Ok(FakeExec::fail("no server running")), // has-session: confirms no session
@@ -1543,6 +1612,9 @@ pub(crate) mod tests {
         // be force-removed. A has-session probe gates the orphan cleanup.
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                 // fetch
+            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
+            Ok(FakeExec::ok()),                 // verify
             Ok(FakeExec::ok()),                                               // worktree add
             Ok(FakeExec::fail("set-option: unknown option: remain-on-exit")), // created, set-option failed
             Ok(FakeExec::ok()), // has-session: the session IS live
@@ -1565,6 +1637,9 @@ pub(crate) mod tests {
         // ambiguous leaves the worktree.
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                 // fetch
+            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
+            Ok(FakeExec::ok()),                 // verify
             Ok(FakeExec::ok()),                                               // worktree add
             Ok(FakeExec::fail("set-option: unknown option: remain-on-exit")), // created, set-option failed
             Ok(FakeExec::fail(
@@ -1585,6 +1660,9 @@ pub(crate) mod tests {
         // A duplicate means a LIVE session owns the worktree — never remove it.
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                 // fetch
+            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
+            Ok(FakeExec::ok()),                 // verify
             Ok(FakeExec::ok()), // worktree add
             Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
         ]);
@@ -1650,6 +1728,103 @@ pub(crate) mod tests {
             "no server running on /tmp/tmux-1000/default",
         ))]);
         assert!(run_list(&fake, &config).expect("list").is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_base tests (#54)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_base_uses_explicit_plan_base_without_detection() {
+        let plan = SpawnPlan { base: Some("origin/dev".into()), ..worktree_plan() };
+        let fake = FakeExec::new(vec![Ok(FakeExec::ok())]); // only the fetch
+        let got = resolve_base(&fake, &plan).expect("ok");
+        assert_eq!(got.as_deref(), Some("origin/dev"));
+        // fetch happened, no symbolic-ref/rev-parse probes.
+        assert_eq!(fake.count_calls_with("fetch"), 1);
+        assert_eq!(fake.count_calls_with("symbolic-ref"), 0);
+    }
+
+    #[test]
+    fn resolve_base_detects_origin_head_when_verified() {
+        let plan = worktree_plan(); // base: None
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),            // fetch
+            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
+            Ok(FakeExec::ok()),            // verify refs/remotes/origin/main^{commit}
+        ]);
+        assert_eq!(resolve_base(&fake, &plan).expect("ok").as_deref(), Some("origin/main"));
+    }
+
+    #[test]
+    fn resolve_base_falls_through_dangling_origin_head_to_main() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                 // fetch
+            Ok(FakeExec::out("origin/gone\n")), // symbolic-ref succeeds
+            Ok(FakeExec::fail("")),             // verify origin/gone -> dangling
+            Ok(FakeExec::ok()),                 // verify refs/remotes/origin/main -> ok
+        ]);
+        assert_eq!(resolve_base(&fake, &plan).expect("ok").as_deref(), Some("origin/main"));
+    }
+
+    #[test]
+    fn resolve_base_probes_master_then_omits() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),     // fetch
+            Ok(FakeExec::fail("")), // symbolic-ref: origin/HEAD unset (non-zero exit)
+            Ok(FakeExec::fail("")), // verify origin/main -> absent
+            Ok(FakeExec::fail("")), // verify origin/master -> absent
+        ]);
+        assert_eq!(resolve_base(&fake, &plan).expect("ok"), None);
+    }
+
+    #[test]
+    fn resolve_base_propagates_detection_transport_error() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                                  // fetch
+            Err(SourceError::Transport("ssh down".into())),      // symbolic-ref Err
+        ]);
+        assert!(matches!(resolve_base(&fake, &plan), Err(SourceError::Transport(_))));
+    }
+
+    #[test]
+    fn resolve_base_swallows_fetch_failure() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Err(SourceError::Transport("offline".into())), // fetch Err -> swallowed
+            Ok(FakeExec::out("origin/main\n")),            // symbolic-ref
+            Ok(FakeExec::ok()),                            // verify
+        ]);
+        assert_eq!(resolve_base(&fake, &plan).expect("ok").as_deref(), Some("origin/main"));
+    }
+
+    #[test]
+    fn worktree_add_appends_quoted_start_point_last() {
+        let plan = worktree_plan();
+        let with = worktree_add_tokens(&plan, Some("origin/main"));
+        assert_eq!(with.last().map(String::as_str), Some(shell_quote("origin/main").as_str()));
+        let without = worktree_add_tokens(&plan, None);
+        assert_eq!(without.last().map(String::as_str), Some("\"$HOME\"/.remora/worktrees/api/fix-login"));
+    }
+
+    #[test]
+    fn run_spawn_fetches_before_worktree_add() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                 // fetch
+            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
+            Ok(FakeExec::ok()),                 // verify
+            Ok(FakeExec::ok()),                 // worktree add
+            Ok(FakeExec::ok()),                 // new-session
+        ]);
+        let _ = run_spawn(&fake, &plan);
+        let calls = fake.calls.lock().expect("lock");
+        let fetch_i = calls.iter().position(|a| a.iter().any(|t| t == "fetch")).expect("fetch");
+        let add_i = calls.iter().position(|a| a.iter().any(|t| t == "worktree")).expect("add");
+        assert!(fetch_i < add_i, "fetch must precede worktree add");
     }
 
     #[test]

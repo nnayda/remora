@@ -406,7 +406,7 @@ mod tests {
         let argv = ssh_compose(
             &host("devbox", None, None),
             false,
-            &worktree_add_tokens(&plan),
+            &worktree_add_tokens(&plan, None),
         );
         let g = argv.iter().position(|a| a == "git").expect("git");
         assert_eq!(argv[g + 1], "-C");
