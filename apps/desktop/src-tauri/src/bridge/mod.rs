@@ -1216,6 +1216,7 @@ mod tests {
             path: "/srv/api".into(),
             workspace: WorkspaceModeDto::Worktree,
             agent: "claude".into(),
+            base: None,
         }
     }
     fn agent_input() -> AgentInputDto {

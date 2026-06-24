@@ -254,7 +254,7 @@ export type EditorHostDto = { id: string; name: string | null; transport: Transp
  * A project with every editable field, including the on-host `path` and
  * `workspace` mode that the display `ProjectDto` omits.
  */
-export type EditorProjectDto = { id: string; name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string }
+export type EditorProjectDto = { id: string; name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string; base: string | null }
 /**
  * A configured host, label-only. The `transport` discriminant is all the UI
  * needs (an icon/badge); the connection details never cross.
@@ -283,7 +283,7 @@ export type ProjectDto = { id: string; name: string | null; hostId: string; work
  * Form payload for create/edit of a project. `host_id` and `agent` are
  * references to existing entries; converting parses them into ids.
  */
-export type ProjectInputDto = { name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string }
+export type ProjectInputDto = { name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string; base?: string | null }
 export type SessionMetaDto = { projectId: string; sessionId: string; state: SessionStateDto; 
 /**
  * Agent id the sandbox advertises for this session. Untrusted,
