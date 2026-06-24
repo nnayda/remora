@@ -17,6 +17,7 @@ the old one rather than editing history (see
 | [0004](0004-local-config-live-session-discovery.md) | Configure hosts and projects locally, discover sessions from the sandbox | Accepted |
 | [0005](0005-async-session-source-on-tokio.md) | SessionSource is async on tokio; channels are message pipes | Accepted |
 | [0006](0006-app-managed-config-writes.md) | The app writes the config file through a validated editor channel | Accepted |
+| [0007](0007-dynamic-kubectl-field-resolution.md) | kubectl host fields may be resolved from a local shell command at connect time | Accepted |
 
 ## Statuses
 
