@@ -2007,7 +2007,10 @@ pub(crate) mod tests {
     #[test]
     fn shell_runner_times_out_and_kills() {
         // Tiny timeout so the test is fast; sleep would otherwise hang.
-        let runner = ShellRunner::with_limits(std::time::Duration::from_millis(50), 64 * 1024);
+        // 500ms (not 50ms) stays well clear of process-spawn jitter on a loaded
+        // CI runner while remaining 10x under `sleep 5`, so the kill-on-timeout
+        // path fires deterministically without flaking.
+        let runner = ShellRunner::with_limits(std::time::Duration::from_millis(500), 64 * 1024);
         let err = resolve_local_command(&runner, "pod", "sleep 5").expect_err("must time out");
         assert!(format!("{err}").contains("timed out"), "{err}");
     }
