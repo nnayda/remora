@@ -266,6 +266,12 @@ export type HostDto = { id: string; name: string | null; transport: TransportKin
  */
 export type HostInputDto = { name: string | null; transport: TransportDto }
 /**
+ * A kubectl connection field for the editor: `command = false` is a literal
+ * value, `command = true` means `value` is a shell command line resolved at
+ * connect time. Flat + form-friendly for the TS toggle.
+ */
+export type KubectlFieldDto = { command: boolean; value: string }
+/**
  * Entry ids present in each section of the document, regardless of validity —
  * the delete targets degraded-mode recovery offers. Mirrors core's
  * [`PresentIds`] field-for-field; the `From` impl below is the single place to
@@ -307,7 +313,7 @@ export type SessionStateDto = "live" | "stopped"
  * inputs (it round-trips: what the form shows is what it submits). Internally
  * tagged on `kind` so the TS side discriminates on a single field.
  */
-export type TransportDto = { kind: "ssh"; host: string; user: string | null; port: number | null } | { kind: "kubectl"; pod: string; namespace: string | null; context: string | null; container: string | null }
+export type TransportDto = { kind: "ssh"; host: string; user: string | null; port: number | null } | { kind: "kubectl"; pod: KubectlFieldDto; namespace: KubectlFieldDto | null; context: KubectlFieldDto | null; container: KubectlFieldDto | null }
 /**
  * Which transport a host uses — the discriminant only, no connection fields.
  */

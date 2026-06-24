@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dynamic kubectl field resolution** (#52): a kubectl host's `pod`,
+  `namespace`, `context`, or `container` may be a literal string *or* a
+  `{ command = "…" }` table whose shell command is resolved **locally** at
+  connect time (its trimmed stdout becomes the argv token) — so a sandbox pod
+  that gets renamed/recreated is picked up with no config edit, e.g.
+  `pod = { command = "kubectl -n sb get pods -l app=dev -o name | head -n1" }`.
+  This is the single, opt-in crossing of ADR-0004's "config is never
+  shell-evaluated" line: only `{ command }` fields are evaluated, the resolved
+  value is re-validated against the literal-field guard (no control chars,
+  newlines, leading `-`) before entering the argv, resolution runs locally
+  behind the `SessionSource`/`remote.rs` seam (never in the pod), is re-run
+  every connect (never persisted), and is bounded by a 10s timeout + 64 KiB
+  output cap with a process-group kill so a hung selector can't leak. The
+  desktop config editor gains a per-field "resolve via command" toggle. See
+  [ADR-0009](docs/adr/0009-dynamic-kubectl-field-resolution.md).
 - **Per-session workspace mode** (#34): the new-session dialog gains a
   Worktree/Shared picker that overrides the project's default for that one
   session (`SpawnSpec.workspace`). To keep the choice coherent past spawn, a
