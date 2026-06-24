@@ -174,6 +174,7 @@ impl SessionSource for SshSource {
             project_id: project_id.clone(),
             session_id: session_id.clone(),
             agent,
+            workspace: None,
         };
         let plan = plan_spawn(&self.config, &spec)?;
         let exec = Arc::clone(&self.exec);
@@ -247,6 +248,7 @@ mod tests {
             project_id: ProjectId::new("api").expect("slug"),
             session_id: SessionId::new("fix-login").expect("slug"),
             agent: Some(AgentId::new("claude").expect("slug")),
+            workspace: None,
         }
     }
 

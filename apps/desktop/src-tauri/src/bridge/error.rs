@@ -192,6 +192,7 @@ mod tests {
             agent: Some("claude".into()),
             created_at: Some(1_765_500_000),
             workspace_path: None,
+            workspace: None,
         };
         let dto = SessionMetaDto::from(meta);
         let json = serde_json::to_string(&dto).expect("serialize");

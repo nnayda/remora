@@ -120,6 +120,7 @@ impl Bridge {
                 .map_err(|e| BridgeError::InvalidId {
                     message: e.to_string(),
                 })?,
+            workspace: None,
         };
         let source = self.resolve_for(&spec.project_id)?;
         let channel = source.spawn(spec).await?;
@@ -812,6 +813,7 @@ mod tests {
             project_id: pid("api"),
             session_id: sid("x"),
             agent: None,
+            workspace: None,
         })
         .await
         .expect("spawn");
@@ -863,6 +865,7 @@ mod tests {
                     agent: None,
                     created_at: None,
                     workspace_path: None,
+                    workspace: None,
                 },
                 SessionMeta {
                     project_id: pid("api"),
@@ -871,6 +874,7 @@ mod tests {
                     agent: None,
                     created_at: None,
                     workspace_path: None,
+                    workspace: None,
                 },
             ])
         }
@@ -1094,6 +1098,7 @@ mod tests {
             project_id: pid("api"),
             session_id: sid("x"),
             agent: None,
+            workspace: None,
         })
         .await
         .expect("spawn");
@@ -1470,6 +1475,7 @@ mod tests {
             project_id: pid("api"),
             session_id: sid("x"),
             agent: None,
+            workspace: None,
         })
         .await
         .expect("spawn");
@@ -1488,6 +1494,7 @@ mod tests {
             project_id: pid("api"),
             session_id: sid("x"),
             agent: None,
+            workspace: None,
         })
         .await
         .expect("spawn");
@@ -1505,6 +1512,7 @@ mod tests {
             project_id: pid("api"),
             session_id: sid("x"),
             agent: None,
+            workspace: None,
         })
         .await
         .expect("spawn");

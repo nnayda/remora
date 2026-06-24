@@ -189,6 +189,7 @@ async fn e2e_spawn_shared_session_runs_and_blocks_duplicate() {
         project_id: ProjectId::new(&project).expect("slug"),
         session_id: SessionId::new(&session).expect("slug"),
         agent: None,
+        workspace: None,
     };
 
     // First spawn succeeds; the agent (sh) is interactive in the session.
@@ -246,6 +247,7 @@ async fn e2e_spawn_worktree_cold_start_creates_worktree() {
         project_id: ProjectId::new("gitproj").expect("slug"),
         session_id: SessionId::new(&session).expect("slug"),
         agent: None,
+        workspace: None,
     };
 
     // Cold start: ~/.remora/worktrees/gitproj/ need not pre-exist; git creates it.
@@ -290,6 +292,7 @@ async fn e2e_discovery_stopped_then_respawn_reuses_worktree() {
         project_id: project.clone(),
         session_id: session_id.clone(),
         agent: None,
+        workspace: None,
     };
     let mut channel = source.spawn(spec).await.expect("spawn");
     let marker = format!("REMORA_MARKER_{session}");
@@ -380,6 +383,7 @@ async fn e2e_respawn_of_vanished_worktree_is_not_found() {
         project_id: project.clone(),
         session_id: session_id.clone(),
         agent: None,
+        workspace: None,
     };
     let mut channel = source.spawn(spec).await.expect("spawn");
     channel

@@ -4,6 +4,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AgentId, ProjectId, SessionId};
 
+/// Workspace mode for a session (ADR-0004/ADR-0008). `shared` sessions can
+/// clobber each other, so it is an explicit opt-in, never defaulted. Lives in
+/// the protocol crate because both `SpawnSpec` (the per-session override) and
+/// `SessionMeta` (the effective mode discovered from the sandbox) carry it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMode {
+    /// Each session gets a fresh git worktree + branch.
+    Worktree,
+    /// Sessions share the project directory (effectively single-writer).
+    Shared,
+}
+
 /// Lifecycle state of a session as discovered on a host (ADR-0004).
 ///
 /// `Live` means the named tmux session exists; `Stopped` means only the
@@ -51,6 +64,10 @@ pub struct SessionMeta {
     /// Workspace (worktree) path, as advertised by the sandbox. Untrusted;
     /// display only.
     pub workspace_path: Option<String>,
+    /// Effective workspace mode, discovered from real sandbox state (a surviving
+    /// worktree ⇒ `Worktree`). Drives display gating. `None` from an older
+    /// sender; the client then falls back to the project's configured mode.
+    pub workspace: Option<WorkspaceMode>,
 }
 
 /// Request to create a new session.
@@ -66,6 +83,10 @@ pub struct SpawnSpec {
     pub session_id: SessionId,
     /// Agent adapter to launch; `None` uses the project's default agent.
     pub agent: Option<AgentId>,
+    /// Per-session workspace-mode override; `None` uses the project's default.
+    /// Always serialized (mirrors `agent`); an absent key deserializes to
+    /// `None`, so older peers stay compatible without a `PROTOCOL_VERSION` bump.
+    pub workspace: Option<WorkspaceMode>,
 }
 
 #[cfg(test)]
@@ -80,6 +101,7 @@ mod tests {
             agent: Some("claude".to_string()),
             created_at: Some(1_765_500_000),
             workspace_path: Some("/home/dev/.remora/worktrees/api/fix-login".to_string()),
+            workspace: None,
         }
     }
 
@@ -96,7 +118,7 @@ mod tests {
         let json = serde_json::to_string(&meta()).expect("serialize");
         assert_eq!(
             json,
-            r#"{"project_id":"api","session_id":"fix-login","state":"live","agent":"claude","created_at":1765500000,"workspace_path":"/home/dev/.remora/worktrees/api/fix-login"}"#
+            r#"{"project_id":"api","session_id":"fix-login","state":"live","agent":"claude","created_at":1765500000,"workspace_path":"/home/dev/.remora/worktrees/api/fix-login","workspace":null}"#
         );
     }
 
@@ -151,11 +173,12 @@ mod tests {
             project_id: ProjectId::new("api").expect("valid slug"),
             session_id: SessionId::new("fix-login").expect("valid slug"),
             agent: Some(AgentId::new("claude").expect("valid slug")),
+            workspace: None,
         };
         let json = serde_json::to_string(&spec).expect("serialize");
         assert_eq!(
             json,
-            r#"{"project_id":"api","session_id":"fix-login","agent":"claude"}"#
+            r#"{"project_id":"api","session_id":"fix-login","agent":"claude","workspace":null}"#
         );
         let back: SpawnSpec = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(spec, back);
@@ -172,5 +195,42 @@ mod tests {
     fn spawn_spec_rejects_forged_ids() {
         let json = r#"{"project_id":"api; rm -rf /","session_id":"fix-login","agent":null}"#;
         assert!(serde_json::from_str::<SpawnSpec>(json).is_err());
+    }
+
+    #[test]
+    fn spawn_spec_workspace_round_trips_and_defaults_to_none() {
+        let spec = SpawnSpec {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("s1").expect("slug"),
+            agent: None,
+            workspace: Some(WorkspaceMode::Shared),
+        };
+        let json = serde_json::to_string(&spec).expect("serialize");
+        assert!(json.contains(r#""workspace":"shared""#));
+        assert_eq!(serde_json::from_str::<SpawnSpec>(&json).expect("de"), spec);
+        // Absent key tolerated → None.
+        let bare = r#"{"project_id":"api","session_id":"s1"}"#;
+        assert_eq!(
+            serde_json::from_str::<SpawnSpec>(bare)
+                .expect("de")
+                .workspace,
+            None
+        );
+    }
+
+    #[test]
+    fn session_meta_carries_effective_workspace() {
+        let json =
+            r#"{"project_id":"api","session_id":"s1","state":"live","workspace":"worktree"}"#;
+        let m: SessionMeta = serde_json::from_str(json).expect("de");
+        assert_eq!(m.workspace, Some(WorkspaceMode::Worktree));
+        // Absent → None (older sender).
+        let bare = r#"{"project_id":"api","session_id":"s1","state":"live"}"#;
+        assert_eq!(
+            serde_json::from_str::<SessionMeta>(bare)
+                .expect("de")
+                .workspace,
+            None
+        );
     }
 }

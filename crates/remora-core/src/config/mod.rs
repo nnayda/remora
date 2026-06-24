@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub use remora_protocol::{AgentId, InvalidIdError, ProjectId};
+pub use remora_protocol::{AgentId, InvalidIdError, ProjectId, WorkspaceMode};
 
 pub mod document;
 pub use document::{ConfigDocument, PresentIds};
@@ -154,17 +154,6 @@ pub struct Project {
     pub workspace: WorkspaceMode,
     /// Default agent adapter; must reference a configured agent.
     pub agent: AgentId,
-}
-
-/// Workspace mode a project declares (ADR-0004). Required, not defaulted:
-/// `shared` sessions can clobber each other, so the user opts in explicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkspaceMode {
-    /// Each session gets a fresh git worktree + branch.
-    Worktree,
-    /// Sessions share the project directory (effectively single-writer).
-    Shared,
 }
 
 /// Per-agent adapter data (ADR-0003): data, never code paths.

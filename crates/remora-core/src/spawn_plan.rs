@@ -139,6 +139,7 @@ mod tests {
             project_id: ProjectId::new(project).expect("slug"),
             session_id: SessionId::new(session).expect("slug"),
             agent: agent.map(|a| AgentId::new(a).expect("slug")),
+            workspace: None,
         }
     }
 

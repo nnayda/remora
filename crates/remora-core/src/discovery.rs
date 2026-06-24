@@ -98,6 +98,7 @@ pub fn join(
             agent: env.agent,
             created_at: env.created_at,
             workspace_path: env.workspace_path,
+            workspace: None,
         })
         .collect();
 
@@ -112,6 +113,7 @@ pub fn join(
             agent: None,
             created_at: None,
             workspace_path: clean_metadata(&path),
+            workspace: None,
         });
     }
 
