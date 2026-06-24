@@ -256,6 +256,7 @@ impl SessionSource for FakeSessionSource {
                 agent: session.agent.clone(),
                 created_at: None,
                 workspace_path: None,
+                workspace: None,
             })
             .collect();
         // Deterministic order for callers and tests.
@@ -320,6 +321,8 @@ mod tests {
             project_id: ProjectId::new(project).expect("valid slug"),
             session_id: SessionId::new(session).expect("valid slug"),
             agent: Some(AgentId::new("claude").expect("valid slug")),
+            base: None,
+            workspace: None,
         }
     }
 

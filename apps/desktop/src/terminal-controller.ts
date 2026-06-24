@@ -33,6 +33,7 @@ export class TerminalController {
     this.term = new Terminal({ cursorBlink: true });
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
+    this.term.attachCustomKeyEventHandler((e) => this.handleKeyEvent(e));
     this.term.open(element);
 
     this.unsubscribe = connection.subscribe((msg) => {
@@ -52,6 +53,38 @@ export class TerminalController {
     this.observer = new ResizeObserver(() => this.scheduleFit());
     this.observer.observe(element);
     this.syncSize(); // initial fit
+  }
+
+  /**
+   * Intercept Shift+Enter and forward it as ESC+CR (`\x1b\r`) — the soft-return
+   * sequence agents expect to insert a newline in their input — instead of
+   * letting xterm collapse it to a bare CR that submits the prompt. Returning
+   * `false` suppresses xterm's default handling so it doesn't also emit a CR;
+   * every other key returns `true` and falls through to xterm unchanged.
+   *
+   * Stays agent-agnostic: `\x1b\r` is the same byte sequence a native terminal
+   * is configured to send for Shift+Enter, so we're faithfully forwarding the
+   * keystroke over the PTY, not special-casing any agent. Other modifiers
+   * (Ctrl/Alt/Meta) are left alone so their own bindings still reach the agent.
+   */
+  private handleKeyEvent(event: KeyboardEvent): boolean {
+    if (
+      event.type === "keydown" &&
+      event.key === "Enter" &&
+      event.shiftKey &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      !event.metaKey
+    ) {
+      // Suppress the default CR either way; only write while the session lives.
+      if (!this.closed) {
+        void this.connection
+          .write(encoder.encode("\x1b\r"))
+          .catch((e) => this.logTransportError("write", e));
+      }
+      return false;
+    }
+    return true;
   }
 
   /** Move keyboard focus into the emulator so the user can type immediately.

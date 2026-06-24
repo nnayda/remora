@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub use remora_protocol::{AgentId, InvalidIdError, ProjectId};
+pub use remora_protocol::{AgentId, InvalidIdError, ProjectId, WorkspaceMode};
 
 pub mod document;
 pub use document::{ConfigDocument, PresentIds};
@@ -129,14 +129,25 @@ pub struct SshHost {
     pub port: Option<u16>,
 }
 
+/// A kubectl connection field: either a literal value used verbatim as one
+/// argv token, or a user-authored shell command line resolved LOCALLY at
+/// connect time (its trimmed stdout becomes the token). The `Command` form is
+/// the single, opt-in crossing of ADR-0004's "config is never shell-evaluated"
+/// line; `Literal` keeps the existing guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KubectlField {
+    Literal(String),
+    Command(String),
+}
+
 /// Connection details for a `kubectl exec` host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KubectlHost {
-    pub pod: String,
-    pub namespace: Option<String>,
+    pub pod: KubectlField,
+    pub namespace: Option<KubectlField>,
     /// kubeconfig context; `None` uses the current context.
-    pub context: Option<String>,
-    pub container: Option<String>,
+    pub context: Option<KubectlField>,
+    pub container: Option<KubectlField>,
 }
 
 /// A directory on a host with a workspace mode and a default agent
@@ -154,17 +165,10 @@ pub struct Project {
     pub workspace: WorkspaceMode,
     /// Default agent adapter; must reference a configured agent.
     pub agent: AgentId,
-}
-
-/// Workspace mode a project declares (ADR-0004). Required, not defaulted:
-/// `shared` sessions can clobber each other, so the user opts in explicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkspaceMode {
-    /// Each session gets a fresh git worktree + branch.
-    Worktree,
-    /// Sessions share the project directory (effectively single-writer).
-    Shared,
+    /// Optional default git start-point for new worktrees (#54), e.g.
+    /// `origin/develop`. Omitted = detect the remote default branch.
+    #[serde(default)]
+    pub base: Option<String>,
 }
 
 /// Per-agent adapter data (ADR-0003): data, never code paths.
@@ -314,6 +318,72 @@ fn display_issues(issues: &[ValidationIssue]) -> String {
     out
 }
 
+/// Raw kubectl field as authored in TOML: a bare string (literal) or a
+/// `{ command = "…" }` table. A hand-written `Deserialize` is required: serde
+/// SILENTLY IGNORES `#[serde(deny_unknown_fields)]` inside an `#[serde(untagged)]`
+/// variant (it buffers into `Content` first), so a typo'd inner key would parse
+/// and be dropped — breaking the loud-typo invariant `RawHost` relies on. The
+/// Visitor rejects unknown keys with TOML line/column, exactly like
+/// `deny_unknown_fields` elsewhere.
+#[derive(Debug)]
+enum RawKubectlField {
+    Literal(String),
+    Command(String),
+}
+
+impl From<RawKubectlField> for KubectlField {
+    fn from(raw: RawKubectlField) -> Self {
+        match raw {
+            RawKubectlField::Literal(v) => KubectlField::Literal(v),
+            RawKubectlField::Command(c) => KubectlField::Command(c),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RawKubectlField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+        use std::fmt;
+
+        struct FieldVisitor;
+
+        impl<'de> Visitor<'de> for FieldVisitor {
+            type Value = RawKubectlField;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a string or a { command = \"…\" } table")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(RawKubectlField::Literal(v.to_owned()))
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut command: Option<String> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "command" => {
+                            if command.is_some() {
+                                return Err(de::Error::duplicate_field("command"));
+                            }
+                            command = Some(map.next_value()?);
+                        }
+                        other => return Err(de::Error::unknown_field(other, &["command"])),
+                    }
+                }
+                command
+                    .map(RawKubectlField::Command)
+                    .ok_or_else(|| de::Error::missing_field("command"))
+            }
+        }
+
+        deserializer.deserialize_any(FieldVisitor)
+    }
+}
+
 /// Deserialization shape for one `[hosts.<id>]` table.
 ///
 /// Carries the *union* of every transport's fields because serde cannot
@@ -331,10 +401,10 @@ struct RawHost {
     user: Option<String>,
     port: Option<u16>,
     // kubectl
-    pod: Option<String>,
-    namespace: Option<String>,
-    context: Option<String>,
-    container: Option<String>,
+    pod: Option<RawKubectlField>,
+    namespace: Option<RawKubectlField>,
+    context: Option<RawKubectlField>,
+    container: Option<RawKubectlField>,
 }
 
 #[derive(Deserialize)]
@@ -346,6 +416,37 @@ struct RawConfig {
     projects: BTreeMap<ProjectId, Project>,
     #[serde(default)]
     agents: BTreeMap<AgentId, Agent>,
+}
+
+/// The guard for a value used verbatim as one argv token (literal fields AND
+/// re-validated resolved command output): non-empty, no control chars, no edge
+/// whitespace, no leading `-` (which ssh/kubectl would parse as a flag). Single
+/// source of truth so config-time and resolve-time checks cannot drift.
+pub(crate) fn literal_field_problem(value: &str) -> Option<&'static str> {
+    if value.trim().is_empty() {
+        Some("must not be empty")
+    } else if value.chars().any(char::is_control) {
+        Some("must not contain control characters")
+    } else if value != value.trim() {
+        Some("must not have leading or trailing whitespace")
+    } else if value.starts_with('-') {
+        Some("must not start with `-`")
+    } else {
+        None
+    }
+}
+
+/// The looser guard for a `{ command }` field at config time: it is a shell
+/// command line, so dashes and internal/edge whitespace are allowed; only an
+/// empty/whitespace-only command or control characters fail.
+pub(crate) fn command_field_problem(value: &str) -> Option<&'static str> {
+    if value.trim().is_empty() {
+        Some("must not be empty")
+    } else if value.chars().any(char::is_control) {
+        Some("must not contain control characters")
+    } else {
+        None
+    }
 }
 
 /// Validates an optional display name (hosts and projects), returning the
@@ -421,13 +522,13 @@ fn reject_foreign(
 /// Unwraps a transport's required field, recording an issue if it is
 /// missing. Value problems (blank, leading dash) are caught for every
 /// present field by [`RawHost::check_field_values`].
-fn require_field(
+fn require_field<T>(
     host: &HostId,
     transport: &'static str,
     field: &'static str,
-    value: Option<String>,
+    value: Option<T>,
     issues: &mut Vec<ValidationIssue>,
-) -> Option<String> {
+) -> Option<T> {
     if value.is_none() {
         issues.push(ValidationIssue::MissingHostField {
             host: host.clone(),
@@ -450,30 +551,39 @@ impl RawHost {
         let string_fields = [
             ("host", self.host.as_deref()),
             ("user", self.user.as_deref()),
-            ("pod", self.pod.as_deref()),
-            ("namespace", self.namespace.as_deref()),
-            ("context", self.context.as_deref()),
-            ("container", self.container.as_deref()),
         ];
         for (field, value) in string_fields {
             let Some(value) = value else { continue };
-            let reason = if value.trim().is_empty() {
-                "must not be empty"
-            } else if value.chars().any(char::is_control) {
-                "must not contain control characters"
-            } else if value != value.trim() {
-                "must not have leading or trailing whitespace"
-            } else if value.starts_with('-') {
-                "must not start with `-`"
-            } else {
-                continue;
-            };
-            issues.push(ValidationIssue::InvalidHostField {
-                host: id.clone(),
-                field,
-                reason,
-            });
+            if let Some(reason) = literal_field_problem(value) {
+                issues.push(ValidationIssue::InvalidHostField {
+                    host: id.clone(),
+                    field,
+                    reason,
+                });
+            }
         }
+
+        let kube_fields = [
+            ("pod", self.pod.as_ref()),
+            ("namespace", self.namespace.as_ref()),
+            ("context", self.context.as_ref()),
+            ("container", self.container.as_ref()),
+        ];
+        for (field, value) in kube_fields {
+            let Some(raw) = value else { continue };
+            let reason = match raw {
+                RawKubectlField::Literal(v) => literal_field_problem(v),
+                RawKubectlField::Command(c) => command_field_problem(c),
+            };
+            if let Some(reason) = reason {
+                issues.push(ValidationIssue::InvalidHostField {
+                    host: id.clone(),
+                    field,
+                    reason,
+                });
+            }
+        }
+
         if let Some(reason) = check_display_name(self.name.as_deref()) {
             issues.push(ValidationIssue::InvalidHostField {
                 host: id.clone(),
@@ -532,10 +642,10 @@ impl RawHost {
                 );
                 require_field(id, "kubectl", "pod", self.pod, issues).map(|pod| {
                     Transport::Kubectl(KubectlHost {
-                        pod,
-                        namespace: self.namespace,
-                        context: self.context,
-                        container: self.container,
+                        pod: pod.into(),
+                        namespace: self.namespace.map(Into::into),
+                        context: self.context.map(Into::into),
+                        container: self.container.map(Into::into),
                     })
                 })
             }
@@ -624,6 +734,24 @@ impl Config {
                     field: "name",
                     reason,
                 });
+            }
+            if let Some(base) = project.base.as_deref() {
+                let reason = if base.trim().is_empty() {
+                    Some("must not be empty (omit the key instead)")
+                } else if base.chars().any(char::is_control) {
+                    Some("must not contain control characters")
+                } else if base.trim_start().starts_with('-') {
+                    Some("must not start with `-`")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    issues.push(ValidationIssue::InvalidProjectField {
+                        project: id.clone(),
+                        field: "base",
+                        reason,
+                    });
+                }
             }
         }
 
@@ -800,10 +928,13 @@ mod tests {
         let Transport::Kubectl(k8s) = &staging.transport else {
             panic!("staging should be kubectl");
         };
-        assert_eq!(k8s.pod, "sandbox-0");
-        assert_eq!(k8s.namespace.as_deref(), Some("agents"));
-        assert_eq!(k8s.context.as_deref(), Some("staging-cluster"));
-        assert_eq!(k8s.container.as_deref(), Some("main"));
+        assert_eq!(k8s.pod, KubectlField::Literal("sandbox-0".into()));
+        assert_eq!(k8s.namespace, Some(KubectlField::Literal("agents".into())));
+        assert_eq!(
+            k8s.context,
+            Some(KubectlField::Literal("staging-cluster".into()))
+        );
+        assert_eq!(k8s.container, Some(KubectlField::Literal("main".into())));
 
         let api = &config.projects[&ProjectId::new("api").expect("valid slug")];
         assert_eq!(api.name.as_deref(), Some("API server"));
@@ -1234,7 +1365,7 @@ mod tests {
         let Transport::Kubectl(k8s) = &config.hosts[&host_id("staging")].transport else {
             panic!("staging should be kubectl");
         };
-        assert_eq!(k8s.pod, "sandbox-0");
+        assert_eq!(k8s.pod, KubectlField::Literal("sandbox-0".into()));
         assert_eq!(k8s.namespace, None);
         assert_eq!(k8s.context, None);
         assert_eq!(k8s.container, None);
@@ -1402,5 +1533,128 @@ mod tests {
             "{msg}"
         );
         assert!(matches!(err, ConfigError::Io { .. }));
+    }
+
+    #[test]
+    fn project_base_parses_and_is_optional() {
+        let cfg = Config::from_toml_str(
+            "[hosts.devbox]\ntransport = \"ssh\"\nhost = \"devbox\"\n\
+             [projects.api]\nhost = \"devbox\"\npath = \"/api\"\nworkspace = \"worktree\"\n\
+             agent = \"claude\"\nbase = \"origin/develop\"\n\
+             [agents.claude]\ncommand = [\"claude\"]\n",
+        )
+        .expect("valid");
+        let api = &cfg.projects[&ProjectId::new("api").expect("slug")];
+        assert_eq!(api.base.as_deref(), Some("origin/develop"));
+    }
+
+    #[test]
+    fn rejects_invalid_project_base() {
+        for bad in ["\"\"", "\"  \"", "\"-x\"", "\" -x\"", "\"a\\nb\""] {
+            let issues = issues_of(&format!(
+                "[hosts.devbox]\ntransport = \"ssh\"\nhost = \"devbox\"\n\
+                 [projects.api]\nhost = \"devbox\"\npath = \"/api\"\nworkspace = \"worktree\"\n\
+                 agent = \"claude\"\nbase = {bad}\n\
+                 [agents.claude]\ncommand = [\"claude\"]\n"
+            ));
+            assert_eq!(issues.len(), 1, "base {bad}: {issues:?}");
+            assert!(issues[0].to_string().contains("base"), "{issues:?}");
+        }
+    }
+
+    #[test]
+    fn kubectl_pod_literal_parses() {
+        let cfg =
+            Config::from_toml_str("[hosts.k]\ntransport = \"kubectl\"\npod = \"sandbox-0\"\n")
+                .expect("valid literal pod");
+        let Transport::Kubectl(k) = &cfg.hosts.values().next().expect("one host").transport else {
+            panic!("expected kubectl");
+        };
+        assert_eq!(k.pod, KubectlField::Literal("sandbox-0".into()));
+    }
+
+    #[test]
+    fn kubectl_pod_command_parses() {
+        let cfg = Config::from_toml_str(
+            "[hosts.k]\ntransport = \"kubectl\"\npod = { command = \"kubectl get pods -o name | head -n1\" }\n",
+        )
+        .expect("valid command pod");
+        let Transport::Kubectl(k) = &cfg.hosts.values().next().expect("one host").transport else {
+            panic!("expected kubectl");
+        };
+        assert_eq!(
+            k.pod,
+            KubectlField::Command("kubectl get pods -o name | head -n1".into())
+        );
+    }
+
+    #[test]
+    fn kubectl_command_allows_dashes_and_whitespace_but_rejects_empty() {
+        // A command line legitimately starts with a flag-y token / has spaces.
+        Config::from_toml_str(
+            "[hosts.k]\ntransport = \"kubectl\"\npod = { command = \"  kubectl -n sb get pods -o name | head -n1  \" }\n",
+        )
+        .expect("dashes + edge whitespace allowed in a command");
+        // Empty command is rejected.
+        let err =
+            Config::from_toml_str("[hosts.k]\ntransport = \"kubectl\"\npod = { command = \"\" }\n")
+                .expect_err("empty command rejected");
+        assert!(format!("{err}").contains("pod"), "{err}");
+    }
+
+    #[test]
+    fn kubectl_command_table_unknown_key_is_loud() {
+        // The whole reason for the custom Visitor: a typo'd inner key must fail,
+        // not be silently dropped (untagged + deny_unknown_fields would drop it).
+        let err = Config::from_toml_str(
+            "[hosts.k]\ntransport = \"kubectl\"\npod = { command = \"x\", typo = 1 }\n",
+        )
+        .expect_err("unknown inner key rejected");
+        assert!(format!("{err}").contains("typo"), "{err}");
+    }
+
+    #[test]
+    fn kubectl_command_table_duplicate_command_key_is_rejected() {
+        // TOML likely rejects the duplicate key before serde sees it; either way
+        // the diagnostic must name `command`. (The Visitor's `duplicate_field`
+        // branch stays as defensive coverage for non-TOML deserializers.)
+        let err = Config::from_toml_str(
+            "[hosts.k]\ntransport = \"kubectl\"\npod = { command = \"x\", command = \"y\" }\n",
+        )
+        .expect_err("duplicate inner key rejected");
+        assert!(format!("{err}").contains("command"), "{err}");
+    }
+
+    #[test]
+    fn kubectl_command_with_control_char_is_rejected() {
+        let err = Config::from_toml_str(
+            "[hosts.k]\ntransport = \"kubectl\"\npod = { command = \"kubectl\\u0007get\" }\n",
+        )
+        .expect_err("control char in command rejected");
+        assert!(format!("{err}").contains("control"), "{err}");
+    }
+
+    #[test]
+    fn kubectl_command_table_missing_command_is_rejected() {
+        let err = Config::from_toml_str("[hosts.k]\ntransport = \"kubectl\"\npod = {}\n")
+            .expect_err("empty table rejected");
+        assert!(format!("{err}").contains("command"), "{err}");
+    }
+
+    #[test]
+    fn kubectl_pod_wrong_shape_has_clean_expected_type_message() {
+        // pod = 42 is neither a string nor a table.
+        let err = Config::from_toml_str("[hosts.k]\ntransport = \"kubectl\"\npod = 42\n")
+            .expect_err("integer pod rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("string") && msg.contains("command"), "{msg}");
+    }
+
+    #[test]
+    fn literal_pod_guard_unchanged() {
+        // Leading dash on a LITERAL is still rejected (unchanged behavior).
+        let err = Config::from_toml_str("[hosts.k]\ntransport = \"kubectl\"\npod = \"-bad\"\n")
+            .expect_err("leading dash literal rejected");
+        assert!(format!("{err}").contains("pod"), "{err}");
     }
 }

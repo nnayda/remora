@@ -11,7 +11,7 @@ mod session;
 
 pub use channel::{ChannelInput, ChannelOutput, InvalidTerminalSizeError, TerminalSize};
 pub use id::{AgentId, InvalidIdError, ProjectId, SessionId, MAX_ID_LEN};
-pub use session::{SessionMeta, SessionState, SpawnSpec};
+pub use session::{SessionMeta, SessionState, SpawnSpec, WorkspaceMode};
 
 /// Version of the wire format defined by this crate.
 ///

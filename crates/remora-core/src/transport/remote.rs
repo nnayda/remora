@@ -12,7 +12,7 @@ use portable_pty::CommandBuilder;
 use remora_protocol::{ProjectId, SessionId, SessionMeta};
 
 use super::pty_process::spawn_pty_channel;
-use crate::config::{Config, WorkspaceMode};
+use crate::config::Config;
 use crate::discovery::{self, DiscoveredEnv};
 use crate::naming::{branch_name, parse_tmux_session_name, tmux_session_name, worktree_path};
 use crate::spawn_plan::{PlanError, SpawnPlan};
@@ -167,12 +167,12 @@ pub(crate) fn attach_tokens(tmux_name: &str) -> Vec<String> {
     ]
 }
 
-/// Tokens for `git -C <project> worktree add -b <branch> <worktree>`.
-/// Precondition: `plan.branch` is `Some` (worktree mode); the only caller
-/// checks. `git worktree add` creates leading directories.
-pub(crate) fn worktree_add_tokens(plan: &SpawnPlan) -> Vec<String> {
+/// Tokens for `git -C <project> worktree add -b <branch> <worktree> [<start>]`.
+/// `start_point` (a resolved base ref, #54) is appended last and shell-quoted
+/// when present; `None` reproduces the legacy local-HEAD behavior.
+pub(crate) fn worktree_add_tokens(plan: &SpawnPlan, start_point: Option<&str>) -> Vec<String> {
     let branch = plan.branch.as_deref().unwrap_or_default();
-    vec![
+    let mut tokens = vec![
         "git".into(),
         "-C".into(),
         quote_remote_path(&plan.project_path),
@@ -181,6 +181,54 @@ pub(crate) fn worktree_add_tokens(plan: &SpawnPlan) -> Vec<String> {
         "-b".into(),
         shell_quote(branch),
         quote_remote_path(&plan.dir),
+    ];
+    if let Some(sp) = start_point {
+        tokens.push(shell_quote(sp));
+    }
+    tokens
+}
+
+/// Tokens for `git -C <project> fetch origin` — refreshes origin's
+/// remote-tracking refs before a new worktree is based off them (#54). Always
+/// origin: deriving a remote from a base ref's text is ambiguous, and
+/// multi-remote is out of scope.
+pub(crate) fn fetch_tokens(project_path: &str) -> Vec<String> {
+    vec![
+        "git".into(),
+        "-C".into(),
+        quote_remote_path(project_path),
+        "fetch".into(),
+        "origin".into(),
+    ]
+}
+
+/// Tokens for `git -C <project> symbolic-ref --short refs/remotes/origin/HEAD`
+/// — prints origin's default branch (e.g. `origin/main`).
+pub(crate) fn remote_head_tokens(project_path: &str) -> Vec<String> {
+    vec![
+        "git".into(),
+        "-C".into(),
+        quote_remote_path(project_path),
+        "symbolic-ref".into(),
+        "--short".into(),
+        "refs/remotes/origin/HEAD".into(),
+    ]
+}
+
+/// Tokens for `git -C <project> rev-parse --verify --quiet <ref>^{commit}` —
+/// confirms `git_ref` resolves to a commit. The exact (fully-qualified) ref
+/// plus the `^{commit}` peel defeats DWIM resolution against a tag like
+/// `refs/tags/origin/main` and rejects a dangling symbolic ref. The ref is
+/// shell-quoted because `^{}` are shell-special.
+pub(crate) fn verify_commit_tokens(project_path: &str, git_ref: &str) -> Vec<String> {
+    vec![
+        "git".into(),
+        "-C".into(),
+        quote_remote_path(project_path),
+        "rev-parse".into(),
+        "--verify".into(),
+        "--quiet".into(),
+        shell_quote(&format!("{git_ref}^{{commit}}")),
     ]
 }
 
@@ -513,6 +561,62 @@ pub(crate) fn attach_channel(
     exec.open_channel(&attach_tokens(tmux_name))
 }
 
+/// Resolves the git start-point for a new worktree (#54): fetch origin
+/// (best-effort), then the cascade — explicit `plan.base` → detected
+/// `origin/HEAD` (verified) → `origin/main` → `origin/master` → `None` (omit
+/// the start-point, branch off local `HEAD`). Only the fetch swallows errors;
+/// a detection exec `Err` (transport down) propagates, while a non-zero exit
+/// (ref absent) falls through.
+pub(crate) fn resolve_base(
+    exec: &dyn RemoteExec,
+    plan: &SpawnPlan,
+) -> Result<Option<String>, SourceError> {
+    // 1. Fetch — best-effort: swallow both Err and a non-zero exit.
+    let _ = exec.run(&fetch_tokens(&plan.project_path));
+
+    // 2. Explicit per-session/per-project base wins; no detection round-trips.
+    if let Some(base) = &plan.base {
+        return Ok(Some(base.clone()));
+    }
+
+    // 3. origin/HEAD, verified to resolve to a commit (guards stale/dangling).
+    let head = exec.run(&remote_head_tokens(&plan.project_path))?;
+    if head.success {
+        let candidate = head.stdout.trim();
+        if !candidate.is_empty()
+            && ref_resolves(
+                exec,
+                &plan.project_path,
+                &format!("refs/remotes/{candidate}"),
+            )?
+        {
+            return Ok(Some(candidate.to_string()));
+        }
+    }
+
+    // 4. Probe origin/main then origin/master (exact refspec, exit-only fall-through).
+    for short in ["origin/main", "origin/master"] {
+        if ref_resolves(exec, &plan.project_path, &format!("refs/remotes/{short}"))? {
+            return Ok(Some(short.to_string()));
+        }
+    }
+
+    // 5. Nothing resolved — omit the start-point (legacy local-HEAD base).
+    Ok(None)
+}
+
+/// Whether `git_ref^{commit}` resolves. Exec `Err` (transport) propagates; a
+/// non-zero exit (ref absent / dangling) is `false`.
+fn ref_resolves(
+    exec: &dyn RemoteExec,
+    project_path: &str,
+    git_ref: &str,
+) -> Result<bool, SourceError> {
+    Ok(exec
+        .run(&verify_commit_tokens(project_path, git_ref))?
+        .success)
+}
+
 /// Orchestrates the full spawn sequence: optional worktree creation, tmux
 /// new-session (the atomic lock, which also applies `remain-on-exit`), env
 /// metadata, then attach. Each step crosses the `RemoteExec` seam so tests can
@@ -522,7 +626,8 @@ pub(crate) fn run_spawn(
     plan: &SpawnPlan,
 ) -> Result<SessionChannel, SourceError> {
     if plan.branch.is_some() {
-        let out = exec.run(&worktree_add_tokens(plan))?;
+        let start_point = resolve_base(exec, plan)?;
+        let out = exec.run(&worktree_add_tokens(plan, start_point.as_deref()))?;
         if !out.success {
             return Err(classify_worktree_add_failure(
                 &out.stderr,
@@ -624,7 +729,8 @@ pub(crate) fn read_environment(
 
 /// Discovers sessions on the host and joins them to local config. Config-
 /// scoped throughout (R1): the live set keeps only configured projects, and
-/// the stopped scan runs only for configured worktree-mode projects.
+/// the worktree scan runs for every configured project (a worktree-override
+/// session can live on a shared-default project).
 pub(crate) fn run_list(
     exec: &dyn RemoteExec,
     config: &Config,
@@ -643,23 +749,244 @@ pub(crate) fn run_list(
         live.push((project, session, env));
     }
 
-    let mut stopped = Vec::new();
+    let mut worktrees = Vec::new();
+    let mut scanned = std::collections::HashSet::new();
     for (project_id, project) in &config.projects {
-        if project.workspace != WorkspaceMode::Worktree {
-            continue; // shared projects have no surviving worktree
-        }
-        // A failure for one project (bad path, not a repo) yields empty for
-        // that project, never a failed discovery (decision 8).
+        // Scan EVERY project: a worktree-override session can live on a
+        // shared-default project. `parse_worktree_list` rejects the main
+        // checkout and foreign paths, so a project with no remora worktrees
+        // yields nothing. Record which projects scanned cleanly so `join` can
+        // tell "scanned, no worktree" (⇒ Shared) apart from "scan failed"
+        // (⇒ unknown), instead of conflating a transient failure with Shared.
         if let Ok(out) = exec.run(&worktree_list_tokens(&project.path)) {
             if out.success {
+                scanned.insert(project_id.clone());
                 for (session, path) in discovery::parse_worktree_list(&out.stdout, project_id) {
-                    stopped.push((project_id.clone(), session, path));
+                    worktrees.push((project_id.clone(), session, path));
                 }
             }
         }
     }
 
-    Ok(discovery::join(live, stopped))
+    Ok(discovery::join(live, worktrees, &scanned))
+}
+
+// ---------------------------------------------------------------------------
+// Local command resolution (opt-in crossing of ADR-0004 for `{ command }` fields)
+// ---------------------------------------------------------------------------
+
+use std::io::Read;
+use std::time::{Duration, Instant};
+
+/// Wall-clock and output bounds for a local resolution command. A hung
+/// selector (e.g. `kubectl get` against an unreachable API) must NOT block the
+/// discovery poll forever, and runaway output must not exhaust memory.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+const RESOLVE_MAX_OUTPUT: usize = 64 * 1024;
+
+/// Seam for running a user-authored command line LOCALLY. Behind a trait so the
+/// timeout / output-cap / exit-status paths are testable deterministically and
+/// transport tests can resolve through a real (or scripted) runner without the
+/// kubectl exec tail.
+pub(crate) trait LocalRunner: Send + Sync {
+    fn run_local(&self, command: &str) -> Result<RemoteOutput, SourceError>;
+}
+
+/// The real runner: `sh -c <command>` with a timeout and an output cap.
+pub(crate) struct ShellRunner {
+    timeout: Duration,
+    max_output: usize,
+}
+
+impl ShellRunner {
+    pub(crate) fn new() -> Self {
+        Self {
+            timeout: RESOLVE_TIMEOUT,
+            max_output: RESOLVE_MAX_OUTPUT,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits(timeout: Duration, max_output: usize) -> Self {
+        Self {
+            timeout,
+            max_output,
+        }
+    }
+}
+
+impl LocalRunner for ShellRunner {
+    fn run_local(&self, command: &str) -> Result<RemoteOutput, SourceError> {
+        run_shell_bounded(command, self.timeout, self.max_output)
+    }
+}
+
+/// Reads to EOF, retaining at most `cap` bytes but always draining the pipe so
+/// the child can't deadlock on a full buffer after we stop retaining. Returns
+/// (lossy string, whether the cap was exceeded).
+fn read_capped(reader: &mut impl Read, cap: usize) -> (String, bool) {
+    let mut kept: Vec<u8> = Vec::new();
+    let mut over = false;
+    let mut chunk = [0u8; 4096];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                // `over` means MORE than `cap` bytes were actually produced:
+                // exactly `cap` bytes total must never trip it (off-by-one).
+                if kept.len() + n > cap {
+                    over = true;
+                }
+                if kept.len() < cap {
+                    let take = (cap - kept.len()).min(n);
+                    kept.extend_from_slice(&chunk[..take]);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    (String::from_utf8_lossy(&kept).into_owned(), over)
+}
+
+/// SIGKILLs the `child`'s entire process group. On Unix the child is the leader
+/// of its own group (pgid == child pid), so this also kills pipeline members
+/// (`kubectl`, `head`) and backgrounded descendants that outlived `sh` while
+/// holding the stdout/stderr pipe open — closing the pipe write-ends so the
+/// reader threads hit EOF and their joins return instead of blocking forever.
+/// `ESRCH` (group already empty) is the expected no-op, so the Result is
+/// ignored. Does NOT reap `sh` itself; the caller `wait`s for that.
+#[cfg(unix)]
+fn reap_group(child: &std::process::Child) {
+    let pgid = nix::unistd::Pid::from_raw(child.id() as i32);
+    let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+}
+
+/// Non-Unix fallback: no process groups, so kill only the child. (The whole
+/// function assumes `sh`, so Unix is the real target; this just keeps a
+/// non-unix `cargo check` compiling.)
+#[cfg(not(unix))]
+fn reap_group(child: &mut std::process::Child) {
+    let _ = child.kill();
+}
+
+/// Spawns `sh -c command` with bounded time and output. Reader threads prevent
+/// pipe-buffer deadlock; a poll loop enforces the timeout. On both timeout AND
+/// normal exit the child's whole process group is SIGKILLed (on Unix) before
+/// the reader threads are joined: pipeline members and backgrounded
+/// descendants can outlive `sh` and keep the stdout pipe open, which would
+/// otherwise block the reader-thread joins indefinitely (leaking threads/FDs/
+/// processes on every discovery poll). Reaping the group closes those
+/// write-ends so the joins always return.
+fn run_shell_bounded(
+    command: &str,
+    timeout: Duration,
+    max_output: usize,
+) -> Result<RemoteOutput, SourceError> {
+    use std::process::{Command, Stdio};
+
+    let mut builder = Command::new("sh");
+    builder
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Put the child in its own process group (pgid == child pid) so `reap_group`
+    // can SIGKILL the whole pipeline, not just `sh`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        builder.process_group(0);
+    }
+    let mut child = builder
+        .spawn()
+        .map_err(|e| SourceError::Transport(format!("resolve: spawn sh: {e}")))?;
+
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let out_handle = std::thread::spawn(move || read_capped(&mut stdout_pipe, max_output));
+    let err_handle = std::thread::spawn(move || read_capped(&mut stderr_pipe, max_output));
+
+    let deadline = Instant::now() + timeout;
+    let outcome = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(Some(status)),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    break Ok(None); // timed out
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => break Err(e),
+        }
+    };
+
+    // ALWAYS kill the group, then `wait` for `sh`, BEFORE joining the readers:
+    // on timeout this kills the hung pipeline; on normal exit it reaps any
+    // backgrounded descendant still holding the pipe (harmless if the group is
+    // already empty). Either way the pipe write-ends close → readers hit EOF →
+    // joins return promptly.
+    #[cfg(unix)]
+    reap_group(&child);
+    #[cfg(not(unix))]
+    reap_group(&mut child);
+    let _ = child.wait();
+
+    let (stdout, stdout_over) = out_handle.join().unwrap_or_else(|_| (String::new(), false));
+    let (stderr, _) = err_handle.join().unwrap_or_else(|_| (String::new(), false));
+
+    let status = match outcome {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            return Err(SourceError::Transport(format!(
+                "resolution command timed out after {}s",
+                timeout.as_secs()
+            )));
+        }
+        Err(e) => return Err(SourceError::Transport(format!("resolve: wait: {e}"))),
+    };
+
+    if stdout_over {
+        return Err(SourceError::Transport(format!(
+            "resolution command produced more than {max_output} bytes"
+        )));
+    }
+    Ok(RemoteOutput {
+        success: status.success(),
+        stdout,
+        stderr,
+    })
+}
+
+/// Resolves a user-authored command line LOCALLY and returns its trimmed
+/// stdout. The deliberate, opt-in crossing of ADR-0004's never-shell-evaluate
+/// line. Nonzero exit, empty output, or output that fails the literal-field
+/// guard (control chars, embedded newline, leading `-`, edge whitespace) is a
+/// hard error — never silently target "".
+pub(crate) fn resolve_local_command(
+    runner: &dyn LocalRunner,
+    field: &str,
+    command: &str,
+) -> Result<String, SourceError> {
+    let out = runner.run_local(command)?;
+    if !out.success {
+        return Err(SourceError::Transport(format!(
+            "kubectl `{field}` resolution command failed: {}",
+            out.stderr.trim()
+        )));
+    }
+    let value = out.stdout.trim();
+    if value.is_empty() {
+        return Err(SourceError::Transport(format!(
+            "kubectl `{field}` resolution command produced no output"
+        )));
+    }
+    if let Some(reason) = crate::config::literal_field_problem(value) {
+        return Err(SourceError::Transport(format!(
+            "kubectl `{field}` resolved value {reason}"
+        )));
+    }
+    Ok(value.to_owned())
 }
 
 /// Whether a failed `tmux kill-session` stderr positively signals the session
@@ -683,21 +1010,20 @@ pub(crate) fn kill_session(exec: &dyn RemoteExec, tmux_name: &str) -> Result<(),
 }
 
 /// Paths derived from config needed for teardown. All fields are pure strings
-/// (no network round-trip): tmux name, project dir on the host, session
-/// worktree dir, optional branch (worktree-mode only).
+/// (no network round-trip): tmux name and project dir on the host. Worktree
+/// path and branch are now computed on-demand in `run_remove` (from ids, not
+/// config) to correctly handle worktree-override sessions on shared-default
+/// projects.
 #[derive(Debug)]
 struct TeardownPaths {
     tmux_name: String,
     project_path: String,
-    dir: String,
-    branch: Option<String>,
-    workspace: WorkspaceMode,
 }
 
 /// Resolves teardown paths from config for `(project_id, session_id)`.
 /// Returns `Transport` if the project is unknown (consistent with spawn
 /// behavior — unknown project is a config error, not a protocol error).
-/// Does NOT consult agents (D3): teardown needs only the project path and mode.
+/// Does NOT consult agents (D3): teardown needs only the project path.
 fn teardown_paths(
     config: &Config,
     project_id: &ProjectId,
@@ -708,20 +1034,9 @@ fn teardown_paths(
         .get(project_id)
         .ok_or_else(|| SourceError::Transport(format!("unknown project `{project_id}`")))?;
     let tmux_name = tmux_session_name(project_id, session_id);
-    let (dir, branch) = if project.workspace == WorkspaceMode::Worktree {
-        (
-            worktree_path(project_id, session_id),
-            Some(branch_name(session_id)),
-        )
-    } else {
-        (project.path.clone(), None)
-    };
     Ok(TeardownPaths {
         tmux_name,
         project_path: project.path.clone(),
-        dir,
-        branch,
-        workspace: project.workspace,
     })
 }
 
@@ -791,9 +1106,12 @@ pub(crate) fn run_stop(
     kill_session(exec, &paths.tmux_name)
 }
 
-/// Ends a session for good. Worktree mode: optional dirty gate (unless force) →
-/// kill tmux → idempotent worktree remove → idempotent branch delete. Shared
-/// mode: kill tmux only (never touches the project dir).
+/// Ends a session for good. Mode is determined from REAL remote state (not
+/// project config): a worktree-override session on a shared-default project
+/// must still be cleaned up. If the canonical worktree directory exists →
+/// worktree session: optional dirty gate (unless force) → kill tmux →
+/// idempotent worktree remove → idempotent branch delete. If not → kill tmux
+/// only (shared session, or worktree already gone).
 ///
 /// Accepted limitation: the dirty probe and the kill are separate round-trips,
 /// so a still-running agent could write new uncommitted work in the window
@@ -811,10 +1129,24 @@ pub(crate) fn run_remove(
     force: bool,
 ) -> Result<(), SourceError> {
     let paths = teardown_paths(config, project_id, session_id)?;
-    let worktree = matches!(paths.workspace, WorkspaceMode::Worktree);
+    // Determine mode from REAL remote state, not project config: a per-session
+    // override means the project's default doesn't decide whether this session
+    // has a worktree. The canonical path is recomputed from validated ids
+    // (never from discovered metadata — ADR-0004).
+    let worktree_dir = worktree_path(project_id, session_id);
+    let probe = exec.run(&dir_exists_tokens(&worktree_dir))?;
+    // `test -d` is silent: a clean non-zero exit (empty stderr) means the dir is
+    // absent (shared session, or worktree already gone). A non-empty stderr
+    // means the probe itself couldn't run (ssh/kubectl/auth/shell error) — fail
+    // closed rather than mistaking a transport error for "no worktree" and
+    // orphaning a live worktree + branch (mirrors `run_respawn`).
+    if !probe.success && !probe.stderr.trim().is_empty() {
+        return Err(SourceError::Transport(probe.stderr));
+    }
+    let has_worktree = probe.success;
 
-    if worktree && !force {
-        if let Some(reason) = worktree_has_work(exec, &paths.dir)? {
+    if has_worktree && !force {
+        if let Some(reason) = worktree_has_work(exec, &worktree_dir)? {
             return Err(SourceError::WorkspaceDirty {
                 project_id: project_id.clone(),
                 session_id: session_id.clone(),
@@ -825,12 +1157,13 @@ pub(crate) fn run_remove(
 
     kill_session(exec, &paths.tmux_name)?;
 
-    if let Some(branch) = paths.branch.as_deref() {
-        let rm = exec.run(&worktree_remove_tokens(&paths.project_path, &paths.dir))?;
+    if has_worktree {
+        let rm = exec.run(&worktree_remove_tokens(&paths.project_path, &worktree_dir))?;
         if !rm.success && !stderr_signals_worktree_absent(&rm.stderr) {
             return Err(SourceError::Transport(rm.stderr));
         }
-        let del = exec.run(&branch_delete_tokens(&paths.project_path, branch))?;
+        let branch = branch_name(session_id);
+        let del = exec.run(&branch_delete_tokens(&paths.project_path, &branch))?;
         if !del.success && !stderr_signals_branch_absent(&del.stderr) {
             return Err(SourceError::Transport(del.stderr));
         }
@@ -856,6 +1189,7 @@ pub(crate) mod tests {
             project_path: "/home/dev/api".into(),
             dir: "~/.remora/worktrees/api/fix-login".into(),
             branch: Some("remora/fix-login".into()),
+            base: None,
             env: vec![
                 ("REMORA_AGENT".into(), "claude".into()),
                 (
@@ -1043,7 +1377,7 @@ pub(crate) mod tests {
     #[test]
     fn worktree_add_tokens_builds_git_command() {
         let plan = worktree_plan();
-        let tokens = worktree_add_tokens(&plan);
+        let tokens = worktree_add_tokens(&plan, None);
         let g = tokens.iter().position(|a| a == "git").expect("git");
         assert_eq!(tokens[g + 1], "-C");
         assert_eq!(tokens[g + 2], "/home/dev/api");
@@ -1374,11 +1708,16 @@ pub(crate) mod tests {
     #[test]
     fn existing_worktree_aborts_before_create() {
         let plan = worktree_plan();
-        let fake = FakeExec::new(vec![Ok(FakeExec::fail("fatal: '<path>' already exists"))]);
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                                   // fetch
+            Ok(FakeExec::out("origin/main\n")),                   // symbolic-ref
+            Ok(FakeExec::ok()),                                   // verify
+            Ok(FakeExec::fail("fatal: '<path>' already exists")), // worktree add FAILS
+        ]);
         let err = run_spawn(&fake, &plan).expect_err("worktree already exists");
         assert!(matches!(err, SourceError::SessionExists { .. }), "{err}");
-        // Exactly 1 call (worktree-add), no channel opened.
-        assert_eq!(fake.calls.lock().expect("lock").len(), 1);
+        // 4 calls: fetch + symbolic-ref + verify + worktree-add, no channel opened.
+        assert_eq!(fake.calls.lock().expect("lock").len(), 4);
         assert_eq!(fake.opened.lock().expect("lock").len(), 0);
     }
 
@@ -1386,6 +1725,9 @@ pub(crate) mod tests {
     fn duplicate_session_does_not_open_a_channel() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                 // fetch
+            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
+            Ok(FakeExec::ok()),                 // verify
             // worktree add succeeds
             Ok(FakeExec::ok()),
             // new-session fails with duplicate
@@ -1422,27 +1764,30 @@ pub(crate) mod tests {
     fn worktree_spawn_runs_add_create_metadata_then_attaches_in_order() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),
-            Ok(FakeExec::ok()),
-            Ok(FakeExec::ok()),
-            Ok(FakeExec::ok()),
-            Ok(FakeExec::ok()),
+            Ok(FakeExec::ok()),                 // fetch
+            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
+            Ok(FakeExec::ok()),                 // verify
+            Ok(FakeExec::ok()),                 // worktree add
+            Ok(FakeExec::ok()),                 // new-session
+            Ok(FakeExec::ok()),                 // set-environment REMORA_AGENT
+            Ok(FakeExec::ok()),                 // set-environment REMORA_WORKSPACE
+            Ok(FakeExec::ok()),                 // set-environment REMORA_CREATED_AT
         ]);
         let result = run_spawn(&fake, &plan);
         assert!(result.is_ok());
         let calls = fake.calls.lock().expect("lock");
-        // worktree add, new-session (remain-on-exit folded in atomically), then
-        // 3x set-environment = 5 blocking cmds — there is no separate set-option.
-        assert_eq!(calls.len(), 5);
-        assert!(calls[0].iter().any(|a| a == "worktree"));
-        assert!(calls[1].iter().any(|a| a == "new-session"));
+        // fetch + symbolic-ref + verify + worktree add + new-session
+        // (remain-on-exit folded in atomically) + 3x set-environment = 8 blocking cmds.
+        assert_eq!(calls.len(), 8);
+        assert!(calls[3].iter().any(|a| a == "worktree"));
+        assert!(calls[4].iter().any(|a| a == "new-session"));
         // remain-on-exit rides on the new-session call, not a follow-up exec:
-        // its `set-option` lives inside calls[1], never as a standalone call.
-        assert!(calls[1].iter().any(|a| a == "set-option"));
-        assert!(calls[1].iter().any(|a| a == "remain-on-exit"));
-        assert!(calls[2].iter().any(|a| a == "set-environment"));
+        // its `set-option` lives inside calls[4], never as a standalone call.
+        assert!(calls[4].iter().any(|a| a == "set-option"));
+        assert!(calls[4].iter().any(|a| a == "remain-on-exit"));
+        assert!(calls[5].iter().any(|a| a == "set-environment"));
         assert!(
-            !calls[2..]
+            !calls[5..]
                 .iter()
                 .any(|c| c.iter().any(|a| a == "set-option")),
             "remain-on-exit is not a standalone follow-up call"
@@ -1454,6 +1799,9 @@ pub(crate) mod tests {
     fn metadata_failure_is_tolerated_and_still_attaches() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                        // fetch
+            Ok(FakeExec::out("origin/main\n")),        // symbolic-ref
+            Ok(FakeExec::ok()),                        // verify
             Ok(FakeExec::ok()),                        // worktree add
             Ok(FakeExec::ok()), // new-session (live! remain-on-exit folded in)
             Ok(FakeExec::fail("set-env boom")), // REMORA_AGENT — tolerated
@@ -1472,6 +1820,9 @@ pub(crate) mod tests {
     fn new_session_generic_failure_is_transport_and_opens_no_channel() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                      // fetch
+            Ok(FakeExec::out("origin/main\n")),      // symbolic-ref
+            Ok(FakeExec::ok()),                      // verify
             Ok(FakeExec::ok()),                      // worktree add
             Ok(FakeExec::fail("no server running")), // new-session: generic failure
             Ok(FakeExec::fail("no server running")), // has-session: confirms no session
@@ -1495,6 +1846,9 @@ pub(crate) mod tests {
         // be force-removed. A has-session probe gates the orphan cleanup.
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                                               // fetch
+            Ok(FakeExec::out("origin/main\n")),                               // symbolic-ref
+            Ok(FakeExec::ok()),                                               // verify
             Ok(FakeExec::ok()),                                               // worktree add
             Ok(FakeExec::fail("set-option: unknown option: remain-on-exit")), // created, set-option failed
             Ok(FakeExec::ok()), // has-session: the session IS live
@@ -1517,6 +1871,9 @@ pub(crate) mod tests {
         // ambiguous leaves the worktree.
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                                               // fetch
+            Ok(FakeExec::out("origin/main\n")),                               // symbolic-ref
+            Ok(FakeExec::ok()),                                               // verify
             Ok(FakeExec::ok()),                                               // worktree add
             Ok(FakeExec::fail("set-option: unknown option: remain-on-exit")), // created, set-option failed
             Ok(FakeExec::fail(
@@ -1537,7 +1894,10 @@ pub(crate) mod tests {
         // A duplicate means a LIVE session owns the worktree — never remove it.
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()), // worktree add
+            Ok(FakeExec::ok()),                 // fetch
+            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
+            Ok(FakeExec::ok()),                 // verify
+            Ok(FakeExec::ok()),                 // worktree add
             Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
         ]);
         let err = run_spawn(&fake, &plan).expect_err("dup");
@@ -1604,6 +1964,185 @@ pub(crate) mod tests {
         assert!(run_list(&fake, &config).expect("list").is_empty());
     }
 
+    // -----------------------------------------------------------------------
+    // resolve_base tests (#54)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_base_uses_explicit_plan_base_without_detection() {
+        let plan = SpawnPlan {
+            base: Some("origin/dev".into()),
+            ..worktree_plan()
+        };
+        let fake = FakeExec::new(vec![Ok(FakeExec::ok())]); // only the fetch
+        let got = resolve_base(&fake, &plan).expect("ok");
+        assert_eq!(got.as_deref(), Some("origin/dev"));
+        // fetch happened, no symbolic-ref/rev-parse probes.
+        assert_eq!(fake.count_calls_with("fetch"), 1);
+        assert_eq!(fake.count_calls_with("symbolic-ref"), 0);
+    }
+
+    #[test]
+    fn resolve_base_detects_origin_head_when_verified() {
+        let plan = worktree_plan(); // base: None
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                 // fetch
+            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
+            Ok(FakeExec::ok()),                 // verify refs/remotes/origin/main^{commit}
+        ]);
+        assert_eq!(
+            resolve_base(&fake, &plan).expect("ok").as_deref(),
+            Some("origin/main")
+        );
+    }
+
+    #[test]
+    fn resolve_base_falls_through_dangling_origin_head_to_main() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                 // fetch
+            Ok(FakeExec::out("origin/gone\n")), // symbolic-ref succeeds
+            Ok(FakeExec::fail("")),             // verify origin/gone -> dangling
+            Ok(FakeExec::ok()),                 // verify refs/remotes/origin/main -> ok
+        ]);
+        assert_eq!(
+            resolve_base(&fake, &plan).expect("ok").as_deref(),
+            Some("origin/main")
+        );
+    }
+
+    #[test]
+    fn resolve_base_probes_master_then_omits() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),     // fetch
+            Ok(FakeExec::fail("")), // symbolic-ref: origin/HEAD unset (non-zero exit)
+            Ok(FakeExec::fail("")), // verify origin/main -> absent
+            Ok(FakeExec::fail("")), // verify origin/master -> absent
+        ]);
+        assert_eq!(resolve_base(&fake, &plan).expect("ok"), None);
+    }
+
+    #[test]
+    fn resolve_base_propagates_detection_transport_error() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                             // fetch
+            Err(SourceError::Transport("ssh down".into())), // symbolic-ref Err
+        ]);
+        assert!(matches!(
+            resolve_base(&fake, &plan),
+            Err(SourceError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_base_swallows_fetch_failure() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Err(SourceError::Transport("offline".into())), // fetch Err -> swallowed
+            Ok(FakeExec::out("origin/main\n")),            // symbolic-ref
+            Ok(FakeExec::ok()),                            // verify
+        ]);
+        assert_eq!(
+            resolve_base(&fake, &plan).expect("ok").as_deref(),
+            Some("origin/main")
+        );
+    }
+
+    #[test]
+    fn resolve_base_swallows_fetch_nonzero_exit() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::fail("error: could not fetch origin")), // fetch Ok(non-zero) -> swallowed
+            Ok(FakeExec::out("origin/main\n")),                  // symbolic-ref
+            Ok(FakeExec::ok()), // verify refs/remotes/origin/main^{commit}
+        ]);
+        assert_eq!(
+            resolve_base(&fake, &plan).expect("ok").as_deref(),
+            Some("origin/main")
+        );
+    }
+
+    #[test]
+    fn resolve_base_probes_master_when_main_absent() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),     // fetch
+            Ok(FakeExec::fail("")), // symbolic-ref: origin/HEAD unset (non-zero exit)
+            Ok(FakeExec::fail("")), // verify refs/remotes/origin/main -> absent
+            Ok(FakeExec::ok()),     // verify refs/remotes/origin/master -> resolves
+        ]);
+        assert_eq!(
+            resolve_base(&fake, &plan).expect("ok").as_deref(),
+            Some("origin/master")
+        );
+    }
+
+    #[test]
+    fn worktree_add_appends_quoted_start_point_last() {
+        let plan = worktree_plan();
+        let with = worktree_add_tokens(&plan, Some("origin/main"));
+        assert_eq!(
+            with.last().map(String::as_str),
+            Some(shell_quote("origin/main").as_str())
+        );
+        let without = worktree_add_tokens(&plan, None);
+        assert_eq!(
+            without.last().map(String::as_str),
+            Some("\"$HOME\"/.remora/worktrees/api/fix-login")
+        );
+    }
+
+    #[test]
+    fn run_spawn_fetches_before_worktree_add() {
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                 // fetch
+            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
+            Ok(FakeExec::ok()),                 // verify
+            Ok(FakeExec::ok()),                 // worktree add
+            Ok(FakeExec::ok()),                 // new-session
+        ]);
+        let _ = run_spawn(&fake, &plan);
+        let calls = fake.calls.lock().expect("lock");
+        let fetch_i = calls
+            .iter()
+            .position(|a| a.iter().any(|t| t == "fetch"))
+            .expect("fetch");
+        let add_i = calls
+            .iter()
+            .position(|a| a.iter().any(|t| t == "worktree"))
+            .expect("add");
+        assert!(fetch_i < add_i, "fetch must precede worktree add");
+    }
+
+    #[test]
+    fn fetch_tokens_targets_origin() {
+        assert_eq!(
+            fetch_tokens("/home/dev/api"),
+            vec!["git", "-C", "/home/dev/api", "fetch", "origin"]
+        );
+    }
+
+    #[test]
+    fn remote_head_tokens_reads_origin_head() {
+        let t = remote_head_tokens("/home/dev/api");
+        assert_eq!(t[3], "symbolic-ref");
+        assert_eq!(t[4], "--short");
+        assert_eq!(t[5], "refs/remotes/origin/HEAD");
+    }
+
+    #[test]
+    fn verify_commit_tokens_peels_to_commit_with_exact_ref() {
+        let t = verify_commit_tokens("/home/dev/api", "refs/remotes/origin/main");
+        assert_eq!(t[3], "rev-parse");
+        assert_eq!(t[4], "--verify");
+        assert_eq!(t[5], "--quiet");
+        // exact ref + ^{commit} peel defeats DWIM tag collisions / dangling refs.
+        assert_eq!(t[6], shell_quote("refs/remotes/origin/main^{commit}"));
+    }
+
     #[test]
     fn list_keeps_session_live_when_show_environment_fails() {
         // The session is listed live, but its show-environment read flakes
@@ -1638,6 +2177,60 @@ pub(crate) mod tests {
         assert_eq!(metas[0].session_id.as_str(), "fix-login");
         assert_eq!(metas[0].state, SessionState::Live);
         assert!(metas.iter().all(|m| m.state == SessionState::Live));
+    }
+
+    #[test]
+    fn list_discovers_worktree_session_on_shared_default_project() {
+        // Before the fix, the worktree scan was guarded by
+        // `project.workspace == WorkspaceMode::Worktree`, so a worktree-override
+        // session on a shared-default project was silently lost. This test is the
+        // RED proof: on the old code the assertion fails (session not discovered);
+        // on the new code it passes.
+        //
+        // Config: `api` (worktree-default) + `scratch` (shared-default).
+        // No live sessions. The `scratch` project has one surviving worktree at
+        // ~/.remora/worktrees/scratch/s1.
+        //
+        // FakeExec call order (config is a BTreeMap, sorted: api first, scratch second):
+        //   1) list-sessions        -> empty (no live sessions)
+        //   2) git worktree list for `api`     -> empty
+        //   3) git worktree list for `scratch` -> s1 worktree entry
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.api]
+            host = "devbox"
+            path = "/home/dev/api"
+            workspace = "worktree"
+            agent = "claude"
+            [projects.scratch]
+            host = "devbox"
+            path = "/home/dev/scratch"
+            workspace = "shared"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+        "#;
+        let config = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("")), // list-sessions: no live sessions
+            Ok(FakeExec::out("")), // worktree list for api: empty
+            Ok(FakeExec::out(
+                "worktree /home/dev/.remora/worktrees/scratch/s1\nbranch refs/heads/remora/s1\n",
+            )), // worktree list for scratch: one worktree session
+        ]);
+        let metas = run_list(&fake, &config).expect("list");
+        // The scratch/s1 worktree session must be discovered as Stopped + Worktree.
+        assert_eq!(
+            metas.len(),
+            1,
+            "expected one discovered session, got: {metas:?}"
+        );
+        assert_eq!(metas[0].project_id.as_str(), "scratch");
+        assert_eq!(metas[0].session_id.as_str(), "s1");
+        assert_eq!(metas[0].state, SessionState::Stopped);
+        assert_eq!(metas[0].workspace, Some(WorkspaceMode::Worktree));
     }
 
     // -----------------------------------------------------------------------
@@ -1698,13 +2291,10 @@ pub(crate) mod tests {
         let p = teardown_paths(&config, &pid("api"), &sid("fix-login")).expect("paths");
         assert_eq!(p.tmux_name, "remora_api_fix-login");
         assert_eq!(p.project_path, "/home/dev/api");
-        assert_eq!(p.dir, "~/.remora/worktrees/api/fix-login");
-        assert_eq!(p.branch.as_deref(), Some("remora/fix-login"));
-        assert_eq!(p.workspace, WorkspaceMode::Worktree);
     }
 
     #[test]
-    fn teardown_paths_shared_has_no_branch() {
+    fn teardown_paths_shared_resolves_project_path() {
         let toml = r#"
             [hosts.devbox]
             transport = "ssh"
@@ -1719,9 +2309,8 @@ pub(crate) mod tests {
         "#;
         let config = Arc::new(Config::from_toml_str(toml).expect("config"));
         let p = teardown_paths(&config, &pid("scratch"), &sid("s1")).expect("paths");
-        assert_eq!(p.dir, "~/scratch");
-        assert_eq!(p.branch, None);
-        assert_eq!(p.workspace, WorkspaceMode::Shared);
+        assert_eq!(p.project_path, "~/scratch");
+        assert_eq!(p.tmux_name, "remora_scratch_s1");
     }
 
     #[test]
@@ -1837,6 +2426,7 @@ pub(crate) mod tests {
     #[test]
     fn run_remove_clean_worktree_runs_probe_kill_remove_delete_in_order() {
         let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),       // test -d worktree probe: exists
             Ok(FakeExec::out("")),    // status --porcelain (clean)
             Ok(FakeExec::out("0\n")), // rev-list (on remote)
             Ok(FakeExec::ok()),       // kill-session
@@ -1845,16 +2435,18 @@ pub(crate) mod tests {
         ]);
         assert!(run_remove(&fake, &test_config(), &pid("api"), &sid("fix-login"), false).is_ok());
         let calls = fake.calls.lock().expect("lock");
-        assert!(calls[0].iter().any(|a| a == "status"));
-        assert!(calls[1].iter().any(|a| a == "rev-list"));
-        assert!(calls[2].iter().any(|a| a == "kill-session"));
-        assert!(calls[3].iter().any(|a| a == "remove")); // worktree remove
-        assert!(calls[4].iter().any(|a| a == "-D")); // branch -D
+        assert!(calls[0].iter().any(|a| a == "test") && calls[0].iter().any(|a| a == "-d"));
+        assert!(calls[1].iter().any(|a| a == "status"));
+        assert!(calls[2].iter().any(|a| a == "rev-list"));
+        assert!(calls[3].iter().any(|a| a == "kill-session"));
+        assert!(calls[4].iter().any(|a| a == "remove")); // worktree remove
+        assert!(calls[5].iter().any(|a| a == "-D")); // branch -D
     }
 
     #[test]
     fn run_remove_refuses_dirty_without_force_and_touches_nothing() {
         let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                 // test -d worktree probe: exists
             Ok(FakeExec::out(" M src/x.rs\n")), // status dirty
             Ok(FakeExec::out("0\n")),           // rev-list
         ]);
@@ -1872,8 +2464,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn run_remove_force_skips_the_probe() {
+    fn run_remove_force_skips_the_dirty_probe_but_still_probes_existence() {
+        // force=true skips the dirty-check (status/rev-list) but the `test -d`
+        // existence probe still runs — it decides whether to do worktree cleanup.
         let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()), // test -d worktree probe: exists
             Ok(FakeExec::ok()), // kill-session
             Ok(FakeExec::ok()), // worktree remove
             Ok(FakeExec::ok()), // branch -D
@@ -1888,6 +2483,7 @@ pub(crate) mod tests {
     #[test]
     fn run_remove_idempotent_when_worktree_and_branch_already_gone() {
         let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),       // test -d worktree probe: exists
             Ok(FakeExec::out("")),    // status --porcelain (clean)
             Ok(FakeExec::out("0\n")), // rev-list
             Ok(FakeExec::ok()),       // kill-session
@@ -1902,7 +2498,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn run_remove_shared_mode_skips_worktree_and_branch() {
+    fn run_remove_shared_session_skips_worktree_and_branch() {
+        // A genuinely shared session (no worktree dir on disk): `test -d` fails,
+        // so only kill-session runs — no worktree remove, no branch delete.
         let toml = r#"
             [hosts.devbox]
             transport = "ssh"
@@ -1917,11 +2515,183 @@ pub(crate) mod tests {
         "#;
         let config = Arc::new(Config::from_toml_str(toml).expect("config"));
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()), // kill-session only
+            Ok(FakeExec::fail("")), // test -d: no worktree dir
+            Ok(FakeExec::ok()),     // kill-session
         ]);
         assert!(run_remove(&fake, &config, &pid("scratch"), &sid("s1"), false).is_ok());
         assert_eq!(fake.count_calls_with("kill-session"), 1);
-        assert_eq!(fake.count_calls_with("worktree"), 0);
+        // Use "worktree remove" (the git subcommand pair) rather than the path
+        // substring "worktree", which also appears in the `test -d` probe argv.
+        assert_eq!(fake.count_calls_with("remove"), 0);
         assert_eq!(fake.count_calls_with("-D"), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // LocalRunner / ShellRunner / resolve_local_command tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_local_command_trims_and_returns_stdout() {
+        let runner = ShellRunner::new();
+        let pod = resolve_local_command(&runner, "pod", "echo sandbox-7").expect("ok");
+        assert_eq!(pod, "sandbox-7");
+    }
+
+    #[test]
+    fn resolve_local_command_rejects_multiline_output() {
+        let runner = ShellRunner::new();
+        let err = resolve_local_command(&runner, "pod", "printf 'a\\nb\\n'")
+            .expect_err("embedded newline is a control char");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
+    }
+
+    #[test]
+    fn resolve_local_command_rejects_empty_output() {
+        let runner = ShellRunner::new();
+        let err = resolve_local_command(&runner, "pod", "true").expect_err("no output");
+        assert!(format!("{err}").contains("no output"), "{err}");
+    }
+
+    #[test]
+    fn resolve_local_command_nonzero_exit_is_transport_error() {
+        let runner = ShellRunner::new();
+        let err = resolve_local_command(&runner, "pod", "echo boom >&2; exit 1")
+            .expect_err("nonzero exit");
+        assert!(format!("{err}").contains("boom"), "{err}");
+    }
+
+    #[test]
+    fn resolve_local_command_rejects_leading_dash() {
+        let runner = ShellRunner::new();
+        let err = resolve_local_command(&runner, "pod", "echo -- -bad | tr -d ' '")
+            .expect_err("leading dash would be a flag");
+        // Simpler, deterministic form:
+        let err2 =
+            resolve_local_command(&runner, "pod", "printf -- '-bad'").expect_err("leading dash");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
+        assert!(matches!(err2, SourceError::Transport(_)), "{err2}");
+    }
+
+    #[test]
+    fn shell_runner_times_out_and_kills() {
+        // Tiny timeout so the test is fast; sleep would otherwise hang.
+        // 500ms (not 50ms) stays well clear of process-spawn jitter on a loaded
+        // CI runner while remaining 10x under `sleep 5`, so the kill-on-timeout
+        // path fires deterministically without flaking.
+        let runner = ShellRunner::with_limits(std::time::Duration::from_millis(500), 64 * 1024);
+        let err = resolve_local_command(&runner, "pod", "sleep 5").expect_err("must time out");
+        assert!(format!("{err}").contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn shell_runner_caps_output() {
+        // 200 KB of output against a 1 KB cap. `yes | head -c` terminates.
+        let runner = ShellRunner::with_limits(std::time::Duration::from_secs(5), 1024);
+        let err = resolve_local_command(&runner, "pod", "yes | head -c 200000")
+            .expect_err("must exceed the cap");
+        assert!(format!("{err}").contains("bytes"), "{err}");
+    }
+
+    #[test]
+    fn run_shell_bounded_does_not_hang_on_backgrounded_pipe_holder() {
+        // `sleep 30 &` inherits the stdout pipe and outlives sh. Without the
+        // process-group kill, the reader-thread join blocks ~30s (leak). With it,
+        // the group is reaped and the call returns promptly with the real output.
+        let runner = ShellRunner::with_limits(std::time::Duration::from_secs(5), 64 * 1024);
+        let out = resolve_local_command(&runner, "pod", "sleep 30 & printf sandbox-1")
+            .expect("returns promptly with output, not a 30s hang");
+        assert_eq!(out, "sandbox-1");
+    }
+
+    #[test]
+    fn read_capped_exactly_at_cap_is_not_flagged() {
+        let data = vec![b'x'; 8];
+        let (s, over) = read_capped(&mut data.as_slice(), 8);
+        assert_eq!(s.len(), 8);
+        assert!(!over, "exactly cap must not be flagged as over");
+    }
+
+    #[test]
+    fn read_capped_over_cap_is_flagged_and_truncates() {
+        let data = vec![b'x'; 9];
+        let (s, over) = read_capped(&mut data.as_slice(), 8);
+        assert_eq!(s.len(), 8);
+        assert!(over);
+    }
+
+    #[test]
+    fn run_remove_fails_closed_when_the_worktree_probe_errors() {
+        // The `test -d` probe fails with a non-empty stderr (ssh/auth/shell
+        // error, not a clean "dir absent"). run_remove must NOT mistake that for
+        // "no worktree" and proceed to kill tmux while skipping cleanup — that
+        // would orphan a live worktree + branch. It fails closed with Transport.
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.scratch]
+            host = "devbox"
+            path = "~/scratch"
+            workspace = "shared"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+        "#;
+        let config = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::fail("ssh: connect: connection refused")), // test -d: probe error
+        ]);
+        let err = run_remove(&fake, &config, &pid("scratch"), &sid("s1"), true).expect_err("err");
+        assert!(matches!(err, SourceError::Transport(_)));
+        // Failed closed: tmux was never killed, nothing cleaned up.
+        assert_eq!(fake.count_calls_with("kill-session"), 0);
+        assert_eq!(fake.count_calls_with("remove"), 0);
+    }
+
+    #[test]
+    fn run_remove_worktree_session_on_shared_config_project_cleans_up_worktree() {
+        // RED → GREEN: a worktree session spawned on a shared-default project
+        // must still be cleaned up. The probe (`test -d`) finds the worktree dir
+        // exists, so run_remove issues worktree remove + branch -D regardless of
+        // the project config's workspace setting.
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.scratch]
+            host = "devbox"
+            path = "~/scratch"
+            workspace = "shared"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+        "#;
+        let config = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()), // test -d: worktree dir EXISTS (override case)
+            // force=true: no dirty-check
+            Ok(FakeExec::ok()), // kill-session
+            Ok(FakeExec::ok()), // worktree remove
+            Ok(FakeExec::ok()), // branch -D
+        ]);
+        assert!(
+            run_remove(&fake, &config, &pid("scratch"), &sid("s1"), true).is_ok(),
+            "worktree session on shared-config project must be cleaned up"
+        );
+        assert_eq!(
+            fake.count_calls_with("kill-session"),
+            1,
+            "kill-session must run"
+        );
+        assert_eq!(
+            fake.count_calls_with("remove"),
+            1,
+            "worktree remove must run for an existing worktree dir"
+        );
+        assert_eq!(
+            fake.count_calls_with("-D"),
+            1,
+            "branch delete must run for an existing worktree"
+        );
     }
 }

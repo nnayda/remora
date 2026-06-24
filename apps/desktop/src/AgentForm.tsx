@@ -12,6 +12,7 @@ import {
   validateAgentForm,
 } from "./config-editor-model";
 import { formErrorMessage } from "./form-error";
+import { normalizeSlugInput } from "./spawn-input";
 
 interface AgentFormProps {
   mode: FormMode;
@@ -66,7 +67,9 @@ export function AgentForm({
           Id
           <input
             value={form.id}
-            onChange={(e) => setForm((f) => ({ ...f, id: e.target.value }))}
+            onChange={(e) =>
+              setForm((f) => ({ ...f, id: normalizeSlugInput(e.target.value) }))
+            }
             placeholder="claude"
             // biome-ignore lint/a11y/noAutofocus: first field of an opened form
             autoFocus
