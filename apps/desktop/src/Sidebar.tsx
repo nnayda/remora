@@ -58,7 +58,7 @@ export function Sidebar({
         <div className="sidebar-header-actions">
           <button
             type="button"
-            className="sidebar-refresh"
+            className="sidebar-settings"
             onClick={onOpenSettings}
             aria-label="Settings"
             title="Settings"
