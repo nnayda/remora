@@ -624,7 +624,8 @@ pub(crate) fn read_environment(
 
 /// Discovers sessions on the host and joins them to local config. Config-
 /// scoped throughout (R1): the live set keeps only configured projects, and
-/// the stopped scan runs only for configured worktree-mode projects.
+/// the worktree scan runs for every configured project (a worktree-override
+/// session can live on a shared-default project).
 pub(crate) fn run_list(
     exec: &dyn RemoteExec,
     config: &Config,
@@ -643,23 +644,22 @@ pub(crate) fn run_list(
         live.push((project, session, env));
     }
 
-    let mut stopped = Vec::new();
+    let mut worktrees = Vec::new();
     for (project_id, project) in &config.projects {
-        if project.workspace != WorkspaceMode::Worktree {
-            continue; // shared projects have no surviving worktree
-        }
-        // A failure for one project (bad path, not a repo) yields empty for
-        // that project, never a failed discovery (decision 8).
+        // Scan EVERY project: a worktree-override session can live on a
+        // shared-default project. `parse_worktree_list` rejects the main
+        // checkout and foreign paths, so a project with no remora worktrees
+        // yields nothing.
         if let Ok(out) = exec.run(&worktree_list_tokens(&project.path)) {
             if out.success {
                 for (session, path) in discovery::parse_worktree_list(&out.stdout, project_id) {
-                    stopped.push((project_id.clone(), session, path));
+                    worktrees.push((project_id.clone(), session, path));
                 }
             }
         }
     }
 
-    Ok(discovery::join(live, stopped))
+    Ok(discovery::join(live, worktrees))
 }
 
 /// Whether a failed `tmux kill-session` stderr positively signals the session
@@ -1638,6 +1638,60 @@ pub(crate) mod tests {
         assert_eq!(metas[0].session_id.as_str(), "fix-login");
         assert_eq!(metas[0].state, SessionState::Live);
         assert!(metas.iter().all(|m| m.state == SessionState::Live));
+    }
+
+    #[test]
+    fn list_discovers_worktree_session_on_shared_default_project() {
+        // Before the fix, the worktree scan was guarded by
+        // `project.workspace == WorkspaceMode::Worktree`, so a worktree-override
+        // session on a shared-default project was silently lost. This test is the
+        // RED proof: on the old code the assertion fails (session not discovered);
+        // on the new code it passes.
+        //
+        // Config: `api` (worktree-default) + `scratch` (shared-default).
+        // No live sessions. The `scratch` project has one surviving worktree at
+        // ~/.remora/worktrees/scratch/s1.
+        //
+        // FakeExec call order (config is a BTreeMap, sorted: api first, scratch second):
+        //   1) list-sessions        -> empty (no live sessions)
+        //   2) git worktree list for `api`     -> empty
+        //   3) git worktree list for `scratch` -> s1 worktree entry
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.api]
+            host = "devbox"
+            path = "/home/dev/api"
+            workspace = "worktree"
+            agent = "claude"
+            [projects.scratch]
+            host = "devbox"
+            path = "/home/dev/scratch"
+            workspace = "shared"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+        "#;
+        let config = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("")), // list-sessions: no live sessions
+            Ok(FakeExec::out("")), // worktree list for api: empty
+            Ok(FakeExec::out(
+                "worktree /home/dev/.remora/worktrees/scratch/s1\nbranch refs/heads/remora/s1\n",
+            )), // worktree list for scratch: one worktree session
+        ]);
+        let metas = run_list(&fake, &config).expect("list");
+        // The scratch/s1 worktree session must be discovered as Stopped + Worktree.
+        assert_eq!(
+            metas.len(),
+            1,
+            "expected one discovered session, got: {metas:?}"
+        );
+        assert_eq!(metas[0].project_id.as_str(), "scratch");
+        assert_eq!(metas[0].session_id.as_str(), "s1");
+        assert_eq!(metas[0].state, SessionState::Stopped);
+        assert_eq!(metas[0].workspace, Some(WorkspaceMode::Worktree));
     }
 
     // -----------------------------------------------------------------------
