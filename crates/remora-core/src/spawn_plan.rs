@@ -63,7 +63,8 @@ pub fn plan_spawn(config: &Config, spec: &SpawnSpec) -> Result<SpawnPlan, PlanEr
         .ok_or_else(|| PlanError::UnknownAgent(agent_id.clone()))?;
 
     let tmux_name = tmux_session_name(&spec.project_id, &spec.session_id);
-    let (dir, branch) = match project.workspace {
+    let workspace = spec.workspace.unwrap_or(project.workspace);
+    let (dir, branch) = match workspace {
         WorkspaceMode::Worktree => (
             worktree_path(&spec.project_id, &spec.session_id),
             Some(branch_name(&spec.session_id)),
@@ -81,7 +82,7 @@ pub fn plan_spawn(config: &Config, spec: &SpawnSpec) -> Result<SpawnPlan, PlanEr
         project_id: spec.project_id.clone(),
         session_id: spec.session_id.clone(),
         tmux_name,
-        workspace: project.workspace,
+        workspace,
         project_path: project.path.clone(),
         dir,
         branch,
@@ -139,6 +140,7 @@ mod tests {
             project_id: ProjectId::new(project).expect("slug"),
             session_id: SessionId::new(session).expect("slug"),
             agent: agent.map(|a| AgentId::new(a).expect("slug")),
+            workspace: None,
         }
     }
 
@@ -205,5 +207,33 @@ mod tests {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         assert_eq!(env[ENV_AGENT], "shell");
+    }
+
+    #[test]
+    fn workspace_override_forces_worktree_on_a_shared_project() {
+        let spec = SpawnSpec {
+            project_id: ProjectId::new("scratch").expect("slug"),
+            session_id: SessionId::new("s1").expect("slug"),
+            agent: None,
+            workspace: Some(WorkspaceMode::Worktree),
+        };
+        let plan = plan_spawn(&config(), &spec).expect("plan");
+        assert_eq!(plan.workspace, WorkspaceMode::Worktree);
+        assert_eq!(plan.dir, "~/.remora/worktrees/scratch/s1");
+        assert_eq!(plan.branch.as_deref(), Some("remora/s1"));
+    }
+
+    #[test]
+    fn workspace_override_forces_shared_on_a_worktree_project() {
+        let spec = SpawnSpec {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("s1").expect("slug"),
+            agent: None,
+            workspace: Some(WorkspaceMode::Shared),
+        };
+        let plan = plan_spawn(&config(), &spec).expect("plan");
+        assert_eq!(plan.workspace, WorkspaceMode::Shared);
+        assert_eq!(plan.dir, "/home/dev/api");
+        assert_eq!(plan.branch, None);
     }
 }

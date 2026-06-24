@@ -40,6 +40,7 @@ export function NewSessionDialog({
   const [sessionId, setSessionId] = useState("");
   // Agent defaults to the selected project's default; project changes reset it.
   const [agent, setAgent] = useState(initial.agent);
+  const [workspace, setWorkspace] = useState(initial.workspace);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -76,14 +77,16 @@ export function NewSessionDialog({
       const sel = resolveSelection(model, projectId);
       setProjectId(sel.projectId);
       setAgent(sel.agent);
+      setWorkspace(sel.workspace);
     }
   }, [model, projectId]);
 
-  /** Switch the selected project and reset the agent to that project's default. */
+  /** Switch the selected project and reset the agent and workspace to that project's defaults. */
   function selectProject(id: string) {
     const sel = resolveSelection(model, id);
     setProjectId(sel.projectId);
     setAgent(sel.agent);
+    setWorkspace(sel.workspace);
   }
 
   /** Validate, open the session, and reflect the outcome (success closes the
@@ -100,6 +103,7 @@ export function NewSessionDialog({
         projectId,
         sessionId,
         agent: agent === selectedProject?.defaultAgent ? null : agent,
+        workspace,
       });
       if (result.ok) {
         onOpened(result.attached);
@@ -216,6 +220,34 @@ export function NewSessionDialog({
               <span className="hint">
                 Applies only when spawning a new session.
               </span>
+            </label>
+            <label>
+              Workspace
+              <select
+                value={workspace}
+                onChange={(e) =>
+                  setWorkspace(e.target.value as typeof workspace)
+                }
+              >
+                <option value="worktree">
+                  worktree
+                  {selectedProject?.defaultWorkspace === "worktree"
+                    ? " (default)"
+                    : ""}
+                </option>
+                <option value="shared">
+                  shared
+                  {selectedProject?.defaultWorkspace === "shared"
+                    ? " (default)"
+                    : ""}
+                </option>
+              </select>
+              {workspace === "shared" && (
+                <span className="hint">
+                  Shared sessions reuse the project directory and can clobber
+                  each other.
+                </span>
+              )}
             </label>
             {error && (
               <p className="dialog-error" role="alert">
