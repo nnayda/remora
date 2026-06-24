@@ -199,6 +199,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Session, project, host, and agent ids now accept uppercase letters and
+  canonicalize them to lowercase as you type, instead of rejecting them (closes
+  #80). Ids must be lowercase `[a-z0-9-]` slugs (ADR-0004), so a keyboard that
+  autocapitalizes the first character (mobile/touch, macOS autocaps) forced a
+  manual correction on every creation. The new-session dialog and the
+  host/project/agent config forms now run typed id input through a
+  `normalizeSlugInput` lowercaser at the field's `onChange`, so `MyApp` becomes
+  `myapp` and the input visibly shows the canonical form. Only case is
+  canonicalized — other out-of-grammar characters still surface validation
+  feedback, and the protocol grammar (`ProjectId`/`SessionId::new`) and tmux
+  `remora_<project>_<session>` name format stay strict and unchanged, with the
+  Rust bridge remaining the authority.
 - Terminal rendering is no longer corrupted when an agent draws box-drawing or
   other multibyte UTF-8 (e.g. claude-code's logo rendered as underscores/garbage
   over a kubectl pod). The session's tmux was running in non-UTF-8 mode: kubectl
