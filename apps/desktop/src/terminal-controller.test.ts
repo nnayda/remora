@@ -122,7 +122,8 @@ function key(
     ctrlKey: opts.ctrlKey ?? false,
     altKey: opts.altKey ?? false,
     metaKey: opts.metaKey ?? false,
-  } as KeyboardEvent;
+    preventDefault: vi.fn(),
+  } as unknown as KeyboardEvent;
 }
 
 function term(): NonNullable<typeof xt.state.term> {
@@ -149,17 +150,23 @@ describe("TerminalController", () => {
   it("forwards Shift+Enter as ESC+CR (soft return) and suppresses the default CR", () => {
     const conn = fakeConn();
     new TerminalController(el, conn as unknown as SessionConnection);
-    const handled = term().keyCb?.(key("Enter", { shiftKey: true }));
+    const ev = key("Enter", { shiftKey: true });
+    const handled = term().keyCb?.(ev);
     expect(conn.write).toHaveBeenCalledWith(new TextEncoder().encode("\x1b\r"));
     expect(handled).toBe(false); // false = xterm must not also emit a plain CR
+    // preventDefault stops the browser firing a `keypress` that xterm would
+    // otherwise turn into a stray trailing CR (submitting the prompt anyway).
+    expect(ev.preventDefault).toHaveBeenCalled();
   });
 
   it("leaves a plain Enter to xterm's default handling", () => {
     const conn = fakeConn();
     new TerminalController(el, conn as unknown as SessionConnection);
-    const handled = term().keyCb?.(key("Enter", {}));
+    const ev = key("Enter", {});
+    const handled = term().keyCb?.(ev);
     expect(handled).toBe(true);
     expect(conn.write).not.toHaveBeenCalled();
+    expect(ev.preventDefault).not.toHaveBeenCalled(); // xterm owns plain Enter
   });
 
   it("does not treat Ctrl/Alt/Meta+Enter as a soft return", () => {
