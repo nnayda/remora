@@ -834,6 +834,22 @@ mod tests {
     }
 
     #[test]
+    fn command_form_kubectl_host_round_trips() {
+        let toml = "[hosts.staging]\ntransport = \"kubectl\"\npod = { command = \"kubectl -n sb get pods -o name | head -n1\" }\nnamespace = \"sb\"\n";
+        let original = crate::config::Config::from_toml_str(toml).expect("valid");
+
+        // Rewrite the document from the parsed config, then reparse and compare.
+        let doc = ConfigDocument::parse(toml).expect("doc");
+        let rewritten = doc.to_toml();
+        let reparsed = crate::config::Config::from_toml_str(&rewritten).expect("reparse");
+        assert_eq!(original, reparsed, "command-form host must round-trip");
+        assert!(
+            rewritten.contains("command ="),
+            "command field must serialize as an inline table: {rewritten}"
+        );
+    }
+
+    #[test]
     fn insert_project_and_agent_round_trip() {
         let mut doc =
             ConfigDocument::parse("[hosts.devbox]\ntransport = \"ssh\"\nhost = \"devbox\"\n")
