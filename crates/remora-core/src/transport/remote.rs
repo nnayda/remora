@@ -184,6 +184,53 @@ pub(crate) fn worktree_add_tokens(plan: &SpawnPlan) -> Vec<String> {
     ]
 }
 
+/// Tokens for `git -C <project> fetch origin` — refreshes origin's
+/// remote-tracking refs before a new worktree is based off them (#54). Always
+/// origin: deriving a remote from a base ref's text is ambiguous, and
+/// multi-remote is out of scope.
+#[allow(dead_code)]
+pub(crate) fn fetch_tokens(project_path: &str) -> Vec<String> {
+    vec![
+        "git".into(),
+        "-C".into(),
+        quote_remote_path(project_path),
+        "fetch".into(),
+        "origin".into(),
+    ]
+}
+
+/// Tokens for `git -C <project> symbolic-ref --short refs/remotes/origin/HEAD`
+/// — prints origin's default branch (e.g. `origin/main`).
+#[allow(dead_code)]
+pub(crate) fn remote_head_tokens(project_path: &str) -> Vec<String> {
+    vec![
+        "git".into(),
+        "-C".into(),
+        quote_remote_path(project_path),
+        "symbolic-ref".into(),
+        "--short".into(),
+        "refs/remotes/origin/HEAD".into(),
+    ]
+}
+
+/// Tokens for `git -C <project> rev-parse --verify --quiet <ref>^{commit}` —
+/// confirms `git_ref` resolves to a commit. The exact (fully-qualified) ref
+/// plus the `^{commit}` peel defeats DWIM resolution against a tag like
+/// `refs/tags/origin/main` and rejects a dangling symbolic ref. The ref is
+/// shell-quoted because `^{}` are shell-special.
+#[allow(dead_code)]
+pub(crate) fn verify_commit_tokens(project_path: &str, git_ref: &str) -> Vec<String> {
+    vec![
+        "git".into(),
+        "-C".into(),
+        quote_remote_path(project_path),
+        "rev-parse".into(),
+        "--verify".into(),
+        "--quiet".into(),
+        shell_quote(&format!("{git_ref}^{{commit}}")),
+    ]
+}
+
 /// Tokens for `git -C <project> worktree remove --force <worktree>` — best-effort
 /// cleanup of an orphaned worktree after a non-duplicate `new-session`
 /// failure (no live session owns it), so the project/session slot stays
@@ -1603,6 +1650,32 @@ pub(crate) mod tests {
             "no server running on /tmp/tmux-1000/default",
         ))]);
         assert!(run_list(&fake, &config).expect("list").is_empty());
+    }
+
+    #[test]
+    fn fetch_tokens_targets_origin() {
+        assert_eq!(
+            fetch_tokens("/home/dev/api"),
+            vec!["git", "-C", "/home/dev/api", "fetch", "origin"]
+        );
+    }
+
+    #[test]
+    fn remote_head_tokens_reads_origin_head() {
+        let t = remote_head_tokens("/home/dev/api");
+        assert_eq!(t[3], "symbolic-ref");
+        assert_eq!(t[4], "--short");
+        assert_eq!(t[5], "refs/remotes/origin/HEAD");
+    }
+
+    #[test]
+    fn verify_commit_tokens_peels_to_commit_with_exact_ref() {
+        let t = verify_commit_tokens("/home/dev/api", "refs/remotes/origin/main");
+        assert_eq!(t[3], "rev-parse");
+        assert_eq!(t[4], "--verify");
+        assert_eq!(t[5], "--quiet");
+        // exact ref + ^{commit} peel defeats DWIM tag collisions / dangling refs.
+        assert_eq!(t[6], shell_quote("refs/remotes/origin/main^{commit}"));
     }
 
     #[test]
