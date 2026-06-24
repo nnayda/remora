@@ -13,6 +13,7 @@ import {
   type Result,
   type SessionMetaDto,
   type SessionStateDto,
+  type WorkspaceModeDto,
 } from "./bindings";
 
 export type {
@@ -27,6 +28,7 @@ export type {
   ProjectInputDto,
   SessionMetaDto,
   SessionStateDto,
+  WorkspaceModeDto,
 };
 export type OnOutput = (msg: BridgeOutput) => void;
 
@@ -132,6 +134,7 @@ export async function spawnSession(
   sessionId: string,
   agent: string | null,
   base: string | null,
+  workspace: WorkspaceModeDto,
   onOutput: OnOutput,
 ): Promise<ChannelHandle> {
   return unwrap(
@@ -140,6 +143,7 @@ export async function spawnSession(
       sessionId,
       agent,
       base,
+      workspace,
       makeChannel(onOutput),
     ),
   );

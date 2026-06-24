@@ -9,7 +9,7 @@ import type { ConfigDto } from "./bindings";
 import { buildNewSessionModel, resolveSelection } from "./new-session-model";
 import type { OpenResult, SpawnInput } from "./session-store";
 import { OPEN_CANCELLED } from "./session-store";
-import { isValidSlug } from "./spawn-input";
+import { isValidSlug, normalizeSlugInput } from "./spawn-input";
 
 interface NewSessionDialogProps {
   /** Per-device config; drives the project and agent pickers. */
@@ -41,6 +41,7 @@ export function NewSessionDialog({
   // Agent defaults to the selected project's default; project changes reset it.
   const [agent, setAgent] = useState(initial.agent);
   const [base, setBase] = useState("");
+  const [workspace, setWorkspace] = useState(initial.workspace);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -77,14 +78,16 @@ export function NewSessionDialog({
       const sel = resolveSelection(model, projectId);
       setProjectId(sel.projectId);
       setAgent(sel.agent);
+      setWorkspace(sel.workspace);
     }
   }, [model, projectId]);
 
-  /** Switch the selected project and reset the agent to that project's default. */
+  /** Switch the selected project and reset the agent and workspace to that project's defaults. */
   function selectProject(id: string) {
     const sel = resolveSelection(model, id);
     setProjectId(sel.projectId);
     setAgent(sel.agent);
+    setWorkspace(sel.workspace);
   }
 
   /** Validate, open the session, and reflect the outcome (success closes the
@@ -102,6 +105,7 @@ export function NewSessionDialog({
         sessionId,
         agent: agent === selectedProject?.defaultAgent ? null : agent,
         base: base.trim() === "" ? null : base.trim(),
+        workspace,
       });
       if (result.ok) {
         onOpened(result.attached);
@@ -200,7 +204,9 @@ export function NewSessionDialog({
               Session
               <input
                 value={sessionId}
-                onChange={(e) => setSessionId(e.target.value)}
+                onChange={(e) =>
+                  setSessionId(normalizeSlugInput(e.target.value))
+                }
               />
             </label>
             <label>
@@ -228,6 +234,34 @@ export function NewSessionDialog({
                 Start-point for the new worktree. Empty = project default /
                 detected.
               </span>
+            </label>
+            <label>
+              Workspace
+              <select
+                value={workspace}
+                onChange={(e) =>
+                  setWorkspace(e.target.value as typeof workspace)
+                }
+              >
+                <option value="worktree">
+                  worktree
+                  {selectedProject?.defaultWorkspace === "worktree"
+                    ? " (default)"
+                    : ""}
+                </option>
+                <option value="shared">
+                  shared
+                  {selectedProject?.defaultWorkspace === "shared"
+                    ? " (default)"
+                    : ""}
+                </option>
+              </select>
+              {workspace === "shared" && (
+                <span className="hint">
+                  Shared sessions reuse the project directory and can clobber
+                  each other.
+                </span>
+              )}
             </label>
             {error && (
               <p className="dialog-error" role="alert">

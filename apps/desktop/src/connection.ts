@@ -8,6 +8,7 @@ import {
   resizeSession,
   respawnSession,
   spawnSession,
+  type WorkspaceModeDto,
   writeSession,
 } from "./bridge";
 import { extractCause } from "./last-output";
@@ -189,10 +190,11 @@ export async function openSession(
   sessionId: string,
   agent: string | null,
   base: string | null,
+  workspace: WorkspaceModeDto,
 ): Promise<{ connection: SessionConnection; attached: boolean }> {
   try {
     const connection = await openConnection((o) =>
-      spawnSession(projectId, sessionId, agent, base, o),
+      spawnSession(projectId, sessionId, agent, base, workspace, o),
     );
     return { connection, attached: false };
   } catch (e) {

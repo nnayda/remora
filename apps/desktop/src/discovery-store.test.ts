@@ -10,6 +10,7 @@ const session = (sessionId: string): SessionMetaDto => ({
   agent: null,
   createdAt: null,
   workspacePath: null,
+  workspace: null,
 });
 
 /** A promise whose resolution the test controls, to model in-flight/late results. */

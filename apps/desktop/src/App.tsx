@@ -5,7 +5,7 @@ import { ConfirmRemoveDialog } from "./ConfirmRemoveDialog";
 import { NewSessionDialog } from "./NewSessionDialog";
 import { SettingsDialog } from "./SettingsDialog";
 import { Sidebar } from "./Sidebar";
-import { OPEN_CANCELLED } from "./session-store";
+import { canRespawn, OPEN_CANCELLED } from "./session-store";
 import { buildTree, type SessionNode } from "./session-tree";
 import { TabBar } from "./TabBar";
 import { Terminal, type TerminalHandle } from "./Terminal";
@@ -88,6 +88,7 @@ function App() {
         sessionId: node.sessionId,
         agent: node.agent,
         base: null,
+        workspace: node.workspace ?? "worktree",
       })
         .then((r) => {
           if (!r.ok && r.error !== OPEN_CANCELLED) {
@@ -111,6 +112,7 @@ function App() {
       sessionId: node.sessionId,
       agent: node.agent,
       base: null,
+      workspace: node.workspace ?? "worktree",
     })
       .then((result) => {
         if (!result.ok && result.error !== OPEN_CANCELLED) {
@@ -254,12 +256,14 @@ function App() {
                   <div className="pane-status" role="status">
                     <p>Session stopped{t.error ? `: ${t.error}` : "."}</p>
                     <div className="pane-status-actions">
-                      <button
-                        type="button"
-                        onClick={() => void respawnTab(t.key)}
-                      >
-                        Respawn
-                      </button>
+                      {canRespawn(t.workspace) && (
+                        <button
+                          type="button"
+                          onClick={() => void respawnTab(t.key)}
+                        >
+                          Respawn
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => onRemoveTab(t.projectId, t.sessionId)}
@@ -272,12 +276,14 @@ function App() {
                   <div className="pane-status pane-status--error" role="alert">
                     <p>Disconnected: {t.error}</p>
                     <div className="pane-status-actions">
-                      <button
-                        type="button"
-                        onClick={() => void respawnTab(t.key)}
-                      >
-                        Respawn
-                      </button>
+                      {canRespawn(t.workspace) && (
+                        <button
+                          type="button"
+                          onClick={() => void respawnTab(t.key)}
+                        >
+                          Respawn
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => onRemoveTab(t.projectId, t.sessionId)}

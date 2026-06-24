@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-session workspace mode** (#34): the new-session dialog gains a
+  Worktree/Shared picker that overrides the project's default for that one
+  session (`SpawnSpec.workspace`). To keep the choice coherent past spawn, a
+  session's *effective* mode is now discovered from real sandbox state (a
+  surviving git worktree ⇒ worktree) rather than re-derived from project config:
+  discovery scans worktrees for every project and stamps `SessionMeta.workspace`,
+  and teardown/respawn re-probe the worktree (`test -d`) instead of trusting
+  config or discovered metadata. This closes a silent leak where a worktree
+  session spawned on a shared-default project was undiscoverable and unremovable
+  through the UI. `WorkspaceMode` moved to `remora-protocol`; shared sessions
+  show no Respawn affordance (they have no worktree to revive). See
+  [ADR-0008](docs/adr/0008-per-session-workspace-override.md).
 - **No-agent / plain-shell sessions** (#35): an agent configured with an empty
   command (`command = []`) opens a session that is just a login shell
   (`${SHELL:-/bin/sh} -l`), no agent launched — over both ssh and kubectl. The
@@ -199,6 +211,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Session, project, host, and agent ids now accept uppercase letters and
+  canonicalize them to lowercase as you type, instead of rejecting them (closes
+  #80). Ids must be lowercase `[a-z0-9-]` slugs (ADR-0004), so a keyboard that
+  autocapitalizes the first character (mobile/touch, macOS autocaps) forced a
+  manual correction on every creation. The new-session dialog and the
+  host/project/agent config forms now run typed id input through a
+  `normalizeSlugInput` lowercaser at the field's `onChange`, so `MyApp` becomes
+  `myapp` and the input visibly shows the canonical form. Only case is
+  canonicalized — other out-of-grammar characters still surface validation
+  feedback, and the protocol grammar (`ProjectId`/`SessionId::new`) and tmux
+  `remora_<project>_<session>` name format stay strict and unchanged, with the
+  Rust bridge remaining the authority.
 - Terminal rendering is no longer corrupted when an agent draws box-drawing or
   other multibyte UTF-8 (e.g. claude-code's logo rendered as underscores/garbage
   over a kubectl pod). The session's tmux was running in non-UTF-8 mode: kubectl
@@ -264,3 +288,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-runnable. Any other non-zero exit (a real crash, bad flag, or
   `command not found`) still propagates so `remain-on-exit` keeps the dead pane
   and its error inspectable (preserving #28).
+- The sidebar Settings control is now a properly sized icon-button instead of a
+  bare gear glyph (closes #77). It previously borrowed the `.sidebar-refresh`
+  text-button style of the adjacent Refresh button, so it rendered tiny and was
+  hard to tell apart from Refresh. It now has a dedicated `.sidebar-settings`
+  class — a 28×28 bordered, rounded hit area with a larger gear and a hover
+  state, wired into the existing focus-visible outline. Visual-only; the button
+  kept its `aria-label`/`title="Settings"`, so accessibility is unchanged.

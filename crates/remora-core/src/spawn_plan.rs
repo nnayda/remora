@@ -68,9 +68,12 @@ pub fn plan_spawn(config: &Config, spec: &SpawnSpec) -> Result<SpawnPlan, PlanEr
         .ok_or_else(|| PlanError::UnknownAgent(agent_id.clone()))?;
 
     let tmux_name = tmux_session_name(&spec.project_id, &spec.session_id);
-    let (dir, branch, base) = match project.workspace {
+    // Session override wins for both workspace mode (#workspace) and the git
+    // start-point (#54); each falls through to the project default when unset.
+    let workspace = spec.workspace.unwrap_or(project.workspace);
+    let (dir, branch, base) = match workspace {
         WorkspaceMode::Worktree => {
-            // Session override wins; empty falls through to the project default.
+            // Session base override wins; empty falls through to the project default.
             let base = match normalize_base(spec.base.clone())? {
                 Some(b) => Some(b),
                 None => normalize_base(project.base.clone())?,
@@ -94,7 +97,7 @@ pub fn plan_spawn(config: &Config, spec: &SpawnSpec) -> Result<SpawnPlan, PlanEr
         project_id: spec.project_id.clone(),
         session_id: spec.session_id.clone(),
         tmux_name,
-        workspace: project.workspace,
+        workspace,
         project_path: project.path.clone(),
         dir,
         branch,
@@ -184,6 +187,7 @@ mod tests {
             session_id: SessionId::new(session).expect("slug"),
             agent: agent.map(|a| AgentId::new(a).expect("slug")),
             base: None,
+            workspace: None,
         }
     }
 
@@ -316,5 +320,35 @@ mod tests {
     fn shared_project_has_no_base() {
         let plan = plan_spawn(&config(), &spec("scratch", "s1", None)).expect("plan");
         assert_eq!(plan.base, None);
+    }
+
+    #[test]
+    fn workspace_override_forces_worktree_on_a_shared_project() {
+        let spec = SpawnSpec {
+            project_id: ProjectId::new("scratch").expect("slug"),
+            session_id: SessionId::new("s1").expect("slug"),
+            agent: None,
+            base: None,
+            workspace: Some(WorkspaceMode::Worktree),
+        };
+        let plan = plan_spawn(&config(), &spec).expect("plan");
+        assert_eq!(plan.workspace, WorkspaceMode::Worktree);
+        assert_eq!(plan.dir, "~/.remora/worktrees/scratch/s1");
+        assert_eq!(plan.branch.as_deref(), Some("remora/s1"));
+    }
+
+    #[test]
+    fn workspace_override_forces_shared_on_a_worktree_project() {
+        let spec = SpawnSpec {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("s1").expect("slug"),
+            agent: None,
+            base: None,
+            workspace: Some(WorkspaceMode::Shared),
+        };
+        let plan = plan_spawn(&config(), &spec).expect("plan");
+        assert_eq!(plan.workspace, WorkspaceMode::Shared);
+        assert_eq!(plan.dir, "/home/dev/api");
+        assert_eq!(plan.branch, None);
     }
 }

@@ -217,6 +217,11 @@ impl SessionSource for KubectlSource {
             session_id: session_id.clone(),
             agent,
             base: None,
+            // Respawn only ever targets a session whose worktree survived, so
+            // plan worktree mode regardless of the project's current default.
+            // The `test -d` preflight in run_respawn maps a gone worktree to
+            // SessionNotFound.
+            workspace: Some(remora_protocol::WorkspaceMode::Worktree),
         };
         let plan = plan_spawn(&self.config, &spec)?;
         let exec = Arc::clone(&self.exec);
@@ -532,6 +537,7 @@ mod tests {
             session_id: SessionId::new("fix-login").expect("slug"),
             agent: Some(remora_protocol::AgentId::new("claude").expect("slug")),
             base: None,
+            workspace: None,
         };
         source.spawn(spec).await.expect("spawn");
         assert_eq!(*fake.opened.lock().expect("lock"), 1);
@@ -657,8 +663,9 @@ mod tests {
 
     #[tokio::test]
     async fn remove_delegates_to_run_remove_via_spawn_blocking() {
-        // For a worktree project: probe (clean) → kill → worktree remove → branch -D.
+        // For a worktree project: test -d probe → dirty-check (clean) → kill → worktree remove → branch -D.
         let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::ok()),       // test -d worktree probe: dir exists
             Ok(FakeExec::out("")),    // status --porcelain (clean)
             Ok(FakeExec::out("0\n")), // rev-list (on remote)
             Ok(FakeExec::ok()),       // kill-session
