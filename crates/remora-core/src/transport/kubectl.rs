@@ -771,7 +771,11 @@ mod tests {
         };
         let err = source.spawn(spec).await.expect_err("resolution fails");
         assert!(matches!(err, SourceError::Transport(_)), "{err}");
-        assert_eq!(*fake.opened.lock().expect("lock"), 0, "no exec after a failed resolve");
+        assert_eq!(
+            *fake.opened.lock().expect("lock"),
+            0,
+            "no exec after a failed resolve"
+        );
     }
 
     #[test]

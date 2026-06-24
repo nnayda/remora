@@ -1998,8 +1998,8 @@ pub(crate) mod tests {
         let err = resolve_local_command(&runner, "pod", "echo -- -bad | tr -d ' '")
             .expect_err("leading dash would be a flag");
         // Simpler, deterministic form:
-        let err2 = resolve_local_command(&runner, "pod", "printf -- '-bad'")
-            .expect_err("leading dash");
+        let err2 =
+            resolve_local_command(&runner, "pod", "printf -- '-bad'").expect_err("leading dash");
         assert!(matches!(err, SourceError::Transport(_)), "{err}");
         assert!(matches!(err2, SourceError::Transport(_)), "{err2}");
     }
@@ -2008,8 +2008,7 @@ pub(crate) mod tests {
     fn shell_runner_times_out_and_kills() {
         // Tiny timeout so the test is fast; sleep would otherwise hang.
         let runner = ShellRunner::with_limits(std::time::Duration::from_millis(50), 64 * 1024);
-        let err = resolve_local_command(&runner, "pod", "sleep 5")
-            .expect_err("must time out");
+        let err = resolve_local_command(&runner, "pod", "sleep 5").expect_err("must time out");
         assert!(format!("{err}").contains("timed out"), "{err}");
     }
 

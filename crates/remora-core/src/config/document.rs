@@ -15,8 +15,8 @@ use tempfile::NamedTempFile;
 use toml_edit::{value, Array, DocumentMut, Item, Table};
 
 use super::{
-    Agent, AgentId, Config, ConfigError, Host, HostId, KubectlField, Project, ProjectId,
-    Transport, ValidationIssue,
+    Agent, AgentId, Config, ConfigError, Host, HostId, KubectlField, Project, ProjectId, Transport,
+    ValidationIssue,
 };
 
 /// The entry ids present in each section of the document, regardless of whether

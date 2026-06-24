@@ -867,7 +867,10 @@ mod tests {
         };
         assert_eq!(k8s.pod, KubectlField::Literal("sandbox-0".into()));
         assert_eq!(k8s.namespace, Some(KubectlField::Literal("agents".into())));
-        assert_eq!(k8s.context, Some(KubectlField::Literal("staging-cluster".into())));
+        assert_eq!(
+            k8s.context,
+            Some(KubectlField::Literal("staging-cluster".into()))
+        );
         assert_eq!(k8s.container, Some(KubectlField::Literal("main".into())));
 
         let api = &config.projects[&ProjectId::new("api").expect("valid slug")];
@@ -1431,10 +1434,9 @@ mod tests {
 
     #[test]
     fn kubectl_pod_literal_parses() {
-        let cfg = Config::from_toml_str(
-            "[hosts.k]\ntransport = \"kubectl\"\npod = \"sandbox-0\"\n",
-        )
-        .expect("valid literal pod");
+        let cfg =
+            Config::from_toml_str("[hosts.k]\ntransport = \"kubectl\"\npod = \"sandbox-0\"\n")
+                .expect("valid literal pod");
         let Transport::Kubectl(k) = &cfg.hosts.values().next().expect("one host").transport else {
             panic!("expected kubectl");
         };
@@ -1464,10 +1466,9 @@ mod tests {
         )
         .expect("dashes + edge whitespace allowed in a command");
         // Empty command is rejected.
-        let err = Config::from_toml_str(
-            "[hosts.k]\ntransport = \"kubectl\"\npod = { command = \"\" }\n",
-        )
-        .expect_err("empty command rejected");
+        let err =
+            Config::from_toml_str("[hosts.k]\ntransport = \"kubectl\"\npod = { command = \"\" }\n")
+                .expect_err("empty command rejected");
         assert!(format!("{err}").contains("pod"), "{err}");
     }
 
@@ -1484,20 +1485,16 @@ mod tests {
 
     #[test]
     fn kubectl_command_table_missing_command_is_rejected() {
-        let err = Config::from_toml_str(
-            "[hosts.k]\ntransport = \"kubectl\"\npod = {}\n",
-        )
-        .expect_err("empty table rejected");
+        let err = Config::from_toml_str("[hosts.k]\ntransport = \"kubectl\"\npod = {}\n")
+            .expect_err("empty table rejected");
         assert!(format!("{err}").contains("command"), "{err}");
     }
 
     #[test]
     fn kubectl_pod_wrong_shape_has_clean_expected_type_message() {
         // pod = 42 is neither a string nor a table.
-        let err = Config::from_toml_str(
-            "[hosts.k]\ntransport = \"kubectl\"\npod = 42\n",
-        )
-        .expect_err("integer pod rejected");
+        let err = Config::from_toml_str("[hosts.k]\ntransport = \"kubectl\"\npod = 42\n")
+            .expect_err("integer pod rejected");
         let msg = format!("{err}");
         assert!(msg.contains("string") && msg.contains("command"), "{msg}");
     }
@@ -1505,10 +1502,8 @@ mod tests {
     #[test]
     fn literal_pod_guard_unchanged() {
         // Leading dash on a LITERAL is still rejected (unchanged behavior).
-        let err = Config::from_toml_str(
-            "[hosts.k]\ntransport = \"kubectl\"\npod = \"-bad\"\n",
-        )
-        .expect_err("leading dash literal rejected");
+        let err = Config::from_toml_str("[hosts.k]\ntransport = \"kubectl\"\npod = \"-bad\"\n")
+            .expect_err("leading dash literal rejected");
         assert!(format!("{err}").contains("pod"), "{err}");
     }
 }
