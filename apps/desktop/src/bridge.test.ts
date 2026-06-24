@@ -38,6 +38,7 @@ describe("bridge.ts", () => {
         _p: unknown,
         _s: unknown,
         _a: unknown,
+        _w: unknown,
         ch: { onmessage: ((m: unknown) => void) | null },
       ) => {
         ch.onmessage?.({ event: "bytes", bytes: [104] });
@@ -46,7 +47,9 @@ describe("bridge.ts", () => {
       },
     );
     const seen: unknown[] = [];
-    const h = await bridge.spawnSession("api", "x", null, (m) => seen.push(m));
+    const h = await bridge.spawnSession("api", "x", null, "worktree", (m) =>
+      seen.push(m),
+    );
     expect(h).toBe(1);
     expect(seen).toEqual([
       { event: "bytes", bytes: [104] },

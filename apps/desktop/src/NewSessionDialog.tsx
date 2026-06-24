@@ -100,6 +100,7 @@ export function NewSessionDialog({
         projectId,
         sessionId,
         agent: agent === selectedProject?.defaultAgent ? null : agent,
+        workspace: selectedProject?.defaultWorkspace ?? "worktree",
       });
       if (result.ok) {
         onOpened(result.attached);

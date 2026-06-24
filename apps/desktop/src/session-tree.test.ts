@@ -37,6 +37,7 @@ const session = (
   agent,
   createdAt: null,
   workspacePath: null,
+  workspace: null,
 });
 
 const cfg = (

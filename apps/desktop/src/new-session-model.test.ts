@@ -30,8 +30,37 @@ describe("buildNewSessionModel", () => {
         label: "API",
         hostLabel: "Hermes box",
         defaultAgent: "claude",
+        defaultWorkspace: "worktree",
       },
     ]);
+  });
+
+  it("carries each project's default workspace mode", () => {
+    const model = buildNewSessionModel(
+      config({
+        hosts: [{ id: "h", name: null, transport: "ssh" }],
+        projects: [
+          {
+            id: "api",
+            name: null,
+            hostId: "h",
+            agent: "claude",
+            workspace: "worktree" as const,
+          },
+          {
+            id: "scratch",
+            name: null,
+            hostId: "h",
+            agent: "claude",
+            workspace: "shared" as const,
+          },
+        ],
+        agents: [{ id: "claude" }],
+      }),
+    );
+    expect(model.projects.find((p) => p.id === "api")?.defaultWorkspace).toBe(
+      "worktree",
+    );
   });
 
   it("falls back to the project id and host id when names are absent", () => {
@@ -109,6 +138,13 @@ describe("resolveSelection", () => {
           agent: "codex",
           workspace: "worktree" as const,
         },
+        {
+          id: "scratch",
+          name: null,
+          hostId: "h",
+          agent: "claude",
+          workspace: "shared" as const,
+        },
       ],
       agents: [{ id: "claude" }, { id: "codex" }],
     }),
@@ -118,6 +154,7 @@ describe("resolveSelection", () => {
     expect(resolveSelection(model, "web")).toEqual({
       projectId: "web",
       agent: "codex",
+      workspace: "worktree",
     });
   });
 
@@ -125,12 +162,17 @@ describe("resolveSelection", () => {
     expect(resolveSelection(model, "ghost")).toEqual({
       projectId: "api",
       agent: "claude",
+      workspace: "worktree",
     });
   });
 
   it("returns empty strings when there are no projects", () => {
     expect(
       resolveSelection(buildNewSessionModel(config()), "anything"),
-    ).toEqual({ projectId: "", agent: "" });
+    ).toEqual({ projectId: "", agent: "", workspace: "worktree" });
+  });
+
+  it("resolveSelection returns the project's workspace", () => {
+    expect(resolveSelection(model, "scratch").workspace).toBe("shared");
   });
 });
