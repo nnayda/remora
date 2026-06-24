@@ -369,3 +369,92 @@ up cold.
   already covers the explicit case; this is the live-reload polish, deferred to
   its own focused change.
 - **Depends on:** stage 10 `config_get` merged.
+
+## Bound poll-path resolution cost for command-form kubectl fields
+
+- **What:** Avoid re-running a command-form kubectl field's selector on every
+  4s discovery poll — e.g. a short-TTL memo of the resolved host shared across
+  back-to-back `list()` calls, so a `kubectl get pods` selector isn't a network
+  round-trip every tick.
+- **Why:** `list()` is polled every 4s while the window is focused
+  (`discovery-store.ts:62`), and resolution runs at the top of every
+  `SessionSource` method. A command-form pod therefore fires its selector (a k8s
+  API call) every ~4s per host. The in-flight guard + pause-while-hidden cap the
+  damage but don't eliminate steady network load.
+- **Pros:** Cuts repeated API calls; quieter logs/credentials usage. **Cons:**
+  reintroduces a (short) staleness window the design deliberately avoided
+  ("the pod changes" — caching across connects was rejected); adds memo state +
+  invalidation. A TTL memo ≠ the rejected cross-connect cache, but it's adjacent.
+- **Context:** Issue #52 eng review, Performance section (Issue 4). Deferred so
+  the first cut stays minimal; revisit if dogfooding on hermes shows the poll
+  cost biting. See `docs/adr/0007-dynamic-kubectl-field-resolution.md`.
+- **Depends on:** the resolution seam (issue #52 PR).
+
+## Document the command-field trust model (local code execution on poll)
+
+- **What:** Write up, in ADR-0007 (or ARCHITECTURE.md), that a command-form
+  kubectl field executes a local shell command with the user's privileges, and
+  that the discovery poll re-runs it every ~4s — so merely opening the app runs
+  that code repeatedly. State the safety basis (config is local + self-authored,
+  ADR-0004) and that syncing/relaying a config containing command fields is
+  explicitly out of trust scope until revisited.
+- **Why:** The outside voice flagged that command fields turn nominally
+  read-only `list()` polling into repeated local code execution. Today that's
+  safe because you author your own local config, but Remora's vision includes
+  relay/multi-device where config could one day sync — at which point an
+  attacker-authored command field would be RCE-on-open.
+- **Pros:** Makes the trust assumption explicit before config-sync lands.
+  **Cons:** docs-only; no enforcement.
+- **Context:** Issue #52 eng review, outside-voice cross-model tension T2.
+  Chosen as a tracked follow-up rather than ADR-at-build-time.
+- **Depends on:** revisit when/if config sync or relay config distribution is
+  designed.
+
+## Re-resolve-on-vanish retry for command-form pods (TOCTOU)
+
+- **What:** When a `kubectl exec` fails because the resolved pod no longer
+  exists (resolved at lookup, gone by exec), re-resolve once and retry instead
+  of surfacing a hard Transport error.
+- **Why:** A pod swap between `resolve_local_command` and the subsequent exec is
+  a real race during the exact scenario this feature targets (pod churn). Today
+  the connect fails and the user must re-trigger (which re-resolves); a bounded
+  auto-retry smooths that.
+- **Pros:** Smoother UX during a pod swap. **Cons:** needs an error classifier
+  ("which exec failures mean re-resolve"), retry bounds to avoid masking genuine
+  failures, and care not to loop. The manual re-trigger path already recovers.
+- **Context:** Issue #52 eng review, outside voice (Codex pt 6). Deferred as a
+  P3 hardening; ship fail-and-retry first.
+- **Depends on:** the resolution seam (issue #52 PR).
+
+## Packaged-app PATH + Windows support for command-form fields
+
+- **What:** Make command-form resolution work from a GUI-launched, packaged
+  Tauri app: a GUI process (macOS Finder launch) often lacks the user's shell
+  `PATH`, so `kubectl` isn't found even though it works in their terminal; and
+  `sh -c` doesn't exist on Windows.
+- **Why:** Resolution runs the field via `sh -c` in whatever environment the app
+  process inherits. The existing kubectl transport already shells out locally so
+  the PATH issue partly pre-exists, but command resolution widens it and adds an
+  explicit `sh` dependency.
+- **Pros:** Command fields work in shipped builds + on Windows. **Cons:**
+  cross-platform process-env handling is fiddly (login-shell PATH hydration, a
+  Windows resolution path / `cmd` vs `sh`).
+- **Context:** Issue #52 eng review, outside voice (Codex pt 9). Pre-alpha
+  dogfood is hermes (Linux/macOS, terminal-launched), so unaffected now; revisit
+  at packaging (stage 16) / Windows support.
+- **Depends on:** stage 16 (Desktop CI & packaging); Windows support.
+
+## Detect ambiguous selectors (matched N pods, expected 1)
+
+- **What:** Surface a clear "selector matched N pods, expected 1" signal instead
+  of silently accepting whatever `head -n1` returns. E.g. detect a multi-line
+  raw selector result before the user masks it with `head -n1`, or offer a
+  strict non-`head` form.
+- **Why:** ADR-0007 documents the single-active-pod assumption, but the code
+  still lets a 3-pod match resolve to an arbitrary first pod with no warning —
+  the ambiguity is masked, not detected. Worst at multi-replica/HPA.
+- **Pros:** Turns a silent footgun into a clear error. **Cons:** fights the
+  decided "user pipes `head -n1`" ergonomics; needs a UX path for the error.
+- **Context:** Issue #52 eng review, outside voice (Codex pt 5) + semantics
+  section (T3, option not taken). ADR note ships now; active detection deferred.
+- **Depends on:** the resolution seam (issue #52 PR).
