@@ -1187,8 +1187,8 @@ pub(crate) mod tests {
             .position(|a| a == "new-session")
             .expect("new-session");
         // Still exactly one agent-command token after `-c <dir>` (wrapped, not
-        // per-token), followed by two 6-token trailers (mouse, then
-        // remain-on-exit). new-session + 6 (down to agent-cmd) + 6 + 6.
+        // per-token), followed by two 6-token trailers (remain-on-exit, then
+        // mouse). new-session + 6 (down to agent-cmd) + 6 + 6.
         assert_eq!(tokens.len(), n + 1 + 6 + 6 + 6);
         let fragment = join_agent_command(&plan.agent_argv);
         let inner = wrap_with_shell_fallback(&fragment);
@@ -1216,8 +1216,8 @@ pub(crate) mod tests {
         // -d -s <name> -c <dir> <cmd> ; set-option -t <name> remain-on-exit on
         assert_eq!(tokens[n + 4], "-c");
         assert_eq!(tokens[n + 6], shell_quote(PLAIN_SHELL_COMMAND));
-        // Same tmux argv shape as an agent spawn: command token + the mouse and
-        // remain-on-exit 6-token trailers.
+        // Same tmux argv shape as an agent spawn: command token + the
+        // remain-on-exit and mouse 6-token trailers.
         assert_eq!(tokens.len(), n + 1 + 6 + 6 + 6);
         // The agent-exit wrapper must NOT appear for a no-agent pane.
         assert!(
