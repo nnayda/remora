@@ -255,6 +255,12 @@ export function moveArg(
   return next;
 }
 
+/** Unicode `Dash_Punctuation` (Pd) code points minus ASCII hyphen-minus — the
+ * dashes autocorrect/paste plausibly substitutes for `-`. Mirrors the Rust
+ * `starts_with_unicode_dash` guard in remora-core's config validation. */
+const UNICODE_DASH_PREFIX =
+  /^[\u058A\u05BE\u1400\u1806\u2010-\u2015\u2E17\u2E1A\u2E3A\u2E3B\u2E40\u301C\u3030\u30A0\uFE31\uFE32\uFE58\uFE63\uFF0D]/u;
+
 export function validateAgentForm(
   form: AgentFormState,
   mode: FormMode,
@@ -263,6 +269,16 @@ export function validateAgentForm(
   if (idError) return idError;
   if (!form.plainShell && form.command.every((arg) => arg.trim() === "")) {
     return "Command cannot be empty.";
+  }
+  // A leading Unicode dash (e.g. `—flag` from autocorrect) is read as a prompt,
+  // not a flag, by the agent CLI — reject it instead of letting it confuse the
+  // launch silently. Skipped in plain-shell mode, where the command rows are
+  // ignored (saved as `[]`) so a leftover dash row must not block the save.
+  if (
+    !form.plainShell &&
+    form.command.some((arg) => UNICODE_DASH_PREFIX.test(arg.trim()))
+  ) {
+    return "An argument uses a Unicode dash (e.g. — or –). Use ASCII `-`/`--` for flags.";
   }
   return null;
 }
