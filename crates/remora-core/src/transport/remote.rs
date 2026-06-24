@@ -610,32 +610,24 @@ use std::time::{Duration, Instant};
 /// Wall-clock and output bounds for a local resolution command. A hung
 /// selector (e.g. `kubectl get` against an unreachable API) must NOT block the
 /// discovery poll forever, and runaway output must not exhaust memory.
-// Task 4 (kubectl transport wiring) will reference these; allow until then.
-#[allow(dead_code)]
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
-#[allow(dead_code)]
 const RESOLVE_MAX_OUTPUT: usize = 64 * 1024;
 
 /// Seam for running a user-authored command line LOCALLY. Behind a trait so the
 /// timeout / output-cap / exit-status paths are testable deterministically and
 /// transport tests can resolve through a real (or scripted) runner without the
 /// kubectl exec tail.
-// Task 4 wires this into the kubectl transport; allow until then.
-#[allow(dead_code)]
 pub(crate) trait LocalRunner: Send + Sync {
     fn run_local(&self, command: &str) -> Result<RemoteOutput, SourceError>;
 }
 
 /// The real runner: `sh -c <command>` with a timeout and an output cap.
-// Task 4 wires this into the kubectl transport; allow until then.
-#[allow(dead_code)]
 pub(crate) struct ShellRunner {
     timeout: Duration,
     max_output: usize,
 }
 
 impl ShellRunner {
-    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self {
             timeout: RESOLVE_TIMEOUT,
@@ -661,7 +653,6 @@ impl LocalRunner for ShellRunner {
 /// Reads to EOF, retaining at most `cap` bytes but always draining the pipe so
 /// the child can't deadlock on a full buffer after we stop retaining. Returns
 /// (lossy string, whether the cap was exceeded).
-#[allow(dead_code)]
 fn read_capped(reader: &mut impl Read, cap: usize) -> (String, bool) {
     let mut kept: Vec<u8> = Vec::new();
     let mut over = false;
@@ -686,7 +677,6 @@ fn read_capped(reader: &mut impl Read, cap: usize) -> (String, bool) {
 
 /// Spawns `sh -c command` with bounded time and output. Reader threads prevent
 /// pipe-buffer deadlock; a poll loop enforces the timeout and kills on expiry.
-#[allow(dead_code)]
 fn run_shell_bounded(
     command: &str,
     timeout: Duration,
@@ -746,8 +736,6 @@ fn run_shell_bounded(
 /// line. Nonzero exit, empty output, or output that fails the literal-field
 /// guard (control chars, embedded newline, leading `-`, edge whitespace) is a
 /// hard error — never silently target "".
-// Task 4 wires this into the kubectl transport; allow until then.
-#[allow(dead_code)]
 pub(crate) fn resolve_local_command(
     runner: &dyn LocalRunner,
     field: &str,
