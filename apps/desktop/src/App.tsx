@@ -87,6 +87,7 @@ function App() {
         projectId: node.projectId,
         sessionId: node.sessionId,
         agent: node.agent,
+        base: null,
       })
         .then((r) => {
           if (!r.ok && r.error !== OPEN_CANCELLED) {
@@ -109,6 +110,7 @@ function App() {
       projectId: node.projectId,
       sessionId: node.sessionId,
       agent: node.agent,
+      base: null,
     })
       .then((result) => {
         if (!result.ok && result.error !== OPEN_CANCELLED) {

@@ -190,6 +190,7 @@ describe("project form", () => {
       path: "/srv/api",
       workspace: "shared",
       agent: "claude",
+      base: null,
     });
     expect(form.id).toBe("api");
     expect(form.path).toBe("/srv/api");

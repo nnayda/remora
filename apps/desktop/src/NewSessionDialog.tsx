@@ -40,6 +40,7 @@ export function NewSessionDialog({
   const [sessionId, setSessionId] = useState("");
   // Agent defaults to the selected project's default; project changes reset it.
   const [agent, setAgent] = useState(initial.agent);
+  const [base, setBase] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -100,6 +101,7 @@ export function NewSessionDialog({
         projectId,
         sessionId,
         agent: agent === selectedProject?.defaultAgent ? null : agent,
+        base: base.trim() === "" ? null : base.trim(),
       });
       if (result.ok) {
         onOpened(result.attached);
@@ -213,6 +215,18 @@ export function NewSessionDialog({
               </select>
               <span className="hint">
                 Applies only when spawning a new session.
+              </span>
+            </label>
+            <label>
+              Base
+              <input
+                value={base}
+                placeholder="origin/main (auto-detected if empty)"
+                onChange={(e) => setBase(e.target.value)}
+              />
+              <span className="hint">
+                Start-point for the new worktree. Empty = project default /
+                detected.
               </span>
             </label>
             {error && (

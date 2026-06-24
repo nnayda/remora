@@ -9,7 +9,7 @@ import { SessionStore } from "./session-store";
  * (called from App's unmount effect).
  */
 export const sessionStore = new SessionStore({
-  spawn: (p, s, a) => openSession(p, s, a),
+  spawn: (p, s, a, b) => openSession(p, s, a, b),
   attach: (p, s) => attachConnection(p, s),
   respawn: (p, s, a) => respawnConnection(p, s, a),
   schedule: (fn, ms) => setTimeout(fn, ms),

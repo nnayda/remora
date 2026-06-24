@@ -26,6 +26,7 @@ export interface SpawnInput {
   projectId: string;
   sessionId: string;
   agent: string | null;
+  base: string | null;
 }
 
 export type TabStatus = "live" | "reconnecting" | "stopped" | "disconnected";
@@ -52,6 +53,7 @@ export interface StoreOpeners {
     projectId: string,
     sessionId: string,
     agent: string | null,
+    base: string | null,
   ): Promise<{ connection: SessionConnection; attached: boolean }>;
   attach(projectId: string, sessionId: string): Promise<SessionConnection>;
   respawn(
@@ -258,6 +260,7 @@ export class SessionStore {
       p: string,
       s: string,
       a: string | null,
+      b: string | null,
     ) => Promise<{ connection: SessionConnection; attached: boolean }>,
   ): Promise<OpenResult> {
     const key = tabKey(input.projectId, input.sessionId);
@@ -272,7 +275,12 @@ export class SessionStore {
     this.pending.set(key, token);
     let opened: { connection: SessionConnection; attached: boolean };
     try {
-      opened = await open(input.projectId, input.sessionId, input.agent);
+      opened = await open(
+        input.projectId,
+        input.sessionId,
+        input.agent,
+        input.base,
+      );
     } catch (error) {
       this.pending.delete(key);
       return { ok: false, error };
@@ -318,7 +326,7 @@ export class SessionStore {
       return { ok: true, attached: existing.attached };
     }
 
-    return this.openTab(input, (p, s, a) => this.openers.spawn(p, s, a));
+    return this.openTab(input, (p, s, a, b) => this.openers.spawn(p, s, a, b));
   };
 
   /** Close a tab: cancel an in-flight open/reconnect if any, else close the
@@ -406,7 +414,7 @@ export class SessionStore {
       return { ok: true, attached: false };
     }
 
-    return this.openTab(input, (p, s, a) =>
+    return this.openTab(input, (p, s, a, _b) =>
       this.openers
         .respawn(p, s, a)
         .then((connection) => ({ connection, attached: false })),

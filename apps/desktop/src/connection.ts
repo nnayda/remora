@@ -188,10 +188,11 @@ export async function openSession(
   projectId: string,
   sessionId: string,
   agent: string | null,
+  base: string | null,
 ): Promise<{ connection: SessionConnection; attached: boolean }> {
   try {
     const connection = await openConnection((o) =>
-      spawnSession(projectId, sessionId, agent, o),
+      spawnSession(projectId, sessionId, agent, base, o),
     );
     return { connection, attached: false };
   } catch (e) {
