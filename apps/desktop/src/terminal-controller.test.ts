@@ -312,6 +312,24 @@ describe("TerminalController", () => {
     errSpy.mockRestore();
   });
 
+  it("ignores an empty OSC 52 payload (does not clobber the clipboard)", () => {
+    const { writeClipboard } = ctrlWithClipboard();
+    const handled = term().oscCb?.("c;");
+    expect(handled).toBe(true);
+    expect(writeClipboard).not.toHaveBeenCalled();
+  });
+
+  it("logs and swallows OSC 52 with valid base64 but invalid UTF-8 bytes", () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { writeClipboard } = ctrlWithClipboard();
+    // base64("\xff") = "/w==" — 0xFF is not a valid UTF-8 lead byte.
+    const handled = term().oscCb?.("c;/w==");
+    expect(handled).toBe(true);
+    expect(writeClipboard).not.toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
   it("logs a clipboard write rejection without throwing", async () => {
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const conn = fakeConn();

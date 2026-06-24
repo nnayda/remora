@@ -7,11 +7,15 @@ import {
 import type { SessionConnection } from "./connection";
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
+// fatal: a remote-supplied payload with invalid UTF-8 throws here rather than
+// silently landing U+FFFD replacement characters on the clipboard.
+const decoder = new TextDecoder("utf-8", { fatal: true });
 
-/** Decode a base64 string whose bytes are UTF-8 (OSC 52 payloads are UTF-8). */
+/** Decode a base64 string whose bytes are UTF-8 (OSC 52 payloads are UTF-8).
+ * Throws on malformed input: `atob` on invalid base64, the decoder on invalid
+ * UTF-8 — both are caught by the OSC 52 handler. */
 function decodeBase64Utf8(b64: string): string {
-  const binary = atob(b64); // throws DOMException on malformed input
+  const binary = atob(b64);
   const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
   return decoder.decode(bytes);
 }
@@ -103,6 +107,7 @@ export class TerminalController {
     const sep = data.indexOf(";");
     const payload = sep === -1 ? data : data.slice(sep + 1);
     if (payload === "?") return true; // read request: never echo the clipboard back
+    if (payload === "") return true; // empty set: ignore, don't clobber the clipboard
     let text: string;
     try {
       text = decodeBase64Utf8(payload);
