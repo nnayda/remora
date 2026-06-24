@@ -151,6 +151,13 @@ mod tests {
             workspace = "worktree"
             agent = "claude"
 
+            [projects.withbase]
+            host = "devbox"
+            path = "/home/dev/withbase"
+            workspace = "worktree"
+            agent = "claude"
+            base = "origin/main"
+
             [projects.scratch]
             host = "devbox"
             path = "~/scratch"
@@ -281,6 +288,26 @@ mod tests {
         // empty session base falls through (project has no base here) -> None
         spec.base = Some("  ".into());
         assert_eq!(plan_spawn(&cfg, &spec).expect("plan").base, None);
+    }
+
+    #[test]
+    fn whitespace_session_base_falls_through_to_project_base() {
+        let cfg = config(); // withbase project has base = "origin/main"
+
+        // Whitespace-only session base → falls through to project default.
+        let mut s = spec("withbase", "s1", None);
+        s.base = Some("   ".into());
+        assert_eq!(
+            plan_spawn(&cfg, &s).expect("plan").base.as_deref(),
+            Some("origin/main")
+        );
+
+        // No session base at all → project default applies too.
+        s.base = None;
+        assert_eq!(
+            plan_spawn(&cfg, &s).expect("plan").base.as_deref(),
+            Some("origin/main")
+        );
     }
 
     #[test]
