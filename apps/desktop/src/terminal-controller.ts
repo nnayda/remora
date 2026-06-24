@@ -76,6 +76,11 @@ export class TerminalController {
       !event.altKey &&
       !event.metaKey
     ) {
+      // Returning false suppresses xterm's keydown handling, but xterm never
+      // calls preventDefault on our behalf, so the browser would still fire a
+      // `keypress` for Enter and xterm would emit a stray CR there. preventDefault
+      // kills that follow-up keypress — the same thing xterm's own Enter path does.
+      event.preventDefault();
       // Suppress the default CR either way; only write while the session lives.
       if (!this.closed) {
         void this.connection
