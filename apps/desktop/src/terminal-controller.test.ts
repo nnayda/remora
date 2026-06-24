@@ -18,8 +18,28 @@ const xt = vi.hoisted(() => {
     dispose = vi.fn();
     loadAddon = vi.fn();
     focus = vi.fn();
+    oscCb: ((data: string) => boolean) | null = null;
+    oscDispose = vi.fn();
+    keyHandler: ((e: KeyboardEvent) => boolean) | null = null;
+    selection = "";
+    getSelection = vi.fn(() => this.selection);
+    attachCustomKeyEventHandler = vi.fn((cb: (e: KeyboardEvent) => boolean) => {
+      this.keyHandler = cb;
+    });
+    parser: {
+      registerOscHandler: (
+        id: number,
+        cb: (d: string) => boolean,
+      ) => { dispose: () => void };
+    };
     constructor() {
       state.term = this;
+      this.parser = {
+        registerOscHandler: (_id, cb) => {
+          this.oscCb = cb;
+          return { dispose: this.oscDispose };
+        },
+      };
     }
     write(d: string | Uint8Array) {
       this.written.push(d);
@@ -106,6 +126,17 @@ function term(): NonNullable<typeof xt.state.term> {
 }
 
 describe("TerminalController", () => {
+  function ctrlWithClipboard() {
+    const conn = fakeConn();
+    const writeClipboard = vi.fn().mockResolvedValue(undefined);
+    const c = new TerminalController(
+      el,
+      conn as unknown as SessionConnection,
+      writeClipboard,
+    );
+    return { c, conn, writeClipboard };
+  }
+
   it("writes incoming bytes to the terminal as a Uint8Array (not a string)", () => {
     const conn = fakeConn();
     new TerminalController(el, conn as unknown as SessionConnection);
@@ -246,6 +277,53 @@ describe("TerminalController", () => {
     conn.write.mockResolvedValueOnce(undefined);
     term().dataCb?.("y");
     expect(conn.write).toHaveBeenCalledTimes(2);
+    errSpy.mockRestore();
+  });
+
+  it("writes the decoded OSC 52 payload to the clipboard", () => {
+    const { writeClipboard } = ctrlWithClipboard();
+    // base64("hello") = "aGVsbG8="
+    term().oscCb?.("c;aGVsbG8=");
+    expect(writeClipboard).toHaveBeenCalledWith("hello");
+  });
+
+  it("decodes UTF-8 OSC 52 payloads correctly", () => {
+    const { writeClipboard } = ctrlWithClipboard();
+    // base64(utf8("café")) = "Y2Fmw6k="
+    term().oscCb?.("c;Y2Fmw6k=");
+    expect(writeClipboard).toHaveBeenCalledWith("café");
+  });
+
+  it("ignores OSC 52 read requests (never echoes the clipboard back)", () => {
+    const { writeClipboard } = ctrlWithClipboard();
+    const handled = term().oscCb?.("c;?");
+    expect(handled).toBe(true);
+    expect(writeClipboard).not.toHaveBeenCalled();
+  });
+
+  it("logs and swallows a malformed OSC 52 payload", () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { writeClipboard } = ctrlWithClipboard();
+    const handled = term().oscCb?.("c;@@not-base64@@");
+    expect(handled).toBe(true);
+    expect(writeClipboard).not.toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it("logs a clipboard write rejection without throwing", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const conn = fakeConn();
+    const writeClipboard = vi.fn().mockRejectedValueOnce(new Error("denied"));
+    new TerminalController(
+      el,
+      conn as unknown as SessionConnection,
+      writeClipboard,
+    );
+    term().oscCb?.("c;aGVsbG8=");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(errSpy).toHaveBeenCalled();
     errSpy.mockRestore();
   });
 });
