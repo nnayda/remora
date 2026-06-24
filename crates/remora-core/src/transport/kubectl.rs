@@ -15,10 +15,23 @@ use super::remote::{
     attach_channel, capture, has_session_tokens, open_pty, run_list, run_remove, run_respawn,
     run_spawn, run_stop, stderr_signals_session_absent, RemoteExec, RemoteOutput,
 };
-use crate::config::{Config, KubectlHost};
+use crate::config::{Config, KubectlField, KubectlHost};
 use crate::naming::tmux_session_name;
 use crate::spawn_plan::plan_spawn;
 use crate::{SessionChannel, SessionSource, SourceError};
+
+/// Extracts the literal string from a `KubectlField`. Panics on `Command`
+/// because command fields must be resolved before argv construction (Task 3).
+/// This is the pre-resolution placeholder; callers that reach here have already
+/// validated the field is a `Literal`.
+fn field_literal(f: &KubectlField) -> &str {
+    match f {
+        KubectlField::Literal(v) => v.as_str(),
+        KubectlField::Command(_) => {
+            panic!("KubectlField::Command must be resolved before argv construction")
+        }
+    }
+}
 
 /// `kubectl [--context X] [-n NS] exec [-c C] [-i -t] <pod> --` — the
 /// connection prefix. Globals precede `exec`; exec-local flags follow it.
@@ -26,22 +39,22 @@ fn kubectl_base_argv(host: &KubectlHost, interactive: bool) -> Vec<String> {
     let mut argv: Vec<String> = vec!["kubectl".into()];
     if let Some(ctx) = &host.context {
         argv.push("--context".into());
-        argv.push(ctx.clone());
+        argv.push(field_literal(ctx).to_owned());
     }
     if let Some(ns) = &host.namespace {
         argv.push("-n".into());
-        argv.push(ns.clone());
+        argv.push(field_literal(ns).to_owned());
     }
     argv.push("exec".into());
     if let Some(container) = &host.container {
         argv.push("-c".into());
-        argv.push(container.clone());
+        argv.push(field_literal(container).to_owned());
     }
     if interactive {
         argv.push("-i".into());
         argv.push("-t".into());
     }
-    argv.push(host.pod.clone());
+    argv.push(field_literal(&host.pod).to_owned());
     argv.push("--".into());
     argv
 }
@@ -299,10 +312,10 @@ mod tests {
         container: Option<&str>,
     ) -> KubectlHost {
         KubectlHost {
-            pod: pod.into(),
-            namespace: ns.map(String::from),
-            context: ctx.map(String::from),
-            container: container.map(String::from),
+            pod: KubectlField::Literal(pod.into()),
+            namespace: ns.map(|s| KubectlField::Literal(s.into())),
+            context: ctx.map(|s| KubectlField::Literal(s.into())),
+            container: container.map(|s| KubectlField::Literal(s.into())),
         }
     }
 
@@ -476,7 +489,7 @@ mod tests {
             Ok(FakeExec::ok()), // new-session
         ]));
         let kh = KubectlHost {
-            pod: "sandbox-0".into(),
+            pod: KubectlField::Literal("sandbox-0".into()),
             namespace: None,
             context: None,
             container: None,
@@ -506,7 +519,7 @@ mod tests {
             "Unable to connect to the server: dial tcp: lookup api timed out",
         ))]));
         let kh = KubectlHost {
-            pod: "sandbox-0".into(),
+            pod: KubectlField::Literal("sandbox-0".into()),
             namespace: None,
             context: None,
             container: None,
@@ -564,7 +577,7 @@ mod tests {
 
     fn kubectl_host() -> KubectlHost {
         KubectlHost {
-            pod: "sandbox-0".into(),
+            pod: KubectlField::Literal("sandbox-0".into()),
             namespace: None,
             context: None,
             container: None,
