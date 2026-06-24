@@ -51,6 +51,7 @@ export class TerminalController {
     this.oscDisposable = this.term.parser.registerOscHandler(52, (data) =>
       this.handleOsc52(data),
     );
+    this.term.attachCustomKeyEventHandler((e) => this.handleKeyEvent(e));
 
     this.unsubscribe = connection.subscribe((msg) => {
       if (msg.event === "bytes") this.term.write(new Uint8Array(msg.bytes));
@@ -111,6 +112,27 @@ export class TerminalController {
     }
     void this.writeClipboard(text).catch((err) => this.logClipboardError(err));
     return true;
+  }
+
+  /** Intercept the copy chord — Cmd+C (macOS) or Ctrl+Shift+C (Linux/Windows) —
+   * copy the current selection to the clipboard, and swallow the key so it is
+   * not sent to the PTY. Everything else, including a bare Ctrl-C (which must
+   * stay SIGINT), is left for xterm to handle. */
+  private handleKeyEvent(e: KeyboardEvent): boolean {
+    const isCopyChord =
+      e.type === "keydown" &&
+      e.code === "KeyC" &&
+      !e.altKey &&
+      ((e.metaKey && !e.ctrlKey && !e.shiftKey) ||
+        (e.ctrlKey && e.shiftKey && !e.metaKey));
+    if (!isCopyChord) return true; // let xterm handle it (bare Ctrl-C stays SIGINT)
+    const selection = this.term.getSelection();
+    if (selection) {
+      void this.writeClipboard(selection).catch((err) =>
+        this.logClipboardError(err),
+      );
+    }
+    return false; // consume the chord; never forward to the PTY
   }
 
   /** Surface (don't swallow) a clipboard write rejection. Log only: a denied or

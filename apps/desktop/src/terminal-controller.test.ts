@@ -326,4 +326,53 @@ describe("TerminalController", () => {
     expect(errSpy).toHaveBeenCalled();
     errSpy.mockRestore();
   });
+
+  it("copies the selection and consumes Cmd+C when text is selected", () => {
+    const { writeClipboard } = ctrlWithClipboard();
+    term().selection = "selected text";
+    const handled = term().keyHandler?.({
+      type: "keydown",
+      code: "KeyC",
+      metaKey: true,
+    } as KeyboardEvent);
+    expect(writeClipboard).toHaveBeenCalledWith("selected text");
+    expect(handled).toBe(false); // consumed: not forwarded to the PTY
+  });
+
+  it("copies the selection on Ctrl+Shift+C (Linux/Windows chord)", () => {
+    const { writeClipboard } = ctrlWithClipboard();
+    term().selection = "linux copy";
+    const handled = term().keyHandler?.({
+      type: "keydown",
+      code: "KeyC",
+      ctrlKey: true,
+      shiftKey: true,
+    } as KeyboardEvent);
+    expect(writeClipboard).toHaveBeenCalledWith("linux copy");
+    expect(handled).toBe(false);
+  });
+
+  it("consumes the copy chord but writes nothing when there is no selection", () => {
+    const { writeClipboard } = ctrlWithClipboard();
+    term().selection = "";
+    const handled = term().keyHandler?.({
+      type: "keydown",
+      code: "KeyC",
+      metaKey: true,
+    } as KeyboardEvent);
+    expect(writeClipboard).not.toHaveBeenCalled();
+    expect(handled).toBe(false);
+  });
+
+  it("lets a bare Ctrl-C through (stays SIGINT, never copies)", () => {
+    const { writeClipboard } = ctrlWithClipboard();
+    term().selection = "ignored";
+    const handled = term().keyHandler?.({
+      type: "keydown",
+      code: "KeyC",
+      ctrlKey: true,
+    } as KeyboardEvent);
+    expect(writeClipboard).not.toHaveBeenCalled();
+    expect(handled).toBe(true); // passed through to xterm → ^C
+  });
 });
