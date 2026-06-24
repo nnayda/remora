@@ -174,7 +174,11 @@ impl SessionSource for SshSource {
             project_id: project_id.clone(),
             session_id: session_id.clone(),
             agent,
-            workspace: None,
+            // Respawn only ever targets a session whose worktree survived, so
+            // plan worktree mode regardless of the project's current default.
+            // The `test -d` preflight in run_respawn maps a gone worktree to
+            // SessionNotFound.
+            workspace: Some(remora_protocol::WorkspaceMode::Worktree),
         };
         let plan = plan_spawn(&self.config, &spec)?;
         let exec = Arc::clone(&self.exec);
@@ -223,7 +227,7 @@ mod tests {
     use super::super::remote::{join_agent_command, shell_quote, wrap_with_shell_fallback};
     use super::*;
     use crate::config::WorkspaceMode;
-    use crate::spawn_plan::{PlanError, SpawnPlan};
+    use crate::spawn_plan::SpawnPlan;
     use crate::SessionSource;
     use remora_protocol::{AgentId, ProjectId, SessionId, SessionState, SpawnSpec};
 
@@ -823,7 +827,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn respawn_of_shared_project_errors_before_any_remote_call() {
+    async fn respawn_of_shared_config_project_with_no_surviving_worktree_is_not_found() {
+        // RED → GREEN: respawn always plans worktree mode (only worktree sessions
+        // survive to be respawned). A shared-default project with no surviving
+        // worktree dir maps to SessionNotFound via the `test -d` preflight, NOT
+        // NotWorktreeProject (which was the pre-fix behavior that wrongly blocked
+        // every respawn on shared-default projects).
         let toml = r#"
             [hosts.devbox]
             transport = "ssh"
@@ -837,20 +846,59 @@ mod tests {
             command = ["claude"]
         "#;
         let config = Arc::new(Config::from_toml_str(toml).expect("config"));
-        let fake = Arc::new(FakeExec::new(vec![]));
+        let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::fail("")), // test -d: worktree dir gone → SessionNotFound
+        ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let (project, session) = (pid("scratch"), sid("s1"));
         let err = source
             .respawn(&project, &session, None)
             .await
-            .expect_err("shared");
+            .expect_err("no surviving worktree");
         assert!(
-            matches!(err, SourceError::Plan(PlanError::NotWorktreeProject(_))),
-            "{err}"
+            matches!(err, SourceError::SessionNotFound { .. }),
+            "expected SessionNotFound (worktree gone), got: {err}"
         );
+        // The preflight `test -d` must have run.
+        let calls = fake.calls.lock().expect("lock");
+        assert_eq!(calls.len(), 1, "only the preflight probe runs");
         assert!(
-            fake.calls.lock().expect("lock").is_empty(),
-            "no remote call"
+            calls[0].iter().any(|a| a == "test") && calls[0].iter().any(|a| a == "-d"),
+            "preflight must be a `test -d` probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn respawn_of_shared_config_project_with_surviving_worktree_attaches() {
+        // RED → GREEN: a worktree-override session on a shared-default project
+        // must respawn successfully when the worktree dir still exists.
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.scratch]
+            host = "devbox"
+            path = "~/scratch"
+            workspace = "shared"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+        "#;
+        let config = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::ok()), // test -d: worktree dir exists
+            Ok(FakeExec::ok()), // new-session ok
+        ]));
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        let (project, session) = (pid("scratch"), sid("s1"));
+        source
+            .respawn(&project, &session, None)
+            .await
+            .expect("respawn must succeed when worktree exists on shared-config project");
+        assert_eq!(
+            fake.opened.lock().expect("lock").len(),
+            1,
+            "must open exactly one channel"
         );
     }
 
