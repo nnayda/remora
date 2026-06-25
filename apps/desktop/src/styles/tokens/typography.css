@@ -1,0 +1,69 @@
+/* ============================================================
+   REMORA — TYPOGRAPHY TOKENS
+   Two families: humanist sans for chrome, mono for terminal/code.
+   Dense, dev-tool scale. Sizes in rem (16px root).
+   ============================================================ */
+
+:root {
+  /* --- FAMILIES --- */
+  --font-sans:
+    "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+    sans-serif;
+  --font-mono:
+    "JetBrains Mono", ui-monospace, "SF Mono", "Berkeley Mono", Menlo, Consolas,
+    monospace;
+
+  /* --- SIZE SCALE (chrome) --- */
+  --text-2xs: 0.6875rem; /* 11px — micro labels, badges */
+  --text-xs: 0.75rem; /* 12px — meta, captions */
+  --text-sm: 0.8125rem; /* 13px — sidebar rows, body-dense (default UI size) */
+  --text-md: 0.875rem; /* 14px — body, inputs */
+  --text-lg: 1rem; /* 16px — section titles */
+  --text-xl: 1.25rem; /* 20px — dialog / page headings */
+  --text-2xl: 1.625rem; /* 26px — display */
+  --text-3xl: 2.25rem; /* 36px — hero display */
+
+  /* --- MONO SIZES (terminal / code / diff) --- */
+  --mono-xs: 0.75rem; /* 12px */
+  --mono-sm: 0.8125rem; /* 13px — terminal default */
+  --mono-md: 0.875rem; /* 14px */
+
+  /* --- WEIGHTS --- */
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* --- LINE HEIGHTS --- */
+  --leading-tight: 1.2;
+  --leading-snug: 1.35;
+  --leading-normal: 1.5;
+  --leading-mono: 1.55; /* terminal rows */
+
+  /* --- TRACKING --- */
+  --tracking-tight: -0.012em; /* display headings */
+  --tracking-normal: 0;
+  --tracking-wide: 0.04em; /* uppercase micro-labels */
+  --tracking-mono: 0;
+
+  /* --- SEMANTIC ROLES --- */
+  --type-display:
+    var(--weight-semibold) var(--text-3xl) / var(--leading-tight)
+    var(--font-sans);
+  --type-heading:
+    var(--weight-semibold) var(--text-xl) / var(--leading-snug) var(--font-sans);
+  --type-title:
+    var(--weight-semibold) var(--text-lg) / var(--leading-snug) var(--font-sans);
+  --type-body:
+    var(--weight-regular) var(--text-md) / var(--leading-normal)
+    var(--font-sans);
+  --type-ui:
+    var(--weight-medium) var(--text-sm) / var(--leading-snug) var(--font-sans);
+  --type-meta:
+    var(--weight-medium) var(--text-xs) / var(--leading-snug) var(--font-sans);
+  --type-label: var(--weight-semibold) var(--text-2xs) / 1 var(--font-sans);
+  --type-terminal:
+    var(--weight-regular) var(--mono-sm) / var(--leading-mono) var(--font-mono);
+  --type-code:
+    var(--weight-regular) var(--mono-sm) / var(--leading-mono) var(--font-mono);
+}

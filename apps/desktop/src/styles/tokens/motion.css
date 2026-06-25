@@ -1,0 +1,75 @@
+/* ============================================================
+   REMORA — MOTION TOKENS
+   Fast, quiet, purposeful. 120–180ms. No bounce.
+   The one expressive moment: the agent activity pulse.
+   ============================================================ */
+
+:root {
+  /* --- DURATIONS --- */
+  --dur-instant: 80ms; /* @kind other */
+  --dur-fast: 120ms; /* @kind other */
+  --dur-base: 160ms; /* @kind other */
+  --dur-slow: 220ms; /* @kind other */
+  --dur-pulse: 1600ms; /* @kind other */
+
+  /* --- EASING --- */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1); /* @kind other */
+  --ease-in-out: cubic-bezier(0.45, 0, 0.2, 1); /* @kind other */
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1); /* @kind other */
+  --ease-pulse: cubic-bezier(0.4, 0, 0.6, 1); /* @kind other */
+
+  /* --- COMPOSED TRANSITIONS --- */
+  --transition-control:
+    background-color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+  --transition-panel:
+    transform var(--dur-base) var(--ease-out),
+    opacity var(--dur-base) var(--ease-out);
+}
+
+/* --- ACTIVITY PULSE: Remora's signature motion ---
+   A calm breathing glow for "agent is working".
+   For "needs you", pair with a faster, higher-contrast variant. */
+@keyframes remora-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(0.86);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes remora-pulse-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(169, 156, 255, 0);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(169, 156, 255, 0.18);
+  }
+}
+
+@keyframes remora-attention {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.55;
+    transform: scale(0.82);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-instant: 0ms; /* @kind other */
+    --dur-fast: 0ms; /* @kind other */
+    --dur-base: 0ms; /* @kind other */
+    --dur-slow: 0ms; /* @kind other */
+  }
+}

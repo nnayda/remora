@@ -1,0 +1,210 @@
+/* ============================================================
+   REMORA — COLOR TOKENS
+   Dark-first. Light is co-equal and follows the OS setting.
+   Raw palette  →  semantic aliases (theme-switched).
+   ============================================================ */
+
+:root {
+  /* --- RAW: NEUTRAL INK RAMP (dark surfaces) --- */
+  --ink-1000: #08090c;
+  --ink-950: #0b0c10; /* app / terminal base — deepest */
+  --ink-900: #101117; /* sidebar */
+  --ink-850: #15161d;
+  --ink-800: #1a1b22; /* panels, cards */
+  --ink-750: #20212a; /* hover */
+  --ink-700: #282a34; /* active, strong border */
+  --ink-650: #32343f;
+  --ink-600: #3e404c;
+
+  /* --- RAW: PAPER RAMP (text on dark) --- */
+  --paper-50: #f4f5f8; /* primary text */
+  --paper-200: #d6d9e1;
+  --paper-400: #9ca0ae; /* secondary text */
+  --paper-500: #777c8b; /* muted text */
+  --paper-600: #565a68; /* disabled */
+
+  /* --- RAW: NEUTRAL FOR LIGHT THEME --- */
+  --cloud-0: #ffffff;
+  --cloud-50: #fafbfc;
+  --cloud-100: #f4f5f7; /* sidebar (light) */
+  --cloud-150: #edeef1; /* hover (light) */
+  --cloud-200: #e3e5ea; /* border (light) */
+  --cloud-300: #d2d5dc;
+  --slate-900: #14151a; /* primary text (light) */
+  --slate-700: #3c3f49;
+  --slate-500: #5e6271; /* secondary text (light) */
+  --slate-400: #82869a; /* muted (light) */
+
+  /* --- RAW: SIGNATURE ACCENT (marine blue) --- */
+  --marine-300: #86b2ff;
+  --marine-400: #4d8dff; /* hover / bright */
+  --marine-500: #1e6ff5; /* signature accent */
+  --marine-600: #155cd9; /* press */
+  --marine-700: #1048ad;
+  --marine-pulse: #6ea4ff; /* activity pulse — brighter variant */
+
+  /* --- RAW: STATUS (chrome only; terminal owns its own ANSI) --- */
+  --green-400: #4ecb83;
+  --green-500: #34b26c;
+  --amber-400: #e8a33d;
+  --amber-500: #d08a1e;
+  --red-400: #f0556b;
+  --red-500: #dc3c53;
+  --blue-400: #54a0f0;
+  --blue-500: #3a85de;
+
+  /* --- RAW: TERMINAL ANSI (xterm reference palette, dark) --- */
+  --ansi-black: #1a1b22;
+  --ansi-red: #f0556b;
+  --ansi-green: #4ecb83;
+  --ansi-yellow: #e8a33d;
+  --ansi-blue: #54a0f0;
+  --ansi-magenta: #c77dd8;
+  --ansi-cyan: #4fc4c9;
+  --ansi-white: #d6d9e1;
+  --ansi-bright-black: #565a68;
+  --ansi-bright-white: #f4f5f8;
+}
+
+/* ============================================================
+   SEMANTIC ALIASES — DARK (default)
+   ============================================================ */
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg-app: var(--ink-950);
+  --bg-sidebar: var(--ink-900);
+  --bg-panel: var(--ink-800);
+  --bg-elevated: var(--ink-850);
+  --bg-hover: var(--ink-750);
+  --bg-active: var(--ink-700);
+  --bg-input: var(--ink-850);
+  --bg-overlay: rgba(6, 7, 10, 0.62);
+
+  --border-hairline: rgba(255, 255, 255, 0.07);
+  --border-default: rgba(255, 255, 255, 0.1);
+  --border-strong: rgba(255, 255, 255, 0.16);
+
+  --text-primary: var(--paper-50);
+  --text-secondary: var(--paper-400);
+  --text-muted: var(--paper-500);
+  --text-disabled: var(--paper-600);
+  --text-inverse: var(--ink-950);
+
+  --accent: var(--marine-500);
+  --accent-hover: var(--marine-400);
+  --accent-press: var(--marine-600);
+  --accent-bright: var(--marine-pulse);
+  --accent-subtle: rgba(30, 111, 245, 0.14); /* tinted fills */
+  --accent-border: rgba(30, 111, 245, 0.42);
+  --on-accent: #ffffff;
+  --focus-ring: rgba(30, 111, 245, 0.55);
+
+  --success: var(--green-400);
+  --success-bg: rgba(78, 203, 131, 0.14);
+  --warning: var(--amber-400);
+  --warning-bg: rgba(232, 163, 61, 0.14);
+  --danger: var(--red-400);
+  --danger-bg: rgba(240, 85, 107, 0.14);
+  --info: var(--blue-400);
+  --info-bg: rgba(84, 160, 240, 0.14);
+
+  --term-bg: var(--ink-1000);
+  --term-fg: var(--ansi-white);
+}
+
+/* ============================================================
+   SEMANTIC ALIASES — LIGHT
+   Applied when OS prefers light (unless forced dark) or forced light.
+   ============================================================ */
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+
+    --bg-app: var(--cloud-0);
+    --bg-sidebar: var(--cloud-100);
+    --bg-panel: var(--cloud-0);
+    --bg-elevated: var(--cloud-0);
+    --bg-hover: var(--cloud-150);
+    --bg-active: var(--cloud-200);
+    --bg-input: var(--cloud-50);
+    --bg-overlay: rgba(20, 21, 26, 0.32);
+
+    --border-hairline: rgba(20, 21, 26, 0.07);
+    --border-default: rgba(20, 21, 26, 0.11);
+    --border-strong: rgba(20, 21, 26, 0.18);
+
+    --text-primary: var(--slate-900);
+    --text-secondary: var(--slate-500);
+    --text-muted: var(--slate-400);
+    --text-disabled: var(--cloud-300);
+    --text-inverse: var(--cloud-0);
+
+    --accent: var(--marine-600);
+    --accent-hover: var(--marine-500);
+    --accent-press: var(--marine-700);
+    --accent-bright: var(--marine-500);
+    --accent-subtle: rgba(30, 111, 245, 0.12);
+    --accent-border: rgba(21, 92, 217, 0.4);
+    --on-accent: #ffffff;
+    --focus-ring: rgba(21, 92, 217, 0.45);
+
+    --success: var(--green-500);
+    --success-bg: rgba(52, 178, 108, 0.13);
+    --warning: var(--amber-500);
+    --warning-bg: rgba(208, 138, 30, 0.14);
+    --danger: var(--red-500);
+    --danger-bg: rgba(220, 60, 83, 0.12);
+    --info: var(--blue-500);
+    --info-bg: rgba(58, 133, 222, 0.12);
+
+    --term-bg: #14151a; /* terminal stays dark even in light chrome */
+    --term-fg: var(--ansi-white);
+  }
+}
+
+/* Forced light (explicit toggle) — same values, no media query */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg-app: var(--cloud-0);
+  --bg-sidebar: var(--cloud-100);
+  --bg-panel: var(--cloud-0);
+  --bg-elevated: var(--cloud-0);
+  --bg-hover: var(--cloud-150);
+  --bg-active: var(--cloud-200);
+  --bg-input: var(--cloud-50);
+  --bg-overlay: rgba(20, 21, 26, 0.32);
+
+  --border-hairline: rgba(20, 21, 26, 0.07);
+  --border-default: rgba(20, 21, 26, 0.11);
+  --border-strong: rgba(20, 21, 26, 0.18);
+
+  --text-primary: var(--slate-900);
+  --text-secondary: var(--slate-500);
+  --text-muted: var(--slate-400);
+  --text-disabled: var(--cloud-300);
+  --text-inverse: var(--cloud-0);
+
+  --accent: var(--marine-600);
+  --accent-hover: var(--marine-500);
+  --accent-press: var(--marine-700);
+  --accent-bright: var(--marine-500);
+  --accent-subtle: rgba(30, 111, 245, 0.12);
+  --accent-border: rgba(21, 92, 217, 0.4);
+  --on-accent: #ffffff;
+  --focus-ring: rgba(21, 92, 217, 0.45);
+
+  --success: var(--green-500);
+  --success-bg: rgba(52, 178, 108, 0.13);
+  --warning: var(--amber-500);
+  --warning-bg: rgba(208, 138, 30, 0.14);
+  --danger: var(--red-500);
+  --danger-bg: rgba(220, 60, 83, 0.12);
+  --info: var(--blue-500);
+  --info-bg: rgba(58, 133, 222, 0.12);
+
+  --term-bg: #14151a;
+  --term-fg: var(--ansi-white);
+}
