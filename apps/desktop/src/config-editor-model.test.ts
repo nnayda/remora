@@ -94,8 +94,8 @@ describe("host form", () => {
       name: null,
       transport: {
         kind: "kubectl",
-        pod: "p",
-        namespace: "ns",
+        pod: { command: false, value: "p" },
+        namespace: { command: false, value: "ns" },
         context: null,
         container: null,
       },
@@ -163,8 +163,8 @@ describe("host form", () => {
     const input = toHostInput(form);
     expect(input.transport).toEqual({
       kind: "kubectl",
-      pod: "p",
-      namespace: "ns",
+      pod: { command: false, value: "p" },
+      namespace: { command: false, value: "ns" },
       context: null,
       container: null,
     });
@@ -190,6 +190,7 @@ describe("project form", () => {
       path: "/srv/api",
       workspace: "shared",
       agent: "claude",
+      base: null,
     });
     expect(form.id).toBe("api");
     expect(form.path).toBe("/srv/api");
@@ -226,7 +227,120 @@ describe("project form", () => {
       path: "/srv/api",
       workspace: "worktree",
       agent: "claude",
+      base: null,
     });
+  });
+
+  it("round-trips project base through the form, blank -> null", () => {
+    const dto = {
+      id: "api",
+      name: null,
+      hostId: "h",
+      path: "/p",
+      workspace: "worktree",
+      agent: "claude",
+      base: "origin/dev",
+    } as import("./bindings").EditorProjectDto;
+    const form = projectFormFromDto(dto);
+    expect(form.base).toBe("origin/dev");
+    expect(toProjectInput(form).base).toBe("origin/dev");
+
+    const blank = { ...form, base: "  " };
+    expect(toProjectInput(blank).base).toBeNull();
+  });
+});
+
+describe("kubectl command-form fields", () => {
+  it("round-trips a command-form pod with spaces and a pipe", () => {
+    const dto: EditorHostDto = {
+      id: "k",
+      name: null,
+      transport: {
+        kind: "kubectl",
+        pod: {
+          command: true,
+          value: "kubectl -n sb get pods -o name | head -n1",
+        },
+        namespace: { command: false, value: "sb" },
+        context: null,
+        container: null,
+      },
+    };
+    const form = hostFormFromDto(dto);
+    expect(form.podIsCommand).toBe(true);
+    expect(form.pod).toBe("kubectl -n sb get pods -o name | head -n1");
+    expect(form.namespaceIsCommand).toBe(false);
+
+    const input = toHostInput(form);
+    expect(input.transport).toEqual({
+      kind: "kubectl",
+      pod: {
+        command: true,
+        value: "kubectl -n sb get pods -o name | head -n1",
+      },
+      namespace: { command: false, value: "sb" },
+      context: null,
+      container: null,
+    });
+  });
+
+  it("a spaces/pipe command passes validation (pod required, not char-checked)", () => {
+    const form = {
+      ...emptyHostForm(),
+      id: "k",
+      kind: "kubectl" as const,
+      pod: "kubectl get pods -o name | head -n1",
+      podIsCommand: true,
+    };
+    expect(validateHostForm(form, "create")).toBeNull();
+  });
+
+  it("still requires pod in command mode", () => {
+    const form = {
+      ...emptyHostForm(),
+      id: "k",
+      kind: "kubectl" as const,
+      pod: "",
+      podIsCommand: true,
+    };
+    expect(validateHostForm(form, "create")).toBe("Pod is required.");
+  });
+
+  it("an optional field toggled to command but left empty collapses to null", () => {
+    const form = {
+      ...emptyHostForm(),
+      id: "k",
+      kind: "kubectl" as const,
+      pod: "sandbox-0",
+      namespace: "",
+      namespaceIsCommand: true, // toggled on, value empty
+    };
+    const input = toHostInput(form);
+    // narrow to the kubectl transport shape
+    const t = input.transport as Extract<
+      typeof input.transport,
+      { kind: "kubectl" }
+    >;
+    expect(t.namespace).toBeNull();
+  });
+
+  it("hostFormFromDto maps the per-field IsCommand flags", () => {
+    const form = hostFormFromDto({
+      id: "kube",
+      name: null,
+      transport: {
+        kind: "kubectl",
+        pod: { command: true, value: "kubectl get pods -o name | head -n1" },
+        namespace: { command: false, value: "ns" },
+        context: null,
+        container: null,
+      },
+    });
+    expect(form.podIsCommand).toBe(true);
+    expect(form.pod).toBe("kubectl get pods -o name | head -n1");
+    expect(form.namespaceIsCommand).toBe(false);
+    expect(form.namespace).toBe("ns");
+    expect(form.contextIsCommand).toBe(false); // defaulted by emptyHostForm
   });
 });
 

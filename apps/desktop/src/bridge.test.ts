@@ -38,6 +38,8 @@ describe("bridge.ts", () => {
         _p: unknown,
         _s: unknown,
         _a: unknown,
+        _b: unknown,
+        _w: unknown,
         ch: { onmessage: ((m: unknown) => void) | null },
       ) => {
         ch.onmessage?.({ event: "bytes", bytes: [104] });
@@ -46,12 +48,42 @@ describe("bridge.ts", () => {
       },
     );
     const seen: unknown[] = [];
-    const h = await bridge.spawnSession("api", "x", null, (m) => seen.push(m));
+    const h = await bridge.spawnSession(
+      "api",
+      "x",
+      null,
+      null,
+      "worktree",
+      (m) => seen.push(m),
+    );
     expect(h).toBe(1);
     expect(seen).toEqual([
       { event: "bytes", bytes: [104] },
       { event: "closed" },
     ]);
+  });
+
+  it("passes base through to sessionSpawn", async () => {
+    const spy = vi.spyOn(c, "sessionSpawn").mockResolvedValue({
+      status: "ok",
+      data: 2,
+    } as never);
+    await bridge.spawnSession(
+      "api",
+      "s1",
+      null,
+      "origin/dev",
+      "worktree",
+      () => {},
+    );
+    expect(spy).toHaveBeenCalledWith(
+      "api",
+      "s1",
+      null,
+      "origin/dev",
+      "worktree",
+      expect.anything(),
+    );
   });
 
   it("attachSession passes ids + wired channel and returns the handle", async () => {

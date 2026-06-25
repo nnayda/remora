@@ -12,6 +12,7 @@ pub fn run() {
     let builder = bridge::commands::builder();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             // Resolve the per-device config path once: Tauri owns the platform
             // config dir; remora-core owns the `remora/config.toml` suffix

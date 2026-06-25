@@ -21,6 +21,7 @@ remora-core = { workspace = true }
 remora-protocol = { workspace = true }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-clipboard-manager = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }

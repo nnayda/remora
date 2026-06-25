@@ -2795,6 +2795,7 @@ name = "remora-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "nix",
  "portable-pty",
  "remora-protocol",
  "serde",

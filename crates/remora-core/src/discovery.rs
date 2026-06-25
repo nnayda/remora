@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use remora_protocol::{ProjectId, SessionId, SessionMeta, SessionState};
+use remora_protocol::{ProjectId, SessionId, SessionMeta, SessionState, WorkspaceMode};
 
 use crate::naming::parse_worktree_path;
 
@@ -74,16 +74,22 @@ pub fn parse_worktree_list(output: &str, project: &ProjectId) -> Vec<(SessionId,
     found
 }
 
-/// Joins live sessions (with metadata) and stopped-worktree candidates
-/// (carrying their real discovered path) into the session list. A key present
-/// in both is `Live` (live wins). Stopped sessions have no tmux env, so
+/// Joins live sessions (with metadata) and the full worktree set (live+stopped)
+/// into the session list. A key present in both is `Live` (live wins). Each
+/// session's `workspace` is `Some(Worktree)` iff a real worktree exists for it,
+/// else `Some(Shared)`. Stopped sessions (worktree only) have no tmux env, so
 /// `agent`/`created_at` are `None` and `workspace_path` is the sanitized real
 /// path (R6). Sorted by `(project, session)` for determinism (matches the
 /// fake).
 pub fn join(
     live: Vec<(ProjectId, SessionId, DiscoveredEnv)>,
-    stopped: Vec<(ProjectId, SessionId, String)>,
+    worktrees: Vec<(ProjectId, SessionId, String)>,
+    scanned: &HashSet<ProjectId>,
 ) -> Vec<SessionMeta> {
+    let worktree_keys: HashSet<(ProjectId, SessionId)> = worktrees
+        .iter()
+        .map(|(p, s, _)| (p.clone(), s.clone()))
+        .collect();
     let live_keys: HashSet<(ProjectId, SessionId)> = live
         .iter()
         .map(|(p, s, _)| (p.clone(), s.clone()))
@@ -91,19 +97,36 @@ pub fn join(
 
     let mut metas: Vec<SessionMeta> = live
         .into_iter()
-        .map(|(project_id, session_id, env)| SessionMeta {
-            project_id,
-            session_id,
-            state: SessionState::Live,
-            agent: env.agent,
-            created_at: env.created_at,
-            workspace_path: env.workspace_path,
+        .map(|(project_id, session_id, env)| {
+            // Effective mode from real state. A surviving worktree ⇒ Worktree.
+            // "No worktree" only proves Shared when the project was actually
+            // scanned: a failed/absent worktree scan leaves the mode `None`
+            // (unknown) so the client falls back to the project default, rather
+            // than mislabeling a live worktree session as shared on a transient
+            // scan error (which would wrongly hide Stop/Respawn).
+            let has_worktree = worktree_keys.contains(&(project_id.clone(), session_id.clone()));
+            let workspace = if has_worktree {
+                Some(WorkspaceMode::Worktree)
+            } else if scanned.contains(&project_id) {
+                Some(WorkspaceMode::Shared)
+            } else {
+                None
+            };
+            SessionMeta {
+                workspace,
+                project_id,
+                session_id,
+                state: SessionState::Live,
+                agent: env.agent,
+                created_at: env.created_at,
+                workspace_path: env.workspace_path,
+            }
         })
         .collect();
 
-    for (project_id, session_id, path) in stopped {
+    for (project_id, session_id, path) in worktrees {
         if live_keys.contains(&(project_id.clone(), session_id.clone())) {
-            continue;
+            continue; // live wins; already stamped Worktree above
         }
         metas.push(SessionMeta {
             project_id,
@@ -112,6 +135,8 @@ pub fn join(
             agent: None,
             created_at: None,
             workspace_path: clean_metadata(&path),
+            // A surviving worktree IS a worktree session.
+            workspace: Some(WorkspaceMode::Worktree),
         });
     }
 
@@ -124,6 +149,8 @@ pub fn join(
 
 #[cfg(test)]
 mod tests {
+    use remora_protocol::WorkspaceMode;
+
     use super::*;
 
     fn ids(project: &str, session: &str) -> (ProjectId, SessionId) {
@@ -222,7 +249,7 @@ mod tests {
                 "/home/dev/.remora/worktrees/api/fix-login".to_string(),
             ),
         ];
-        let metas = join(live, stopped);
+        let metas = join(live, stopped, &std::collections::HashSet::new());
         // Sorted: add-tests then fix-login. fix-login is Live (not duplicated).
         assert_eq!(metas.len(), 2);
         assert_eq!(metas[0].session_id.as_str(), "add-tests");
@@ -235,5 +262,57 @@ mod tests {
         assert_eq!(metas[1].session_id.as_str(), "fix-login");
         assert_eq!(metas[1].state, SessionState::Live);
         assert_eq!(metas[1].agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn join_stamps_worktree_mode_for_live_session_with_a_worktree() {
+        let p = ProjectId::new("api").expect("slug");
+        let s = SessionId::new("s1").expect("slug");
+        let live = vec![(p.clone(), s.clone(), DiscoveredEnv::default())];
+        let worktrees = vec![(p.clone(), s.clone(), "~/.remora/worktrees/api/s1".into())];
+        let metas = join(
+            live,
+            worktrees,
+            &std::collections::HashSet::from([p.clone()]),
+        );
+        assert_eq!(metas[0].state, SessionState::Live);
+        assert_eq!(metas[0].workspace, Some(WorkspaceMode::Worktree));
+    }
+
+    #[test]
+    fn join_stamps_shared_mode_for_live_session_without_a_worktree() {
+        let p = ProjectId::new("scratch").expect("slug");
+        let s = SessionId::new("s1").expect("slug");
+        let scanned = std::collections::HashSet::from([p.clone()]);
+        let metas = join(vec![(p, s, DiscoveredEnv::default())], vec![], &scanned);
+        assert_eq!(metas[0].workspace, Some(WorkspaceMode::Shared));
+    }
+
+    #[test]
+    fn join_stamps_worktree_mode_for_stopped_session() {
+        let p = ProjectId::new("api").expect("slug");
+        let s = SessionId::new("s1").expect("slug");
+        let metas = join(
+            vec![],
+            vec![(p, s, "~/.remora/worktrees/api/s1".into())],
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(metas[0].state, SessionState::Stopped);
+        assert_eq!(metas[0].workspace, Some(WorkspaceMode::Worktree));
+    }
+
+    #[test]
+    fn join_leaves_mode_unknown_when_project_scan_failed() {
+        // A live session whose project's worktree scan did NOT complete must not
+        // be mislabeled Shared: its mode is unknown (None), so the client falls
+        // back to the project default rather than wrongly hiding Stop/Respawn.
+        let p = ProjectId::new("api").expect("slug");
+        let s = SessionId::new("s1").expect("slug");
+        let metas = join(
+            vec![(p, s, DiscoveredEnv::default())],
+            vec![],
+            &std::collections::HashSet::new(), // project not scanned
+        );
+        assert_eq!(metas[0].workspace, None);
     }
 }

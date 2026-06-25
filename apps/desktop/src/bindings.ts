@@ -22,9 +22,9 @@ async configGet() : Promise<Result<ConfigDto, BridgeError>> {
     else return { status: "error", error: e  as any };
 }
 },
-async sessionSpawn(projectId: string, sessionId: string, agent: string | null, onOutput: TAURI_CHANNEL<BridgeOutput>) : Promise<Result<ChannelHandle, BridgeError>> {
+async sessionSpawn(projectId: string, sessionId: string, agent: string | null, base: string | null, workspace: WorkspaceModeDto | null, onOutput: TAURI_CHANNEL<BridgeOutput>) : Promise<Result<ChannelHandle, BridgeError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("session_spawn", { projectId, sessionId, agent, onOutput }) };
+    return { status: "ok", data: await TAURI_INVOKE("session_spawn", { projectId, sessionId, agent, base, workspace, onOutput }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -254,7 +254,7 @@ export type EditorHostDto = { id: string; name: string | null; transport: Transp
  * A project with every editable field, including the on-host `path` and
  * `workspace` mode that the display `ProjectDto` omits.
  */
-export type EditorProjectDto = { id: string; name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string }
+export type EditorProjectDto = { id: string; name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string; base: string | null }
 /**
  * A configured host, label-only. The `transport` discriminant is all the UI
  * needs (an icon/badge); the connection details never cross.
@@ -265,6 +265,12 @@ export type HostDto = { id: string; name: string | null; transport: TransportKin
  * argument, so it is not carried here.
  */
 export type HostInputDto = { name: string | null; transport: TransportDto }
+/**
+ * A kubectl connection field for the editor: `command = false` is a literal
+ * value, `command = true` means `value` is a shell command line resolved at
+ * connect time. Flat + form-friendly for the TS toggle.
+ */
+export type KubectlFieldDto = { command: boolean; value: string }
 /**
  * Entry ids present in each section of the document, regardless of validity —
  * the delete targets degraded-mode recovery offers. Mirrors core's
@@ -283,7 +289,7 @@ export type ProjectDto = { id: string; name: string | null; hostId: string; work
  * Form payload for create/edit of a project. `host_id` and `agent` are
  * references to existing entries; converting parses them into ids.
  */
-export type ProjectInputDto = { name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string }
+export type ProjectInputDto = { name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string; base?: string | null }
 export type SessionMetaDto = { projectId: string; sessionId: string; state: SessionStateDto; 
 /**
  * Agent id the sandbox advertises for this session. Untrusted,
@@ -295,14 +301,19 @@ agent: string | null; createdAt: number | null;
  * Workspace path the sandbox advertises. Untrusted, display-only (same
  * rule as `agent`).
  */
-workspacePath: string | null }
+workspacePath: string | null; 
+/**
+ * Effective workspace mode discovered for this session (real state), or
+ * null from an older sender. Drives sidebar/tab gating.
+ */
+workspace: WorkspaceModeDto | null }
 export type SessionStateDto = "live" | "stopped"
 /**
  * Transport + connection details, shared by the read projection and the write
  * inputs (it round-trips: what the form shows is what it submits). Internally
  * tagged on `kind` so the TS side discriminates on a single field.
  */
-export type TransportDto = { kind: "ssh"; host: string; user: string | null; port: number | null } | { kind: "kubectl"; pod: string; namespace: string | null; context: string | null; container: string | null }
+export type TransportDto = { kind: "ssh"; host: string; user: string | null; port: number | null } | { kind: "kubectl"; pod: KubectlFieldDto; namespace: KubectlFieldDto | null; context: KubectlFieldDto | null; container: KubectlFieldDto | null }
 /**
  * Which transport a host uses — the discriminant only, no connection fields.
  */
