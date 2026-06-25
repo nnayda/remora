@@ -1,4 +1,4 @@
-# 0011. Detect agent activity client-side in the attached terminal, quiescence-primary
+# 0012. Detect agent activity client-side in the attached terminal, quiescence-primary
 
 - **Status:** Accepted
 - **Date:** 2026-06-25
@@ -129,3 +129,8 @@ Harder, and what we commit to / must still resolve:
 - **kubectl arm unverified.** ADR-0010 proved the ssh path; the kubectl PTY path
   shares the same `open_pty` code but was not live-run against a real cluster
   (RBAC). Re-run tracked in ADR-0010's follow-ups.
+- **OSC passthrough widens the terminal surface.** Enabling `allow-passthrough`
+  means any process in the tmux pane can emit OSC sequences (OSC 52 clipboard,
+  other vendor OSCs) that reach the client's xterm unfiltered. Acceptable under
+  the app's own-sandbox threat model (the pane already runs trusted agent code),
+  but noted for future relay / multi-tenant contexts.
