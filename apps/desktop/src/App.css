@@ -578,6 +578,39 @@ body {
   background: #e05050;
 }
 
+/* Project row: wraps the collapse toggle + the per-project "+" in a flex row. */
+.tree-project-row {
+  display: flex;
+  align-items: center;
+}
+
+.tree-project-row .tree-toggle {
+  flex: 1;
+  min-width: 0;
+}
+
+.tree-project-new {
+  border: none;
+  background: none;
+  color: #888;
+  cursor: pointer;
+  font: inherit;
+  padding: 2px 8px;
+  flex-shrink: 0;
+  line-height: 1;
+  opacity: 0;
+}
+
+.tree-project:hover .tree-project-new,
+.tree-project-new:focus-visible {
+  opacity: 1;
+}
+
+.tree-project-new:focus-visible {
+  outline: 2px solid #8ab4f8;
+  outline-offset: -2px;
+}
+
 /* Session row: wraps the main button + the ⋮ menu toggle in a flex row. */
 .tree-session-row {
   display: flex;
