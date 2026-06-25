@@ -31,8 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   newlines, leading `-`) before entering the argv, resolution runs locally
   behind the `SessionSource`/`remote.rs` seam (never in the pod), is re-run
   every connect (never persisted), and is bounded by a 10s timeout + 64 KiB
-  output cap with a process-group kill so a hung selector can't leak. The
-  desktop config editor gains a per-field "resolve via command" toggle. See
+  output cap with a process-group kill so a hung selector can't leak. A
+  `{ command }` selector that resolves to more than one value (newline-per-pod
+  from `-o name`, or a space-separated jsonpath list) now fails closed with a
+  clear `selector matched N values, expected exactly 1` error — naming the count
+  and a sample, and suggesting `head -n1` or a tighter selector — instead of the
+  opaque "must not contain control characters" rejection (#115). The desktop
+  config editor gains a per-field "resolve via command" toggle. See
   [ADR-0009](docs/adr/0009-dynamic-kubectl-field-resolution.md).
 - **Per-session workspace mode** (#34): the new-session dialog gains a
   Worktree/Shared picker that overrides the project's default for that one

@@ -55,8 +55,12 @@ is therefore only masked when the user opts into `head -n1` themselves; the
 implementation never silently picks a pod from multi-line output. Multi-replica
 and HPA scenarios — where a selector might legitimately match N pods — are
 unsupported; which pod a `head -n1` lands on is the user's responsibility.
-Surfacing a clearer "matched N pods, expected 1" error (instead of the generic
-control-character rejection) is a tracked TODO.
+A resolution that yields more than one whitespace-separated value (newline-per-pod
+from `-o name`, or a space-separated jsonpath list) now surfaces a clear "selector
+matched N values, expected exactly 1" error — with the count and a sample of the
+matches — instead of the generic control-character rejection (#115); the `head -n1`
+path stays masked by construction, since the shell collapses the matches before
+Remora sees them.
 
 **Pod-replacement recovery requires resolution + respawn + a persistent worktree.**
 
@@ -124,8 +128,10 @@ What becomes harder, and what we are committed to:
   a slow selector adds latency to the sidebar refresh. The 10 s timeout is the
   backstop; users writing expensive selectors accept that cost.
 - The single-active-pod assumption and the masked-ambiguity behaviour are now
-  documented behaviour; active ambiguity detection is a follow-up, tracked in
-  #115.
+  documented behaviour; ambiguity in *raw* multi-match output (more than one
+  whitespace-separated value) is detected and reported with a clear "matched N
+  values, expected 1" error (#115). The `head -n1` path remains masked by
+  construction (the shell collapses the matches before resolution sees them).
 - ssh has an analogous dynamic-host scenario (a bastion whose hostname changes).
   `resolve_local_command` is written to be reusable there, but ssh dynamic-host
   support is not implemented in this issue and is deferred to future work.

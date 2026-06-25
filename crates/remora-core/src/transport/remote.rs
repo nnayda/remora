@@ -981,12 +981,52 @@ pub(crate) fn resolve_local_command(
             "kubectl `{field}` resolution command produced no output"
         )));
     }
+    // A selector matching N pods resolves to N whitespace-separated tokens —
+    // one-per-line from `-o name`, or space-separated from a jsonpath list. No
+    // valid kubectl field (a DNS label) contains interior whitespace, so >1
+    // token is unambiguously a multi-match. Catch it before the generic
+    // literal-field guard, which would otherwise reject a newline as an opaque
+    // "control character" (or, worse, accept a space-joined token verbatim) —
+    // surface the ambiguity instead (ADR-0009 single-active-pod, #115).
+    let matches: Vec<&str> = value.split_whitespace().collect();
+    if matches.len() > 1 {
+        return Err(SourceError::Transport(ambiguous_selector_detail(
+            field, &matches,
+        )));
+    }
     if let Some(reason) = crate::config::literal_field_problem(value) {
         return Err(SourceError::Transport(format!(
             "kubectl `{field}` resolved value {reason}"
         )));
     }
     Ok(value.to_owned())
+}
+
+/// Detail for a `{ command }` selector that matched more than one value where
+/// exactly one is required (ADR-0009 single-active-pod). Lists up to `SAMPLE`
+/// values (each clipped to `MAX_NAME`) and summarises the rest; kept quote-free
+/// and length-bounded so the count and guidance survive `SourceError::Transport`'s
+/// escaping/256-char truncation pass even with pathologically long match tokens.
+fn ambiguous_selector_detail(field: &str, matches: &[&str]) -> String {
+    const SAMPLE: usize = 3;
+    const MAX_NAME: usize = 40;
+    let shown: Vec<String> = matches
+        .iter()
+        .take(SAMPLE)
+        .map(|m| match m.char_indices().nth(MAX_NAME) {
+            Some((cut, _)) => format!("{}...", &m[..cut]),
+            None => (*m).to_owned(),
+        })
+        .collect();
+    let mut sample = shown.join(", ");
+    if matches.len() > SAMPLE {
+        sample.push_str(&format!(" (+{} more)", matches.len() - SAMPLE));
+    }
+    format!(
+        "kubectl `{field}` selector matched {} values ({sample}), expected exactly 1; \
+         tighten the selector or pipe through `head -n1` to pick one",
+        matches.len()
+    )
 }
 
 /// Whether a failed `tmux kill-session` stderr positively signals the session
@@ -2543,6 +2583,70 @@ pub(crate) mod tests {
         let err = resolve_local_command(&runner, "pod", "printf 'a\\nb\\n'")
             .expect_err("embedded newline is a control char");
         assert!(matches!(err, SourceError::Transport(_)), "{err}");
+    }
+
+    #[test]
+    fn resolve_local_command_reports_ambiguous_selector_clearly() {
+        // A selector matching N pods (the multi-replica/HPA case) must surface a
+        // clear "matched N, expected 1" signal — not the opaque control-char
+        // rejection. ADR-0009 single-active-pod, #115.
+        let runner = ShellRunner::new();
+        let err = resolve_local_command(&runner, "pod", "printf 'web-0\\nweb-1\\nweb-2\\n'")
+            .expect_err("three pods, expected one");
+        let msg = format!("{err}");
+        assert!(msg.contains("matched 3 values"), "{msg}");
+        assert!(msg.contains("web-0") && msg.contains("web-2"), "{msg}");
+        assert!(msg.contains("expected exactly 1"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_local_command_reports_space_separated_matches() {
+        // A jsonpath selector (`-o jsonpath='{.items[*].metadata.name}'`) emits
+        // space-separated names on ONE line; without whitespace-splitting this
+        // slips past both the line check and the literal-field guard and
+        // resolves to a bogus joined token. #115.
+        let runner = ShellRunner::new();
+        let err = resolve_local_command(&runner, "pod", "printf 'web-0 web-1 web-2'")
+            .expect_err("three space-separated pods");
+        let msg = format!("{err}");
+        assert!(msg.contains("matched 3 values"), "{msg}");
+        assert!(msg.contains("web-0") && msg.contains("web-2"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_local_command_caps_ambiguous_sample() {
+        // Many matches: list only the first few, summarise the rest, so a 64 KiB
+        // selector can't blow the bounded error detail (count of names capped).
+        let runner = ShellRunner::new();
+        let err = resolve_local_command(&runner, "pod", "printf 'a\\nb\\nc\\nd\\ne\\n'")
+            .expect_err("five pods");
+        let msg = format!("{err}");
+        assert!(msg.contains("matched 5 values"), "{msg}");
+        assert!(msg.contains("(+2 more)"), "{msg}");
+        assert!(
+            !msg.contains(", d"),
+            "must not list past the sample cap: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_local_command_clips_long_match_names() {
+        // A pathologically long match token is clipped (length cap) so the count
+        // and the actionable guidance still fit under the 256-char display cap.
+        let runner = ShellRunner::new();
+        let err = resolve_local_command(
+            &runner,
+            "pod",
+            "printf 'a%.0s' $(seq 1 200); printf '\\nb\\n'",
+        )
+        .expect_err("oversized first match");
+        let msg = format!("{err}");
+        assert!(msg.contains("matched 2 values"), "{msg}");
+        assert!(msg.contains("..."), "long name should be clipped: {msg}");
+        assert!(
+            msg.contains("expected exactly 1"),
+            "guidance must survive: {msg}"
+        );
     }
 
     #[test]
