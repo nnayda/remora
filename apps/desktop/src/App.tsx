@@ -9,6 +9,7 @@ import { canRespawn, OPEN_CANCELLED } from "./session-store";
 import { buildTree, type SessionNode } from "./session-tree";
 import { TabBar } from "./TabBar";
 import { Terminal, type TerminalHandle } from "./Terminal";
+import { activityStore } from "./useActivity";
 import { discoveryStore, useDiscovery } from "./useDiscovery";
 import { useReconnect } from "./useReconnect";
 import { sessionStore, useSessions } from "./useSessions";
@@ -30,6 +31,10 @@ function App() {
     removeSession,
   } = useSessions();
   useReconnect(sessionStore);
+  useEffect(() => {
+    activityStore.start();
+    return () => activityStore.stop();
+  }, []);
   const { config, sessions, configError, discoveryUnavailable, refresh } =
     useDiscovery();
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -319,6 +324,7 @@ function App() {
                 ) : (
                   <Terminal
                     connection={t.connection}
+                    sessionKey={t.key}
                     ref={(h) => {
                       if (h) terminals.current.set(t.key, h);
                       else terminals.current.delete(t.key);
