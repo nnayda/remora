@@ -20,6 +20,7 @@ the old one rather than editing history (see
 | [0007](0007-no-agent-plain-shell.md) | A session may run no agent — a plain shell | Accepted |
 | [0008](0008-per-session-workspace-override.md) | Workspace mode is overridable per session, with effective mode discovered from real state | Accepted |
 | [0009](0009-dynamic-kubectl-field-resolution.md) | kubectl host fields may be resolved from a local shell command at connect time | Accepted |
+| [0010](0010-in-band-activity-osc-marker.md) | Carry agent-activity signals in-band via a tmux-passthrough OSC marker | Accepted |
 
 ## Statuses
 
