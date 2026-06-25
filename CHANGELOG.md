@@ -32,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolves kubectl hosts to a live `KubectlSource`. An ignored `kubectl_e2e`
   suite mirrors `ssh_e2e` for on-cluster verification. Known kubectl limitations
   (no keepalive for idle dead-link detection, per-op connection cost, unbounded
-  execution) are documented and tracked in `TODOS.md`. Session teardown
+  execution) are tracked as issues #107, #106, and #99. Session teardown
   (`stop`/`remove`, added in #50) is implemented for both transports through the
   shared `remote.rs` orchestration, so kubectl gets it for free.
 - Session teardown (desktop): **Stop** a session (kills its tmux, keeps the
