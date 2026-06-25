@@ -307,6 +307,7 @@ pub(crate) fn branch_delete_tokens(project_path: &str, branch: &str) -> Vec<Stri
 ///   ';' new-session -d -s <name> -c <dir> <agent…>   (creation + the lock)
 ///   ';' set-option -t <name> remain-on-exit on   (retain a dead pane, #28)
 ///   ';' set-option -t <name> mouse on            (wheel → scrollback, #53)
+///   ';' set-option -t <name> allow-passthrough on  (let our OSC marker through, #55)
 /// ```
 ///
 /// `history-limit` leads and is **global** (`-g`): tmux applies it only to
@@ -339,6 +340,7 @@ pub(crate) fn new_session_tokens(plan: &SpawnPlan) -> Vec<String> {
         )))
     };
     let sep = shell_quote(";");
+    let sep_passthrough = shell_quote(";");
     vec![
         "tmux".into(),
         // Deep scrollback for the agent's long output — must precede the window
@@ -374,6 +376,17 @@ pub(crate) fn new_session_tokens(plan: &SpawnPlan) -> Vec<String> {
         "-t".into(),
         plan.tmux_name.clone(),
         "mouse".into(),
+        "on".into(),
+        sep_passthrough,
+        // allow-passthrough lets our private OSC activity marker (ADR-0010,
+        // #55) survive tmux to attached clients. Rides LAST: it is absent on
+        // tmux < 3.3, and a mid-chain set-option failure aborts the rest, so
+        // placing it last means a failure here strips nothing. Degrades to
+        // quiescence-only when unavailable.
+        "set-option".into(),
+        "-t".into(),
+        plan.tmux_name.clone(),
+        "allow-passthrough".into(),
         "on".into(),
     ]
 }
@@ -1435,6 +1448,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn new_session_tokens_enables_passthrough_last_after_mouse() {
+        // ADR-0010: allow-passthrough lets our private OSC marker survive tmux to
+        // the client. It rides LAST in the chain so a failure on tmux < 3.3 (a
+        // mid-chain set-option aborts the rest) cannot strip anything after it.
+        let plan = worktree_plan();
+        let tokens = new_session_tokens(&plan);
+        let p = tokens
+            .iter()
+            .position(|a| a == "allow-passthrough")
+            .expect("allow-passthrough");
+        // Shape: ';' set-option -t <name> allow-passthrough on
+        assert_eq!(tokens[p - 4], "';'");
+        assert_eq!(tokens[p - 3], "set-option");
+        assert_eq!(tokens[p - 2], "-t");
+        assert_eq!(tokens[p - 1], "remora_api_fix-login");
+        assert_eq!(tokens[p + 1], "on");
+        // It is the final option: nothing follows `on`, and it comes after `mouse`.
+        assert_eq!(p + 1, tokens.len() - 1, "allow-passthrough on is last");
+        let mouse = tokens.iter().position(|a| a == "mouse").expect("mouse");
+        assert!(p > mouse, "passthrough follows mouse");
+    }
+
+    #[test]
     fn new_session_tokens_enables_mouse_and_deep_scrollback() {
         // #53: the scroll wheel must drive tmux scrollback (mouse on), with a
         // history-limit deep enough for long agent output.
@@ -1551,8 +1587,8 @@ pub(crate) mod tests {
         assert_eq!(tokens[n + 4], "-c");
         assert_eq!(tokens[n + 6], shell_quote(PLAIN_SHELL_COMMAND));
         // Same tmux argv shape as an agent spawn: command token + the
-        // remain-on-exit and mouse 6-token trailers.
-        assert_eq!(tokens.len(), n + 1 + 6 + 6 + 6);
+        // remain-on-exit, mouse, and allow-passthrough 6-token trailers.
+        assert_eq!(tokens.len(), n + 1 + 6 + 6 + 6 + 6);
         // The agent-exit wrapper must NOT appear for a no-agent pane.
         assert!(
             !tokens.iter().any(|t| t.contains("__remora_rc")),
