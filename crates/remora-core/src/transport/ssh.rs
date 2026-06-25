@@ -593,9 +593,16 @@ mod tests {
     #[test]
     fn ssh_compose_list_sessions_quotes_the_format_string() {
         let argv = ssh_compose(&host("devbox", None, None), false, &list_sessions_tokens());
-        // `#{session_name}` MUST be shell-quoted: a bare `#` starts a comment
-        // in the remote login shell and would swallow the format argument.
-        assert_eq!(argv.last().map(String::as_str), Some("'#{session_name}'"));
+        // The whole `-F` format (`#{session_name}` + the inline `#{E:}` metadata
+        // fields, #108) MUST be shell-quoted: a bare `#` starts a comment in the
+        // remote login shell and would swallow the format argument.
+        let format = argv.last().expect("format arg");
+        assert!(
+            format.starts_with('\''),
+            "format must be shell-quoted: {format}"
+        );
+        assert!(format.contains("#{session_name}"), "{format}");
+        assert!(format.contains("#{E:REMORA_AGENT}"), "{format}");
         let l = argv
             .iter()
             .position(|a| a == "list-sessions")
@@ -688,11 +695,13 @@ mod tests {
     async fn list_joins_live_metadata_stopped_and_filters_unconfigured() {
         // Config has project `api` (worktree). `ghost` is NOT configured.
         let config = test_config();
+        // Discovery is two listings then the worktree scan (#108): trusted
+        // names, then inline `name\tagent\tworkspace\tcreated_at` metadata.
         let fake = Arc::new(FakeExec::new(vec![
             Ok(FakeExec::out(
                 "remora_api_fix-login\nremora_ghost_x\nmain\nremora__bad\n",
             )),
-            Ok(FakeExec::out("REMORA_AGENT=claude\nREMORA_CREATED_AT=1765500000\n")),
+            Ok(FakeExec::out("remora_api_fix-login\tclaude\t\t1765500000\n")),
             Ok(FakeExec::out(
                 "worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n\n\
                  worktree /home/dev/.remora/worktrees/api/add-tests\nbranch refs/heads/remora/add-tests\n",
@@ -731,12 +740,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_keeps_session_live_when_show_environment_fails() {
+    async fn list_keeps_session_live_when_metadata_read_flakes() {
+        // The session is in the trusted names listing, but the inline-metadata
+        // read flakes (transient, or tmux < 3.0). It must still list as Live with
+        // empty metadata — metadata is best-effort enrichment (#108).
         let config = test_config();
         let fake = Arc::new(FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")),
-            Ok(FakeExec::fail("connection reset")),
-            Ok(FakeExec::out("")),
+            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names
+            Ok(FakeExec::fail("connection reset")),      // 2) metadata flakes
+            Ok(FakeExec::out("")),                       // 3) worktree empty
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let metas = source.list().await.expect("list");
@@ -750,9 +762,9 @@ mod tests {
     async fn list_survives_worktree_list_failure_per_decision_8() {
         let config = test_config();
         let fake = Arc::new(FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")),
-            Ok(FakeExec::out("REMORA_AGENT=claude\n")),
-            Ok(FakeExec::fail("fatal: not a git repository")),
+            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names
+            Ok(FakeExec::out("remora_api_fix-login\tclaude\t\t\n")), // 2) metadata
+            Ok(FakeExec::fail("fatal: not a git repository")), // 3) worktree fails
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let metas = source.list().await.expect("list must not fail");

@@ -69,8 +69,8 @@ pub fn branch_name(session: &SessionId) -> String {
 }
 
 /// Session-environment metadata keys (ADR-0004, versioned wire format).
-/// Stage-5 spawn writes them; stage-6 discovery reads them via
-/// `tmux show-environment`.
+/// Stage-5 spawn writes them; discovery reads them back inline via tmux's
+/// `#{E:VAR}` expansion in `list-sessions` (#108).
 pub const ENV_AGENT: &str = "REMORA_AGENT";
 pub const ENV_WORKSPACE: &str = "REMORA_WORKSPACE";
 pub const ENV_CREATED_AT: &str = "REMORA_CREATED_AT";

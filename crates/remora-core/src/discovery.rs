@@ -33,26 +33,65 @@ fn clean_metadata(value: &str) -> Option<String> {
     }
 }
 
-/// Parses `tmux show-environment -t <name>` output. Lines are `KEY=VALUE`
-/// (tmux emits `-KEY` for vars unset in the session; those have no `=` and
-/// are skipped). Duplicate keys: last wins. `created_at` parses to `u64` or
-/// `None`; `agent`/`workspace_path` go through [`clean_metadata`].
-pub fn parse_session_environment(output: &str) -> DiscoveredEnv {
-    let mut env = DiscoveredEnv::default();
-    for line in output.lines() {
-        // `str::lines()` already strips `\r\n`; an embedded `\r` would be a
-        // control byte and is rejected by `clean_metadata`.
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match key {
-            "REMORA_AGENT" => env.agent = clean_metadata(value),
-            "REMORA_WORKSPACE" => env.workspace_path = clean_metadata(value),
-            "REMORA_CREATED_AT" => env.created_at = value.parse::<u64>().ok(),
-            _ => {}
-        }
+/// Field separator for an inline `list-sessions` metadata row (#108). A tab can
+/// never appear inside a sanitized value (`clean_metadata` rejects control
+/// bytes), so it cleanly separates the name field from the `#{E:}`-expanded env
+/// fields. A NEWLINE in a forged value is a different story — it can fabricate a
+/// whole extra row — which is why the row's name is treated as untrusted and
+/// cross-checked against the names-only listing in `run_list`, not trusted by
+/// position (see [`parse_session_line`]). Shared with the format string the
+/// transport builds in `list_sessions_tokens`, so the writer and reader agree
+/// on the layout by construction.
+pub const SESSION_FIELD_SEP: &str = "\t";
+
+/// True if a field still carries an unexpanded tmux format token (`#{…}`) —
+/// what a tmux too old for `#{E:}` (< 3.0) could echo verbatim instead of the
+/// variable's value. Treated as absent so the old-tmux path degrades to empty
+/// metadata (the #108 graceful version cliff) rather than surfacing the literal
+/// `#{E:REMORA_AGENT}` as a bogus agent name. No legitimate slug/path/number
+/// value contains `#{`, so this never drops real metadata.
+fn looks_unexpanded(value: &str) -> bool {
+    value.contains("#{")
+}
+
+/// [`clean_metadata`] for an inline `#{E:}` field, additionally dropping a value
+/// that still looks like an unexpanded `#{…}` token (the old-tmux cliff, #108).
+fn clean_inline(value: &str) -> Option<String> {
+    if looks_unexpanded(value) {
+        None
+    } else {
+        clean_metadata(value)
     }
-    env
+}
+
+/// Parses one `tmux list-sessions -F` row carrying inline `#{E:}` session
+/// metadata — `name <SEP> agent <SEP> workspace <SEP> created_at` (#108) — into
+/// the raw session name and its [`DiscoveredEnv`]. The name is UNTRUSTED: a
+/// newline inside a forged `#{E:}` value can fabricate an entire extra row, so
+/// the caller (`run_list`) accepts a row's metadata only for a name already in
+/// the trusted names-only listing, then re-validates via `parse_tmux_session_name`.
+/// Missing trailing fields (a session with no metadata, or tmux < 3.0 expanding
+/// `#{E:}` to nothing) parse as empty/`None`. `agent`/`workspace_path` pass
+/// through [`clean_inline`]; `created_at` parses to `u64` or `None`.
+///
+/// `splitn(4, …)` caps the split so a forged value smuggling in the SEPARATOR
+/// (a tab) corrupts only its own row's metadata fields. The field order here is
+/// the contract with `list_sessions_tokens`'s format string; the two must move
+/// together.
+pub fn parse_session_line(line: &str) -> (&str, DiscoveredEnv) {
+    let mut fields = line.splitn(4, SESSION_FIELD_SEP);
+    let name = fields.next().unwrap_or("");
+    let agent = fields.next().and_then(clean_inline);
+    let workspace_path = fields.next().and_then(clean_inline);
+    let created_at = fields.next().and_then(|v| v.parse::<u64>().ok());
+    (
+        name,
+        DiscoveredEnv {
+            agent,
+            created_at,
+            workspace_path,
+        },
+    )
 }
 
 /// Parses `git worktree list --porcelain` for one project, returning each
@@ -161,10 +200,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_remora_env_vars() {
-        let out = "REMORA_AGENT=claude\nREMORA_WORKSPACE=/home/dev/.remora/worktrees/api/x\n\
-                   REMORA_CREATED_AT=1765500000\nSHELL=/bin/bash\n-PATH\n";
-        let env = parse_session_environment(out);
+    fn parses_inline_session_metadata() {
+        let line = "remora_api_x\tclaude\t/home/dev/.remora/worktrees/api/x\t1765500000";
+        let (name, env) = parse_session_line(line);
+        assert_eq!(name, "remora_api_x");
         assert_eq!(env.agent.as_deref(), Some("claude"));
         assert_eq!(
             env.workspace_path.as_deref(),
@@ -173,41 +212,53 @@ mod tests {
         assert_eq!(env.created_at, Some(1_765_500_000));
     }
 
-    /// The reader matches env keys as string literals; the writer
-    /// (`spawn_plan`) emits them via the `naming::ENV_*` constants. Nothing in
-    /// the type system couples the two, so a rename on the write side would
-    /// silently break discovery. This test links them: it builds the env block
-    /// from the constants the writer uses and asserts the reader recognizes
-    /// every field — fail here if the literals in `parse_session_environment`
-    /// ever drift from `naming::ENV_*`.
+    /// The reader is positional; the writer (`list_sessions_tokens`) emits the
+    /// fields in a fixed order joined by `SESSION_FIELD_SEP`. This builds a row
+    /// the way the writer does — name then agent/workspace/created_at in that
+    /// order, `SESSION_FIELD_SEP`-joined — and asserts the reader recovers every
+    /// field. Fails here if the field order or separator drifts between the two.
     #[test]
-    fn reads_exactly_the_keys_the_writer_emits() {
-        use crate::naming::{ENV_AGENT, ENV_CREATED_AT, ENV_WORKSPACE};
-        let out =
-            format!("{ENV_AGENT}=claude\n{ENV_WORKSPACE}=/wt/api/x\n{ENV_CREATED_AT}=1765500000\n");
-        let env = parse_session_environment(&out);
+    fn reads_every_field_a_session_row_carries() {
+        let row = ["remora_api_x", "claude", "/wt/api/x", "1765500000"].join(SESSION_FIELD_SEP);
+        let (name, env) = parse_session_line(&row);
+        assert_eq!(name, "remora_api_x");
         assert_eq!(env.agent.as_deref(), Some("claude"));
         assert_eq!(env.workspace_path.as_deref(), Some("/wt/api/x"));
         assert_eq!(env.created_at, Some(1_765_500_000));
     }
 
     #[test]
-    fn env_duplicate_key_last_wins() {
-        let env = parse_session_environment("REMORA_AGENT=first\nREMORA_AGENT=second\n");
-        assert_eq!(env.agent.as_deref(), Some("second"));
+    fn inline_metadata_empty_when_absent_or_old_tmux() {
+        // tmux < 3.0 expands `#{E:}` to empty: the row is the name then empty
+        // fields. The session still lists (Live decided by the caller) with no
+        // metadata — the #108 graceful version cliff.
+        let (name, env) = parse_session_line("remora_api_x\t\t\t");
+        assert_eq!(name, "remora_api_x");
+        assert_eq!(env, DiscoveredEnv::default());
+        // A bare name with no separators at all also yields empty metadata.
+        let (name2, env2) = parse_session_line("remora_api_y");
+        assert_eq!(name2, "remora_api_y");
+        assert_eq!(env2, DiscoveredEnv::default());
     }
 
     #[test]
-    fn env_garbage_maps_to_none() {
-        // Non-numeric created_at, control byte in agent, over-length workspace.
+    fn inline_metadata_rejects_unexpanded_format_token() {
+        // A tmux too old to understand `#{E:}` might echo the literal token; it
+        // must not surface as a bogus agent name / path (#108 version cliff).
+        let line = "remora_api_x\t#{E:REMORA_AGENT}\t#{E:REMORA_WORKSPACE}\t#{E:REMORA_CREATED_AT}";
+        let (_, env) = parse_session_line(line);
+        assert_eq!(env, DiscoveredEnv::default());
+    }
+
+    #[test]
+    fn inline_metadata_garbage_maps_to_none() {
+        // Control byte in agent, over-length workspace, non-numeric created_at.
         let huge = "x".repeat(MAX_METADATA_LEN + 1);
-        let out = format!(
-            "REMORA_CREATED_AT=not-a-number\nREMORA_AGENT=cla\x07ude\nREMORA_WORKSPACE={huge}\n"
-        );
-        let env = parse_session_environment(&out);
-        assert_eq!(env.created_at, None);
+        let line = format!("remora_api_x\tcla\x07ude\t{huge}\tnot-a-number");
+        let (_, env) = parse_session_line(&line);
         assert_eq!(env.agent, None);
         assert_eq!(env.workspace_path, None);
+        assert_eq!(env.created_at, None);
     }
 
     #[test]
