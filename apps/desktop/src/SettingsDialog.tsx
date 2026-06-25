@@ -24,6 +24,9 @@ import { buildSettingsModel, type SettingsModel } from "./config-editor-model";
 import { formErrorMessage } from "./form-error";
 import { HostForm } from "./HostForm";
 import { ProjectForm } from "./ProjectForm";
+import "./SettingsDialog.css";
+import { Button, Dialog, IconButton } from "./ui";
+import { Cpu, Folder, Plus, Server, Settings, Trash } from "./ui/icons";
 
 interface SettingsDialogProps {
   /** Re-read the sidebar's (redacted) config after a mutation. */
@@ -41,9 +44,10 @@ type View =
 /**
  * Config management modal: list/add/edit/remove hosts, projects, and agents,
  * persisted through the editor bridge (ADR-0006). A thin shell over
- * `config-editor-model` and the entity forms; modal mechanics (focus trap, Esc,
- * inline errors) mirror `NewSessionDialog`. Component render is covered by
- * manual QA — vitest runs in node with no DOM; the model is unit-tested.
+ * `config-editor-model` and the entity forms. The design `<Dialog>` is
+ * presentational, so the modal mechanics that mirror `NewSessionDialog` — focus
+ * trap, Esc, restore-focus, inline errors — stay owned here. Component render is
+ * covered by manual QA — vitest runs in node with no DOM; the model is unit-tested.
  */
 export function SettingsDialog({
   onConfigChanged,
@@ -53,7 +57,11 @@ export function SettingsDialog({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [listError, setListError] = useState<string | null>(null);
   const [view, setView] = useState<View>({ kind: "list" });
-  const dialogRef = useRef<HTMLDivElement>(null);
+  // Anchored inside the presentational Dialog body; the focus trap operates on
+  // the enclosing `.rmra-dialog` element resolved via `dialogRoot()`.
+  const anchorRef = useRef<HTMLDivElement>(null);
+  const dialogRoot = () =>
+    anchorRef.current?.closest<HTMLElement>(".rmra-dialog") ?? null;
 
   /** Re-read the editable config and refresh the sidebar. */
   async function reload() {
@@ -79,9 +87,10 @@ export function SettingsDialog({
   }, []);
 
   // Focus the dialog on open; restore focus to the opener on close.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: mount-only — set initial focus once and restore on unmount.
   useEffect(() => {
     const previouslyFocused = document.activeElement as HTMLElement | null;
-    dialogRef.current?.focus();
+    dialogRoot()?.focus();
     return () => previouslyFocused?.focus?.();
   }, []);
 
@@ -93,10 +102,10 @@ export function SettingsDialog({
   // biome-ignore lint/correctness/useExhaustiveDependencies: re-run on view change
   useEffect(() => {
     if (view.kind === "list") {
-      dialogRef.current?.focus();
+      dialogRoot()?.focus();
       return;
     }
-    dialogRef.current
+    dialogRoot()
       ?.querySelector<HTMLElement>(
         "form input, form select, form textarea, form button",
       )
@@ -116,7 +125,7 @@ export function SettingsDialog({
     // ends) aren't tabbable, so they must not bound the trap — else Tab off a
     // disabled first/last escapes the modal.
     const focusable = Array.from(
-      dialogRef.current?.querySelectorAll<HTMLElement>(
+      dialogRoot()?.querySelectorAll<HTMLElement>(
         'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])',
       ) ?? [],
     ).filter((el) => !el.hasAttribute("disabled"));
@@ -167,31 +176,38 @@ export function SettingsDialog({
       .catch((err) => setListError(formErrorMessage(err)));
   }
 
+  // Forms render their own actions; the list/error states get a Close footer.
+  const footer =
+    view.kind === "list" && model !== null ? (
+      <Button variant="ghost" onClick={onClose}>
+        Close
+      </Button>
+    ) : loadError ? (
+      <Button variant="ghost" onClick={onClose}>
+        Close
+      </Button>
+    ) : undefined;
+
   return (
-    // biome-ignore lint/a11y/noStaticElementInteractions: backdrop key handling
-    <div className="dialog-backdrop" onKeyDown={onKeyDown}>
-      <div
-        ref={dialogRef}
-        className="dialog settings-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Settings"
-        tabIndex={-1}
-      >
-        <h2>Settings</h2>
+    <Dialog
+      className="settings-dialog"
+      title="Settings"
+      description="Manage hosts, projects, and agents."
+      icon={<Settings size={18} />}
+      onClose={onClose}
+      footer={footer}
+      // Presentational Dialog: own the trap + Esc + restore-focus here.
+      onKeyDown={onKeyDown}
+      tabIndex={-1}
+      aria-label="Settings"
+    >
+      <div ref={anchorRef}>
         {loadError ? (
-          <>
-            <p className="dialog-error" role="alert">
-              Could not read config: {loadError}
-            </p>
-            <div className="dialog-actions">
-              <button type="button" onClick={onClose}>
-                Close
-              </button>
-            </div>
-          </>
+          <p className="settings-error" role="alert">
+            Could not read config: {loadError}
+          </p>
         ) : model === null ? (
-          <p className="hint">Loading…</p>
+          <p className="settings-loading">Loading…</p>
         ) : view.kind === "host" ? (
           <HostForm
             // Keyed by identity so a switch to a different entity remounts with
@@ -240,11 +256,10 @@ export function SettingsDialog({
             onRemoveHost={(id) => remove(removeHost, id)}
             onRemoveProject={(id) => remove(removeProject, id)}
             onRemoveAgent={(id) => remove(removeAgent, id)}
-            onClose={onClose}
           />
         )}
       </div>
-    </div>
+    </Dialog>
   );
 }
 
@@ -258,7 +273,6 @@ interface SettingsListProps {
   onRemoveHost: (id: string) => void;
   onRemoveProject: (id: string) => void;
   onRemoveAgent: (id: string) => void;
-  onClose: () => void;
 }
 
 /** The list body: three entity sections, or the degraded-recovery view. */
@@ -272,7 +286,6 @@ function SettingsList({
   onRemoveHost,
   onRemoveProject,
   onRemoveAgent,
-  onClose,
 }: SettingsListProps) {
   if (model.degraded) {
     return (
@@ -282,55 +295,69 @@ function SettingsList({
         onRemoveHost={onRemoveHost}
         onRemoveProject={onRemoveProject}
         onRemoveAgent={onRemoveAgent}
-        onClose={onClose}
       />
     );
   }
   return (
     <div className="settings-body">
       {listError && (
-        <p className="dialog-error" role="alert">
+        <p className="settings-error" role="alert">
           {listError}
         </p>
       )}
-      <Section title="Hosts" onAdd={() => onAdd("host")}>
+      <Section
+        title="Hosts"
+        icon={<Server size={14} />}
+        onAdd={() => onAdd("host")}
+      >
         {model.hosts.map((h) => (
           <EntityRow
             key={h.id}
-            label={h.name ? `${h.name} (${h.id})` : h.id}
+            id={h.id}
+            name={h.name ?? undefined}
             badge={h.transport.kind}
+            editLabel={`Edit host ${h.id}`}
+            removeLabel={`Remove host ${h.id}`}
             onEdit={() => onEditHost(h)}
             onRemove={() => onRemoveHost(h.id)}
           />
         ))}
       </Section>
-      <Section title="Projects" onAdd={() => onAdd("project")}>
+      <Section
+        title="Projects"
+        icon={<Folder size={14} />}
+        onAdd={() => onAdd("project")}
+      >
         {model.projects.map((p) => (
           <EntityRow
             key={p.id}
-            label={p.name ? `${p.name} (${p.id})` : p.id}
+            id={p.id}
+            name={p.name ?? undefined}
             badge={p.hostId}
+            editLabel={`Edit project ${p.id}`}
+            removeLabel={`Remove project ${p.id}`}
             onEdit={() => onEditProject(p)}
             onRemove={() => onRemoveProject(p.id)}
           />
         ))}
       </Section>
-      <Section title="Agents" onAdd={() => onAdd("agent")}>
+      <Section
+        title="Agents"
+        icon={<Cpu size={14} />}
+        onAdd={() => onAdd("agent")}
+      >
         {model.agents.map((a) => (
           <EntityRow
             key={a.id}
-            label={a.id}
+            id={a.id}
             badge={a.command.length === 0 ? "(plain shell)" : a.command[0]}
+            editLabel={`Edit agent ${a.id}`}
+            removeLabel={`Remove agent ${a.id}`}
             onEdit={() => onEditAgent(a)}
             onRemove={() => onRemoveAgent(a.id)}
           />
         ))}
       </Section>
-      <div className="dialog-actions">
-        <button type="button" onClick={onClose}>
-          Close
-        </button>
-      </div>
     </div>
   );
 }
@@ -343,14 +370,13 @@ function DegradedRecovery({
   onRemoveHost,
   onRemoveProject,
   onRemoveAgent,
-  onClose,
 }: Omit<
   SettingsListProps,
   "onAdd" | "onEditHost" | "onEditProject" | "onEditAgent"
 >) {
   return (
     <div className="settings-body">
-      <p className="dialog-error" role="alert">
+      <p className="settings-error" role="alert">
         Your config file has problems and can't be edited normally. Delete the
         offending entries to recover:
       </p>
@@ -360,54 +386,67 @@ function DegradedRecovery({
         ))}
       </ul>
       {listError && (
-        <p className="dialog-error" role="alert">
+        <p className="settings-error" role="alert">
           {listError}
         </p>
       )}
       <DegradedSection
         title="Hosts"
+        icon={<Server size={14} />}
         ids={model.present.hosts}
         onRemove={onRemoveHost}
       />
       <DegradedSection
         title="Projects"
+        icon={<Folder size={14} />}
         ids={model.present.projects}
         onRemove={onRemoveProject}
       />
       <DegradedSection
         title="Agents"
+        icon={<Cpu size={14} />}
         ids={model.present.agents}
         onRemove={onRemoveAgent}
       />
-      <div className="dialog-actions">
-        <button type="button" onClick={onClose}>
-          Close
-        </button>
-      </div>
     </div>
   );
 }
 
 function DegradedSection({
   title,
+  icon,
   ids,
   onRemove,
 }: {
   title: string;
+  icon: React.ReactNode;
   ids: string[];
   onRemove: (id: string) => void;
 }) {
   if (ids.length === 0) return null;
   return (
     <section className="settings-section">
-      <h3>{title}</h3>
+      <div className="settings-section__head">
+        <span className="settings-section__title">
+          {icon}
+          {title}
+        </span>
+      </div>
       <ul className="settings-list">
         {ids.map((id) => (
           <li key={id} className="settings-row">
-            <span className="settings-row-label">{id}</span>
-            <button type="button" onClick={() => onRemove(id)}>
-              Remove
-            </button>
+            <div className="settings-row__main">
+              <span className="settings-row__id">{id}</span>
+            </div>
+            <div className="settings-row__actions">
+              <IconButton
+                size="sm"
+                label={`Remove ${id}`}
+                onClick={() => onRemove(id)}
+              >
+                <Trash size={14} />
+              </IconButton>
+            </div>
           </li>
         ))}
       </ul>
@@ -417,47 +456,73 @@ function DegradedSection({
 
 function Section({
   title,
+  icon,
   onAdd,
   children,
 }: {
   title: string;
+  icon: React.ReactNode;
   onAdd: () => void;
   children: React.ReactNode;
 }) {
+  const hasRows = Array.isArray(children)
+    ? children.length > 0
+    : Boolean(children);
   return (
     <section className="settings-section">
-      <div className="settings-section-head">
-        <h3>{title}</h3>
-        <button type="button" onClick={onAdd}>
-          + Add
-        </button>
+      <div className="settings-section__head">
+        <span className="settings-section__title">
+          {icon}
+          {title}
+        </span>
+        <Button
+          size="sm"
+          variant="secondary"
+          icon={<Plus size={14} />}
+          onClick={onAdd}
+        >
+          Add
+        </Button>
       </div>
-      <ul className="settings-list">{children}</ul>
+      <ul className="settings-list">
+        {hasRows ? children : <li className="settings-empty">None yet.</li>}
+      </ul>
     </section>
   );
 }
 
 function EntityRow({
-  label,
+  id,
+  name,
   badge,
+  editLabel,
+  removeLabel,
   onEdit,
   onRemove,
 }: {
-  label: string;
+  id: string;
+  name?: string;
   badge: string;
+  editLabel: string;
+  removeLabel: string;
   onEdit: () => void;
   onRemove: () => void;
 }) {
   return (
     <li className="settings-row">
-      <span className="settings-row-label">{label}</span>
-      {badge && <span className="settings-badge">{badge}</span>}
-      <button type="button" onClick={onEdit}>
-        Edit
-      </button>
-      <button type="button" onClick={onRemove}>
-        Remove
-      </button>
+      <div className="settings-row__main">
+        {name && <span className="settings-row__name">{name}</span>}
+        <span className="settings-row__id">{id}</span>
+      </div>
+      {badge && <span className="settings-row__badge">{badge}</span>}
+      <div className="settings-row__actions">
+        <IconButton size="sm" label={editLabel} onClick={onEdit}>
+          <Settings size={14} />
+        </IconButton>
+        <IconButton size="sm" label={removeLabel} onClick={onRemove}>
+          <Trash size={14} />
+        </IconButton>
+      </div>
     </li>
   );
 }

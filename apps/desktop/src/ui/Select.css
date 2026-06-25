@@ -1,0 +1,63 @@
+.rmra-select {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  font-family: var(--font-sans);
+}
+.rmra-select__label {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  color: var(--text-secondary);
+}
+.rmra-select__control {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.rmra-select select {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  height: var(--h-control);
+  padding: 0 var(--space-10) 0 var(--space-5);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-sans);
+  font-size: var(--text-md);
+  cursor: pointer;
+  outline: none;
+  transition:
+    var(--transition-control),
+    box-shadow var(--dur-fast) var(--ease-out);
+}
+.rmra-select select:hover {
+  border-color: var(--border-strong);
+}
+.rmra-select select:focus-visible {
+  border-color: var(--accent-border);
+  box-shadow: var(--glow-accent);
+}
+.rmra-select select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.rmra-select__chev {
+  position: absolute;
+  right: var(--space-5);
+  pointer-events: none;
+  color: var(--text-muted);
+  display: inline-flex;
+}
+.rmra-select__chev svg {
+  width: 12px;
+  height: 12px;
+  stroke: currentColor;
+  stroke-width: 2;
+  fill: none;
+}
+.rmra-select--mono select {
+  font-family: var(--font-mono);
+  font-size: var(--mono-sm);
+}

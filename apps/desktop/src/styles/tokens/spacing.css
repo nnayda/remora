@@ -1,0 +1,40 @@
+/* ============================================================
+   REMORA — SPACING TOKENS
+   4px base grid. Dense but breathable. Use for padding, gap, margin.
+   ============================================================ */
+
+:root {
+  --space-0: 0;
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 6px;
+  --space-4: 8px;
+  --space-5: 10px;
+  --space-6: 12px;
+  --space-7: 14px;
+  --space-8: 16px;
+  --space-10: 20px;
+  --space-12: 24px;
+  --space-16: 32px;
+  --space-20: 40px;
+  --space-24: 48px;
+  --space-32: 64px;
+
+  /* --- SEMANTIC DENSITY --- */
+  --gap-row: var(--space-2); /* between sidebar rows */
+  --pad-row: var(--space-3) var(--space-4); /* sidebar / list row padding */
+  --pad-control: var(--space-2) var(--space-6); /* button / input inner padding */
+  --pad-panel: var(--space-8); /* panel interior */
+  --pad-dialog: var(--space-12); /* dialog interior */
+
+  /* --- LAYOUT RAILS --- */
+  --rail-sidebar: 240px;
+  --rail-sidebar-md: 264px;
+  --rail-panel: 300px; /* files / diff / PR peek panel */
+  --h-titlebar: 40px;
+  --h-tabbar: 38px;
+  --h-statusbar: 26px;
+  --h-control: 30px; /* default button/input height */
+  --h-control-sm: 24px;
+  --h-control-lg: 36px;
+}

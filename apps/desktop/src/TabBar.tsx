@@ -1,6 +1,9 @@
 import type { RefObject } from "react";
 import type { ActivityState } from "./activity-store";
 import type { Tab } from "./session-store";
+import { tabIndicatorState } from "./status-state";
+import { IconButton, SessionTab, Tooltip } from "./ui";
+import { PanelRight, Plus } from "./ui/icons";
 
 interface TabBarProps {
   tabs: Tab[];
@@ -10,6 +13,8 @@ interface TabBarProps {
   onClose: (key: string) => void;
   onNew: () => void;
   newButtonRef: RefObject<HTMLButtonElement | null>;
+  panelOpen: boolean;
+  onTogglePanel: () => void;
 }
 
 /** Thin shell: renders tabs from the store snapshot, emits callbacks. */
@@ -21,66 +26,53 @@ export function TabBar({
   onClose,
   onNew,
   newButtonRef,
+  panelOpen,
+  onTogglePanel,
 }: TabBarProps) {
   return (
-    <div className="tabbar" role="tablist" aria-label="Sessions">
-      {tabs.map((t) => {
-        const label = t.key; // `${projectId}/${sessionId}` — see tabKey()
-        const active = t.key === activeKey;
-        return (
-          <div
-            key={t.key}
-            role="presentation"
-            className={active ? "tab tab--active" : "tab"}
-          >
-            <button
-              type="button"
+    <div className="rk-tabbar" role="tablist" aria-label="Sessions">
+      <div className="rk-tabbar__tabs">
+        {tabs.map((t) => {
+          const active = t.key === activeKey;
+          return (
+            <SessionTab
+              key={t.key}
+              label={t.sessionId}
+              state={tabIndicatorState(t.status, activity.get(t.key))}
+              active={active}
               role="tab"
               aria-selected={active}
-              // Status is shown as a color dot (aria-hidden); fold it into the
+              // Full project/session key on hover — disambiguates two sessions
+              // with the same slug under different projects.
+              title={t.key}
+              // Status is shown as an indicator (aria-hidden); fold it into the
               // accessible name so screen-reader users hear reconnecting/
-              // stopped/disconnected, not just the session label.
+              // stopped/disconnected, not just the session slug.
               aria-label={
-                t.status === "live" ? undefined : `${label}, ${t.status}`
+                t.status === "live" ? undefined : `${t.sessionId}, ${t.status}`
               }
-              className="tab-label"
               onClick={() => onFocus(t.key)}
-            >
-              <span
-                className={`tab-status tab-status--${t.status}`}
-                aria-hidden="true"
-              />
-              {t.status === "live" &&
-                (() => {
-                  const a = activity.get(t.key);
-                  return a && a !== "unknown" ? (
-                    <span
-                      className={`tab-activity tab-activity--${a}`}
-                      aria-hidden="true"
-                    />
-                  ) : null;
-                })()}
-              {label}
-            </button>
-            <button
-              type="button"
-              className="tab-close"
-              aria-label={`Close ${label}`}
-              onClick={() => onClose(t.key)}
-            >
-              ×
-            </button>
-          </div>
-        );
-      })}
-      <button
-        type="button"
-        ref={newButtonRef}
-        className="tab-new"
-        onClick={onNew}
-      >
-        + New session
-      </button>
+              onClose={() => onClose(t.key)}
+            />
+          );
+        })}
+      </div>
+      <div className="rk-tabbar__actions">
+        <Tooltip content="New session" side="bottom">
+          <IconButton ref={newButtonRef} label="New session" onClick={onNew}>
+            <Plus />
+          </IconButton>
+        </Tooltip>
+        <Tooltip content="Files & diff" kbd="⌘\" side="bottom">
+          <IconButton
+            label="Toggle files & diff"
+            active={panelOpen}
+            onClick={onTogglePanel}
+          >
+            <PanelRight />
+          </IconButton>
+        </Tooltip>
+      </div>
     </div>
   );
 }

@@ -1,6 +1,23 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ActivityState } from "./activity-store";
+import wordmark from "./assets/remora-wordmark.svg";
 import type { HostNode, ProjectNode, SessionNode } from "./session-tree";
+import { sessionIndicatorState } from "./status-state";
+import { Avatar, IconButton, SessionRow, Tag, useTheme } from "./ui";
+import {
+  AlertTriangle,
+  ChevronRight,
+  Folder,
+  Moon,
+  More,
+  Plus,
+  RotateCw,
+  Search,
+  Settings,
+  Sun,
+  Trash,
+  Unplug,
+} from "./ui/icons";
 
 interface SidebarProps {
   tree: HostNode[];
@@ -28,11 +45,11 @@ interface SidebarProps {
 
 /**
  * Host → Project → Session tree. A thin renderer over the `buildTree` model:
- * it owns only collapse state and click routing. Live sessions open as tabs;
- * stopped sessions are clickable and route through App's openFromSidebar which
- * branches on node.state to trigger respawn. Component-render behaviour is
- * covered by manual QA + a deferred e2e (vitest runs in node with no DOM); the
- * tree model and store are unit-tested.
+ * it owns only collapse state, an inline search filter, and click routing. Live
+ * sessions open as tabs; stopped sessions are clickable and route through App's
+ * openFromSidebar which branches on node.state to trigger respawn. Component-
+ * render behaviour is covered by manual QA + a deferred e2e (vitest runs in node
+ * with no DOM); the tree model and store are unit-tested.
  */
 export function Sidebar({
   tree,
@@ -57,41 +74,78 @@ export function Sidebar({
       return next;
     });
 
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const { theme, cycle } = useTheme();
+
+  const filtered = filterTree(tree, query);
+  const ThemeIcon = theme === "dark" ? Moon : Sun;
+
   return (
-    <nav className="sidebar" aria-label="Sessions">
-      <div className="sidebar-header">
-        <span>Sessions</span>
-        <div className="sidebar-header-actions">
-          <button
-            type="button"
-            className="sidebar-settings"
-            onClick={onOpenSettings}
-            aria-label="Settings"
-            title="Settings"
+    <nav className="rk-sidebar" aria-label="Sessions">
+      <div className="rk-sidebar__top">
+        <div className="rk-brand">
+          <img
+            src={wordmark}
+            height={20}
+            alt="Remora"
+            className="rk-brand__img"
+          />
+        </div>
+        <div className="rk-sidebar__actions">
+          <IconButton
+            label="Search"
+            size="sm"
+            active={searchOpen}
+            onClick={() => setSearchOpen((v) => !v)}
           >
-            ⚙
-          </button>
-          <button type="button" className="sidebar-refresh" onClick={onRefresh}>
-            Refresh
-          </button>
+            <Search size={15} />
+          </IconButton>
+          <IconButton label="Refresh" size="sm" onClick={onRefresh}>
+            <RotateCw size={15} />
+          </IconButton>
         </div>
       </div>
+
+      {searchOpen && (
+        <div className="rk-sidebar__searchwrap">
+          <input
+            className="rk-sidebar__search"
+            type="text"
+            placeholder="Filter sessions…"
+            aria-label="Filter sessions"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </div>
+      )}
+
       {discoveryUnavailable && (
-        <div className="sidebar-warning" role="status">
-          Discovery unavailable — showing last known state.
+        <div
+          className="rk-sidebar__banner rk-sidebar__banner--warning"
+          role="status"
+        >
+          <AlertTriangle size={14} />
+          <span>Discovery unavailable — showing last known state.</span>
         </div>
       )}
       {configError && (
-        <div className="sidebar-error" role="alert">
-          Could not read config: {configError}
+        <div
+          className="rk-sidebar__banner rk-sidebar__banner--danger"
+          role="alert"
+        >
+          <AlertTriangle size={14} />
+          <span>Could not read config: {configError}</span>
         </div>
       )}
-      {tree.length === 0 ? (
-        <p className="sidebar-empty">No hosts configured.</p>
-      ) : (
-        <ul className="tree">
-          {tree.map((host) => (
-            <HostRow
+
+      <div className="rk-sidebar__scroll">
+        <div className="rk-sidebar__label">Hosts</div>
+        {filtered.length === 0 ? (
+          <p className="rk-sidebar__empty">No hosts configured.</p>
+        ) : (
+          filtered.map((host) => (
+            <HostGroup
               key={host.id}
               host={host}
               collapsed={collapsed}
@@ -104,15 +158,61 @@ export function Sidebar({
               onNewSession={onNewSession}
               activity={activity}
             />
-          ))}
-        </ul>
-      )}
+          ))
+        )}
+      </div>
+
+      <div className="rk-sidebar__foot">
+        <Avatar shape="circle" size="sm" name="Remora" />
+        <span className="rk-sidebar__brand">Remora</span>
+        <div className="rk-sidebar__foot-actions">
+          <IconButton label={`Theme: ${theme}`} size="sm" onClick={cycle}>
+            <ThemeIcon size={15} />
+          </IconButton>
+          <IconButton label="Settings" size="sm" onClick={onOpenSettings}>
+            <Settings size={15} />
+          </IconButton>
+        </div>
+      </div>
     </nav>
   );
 }
 
-/** One host row: a collapse toggle plus its project rows (or an empty hint). */
-function HostRow({
+/** Filter the rendered tree client-side by case-insensitive substring over host
+ * label, project label, and sessionId. A host or project that matches keeps all
+ * of its descendants; otherwise only matching sessions survive. Empty query →
+ * the tree unchanged. */
+function filterTree(tree: HostNode[], query: string): HostNode[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return tree;
+  const out: HostNode[] = [];
+  for (const host of tree) {
+    const hostMatch = host.label.toLowerCase().includes(q);
+    const projects: ProjectNode[] = [];
+    for (const project of host.projects) {
+      const projMatch = project.label.toLowerCase().includes(q);
+      const sessions =
+        hostMatch || projMatch
+          ? project.sessions
+          : project.sessions.filter((s) =>
+              s.sessionId.toLowerCase().includes(q),
+            );
+      if (hostMatch || projMatch || sessions.length > 0) {
+        projects.push(
+          sessions === project.sessions ? project : { ...project, sessions },
+        );
+      }
+    }
+    if (hostMatch || projects.length > 0) {
+      out.push({ ...host, projects });
+    }
+  }
+  return out;
+}
+
+/** One host group: a collapse header (chevron + avatar + name + count + the
+ * transport tag) plus its project groups. */
+function HostGroup({
   host,
   collapsed,
   toggle,
@@ -135,49 +235,54 @@ function HostRow({
   onNewSession: (projectId: string) => void;
   activity: ReadonlyMap<string, ActivityState>;
 }) {
-  const isCollapsed = collapsed.has(host.id);
+  const open = !collapsed.has(host.id);
+  const count = host.projects.reduce((n, p) => n + p.sessions.length, 0);
   return (
-    <li className="tree-host">
+    <div className="rk-host">
       <button
         type="button"
-        className="tree-toggle"
+        className="rk-host__hdr"
         onClick={() => toggle(host.id)}
       >
-        <span className="tree-caret">{isCollapsed ? "▸" : "▾"}</span>
-        <span className="tree-label">{host.label}</span>
-        {host.transport && <span className="tree-badge">{host.transport}</span>}
+        <span
+          className="rk-host__chev"
+          style={{ transform: open ? "rotate(90deg)" : "none" }}
+        >
+          <ChevronRight size={12} />
+        </span>
+        <Avatar host name={host.label} size="sm" />
+        <span className="rk-host__name">{host.label}</span>
+        <span className="rk-host__count">{count}</span>
+        {host.transport && <Tag>{host.transport}</Tag>}
       </button>
-      {!isCollapsed && (
-        <ul className="tree-projects">
-          {host.projects.length === 0 ? (
-            <li className="tree-empty">no projects</li>
-          ) : (
-            host.projects.map((project) => (
-              <ProjectRow
-                key={`${host.id}/${project.id}`}
-                rowId={`${host.id}/${project.id}`}
-                project={project}
-                collapsed={collapsed}
-                toggle={toggle}
-                activeKey={activeKey}
-                openKeys={openKeys}
-                onOpenSession={onOpenSession}
-                onStop={onStop}
-                onRemove={onRemove}
-                onNewSession={onNewSession}
-                activity={activity}
-              />
-            ))
-          )}
-        </ul>
+      {open && (
+        <div className="rk-host__rows">
+          {host.projects.map((project) => (
+            <ProjectGroup
+              key={`${host.id}/${project.id}`}
+              rowId={`${host.id}/${project.id}`}
+              project={project}
+              collapsed={collapsed}
+              toggle={toggle}
+              activeKey={activeKey}
+              openKeys={openKeys}
+              onOpenSession={onOpenSession}
+              onStop={onStop}
+              onRemove={onRemove}
+              onNewSession={onNewSession}
+              activity={activity}
+            />
+          ))}
+        </div>
       )}
-    </li>
+    </div>
   );
 }
 
-/** One project row: a collapse toggle, a per-project "+" to start a session
- * pre-scoped to it, plus its session rows (or an empty hint). */
-function ProjectRow({
+/** One project group: a collapse header (chevron + folder + name + count) with a
+ * hover-revealed per-project "+" to start a session pre-scoped to it, plus its
+ * session leaves. */
+function ProjectGroup({
   rowId,
   project,
   collapsed,
@@ -202,146 +307,160 @@ function ProjectRow({
   onNewSession: (projectId: string) => void;
   activity: ReadonlyMap<string, ActivityState>;
 }) {
-  const isCollapsed = collapsed.has(rowId);
+  const open = !collapsed.has(rowId);
   // Only configured projects can be pre-scoped — a synthetic "Unconfigured"
   // project (agent === null) isn't in config, so the dialog couldn't resolve it.
   const canStartSession = project.agent !== null;
   return (
-    <li className="tree-project">
-      <div className="tree-project-row">
+    <div className="rk-proj">
+      <div className="rk-proj__hdr">
         <button
           type="button"
-          className="tree-toggle"
+          className="rk-proj__toggle"
           onClick={() => toggle(rowId)}
         >
-          <span className="tree-caret">{isCollapsed ? "▸" : "▾"}</span>
-          <span className="tree-label">{project.label}</span>
+          <span
+            className="rk-proj__chev"
+            style={{ transform: open ? "rotate(90deg)" : "none" }}
+          >
+            <ChevronRight size={11} />
+          </span>
+          <Folder size={13} className="rk-proj__icon" />
+          <span className="rk-proj__name">{project.label}</span>
+          <span className="rk-proj__count">{project.sessions.length}</span>
         </button>
         {canStartSession && (
-          <button
-            type="button"
-            className="tree-project-new"
-            aria-label={`New session in ${project.label}`}
-            title="New session in this project"
-            onClick={() => onNewSession(project.id)}
-          >
-            +
-          </button>
+          <span className="rk-proj__actions">
+            <IconButton
+              label={`New session in ${project.label}`}
+              size="sm"
+              onClick={() => onNewSession(project.id)}
+            >
+              <Plus size={14} />
+            </IconButton>
+          </span>
         )}
       </div>
-      {!isCollapsed && (
-        <ul className="tree-sessions">
-          {project.sessions.length === 0 ? (
-            <li className="tree-empty">no sessions</li>
-          ) : (
-            project.sessions.map((session) => (
+      {open && (
+        <div className="rk-proj__rows">
+          {project.sessions.map((session) => {
+            const stopped = session.state === "stopped";
+            return (
               <SessionRow
                 key={session.key}
-                session={session}
+                name={session.sessionId}
+                agent={session.agent ?? undefined}
+                branch={null}
+                state={sessionIndicatorState(
+                  session.state,
+                  activity.get(session.key),
+                )}
                 active={session.key === activeKey}
-                open={openKeys.has(session.key)}
-                onOpenSession={onOpenSession}
-                onStop={onStop}
-                onRemove={onRemove}
-                activity={activity.get(session.key)}
+                aria-current={session.key === activeKey ? "true" : undefined}
+                title={stopped ? "Stopped — click to respawn" : undefined}
+                onClick={() => onOpenSession(session)}
+                actions={
+                  <span className="rk-srow-trail">
+                    {openKeys.has(session.key) && (
+                      <span
+                        className="rk-srow__open"
+                        role="img"
+                        aria-label="Open tab"
+                        title="Open in a tab"
+                      />
+                    )}
+                    <SessionMenu
+                      session={session}
+                      onStop={onStop}
+                      onRemove={onRemove}
+                    />
+                  </span>
+                }
               />
-            ))
-          )}
-        </ul>
+            );
+          })}
+        </div>
       )}
-    </li>
+    </div>
   );
 }
 
-/** One session leaf: a state dot, the session id, an open-tab marker, and a
- * ⋮ menu with Stop (worktree live only) and Remove… actions. */
-function SessionRow({
+/** Hover-revealed per-session menu: Stop (worktree live only) / Remove session.
+ * Outside-click closes it (mousedown listener); the trigger stops propagation so
+ * opening the menu never also opens the session. */
+function SessionMenu({
   session,
-  active,
-  open,
-  onOpenSession,
   onStop,
   onRemove,
-  activity,
 }: {
   session: SessionNode;
-  active: boolean;
-  open: boolean;
-  onOpenSession: (node: SessionNode) => void;
   onStop: (node: SessionNode) => void;
   onRemove: (node: SessionNode) => void;
-  activity?: ActivityState;
 }) {
-  const [menuOpen, setMenuOpen] = useState(false);
-  const stopped = session.state === "stopped";
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (ev: MouseEvent) => {
+      if (ref.current && !ref.current.contains(ev.target as Node))
+        setOpen(false);
+    };
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
   const canStop = session.state === "live" && session.workspace === "worktree";
+  const pick = (fn: (node: SessionNode) => void) => (ev: React.MouseEvent) => {
+    ev.stopPropagation();
+    setOpen(false);
+    fn(session);
+  };
 
   return (
-    <li className="tree-session">
-      <div className="tree-session-row">
-        <button
-          type="button"
-          className={`tree-session-button${active ? " tree-session-button--active" : ""}`}
-          // Live → attach/focus; stopped → respawn (App routes by session.state).
-          aria-current={active ? "true" : undefined}
-          title={stopped ? "Stopped — click to respawn" : undefined}
-          onClick={() => {
-            setMenuOpen(false);
-            onOpenSession(session);
-          }}
-        >
-          <span
-            className={
-              open && activity && activity !== "unknown"
-                ? `tree-dot tree-dot--${session.state} tree-dot--act-${activity}`
-                : `tree-dot tree-dot--${session.state}`
-            }
-            aria-hidden="true"
-          />
-          <span className="tree-label">{session.sessionId}</span>
-          {open && (
-            <span className="tree-open" role="img" aria-label="open tab">
-              ●
-            </span>
-          )}
-        </button>
-        <button
-          type="button"
-          className="tree-session-menu-toggle"
-          aria-label={`Session actions for ${session.sessionId}`}
-          aria-expanded={menuOpen}
-          onClick={(e) => {
-            e.stopPropagation();
-            setMenuOpen((v) => !v);
-          }}
-        >
-          ⋮
-        </button>
-      </div>
-      {menuOpen && (
-        <div className="tree-session-menu">
+    <span className="rk-smenu" ref={ref}>
+      <IconButton
+        label={`Session actions for ${session.sessionId}`}
+        size="sm"
+        active={open}
+        aria-expanded={open}
+        onClick={(ev) => {
+          ev.stopPropagation();
+          setOpen((o) => !o);
+        }}
+      >
+        <More size={15} />
+      </IconButton>
+      {open && (
+        <div className="rk-smenu__pop" role="menu">
           {canStop && (
             <button
               type="button"
-              onClick={() => {
-                setMenuOpen(false);
-                onStop(session);
-              }}
+              className="rk-smenu__item"
+              role="menuitem"
+              onClick={pick(onStop)}
             >
+              <Unplug size={14} />
               Stop
             </button>
           )}
           <button
             type="button"
-            onClick={() => {
-              setMenuOpen(false);
-              onRemove(session);
-            }}
+            className="rk-smenu__item rk-smenu__item--danger"
+            role="menuitem"
+            onClick={pick(onRemove)}
           >
-            Remove…
+            <Trash size={14} />
+            Remove session
           </button>
         </div>
       )}
-    </li>
+    </span>
   );
 }

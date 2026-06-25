@@ -1,0 +1,42 @@
+.rmra-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-sans);
+  font-weight: var(--weight-semibold);
+  color: var(--on-accent);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  flex: none;
+  user-select: none;
+  background: var(--accent);
+}
+.rmra-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.rmra-avatar--sm {
+  width: 20px;
+  height: 20px;
+  font-size: 9px;
+  border-radius: var(--radius-xs);
+}
+.rmra-avatar--md {
+  width: 26px;
+  height: 26px;
+  font-size: 11px;
+}
+.rmra-avatar--lg {
+  width: 36px;
+  height: 36px;
+  font-size: 14px;
+}
+.rmra-avatar--circle {
+  border-radius: 50%;
+}
+.rmra-avatar--host {
+  background: var(--bg-active);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
+}

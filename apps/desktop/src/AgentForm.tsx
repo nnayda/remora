@@ -13,6 +13,8 @@ import {
 } from "./config-editor-model";
 import { formErrorMessage } from "./form-error";
 import { normalizeSlugInput } from "./spawn-input";
+import { Button, IconButton, Input, Switch } from "./ui";
+import { ArrowUp, Plus, Trash } from "./ui/icons";
 
 interface AgentFormProps {
   mode: FormMode;
@@ -56,43 +58,42 @@ export function AgentForm({
 
   return (
     <form
+      className="settings-form"
       onSubmit={(e) => {
         e.preventDefault();
         void submit();
       }}
     >
-      <h3>{mode === "create" ? "Add agent" : `Edit agent ${form.id}`}</h3>
+      <h3 className="settings-form__title">
+        {mode === "create" ? "Add agent" : `Edit agent ${form.id}`}
+      </h3>
       {mode === "create" && (
-        <label>
-          Id
-          <input
-            value={form.id}
-            onChange={(e) =>
-              setForm((f) => ({ ...f, id: normalizeSlugInput(e.target.value) }))
-            }
-            placeholder="claude"
-            // biome-ignore lint/a11y/noAutofocus: first field of an opened form
-            autoFocus
-          />
-        </label>
-      )}
-      <label className="checkbox-row">
-        <input
-          type="checkbox"
-          checked={form.plainShell}
+        <Input
+          label="Id"
+          mono
+          value={form.id}
           onChange={(e) =>
-            setForm((f) => ({ ...f, plainShell: e.target.checked }))
+            setForm((f) => ({ ...f, id: normalizeSlugInput(e.target.value) }))
           }
+          placeholder="claude"
+          // biome-ignore lint/a11y/noAutofocus: first field of an opened form
+          autoFocus
         />
-        No command (plain shell)
-      </label>
-      <span className="dialog-label">Command</span>
-      <ul className="argv-editor" aria-disabled={form.plainShell}>
+      )}
+      <Switch
+        className="settings-form__toggle"
+        label="No command (plain shell)"
+        checked={form.plainShell}
+        onChange={(checked) => setForm((f) => ({ ...f, plainShell: checked }))}
+      />
+      <span className="settings-form__fieldlabel">Command</span>
+      <ul className="settings-argv" aria-disabled={form.plainShell}>
         {form.command.map((arg, i) => (
           // biome-ignore lint/suspicious/noArrayIndexKey: argv rows are positional
-          <li key={i} className="argv-row">
-            <input
+          <li key={i} className="settings-argv__row">
+            <Input
               aria-label={`argument ${i + 1}`}
+              mono
               value={arg}
               disabled={form.plainShell}
               onChange={(e) =>
@@ -100,53 +101,57 @@ export function AgentForm({
               }
               placeholder={i === 0 ? "claude" : "--flag"}
             />
-            <button
-              type="button"
-              aria-label={`move argument ${i + 1} up`}
+            <IconButton
+              size="sm"
+              label={`move argument ${i + 1} up`}
               disabled={i === 0 || form.plainShell}
               onClick={() => setCommand(moveArg(form.command, i, -1))}
             >
-              ↑
-            </button>
-            <button
-              type="button"
-              aria-label={`move argument ${i + 1} down`}
+              <ArrowUp size={14} />
+            </IconButton>
+            <IconButton
+              size="sm"
+              label={`move argument ${i + 1} down`}
               disabled={i === form.command.length - 1 || form.plainShell}
               onClick={() => setCommand(moveArg(form.command, i, 1))}
             >
-              ↓
-            </button>
-            <button
-              type="button"
-              aria-label={`remove argument ${i + 1}`}
+              <ArrowUp size={14} style={{ transform: "rotate(180deg)" }} />
+            </IconButton>
+            <IconButton
+              size="sm"
+              label={`remove argument ${i + 1}`}
               disabled={form.command.length === 1 || form.plainShell}
               onClick={() => setCommand(removeArg(form.command, i))}
             >
-              ✕
-            </button>
+              <Trash size={14} />
+            </IconButton>
           </li>
         ))}
       </ul>
-      <button
-        type="button"
-        className="argv-add"
-        disabled={form.plainShell}
-        onClick={() => setCommand(addArg(form.command))}
-      >
-        + Add argument
-      </button>
+      <div>
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          icon={<Plus size={14} />}
+          disabled={form.plainShell}
+          onClick={() => setCommand(addArg(form.command))}
+        >
+          Add argument
+        </Button>
+      </div>
       {error && (
-        <p className="dialog-error" role="alert">
+        <p className="settings-error" role="alert">
           {error}
         </p>
       )}
-      <div className="dialog-actions">
-        <button type="button" onClick={onCancel}>
+      <div className="settings-form__actions">
+        <Button type="button" variant="ghost" onClick={onCancel}>
           Cancel
-        </button>
-        <button type="submit" disabled={submitting}>
+        </Button>
+        <Button type="submit" variant="primary" loading={submitting}>
           {submitting ? "Saving…" : "Save"}
-        </button>
+        </Button>
       </div>
     </form>
   );

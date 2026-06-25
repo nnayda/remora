@@ -1,0 +1,115 @@
+.rmra-dialog__scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: var(--bg-overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-16);
+  animation: rmra-fade var(--dur-base) var(--ease-out);
+}
+@keyframes rmra-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.rmra-dialog__backdrop {
+  position: absolute;
+  inset: 0;
+  border: none;
+  background: none;
+  padding: 0;
+  margin: 0;
+  cursor: default;
+}
+.rmra-dialog {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  max-width: 460px;
+  max-height: 86vh;
+  overflow: hidden;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
+  font-family: var(--font-sans);
+  animation: rmra-rise var(--dur-base) var(--ease-out);
+}
+@keyframes rmra-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.99);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.rmra-dialog__head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-6);
+  padding: var(--space-10) var(--space-12) var(--space-6);
+}
+.rmra-dialog__head-icon {
+  flex: none;
+  margin-top: 1px;
+  color: var(--accent);
+  display: inline-flex;
+  font-size: 18px;
+}
+.rmra-dialog__head-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.rmra-dialog__title {
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+  color: var(--text-primary);
+  letter-spacing: var(--tracking-tight);
+}
+.rmra-dialog__desc {
+  font-size: var(--text-md);
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.rmra-dialog__x {
+  flex: none;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 18px;
+  line-height: 1;
+  padding: 3px;
+  border-radius: var(--radius-sm);
+  transition: var(--transition-control);
+}
+.rmra-dialog__x:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.rmra-dialog__body {
+  padding: 0 var(--space-12);
+  overflow-y: auto;
+}
+.rmra-dialog__foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-5);
+  padding: var(--space-10) var(--space-12) var(--space-12);
+}
+.rmra-dialog__foot--spread {
+  justify-content: space-between;
+}

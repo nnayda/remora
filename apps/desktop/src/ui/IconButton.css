@@ -1,0 +1,62 @@
+.rmra-iconbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  padding: 0;
+  transition:
+    var(--transition-control),
+    box-shadow var(--dur-fast) var(--ease-out);
+  outline: none;
+}
+.rmra-iconbtn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.rmra-iconbtn:active:not(:disabled) {
+  background: var(--bg-active);
+}
+.rmra-iconbtn:focus-visible {
+  box-shadow: var(--glow-accent);
+}
+.rmra-iconbtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.rmra-iconbtn--active {
+  background: var(--accent-subtle);
+  color: var(--accent);
+}
+.rmra-iconbtn--active:hover:not(:disabled) {
+  background: var(--accent-subtle);
+  color: var(--accent-hover);
+}
+.rmra-iconbtn--sm {
+  width: 24px;
+  height: 24px;
+}
+.rmra-iconbtn--md {
+  width: 30px;
+  height: 30px;
+}
+.rmra-iconbtn--lg {
+  width: 36px;
+  height: 36px;
+}
+.rmra-iconbtn svg {
+  width: 1em;
+  height: 1em;
+}
+.rmra-iconbtn--sm svg {
+  font-size: 14px;
+}
+.rmra-iconbtn--md svg {
+  font-size: 16px;
+}
+.rmra-iconbtn--lg svg {
+  font-size: 18px;
+}

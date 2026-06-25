@@ -1,0 +1,15 @@
+/* ============================================================
+   REMORA — RADIUS TOKENS
+   Restrained, Mac-quality rounding. Hairline-friendly.
+   ============================================================ */
+
+:root {
+  --radius-0: 0;
+  --radius-xs: 3px; /* badges, tags, micro-controls */
+  --radius-sm: 5px; /* buttons, inputs, sidebar rows */
+  --radius-md: 7px; /* cards, tabs, menus */
+  --radius-lg: 10px; /* panels, popovers */
+  --radius-xl: 14px; /* dialogs, modals */
+  --radius-pill: 999px;
+  --radius-circle: 50%;
+}

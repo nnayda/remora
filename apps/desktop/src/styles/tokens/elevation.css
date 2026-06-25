@@ -1,0 +1,44 @@
+/* ============================================================
+   REMORA — ELEVATION TOKENS
+   Soft depth via subtle shadows + 1px hairline borders.
+   Never heavy cards. Shadows tuned for dark; lighter set for light.
+   ============================================================ */
+
+:root,
+:root[data-theme="dark"] {
+  /* layered, soft, low-opacity — depth without weight */
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-sm: 0 2px 6px rgba(0, 0, 0, 0.34);
+  --shadow-md: 0 6px 18px rgba(0, 0, 0, 0.42);
+  --shadow-lg: 0 16px 40px rgba(0, 0, 0, 0.52);
+  --shadow-popover: 0 8px 28px rgba(0, 0, 0, 0.48);
+
+  /* inset hairline highlight on raised surfaces */
+  --ring-inset-top: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+
+  /* accent glow — used ONLY on the activity pulse + primary focus */
+  --glow-accent: 0 0 0 3px var(--focus-ring);
+  --glow-pulse: 0 0 16px rgba(169, 156, 255, 0.4);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --shadow-xs: 0 1px 2px rgba(20, 21, 26, 0.06);
+    --shadow-sm: 0 2px 6px rgba(20, 21, 26, 0.08);
+    --shadow-md: 0 6px 18px rgba(20, 21, 26, 0.1);
+    --shadow-lg: 0 16px 40px rgba(20, 21, 26, 0.14);
+    --shadow-popover: 0 8px 28px rgba(20, 21, 26, 0.14);
+    --ring-inset-top: inset 0 1px 0 rgba(255, 255, 255, 0.6);
+    --glow-pulse: 0 0 16px rgba(124, 108, 240, 0.3);
+  }
+}
+
+:root[data-theme="light"] {
+  --shadow-xs: 0 1px 2px rgba(20, 21, 26, 0.06);
+  --shadow-sm: 0 2px 6px rgba(20, 21, 26, 0.08);
+  --shadow-md: 0 6px 18px rgba(20, 21, 26, 0.1);
+  --shadow-lg: 0 16px 40px rgba(20, 21, 26, 0.14);
+  --shadow-popover: 0 8px 28px rgba(20, 21, 26, 0.14);
+  --ring-inset-top: inset 0 1px 0 rgba(255, 255, 255, 0.6);
+  --glow-pulse: 0 0 16px rgba(124, 108, 240, 0.3);
+}
