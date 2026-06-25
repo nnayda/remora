@@ -35,6 +35,15 @@ pnpm dev          # tauri dev — compiles the Rust shell and opens the app
 | `cargo fmt --all` | Format Rust code |
 | `cargo deny check` | License / advisory / source audit ([cargo-deny](https://embarkstudios.github.io/cargo-deny/)) |
 
+## Design system gallery
+
+The `apps/desktop/src/ui/` component library and the `styles/tokens/` are
+showcased in a dev-only gallery. With `pnpm dev` running, open
+**http://localhost:1420/showcase.html** to browse every component and token in
+light and dark (use "Cycle theme"). It mounts the *real* `ui/` components against
+the real tokens, so it can't drift from the shipped library — and `showcase.html`
+is not an entry in `vite build`, so it never reaches the production app.
+
 Run the full pre-push gauntlet (what CI runs):
 
 ```sh
