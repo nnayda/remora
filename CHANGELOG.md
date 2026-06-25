@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ssh connection multiplexing** (#63): the direct ssh transport now shares one
+  authenticated master across the many short-lived per-session ops (discovery,
+  spawn, has-session, attach) via OpenSSH `ControlMaster=auto`,
+  `ControlPath=~/.ssh/remora-%C`, and `ControlPersist=60s`. The user
+  authenticates once (one hardware-key touch / bastion hop) and subsequent ops
+  skip the handshake, helping the "<5s spawn" and live-sidebar goals against
+  FIDO keys, jump hosts, and high-latency links. `auto` degrades gracefully to a
+  fresh connection if a master socket is stale, so a dead master never wedges. A
+  warm authenticated socket lingers up to 60s after the last connection — a
+  small, bounded security trade-off. Scoped to direct ssh; the kubectl transport
+  is untouched and relay-mode multiplexing is deferred. See
+  [ADR-0011](docs/adr/0011-ssh-connection-multiplexing-direct-mode.md).
 - **Terminal clipboard** (#87): selecting text and pressing the copy chord —
   Cmd+C on macOS, Ctrl+Shift+C on Linux/Windows — now writes the selection to
   the host system clipboard, and the agent's OSC 52 clipboard-set sequence is
