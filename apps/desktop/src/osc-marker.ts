@@ -18,12 +18,14 @@ const TOKEN = "remora"; // collision guard (ADR-0010); the real scoping, not the
 const PAYLOAD_CAP = 80;
 
 // Wire tokens → internal states. `awaiting_input` (protocol/spec word) maps to
-// the shorter internal `awaiting`.
-const STATE_BY_TOKEN: Record<string, MarkerState> = {
-  working: "working",
-  idle: "idle",
-  awaiting_input: "awaiting",
-};
+// the shorter internal `awaiting`. A Map (not a plain object) prevents
+// prototype-chain collisions: `STATE_BY_TOKEN["toString"]` on a plain object
+// would return a truthy function, silently accepting a forged payload.
+const STATE_BY_TOKEN = new Map<string, MarkerState>([
+  ["working", "working"],
+  ["idle", "idle"],
+  ["awaiting_input", "awaiting"],
+]);
 
 /**
  * Parse the data of an OSC 7366 sequence (everything after `7366;`):
@@ -49,6 +51,6 @@ export function parseActivityMarker(data: string): ActivityMarker | null {
     stripTerminalEscapes(decoded, { keepWhitespace: false }),
     PAYLOAD_CAP,
   );
-  const state = STATE_BY_TOKEN[clean];
+  const state = STATE_BY_TOKEN.get(clean);
   return state ? { state } : null;
 }

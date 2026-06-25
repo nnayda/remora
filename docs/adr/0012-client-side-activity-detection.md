@@ -58,9 +58,11 @@ using two cooperating signals managed by a shared `ActivityStore`:
   marker (emit wiring is a #55 follow-up, blocked on the launch-inject-vs-pre-config
   decision for the `Agent` schema).
 
-- **Marker-only red.** `awaiting_input` (`MarkerState`) is **never inferred from
-  a stable screen**. The state machine only enters `awaiting` when the OSC-7366
-  marker explicitly carries `state=awaiting_input` and the session is settled. A
+- **Marker-only red.** The wire token `awaiting_input` (carried in the OSC-7366
+  payload) maps to the internal `MarkerState` value `awaiting`; these are distinct.
+  `awaiting` is **never inferred from a stable screen**. The state machine only
+  enters `awaiting` when the OSC-7366 marker explicitly carries the wire token
+  `awaiting_input` and the session is settled. A
   quiescent terminal without a marker stays blue. This makes the red indicator a
   high-confidence signal (agent-asserted) rather than a guess.
 

@@ -8,9 +8,13 @@
 // CSI: ESC [ , params/intermediates, final byte @-~.
 // biome-ignore lint/suspicious/noControlCharactersInRegex: matching escapes needs the ESC byte.
 const CSI = /\x1b\[[0-?]*[ -/]*[@-~]/g;
-// OSC: ESC ] … terminated by BEL (\x07) or ST (ESC \).
+// OSC: ESC ] … terminated by BEL (\x07) or ST (ESC \). The character class
+// [^\x07] matches any byte except BEL, but allows an embedded ESC only when
+// it is NOT followed by \ (i.e. not an ST opener), so a sequence like
+// ESC]0;title ESC[31m boom\x07 is consumed in full rather than stopping at
+// the inner ESC and leaving the tail unstripped.
 // biome-ignore lint/suspicious/noControlCharactersInRegex: matching escapes needs the ESC/BEL bytes.
-const OSC = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+const OSC = /\x1b\](?:[^\x07]|\x1b(?!\\))*?(?:\x07|\x1b\\)/g;
 // Any other escape: ESC, optional intermediates, optional final byte.
 // biome-ignore lint/suspicious/noControlCharactersInRegex: matching escapes needs the ESC byte.
 const ESC = /\x1b[ -/]*[0-~]?/g;

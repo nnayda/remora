@@ -558,4 +558,49 @@ describe("TerminalController", () => {
     conn.emit({ event: "closed" });
     expect(activity.clear).toHaveBeenCalledWith("api/fix");
   });
+
+  it("does not call noteOutput for bytes replayed from the backlog on subscribe, but does for live bytes after", () => {
+    // Simulates attaching to an already-active session: the connection replays
+    // buffered bytes synchronously inside subscribe(), then delivers live bytes
+    // asynchronously. Replayed bytes must NOT count as live activity (they are
+    // catch-up output, not fresh agent work), while live bytes MUST.
+    const activity = {
+      noteOutput: vi.fn(),
+      noteMarker: vi.fn(),
+      clear: vi.fn(),
+    };
+    // A connection that replays one buffered bytes event synchronously on subscribe.
+    let sub: OnOutput | null = null;
+    const unsubscribe = vi.fn();
+    const bufferedConn = {
+      closed: false,
+      subscribe: vi.fn((cb: OnOutput) => {
+        sub = cb;
+        // Synchronous replay of buffered output — same contract as real openConnection.
+        cb({ event: "bytes", bytes: [104, 105] });
+        return unsubscribe;
+      }),
+      write: vi.fn().mockResolvedValue(undefined),
+      resize: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      unsubscribe,
+      emit: (m: BridgeOutput) => sub?.(m),
+    };
+    const hEl = {} as HTMLElement;
+    new TerminalController(
+      hEl,
+      bufferedConn as unknown as SessionConnection,
+      undefined,
+      { sessionKey: "s/attach", activity },
+    );
+    // The replayed byte must have been written to the terminal.
+    expect(xt.state.term?.written).toContainEqual(new Uint8Array([104, 105]));
+    // But noteOutput must NOT have been called for the replayed byte.
+    expect(activity.noteOutput).not.toHaveBeenCalled();
+
+    // A live byte arriving after subscribe() must call noteOutput.
+    bufferedConn.emit({ event: "bytes", bytes: [119] });
+    expect(activity.noteOutput).toHaveBeenCalledWith("s/attach");
+    expect(activity.noteOutput).toHaveBeenCalledTimes(1);
+  });
 });

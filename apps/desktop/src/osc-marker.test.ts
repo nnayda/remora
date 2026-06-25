@@ -40,4 +40,11 @@ describe("parseActivityMarker", () => {
     // escape must be gone; a payload that is ONLY controls -> "" -> null.
     expect(parseActivityMarker(`remora;1;state;${btoa("\x1b[2J")}`)).toBeNull();
   });
+  it("rejects Object.prototype inherited keys (prototype-chain safety)", () => {
+    // A plain-object lookup would return a truthy function for these keys;
+    // the Map-based lookup must return null for all of them.
+    expect(parseActivityMarker(marker("toString"))).toBeNull();
+    expect(parseActivityMarker(marker("__proto__"))).toBeNull();
+    expect(parseActivityMarker(marker("constructor"))).toBeNull();
+  });
 });

@@ -11,6 +11,11 @@ describe("stripTerminalEscapes", () => {
     expect(stripTerminalEscapes("\x1b]0;title\x07x")).toBe("x");
     expect(stripTerminalEscapes("\x1b(Bok")).toBe("ok");
   });
+  it("strips an OSC that contains an embedded ESC (not a ST)", () => {
+    // The inner ESC[31m is not a string terminator, so the whole OSC up to
+    // the BEL must be consumed; only the trailing "x" survives.
+    expect(stripTerminalEscapes("\x1b]0;title\x1b[31mboom\x07x")).toBe("x");
+  });
   it("keeps \\t\\n\\r when keepWhitespace (default true)", () => {
     expect(stripTerminalEscapes("a\nb\tc")).toBe("a\nb\tc");
   });

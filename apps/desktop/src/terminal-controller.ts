@@ -60,9 +60,18 @@ export class TerminalController {
       (data) => this.handleActivityMarker(data),
     );
 
+    // `subscribe` synchronously replays buffered output (bytes already received
+    // before this terminal mounted) before returning, then streams live bytes
+    // asynchronously. The replay is a catch-up write — not live agent activity —
+    // so we must not call noteOutput for replayed bytes, or a quiet attach would
+    // falsely flip the indicator to "working" and decay to idle only after the
+    // settle window. The `replaying` flag is cleared immediately after
+    // subscribe() returns, before any async message can arrive.
+    let replaying = true;
     this.unsubscribe = connection.subscribe((msg) => {
       if (msg.event === "bytes") {
-        if (this.sessionKey) this.activity.noteOutput(this.sessionKey);
+        if (this.sessionKey && !replaying)
+          this.activity.noteOutput(this.sessionKey);
         this.term.write(new Uint8Array(msg.bytes));
       } else if (msg.event === "closed") {
         this.handleClosed();
@@ -70,6 +79,7 @@ export class TerminalController {
       // A future BridgeOutput variant falls through here and is ignored, rather
       // than being mislabeled as a closed session.
     });
+    replaying = false;
 
     this.onDataDisposable = this.term.onData((data) => {
       if (this.closed) return;
