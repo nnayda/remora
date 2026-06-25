@@ -76,6 +76,7 @@ export class ActivityStore implements ActivitySink {
       lastOutputAt: 0,
       state: "unknown" as ActivityState,
     };
+    const prevState = e.state;
     if (marker === "working") {
       e.lastOutputAt = this.now();
       e.state = "working";
@@ -86,7 +87,8 @@ export class ActivityStore implements ActivitySink {
       e.state = marker === "awaiting" ? "awaiting" : "idle";
     }
     this.entries.set(key, e);
-    this.commit();
+    const transitioned = e.state !== prevState;
+    if (transitioned) this.commit(); // skip same-state marker floods
   }
 
   clear(key: string): void {

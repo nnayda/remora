@@ -84,4 +84,16 @@ describe("ActivityStore", () => {
     store.noteOutput(K); // still working: no notify
     expect(n).toBe(1);
   });
+
+  it("noteMarker does not notify on same-state flood", () => {
+    const { store } = fixture();
+    let n = 0;
+    store.subscribe(() => {
+      n += 1;
+    });
+    store.noteMarker(K, "awaiting"); // unknown -> awaiting: 1 notify
+    store.noteMarker(K, "awaiting"); // still awaiting: no notify
+    store.noteMarker(K, "awaiting"); // still awaiting: no notify
+    expect(n).toBe(1);
+  });
 });
