@@ -14,6 +14,10 @@ import { isValidSlug, normalizeSlugInput } from "./spawn-input";
 interface NewSessionDialogProps {
   /** Per-device config; drives the project and agent pickers. */
   config: ConfigDto;
+  /** Project to pre-scope to (e.g. a sidebar per-project "+"). Clamped to a
+   * real project — a stale/unknown id falls back to the first project, same as
+   * the global "+ New session" entry point (which passes nothing). */
+  initialProjectId?: string;
   openSession: (input: SpawnInput) => Promise<OpenResult>;
   onOpened: (attached: boolean) => void;
   onClose: () => void;
@@ -30,12 +34,13 @@ function errorMessage(error: unknown): string {
 /** Thin modal shell. Owns the connecting + error UI; never leaves an orphan tab. */
 export function NewSessionDialog({
   config,
+  initialProjectId = "",
   openSession,
   onOpened,
   onClose,
 }: NewSessionDialogProps) {
   const model = useMemo(() => buildNewSessionModel(config), [config]);
-  const initial = resolveSelection(model, "");
+  const initial = resolveSelection(model, initialProjectId);
   const [projectId, setProjectId] = useState(initial.projectId);
   const [sessionId, setSessionId] = useState("");
   // Agent defaults to the selected project's default; project changes reset it.

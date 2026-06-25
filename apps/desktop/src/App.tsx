@@ -33,6 +33,9 @@ function App() {
   const { config, sessions, configError, discoveryUnavailable, refresh } =
     useDiscovery();
   const [dialogOpen, setDialogOpen] = useState(false);
+  // Project the New Session dialog is pre-scoped to (per-project sidebar "+"),
+  // or null for the global "+ New session" entry point.
+  const [dialogProjectId, setDialogProjectId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [removeTarget, setRemoveTarget] = useState<{
@@ -203,6 +206,17 @@ function App() {
     void discoveryStore.refreshAfterOpen();
   }
 
+  /** Open the New Session dialog. `projectId` pre-scopes it to a project (the
+   * sidebar per-project "+"); null is the global, no-context entry point. */
+  function openNewSession(projectId: string | null) {
+    setNotice(null);
+    // Drop any unconsumed selection intent so spawning from the dialog doesn't
+    // later yank focus off the opener onto the new terminal.
+    focusOnSelect.current = false;
+    setDialogProjectId(projectId);
+    setDialogOpen(true);
+  }
+
   return (
     <main className="app">
       <Sidebar
@@ -215,6 +229,7 @@ function App() {
         onRefresh={() => void refresh()}
         onStop={onStop}
         onRemove={onRemove}
+        onNewSession={openNewSession}
         onOpenSettings={() => {
           setNotice(null);
           setSettingsOpen(true);
@@ -241,13 +256,7 @@ function App() {
             setNotice(null);
             closeTab(key);
           }}
-          onNew={() => {
-            setNotice(null);
-            // Drop any unconsumed selection intent so spawning from the dialog
-            // doesn't later yank focus off newButtonRef onto the new terminal.
-            focusOnSelect.current = false;
-            setDialogOpen(true);
-          }}
+          onNew={() => openNewSession(null)}
           newButtonRef={newButtonRef}
         />
         {notice && (
@@ -324,6 +333,7 @@ function App() {
       {dialogOpen && (
         <NewSessionDialog
           config={config}
+          initialProjectId={dialogProjectId ?? undefined}
           openSession={openSession}
           onOpened={handleOpened}
           onClose={() => {

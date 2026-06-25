@@ -18,6 +18,8 @@ interface SidebarProps {
   onStop: (node: SessionNode) => void;
   /** Open the remove confirm dialog for any session. */
   onRemove: (node: SessionNode) => void;
+  /** Open the New Session dialog pre-scoped to a project (per-project "+"). */
+  onNewSession: (projectId: string) => void;
   /** Open the config-management (Settings) modal. */
   onOpenSettings: () => void;
 }
@@ -40,6 +42,7 @@ export function Sidebar({
   onRefresh,
   onStop,
   onRemove,
+  onNewSession,
   onOpenSettings,
 }: SidebarProps) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
@@ -95,6 +98,7 @@ export function Sidebar({
               onOpenSession={onOpenSession}
               onStop={onStop}
               onRemove={onRemove}
+              onNewSession={onNewSession}
             />
           ))}
         </ul>
@@ -113,6 +117,7 @@ function HostRow({
   onOpenSession,
   onStop,
   onRemove,
+  onNewSession,
 }: {
   host: HostNode;
   collapsed: Set<string>;
@@ -122,6 +127,7 @@ function HostRow({
   onOpenSession: (node: SessionNode) => void;
   onStop: (node: SessionNode) => void;
   onRemove: (node: SessionNode) => void;
+  onNewSession: (projectId: string) => void;
 }) {
   const isCollapsed = collapsed.has(host.id);
   return (
@@ -152,6 +158,7 @@ function HostRow({
                 onOpenSession={onOpenSession}
                 onStop={onStop}
                 onRemove={onRemove}
+                onNewSession={onNewSession}
               />
             ))
           )}
@@ -161,7 +168,8 @@ function HostRow({
   );
 }
 
-/** One project row: a collapse toggle plus its session rows (or an empty hint). */
+/** One project row: a collapse toggle, a per-project "+" to start a session
+ * pre-scoped to it, plus its session rows (or an empty hint). */
 function ProjectRow({
   rowId,
   project,
@@ -172,6 +180,7 @@ function ProjectRow({
   onOpenSession,
   onStop,
   onRemove,
+  onNewSession,
 }: {
   rowId: string;
   project: ProjectNode;
@@ -182,18 +191,35 @@ function ProjectRow({
   onOpenSession: (node: SessionNode) => void;
   onStop: (node: SessionNode) => void;
   onRemove: (node: SessionNode) => void;
+  onNewSession: (projectId: string) => void;
 }) {
   const isCollapsed = collapsed.has(rowId);
+  // Only configured projects can be pre-scoped — a synthetic "Unconfigured"
+  // project (agent === null) isn't in config, so the dialog couldn't resolve it.
+  const canStartSession = project.agent !== null;
   return (
     <li className="tree-project">
-      <button
-        type="button"
-        className="tree-toggle"
-        onClick={() => toggle(rowId)}
-      >
-        <span className="tree-caret">{isCollapsed ? "▸" : "▾"}</span>
-        <span className="tree-label">{project.label}</span>
-      </button>
+      <div className="tree-project-row">
+        <button
+          type="button"
+          className="tree-toggle"
+          onClick={() => toggle(rowId)}
+        >
+          <span className="tree-caret">{isCollapsed ? "▸" : "▾"}</span>
+          <span className="tree-label">{project.label}</span>
+        </button>
+        {canStartSession && (
+          <button
+            type="button"
+            className="tree-project-new"
+            aria-label={`New session in ${project.label}`}
+            title="New session in this project"
+            onClick={() => onNewSession(project.id)}
+          >
+            +
+          </button>
+        )}
+      </div>
       {!isCollapsed && (
         <ul className="tree-sessions">
           {project.sessions.length === 0 ? (
