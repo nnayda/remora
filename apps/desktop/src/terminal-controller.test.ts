@@ -429,27 +429,40 @@ describe("TerminalController", () => {
     errSpy.mockRestore();
   });
 
+  // A copy-chord KeyboardEvent double. `key` is matched by code, not key, so the
+  // soft-return branch is skipped; preventDefault is a spy we can assert on.
+  function copyChord(opts: {
+    metaKey?: boolean;
+    ctrlKey?: boolean;
+    shiftKey?: boolean;
+  }): KeyboardEvent {
+    return {
+      type: "keydown",
+      code: "KeyC",
+      altKey: false,
+      metaKey: opts.metaKey ?? false,
+      ctrlKey: opts.ctrlKey ?? false,
+      shiftKey: opts.shiftKey ?? false,
+      preventDefault: vi.fn(),
+    } as unknown as KeyboardEvent;
+  }
+
   it("copies the selection and consumes Cmd+C when text is selected", () => {
     const { writeClipboard } = ctrlWithClipboard();
     term().selection = "selected text";
-    const handled = term().keyHandler?.({
-      type: "keydown",
-      code: "KeyC",
-      metaKey: true,
-    } as KeyboardEvent);
+    const ev = copyChord({ metaKey: true });
+    const handled = term().keyHandler?.(ev);
     expect(writeClipboard).toHaveBeenCalledWith("selected text");
     expect(handled).toBe(false); // consumed: not forwarded to the PTY
+    expect(ev.preventDefault).toHaveBeenCalled(); // also suppress native copy
   });
 
   it("copies the selection on Ctrl+Shift+C (Linux/Windows chord)", () => {
     const { writeClipboard } = ctrlWithClipboard();
     term().selection = "linux copy";
-    const handled = term().keyHandler?.({
-      type: "keydown",
-      code: "KeyC",
-      ctrlKey: true,
-      shiftKey: true,
-    } as KeyboardEvent);
+    const handled = term().keyHandler?.(
+      copyChord({ ctrlKey: true, shiftKey: true }),
+    );
     expect(writeClipboard).toHaveBeenCalledWith("linux copy");
     expect(handled).toBe(false);
   });
@@ -457,24 +470,20 @@ describe("TerminalController", () => {
   it("consumes the copy chord but writes nothing when there is no selection", () => {
     const { writeClipboard } = ctrlWithClipboard();
     term().selection = "";
-    const handled = term().keyHandler?.({
-      type: "keydown",
-      code: "KeyC",
-      metaKey: true,
-    } as KeyboardEvent);
+    const ev = copyChord({ metaKey: true });
+    const handled = term().keyHandler?.(ev);
     expect(writeClipboard).not.toHaveBeenCalled();
     expect(handled).toBe(false);
+    expect(ev.preventDefault).toHaveBeenCalled();
   });
 
   it("lets a bare Ctrl-C through (stays SIGINT, never copies)", () => {
     const { writeClipboard } = ctrlWithClipboard();
     term().selection = "ignored";
-    const handled = term().keyHandler?.({
-      type: "keydown",
-      code: "KeyC",
-      ctrlKey: true,
-    } as KeyboardEvent);
+    const ev = copyChord({ ctrlKey: true });
+    const handled = term().keyHandler?.(ev);
     expect(writeClipboard).not.toHaveBeenCalled();
     expect(handled).toBe(true); // passed through to xterm → ^C
+    expect(ev.preventDefault).not.toHaveBeenCalled(); // not consumed
   });
 });

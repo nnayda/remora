@@ -122,6 +122,10 @@ export class TerminalController {
       ((event.metaKey && !event.ctrlKey && !event.shiftKey) ||
         (event.ctrlKey && event.shiftKey && !event.metaKey));
     if (isCopyChord) {
+      // Suppress the browser's native copy too, not just xterm's handling:
+      // returning false only stops xterm, so without this the webview's own
+      // Cmd+C copy could also fire and race our clipboard write.
+      event.preventDefault();
       const selection = this.term.getSelection();
       if (selection) {
         void this.writeClipboard(selection).catch((err) =>
