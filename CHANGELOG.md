@@ -9,7 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Dynamic kubectl field resolution** (#52): a kubectl host's `pod`,
+- **Terminal clipboard** (#87): selecting text and pressing the copy chord —
+  Cmd+C on macOS, Ctrl+Shift+C on Linux/Windows — now writes the selection to
+  the host system clipboard, and the agent's OSC 52 clipboard-set sequence is
+  honored so copy-on-select reaches the OS clipboard. A bare Ctrl-C is left
+  untouched and still sends SIGINT. Writes go through the Tauri
+  clipboard-manager plugin behind a small `writeClipboard` seam; the capability
+  is **write-only** and OSC 52 *read* requests (`?`) are ignored so a remote can
+  never exfiltrate the local clipboard. The OSC 52 decoder is fatal on invalid
+  UTF-8 and ignores empty payloads so a malformed sequence can't clobber the
+  clipboard. Follow-up hardening (opt-in gate for remote-driven writes) tracked
+  in #94.
   `namespace`, `context`, or `container` may be a literal string *or* a
   `{ command = "…" }` table whose shell command is resolved **locally** at
   connect time (its trimmed stdout becomes the argv token) — so a sandbox pod
