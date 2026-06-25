@@ -14,7 +14,10 @@ use remora_protocol::{ProjectId, SessionId, SessionMeta};
 use super::pty_process::spawn_pty_channel;
 use crate::config::Config;
 use crate::discovery::{self, DiscoveredEnv};
-use crate::naming::{branch_name, parse_tmux_session_name, tmux_session_name, worktree_path};
+use crate::naming::{
+    branch_name, parse_tmux_session_name, tmux_session_name, worktree_path, ENV_AGENT,
+    ENV_CREATED_AT, ENV_WORKSPACE,
+};
 use crate::spawn_plan::{PlanError, SpawnPlan};
 use crate::{DirtyReason, SessionChannel, SourceError};
 
@@ -400,7 +403,8 @@ pub(crate) fn set_passthrough_tokens(tmux_name: &str) -> Vec<String> {
 
 /// Tokens for `tmux set-environment -t <name> <key> <value>`. The value is
 /// the logical metadata string, single-quoted as a literal (no tilde
-/// expansion — the stored value must round-trip via stage-6 `show-environment`).
+/// expansion — the stored value must round-trip via the inline `#{E:VAR}`
+/// read in `list_sessions_tokens`, #108).
 pub(crate) fn set_environment_tokens(tmux_name: &str, key: &str, value: &str) -> Vec<String> {
     vec![
         "tmux".into(),
@@ -412,9 +416,12 @@ pub(crate) fn set_environment_tokens(tmux_name: &str, key: &str, value: &str) ->
     ]
 }
 
-/// Tokens for `tmux list-sessions -F '#{session_name}'`. The format string is
-/// shell-quoted: a bare `#` would start a comment in the remote login shell.
-pub(crate) fn list_sessions_tokens() -> Vec<String> {
+/// Tokens for `tmux list-sessions -F '#{session_name}'` — the TRUSTED live set.
+/// The format carries no env expansion, so a forged `#{E:}` value (which could
+/// contain a newline and fabricate a phantom row, #108) cannot pollute it; this
+/// is the same names-only listing the pre-#108 code trusted. Shell-quoted: a
+/// bare `#` starts a comment in the remote login shell.
+pub(crate) fn list_session_names_tokens() -> Vec<String> {
     vec![
         "tmux".into(),
         "list-sessions".into(),
@@ -423,14 +430,33 @@ pub(crate) fn list_sessions_tokens() -> Vec<String> {
     ]
 }
 
-/// Tokens for `tmux show-environment -t <name>` — reads one session's env
-/// metadata.
-pub(crate) fn show_environment_query_tokens(tmux_name: &str) -> Vec<String> {
+/// Tokens for `tmux list-sessions -F '<name>\t<agent>\t<workspace>\t<created_at>'`,
+/// carrying each session's `REMORA_*` metadata inline via tmux ≥ 3.0's `#{E:VAR}`
+/// env-expansion. This is the metadata ENRICHMENT call — one round-trip for the
+/// whole live set, replacing the old `1 + N` show-environment fan-out (the bulk
+/// of discovery latency on a high-RTT link, #108). It is paired with
+/// [`list_session_names_tokens`]: `run_list` keys this metadata by a name already
+/// proven live there, so an injected phantom row (forged `#{E:}` newline) is
+/// dropped rather than fabricating a session. Fields are joined by
+/// `discovery::SESSION_FIELD_SEP` (a tab, which `clean_metadata` guarantees no
+/// sanitized value contains) and parsed back by `discovery::parse_session_line`;
+/// the field order here IS that parser's contract. On tmux < 3.0 the `#{E:}`
+/// fields expand empty — the session still lists Live (from the names call),
+/// just without metadata (a graceful version cliff). The whole format is
+/// shell-quoted: a bare `#` starts a comment in the remote login shell.
+pub(crate) fn list_sessions_tokens() -> Vec<String> {
+    let format = [
+        "#{session_name}".to_string(),
+        format!("#{{E:{ENV_AGENT}}}"),
+        format!("#{{E:{ENV_WORKSPACE}}}"),
+        format!("#{{E:{ENV_CREATED_AT}}}"),
+    ]
+    .join(discovery::SESSION_FIELD_SEP);
     vec![
         "tmux".into(),
-        "show-environment".into(),
-        "-t".into(),
-        tmux_name.into(),
+        "list-sessions".into(),
+        "-F".into(),
+        shell_quote(&format),
     ]
 }
 
@@ -471,9 +497,11 @@ pub(crate) fn has_session_tokens(tmux_name: &str) -> Vec<String> {
 // Error classifiers
 // ---------------------------------------------------------------------------
 
-/// Classifies `tmux list-sessions`: success → session-name lines; a
-/// no-server / no-sessions stderr → empty (the normal cold state, decision 9,
-/// matched case-insensitively); any other failure → `Transport`.
+/// Classifies `tmux list-sessions`: success → the stdout rows (each a
+/// `name<SEP>agent<SEP>workspace<SEP>created_at` line, parsed by
+/// `discovery::parse_session_line`); a no-server / no-sessions stderr → empty
+/// (the normal cold state, decision 9, matched case-insensitively); any other
+/// failure → `Transport`.
 pub(crate) fn classify_list_sessions(out: &RemoteOutput) -> Result<Vec<String>, SourceError> {
     if out.success {
         return Ok(out.stdout.lines().map(str::to_string).collect());
@@ -737,31 +765,54 @@ pub(crate) fn run_respawn(
     }
 }
 
-/// Reads a live session's metadata; a failed `show-environment` (race: the
-/// session died after `list-sessions`) yields empty metadata — the session is
-/// still listed `Live` (don't downgrade a known-live session on a metadata
-/// read flake). The target name is rebuilt from validated ids.
-pub(crate) fn read_environment(
-    exec: &dyn RemoteExec,
-    project: &ProjectId,
-    session: &SessionId,
-) -> DiscoveredEnv {
-    let tmux_name = tmux_session_name(project, session);
-    match exec.run(&show_environment_query_tokens(&tmux_name)) {
-        Ok(out) if out.success => discovery::parse_session_environment(&out.stdout),
-        _ => DiscoveredEnv::default(),
+/// Reads the inline `#{E:}` session metadata into a `name → env` map
+/// (best-effort; a failed/`no-server` read yields an empty map). This is
+/// ENRICHMENT only: `run_list` keys it by a name already proven live by the
+/// trusted [`list_session_names_tokens`] listing, so a forged env value whose
+/// embedded newline fabricates an extra row here cannot introduce a session —
+/// the phantom name simply isn't in the trusted set. A forged row that reuses a
+/// real session's name can at worst set that session's own (already untrusted,
+/// display-only — ADR-0004) metadata, which its real env could do anyway. Last
+/// row wins on a duplicate name.
+fn read_inline_metadata(exec: &dyn RemoteExec) -> std::collections::HashMap<String, DiscoveredEnv> {
+    let mut map = std::collections::HashMap::new();
+    if let Ok(out) = exec.run(&list_sessions_tokens()) {
+        if out.success {
+            for row in out.stdout.lines() {
+                let (name, env) = discovery::parse_session_line(row);
+                if !name.is_empty() {
+                    map.insert(name.to_string(), env);
+                }
+            }
+        }
     }
+    map
 }
 
 /// Discovers sessions on the host and joins them to local config. Config-
 /// scoped throughout (R1): the live set keeps only configured projects, and
 /// the worktree scan runs for every configured project (a worktree-override
 /// session can live on a shared-default project).
+///
+/// Two listings, both one round-trip each (cheap over the shared ControlMaster,
+/// #63), replace the old `1 + N` per-session show-environment fan-out (#108):
+/// the TRUSTED names-only [`list_session_names_tokens`] decides the live set
+/// (env-free, so unforgeable), and [`read_inline_metadata`] enriches each by
+/// name. A live session whose metadata is missing (tmux < 3.0, or a metadata
+/// read flake) still lists, just with empty metadata.
 pub(crate) fn run_list(
     exec: &dyn RemoteExec,
     config: &Config,
 ) -> Result<Vec<SessionMeta>, SourceError> {
-    let names = classify_list_sessions(&exec.run(&list_sessions_tokens())?)?;
+    let names = classify_list_sessions(&exec.run(&list_session_names_tokens())?)?;
+
+    // Skip the metadata round-trip entirely when nothing is live (matches the
+    // pre-#108 "no names ⇒ no per-session reads" behavior).
+    let metadata = if names.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        read_inline_metadata(exec)
+    };
 
     let mut live = Vec::new();
     for name in &names {
@@ -771,7 +822,7 @@ pub(crate) fn run_list(
         if !config.projects.contains_key(&project) {
             continue; // R1: configured projects only
         }
-        let env = read_environment(exec, &project, &session);
+        let env = metadata.get(name.as_str()).cloned().unwrap_or_default();
         live.push((project, session, env));
     }
 
@@ -1600,14 +1651,59 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn list_sessions_tokens_quotes_the_format_string() {
+    fn list_sessions_tokens_quotes_the_inline_metadata_format() {
         let tokens = list_sessions_tokens();
-        assert_eq!(tokens.last().map(String::as_str), Some("'#{session_name}'"));
+        let format = tokens.last().expect("format arg");
+        // The whole format is shell-quoted (a bare `#` would start a comment).
+        assert!(format.starts_with('\''), "must be quoted: {format}");
+        // It carries the name plus the three inline `#{E:}` metadata fields (#108).
+        for needle in [
+            "#{session_name}",
+            "#{E:REMORA_AGENT}",
+            "#{E:REMORA_WORKSPACE}",
+            "#{E:REMORA_CREATED_AT}",
+        ] {
+            assert!(format.contains(needle), "format missing {needle}: {format}");
+        }
         let l = tokens
             .iter()
             .position(|a| a == "list-sessions")
             .expect("list-sessions");
         assert_eq!(tokens[l + 1], "-F");
+    }
+
+    #[test]
+    fn list_session_names_tokens_is_env_free_and_quoted() {
+        let tokens = list_session_names_tokens();
+        // Names-only format: NO `#{E:}` env expansion (that's the trusted-set
+        // listing, #108), and shell-quoted against the bare-`#` comment trap.
+        assert_eq!(tokens.last().map(String::as_str), Some("'#{session_name}'"));
+        assert!(
+            !tokens.iter().any(|t| t.contains("#{E:")),
+            "names listing must carry no env expansion: {tokens:?}"
+        );
+        let l = tokens
+            .iter()
+            .position(|a| a == "list-sessions")
+            .expect("list-sessions");
+        assert_eq!(tokens[l + 1], "-F");
+    }
+
+    /// Couples the format-string field ORDER to `parse_session_line`'s positional
+    /// read: name, then agent/workspace/created_at, built from `naming::ENV_*`.
+    /// A reorder or rename moves both sides together or fails here (#108).
+    #[test]
+    fn list_sessions_format_orders_fields_for_the_parser() {
+        let tokens = list_sessions_tokens();
+        let format = tokens.last().expect("format arg");
+        let mut last = 0usize;
+        for needle in ["session_name", ENV_AGENT, ENV_WORKSPACE, ENV_CREATED_AT] {
+            let at = format
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing {needle} in {format}"));
+            assert!(at >= last, "field {needle} out of order in {format}");
+            last = at;
+        }
     }
 
     #[test]
@@ -2039,16 +2135,16 @@ pub(crate) mod tests {
     fn list_joins_live_metadata_stopped_and_filters_unconfigured() {
         // Config has project `api` (worktree). `ghost` is NOT configured.
         let config = test_config();
-        // Scripted exec, in call order:
-        //  1) list-sessions -> api (configured) + ghost (unconfigured) +
-        //     `main` & `remora__bad` (unparseable) — only api survives.
-        //  2) show-environment for api/fix-login -> metadata
+        // Scripted exec, in call order (two listings then the worktree scan, #108):
+        //  1) list-sessions names -> api (configured) + ghost (unconfigured) +
+        //     `main` & `remora__bad` (unparseable). Only api survives.
+        //  2) list-sessions inline metadata -> enrichment keyed by trusted name.
         //  3) git worktree list for api -> fix-login (live) + add-tests (stopped)
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out(
                 "remora_api_fix-login\nremora_ghost_x\nmain\nremora__bad\n",
             )),
-            Ok(FakeExec::out("REMORA_AGENT=claude\nREMORA_CREATED_AT=1765500000\n")),
+            Ok(FakeExec::out("remora_api_fix-login\tclaude\t\t1765500000\n")),
             Ok(FakeExec::out(
                 "worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n\n\
                  worktree /home/dev/.remora/worktrees/api/add-tests\nbranch refs/heads/remora/add-tests\n",
@@ -2266,15 +2362,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn list_keeps_session_live_when_show_environment_fails() {
-        // The session is listed live, but its show-environment read flakes
-        // (race: it could die between list-sessions and the metadata read).
-        // The session must stay Live with empty metadata, not be downgraded.
+    fn list_keeps_session_live_when_metadata_read_flakes() {
+        // The session is in the trusted names listing, but the inline-metadata
+        // read flakes (transient, or tmux < 3.0). It must stay Live with empty
+        // metadata, not be downgraded — metadata is best-effort enrichment (#108).
         let config = test_config();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")), // list-sessions
-            Ok(FakeExec::fail("connection reset")),      // show-environment flakes
-            Ok(FakeExec::out("")),                       // worktree list: empty
+            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names: live set
+            Ok(FakeExec::fail("connection reset")),      // 2) metadata read flakes
+            Ok(FakeExec::out("")),                       // 3) worktree list: empty
         ]);
         let metas = run_list(&fake, &config).expect("list");
         assert_eq!(metas.len(), 1);
@@ -2284,15 +2380,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn list_ignores_phantom_row_not_in_trusted_names() {
+        // A forged env value with an embedded newline fabricates an extra inline
+        // metadata row (`remora_api_evil...`). Because the live set comes from the
+        // trusted names-only listing, the phantom name — absent there — must be
+        // dropped, never surfaced as a Live session (#108 regression guard).
+        let config = test_config();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names: ONLY the real session
+            Ok(FakeExec::out(
+                "remora_api_fix-login\tx\t\t\n\
+                 remora_api_evil\t/ws\t9999999999\t\n", // 2) metadata: real + injected phantom
+            )),
+            Ok(FakeExec::out("")), // 3) worktree list: empty
+        ]);
+        let metas = run_list(&fake, &config).expect("list");
+        assert_eq!(metas.len(), 1, "phantom must not appear: {metas:?}");
+        assert_eq!(metas[0].session_id.as_str(), "fix-login");
+    }
+
+    #[test]
     fn list_survives_worktree_list_failure_per_decision_8() {
         // A failed `git worktree list` for one project yields empty for that
         // project, never a failed discovery (decision 8): the live session
         // still lists, just with no Stopped twin.
         let config = test_config();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")), // list-sessions
-            Ok(FakeExec::out("REMORA_AGENT=claude\n")),  // show-environment
-            Ok(FakeExec::fail("fatal: not a git repository")), // worktree list fails
+            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names: live set
+            Ok(FakeExec::out("remora_api_fix-login\tclaude\t\t\n")), // 2) inline metadata
+            Ok(FakeExec::fail("fatal: not a git repository")), // 3) worktree list fails
         ]);
         let metas = run_list(&fake, &config).expect("list must not fail");
         assert_eq!(metas.len(), 1);
