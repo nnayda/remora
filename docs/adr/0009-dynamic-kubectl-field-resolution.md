@@ -86,7 +86,7 @@ discovery poll. Safety rests entirely on the guarantee inherited from ADR-0004:
 config is a local, self-authored file. Syncing or relaying a config that contains
 `{ command }` fields to another device is out of trust scope; such fields in a
 relayed config must be rejected or stripped until explicitly revisited. This is
-tracked in TODOS.md.
+tracked in #114.
 
 ## Alternatives considered
 
@@ -125,7 +125,7 @@ What becomes harder, and what we are committed to:
   backstop; users writing expensive selectors accept that cost.
 - The single-active-pod assumption and the masked-ambiguity behaviour are now
   documented behaviour; active ambiguity detection is a follow-up, tracked in
-  TODOS.md.
+  #115.
 - ssh has an analogous dynamic-host scenario (a bastion whose hostname changes).
   `resolve_local_command` is written to be reusable there, but ssh dynamic-host
   support is not implemented in this issue and is deferred to future work.

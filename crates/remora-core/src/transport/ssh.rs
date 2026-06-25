@@ -88,7 +88,7 @@ fn ssh_base_argv(host: &SshHost, interactive: bool) -> Vec<String> {
     argv.push("ServerAliveCountMax=3".into());
     // Bound the connect phase so an unreachable/slow host fails fast instead
     // of parking a spawn_blocking thread. Execution-phase hangs (a wedged
-    // remote git/tmux) are not covered — see TODOS.md (execution watchdog).
+    // remote git/tmux) are not covered — see #99 (execution watchdog).
     argv.push("-o".into());
     argv.push("ConnectTimeout=10".into());
     if let Some(port) = host.port {
