@@ -564,9 +564,8 @@ mod tests {
             .position(|a| a == "new-session")
             .expect("new-session");
         // Still exactly one agent-command arg after `-c <dir>` (wrapped, not
-        // per-token), followed by the remain-on-exit, mouse, and allow-passthrough
-        // 6-token trailers.
-        assert_eq!(argv.len(), n + 7 + 6 + 6 + 6);
+        // per-token), followed by the remain-on-exit and mouse 6-token trailers.
+        assert_eq!(argv.len(), n + 7 + 6 + 6);
         // The inner string the ssh login shell yields (tmux's `sh -c` re-parses
         // it) is the wrapped compound built from the joined agent fragment.
         let fragment = join_agent_command(&plan.agent_argv);
