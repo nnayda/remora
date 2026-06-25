@@ -38,7 +38,7 @@ Remora's own tmux session, recognized by generic (never agent-specific) code:
   passthrough envelope so tmux forwards it to attached clients and strips the
   envelope:
 
-  ```
+  ```text
   inner:    ESC ] 7366 ; remora ; <ver> ; <type> ; <base64-payload> BEL
   on-wire:  ESC P tmux ; ESC ESC ] 7366 ; remora;<ver>;<type>;<b64> BEL ESC \
   ```
@@ -134,8 +134,8 @@ Harder, and what we commit to / must still resolve in #55/#61:
   there). Remora's one-session=one-window=one-pane topology guarantees this; a
   future multi-window layout must add a guard/test, not just honor a doc note.
 
-Follow-ups: implement the parser/event/sanitizer and client handler under
-#55/#61; add the passthrough trailer to `new_session_tokens`; **re-run the spike
+Follow-ups: implement the parser/event/sanitizer and client handler under #55/#61;
+add the passthrough trailer to `new_session_tokens`; **re-run the spike
 harness over `kubectl exec`** (the spike proved ssh; kubectl shares the identical
 post-attach `open_pty` PTY byte path but differs in PTY flags and an in-pod
 TERM/locale preamble, and was not live-run — RBAC); add an integration test that
