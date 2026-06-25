@@ -250,8 +250,6 @@ function App() {
     setDialogOpen(true);
   }
 
-  const working = activeTab?.status === "live" && activeActivity === "working";
-
   return (
     <main className={`rk-app rk-app--${mobilePane}`}>
       <div className="rk-app__sidebar">
@@ -412,15 +410,6 @@ function App() {
             ))
           )}
         </div>
-        {working && (
-          <div className="rk-workstrip" role="status">
-            <StatusIndicator state="working" />
-            <span>
-              Agent is working — <span className="rk-workstrip__kbd">⌘.</span>{" "}
-              to interrupt
-            </span>
-          </div>
-        )}
       </div>
       {panelOpen && (
         <div className="rk-app__panel">

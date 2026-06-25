@@ -1,7 +1,7 @@
 /* ============================================================
    REMORA — .rk-* SHELL GRAMMAR
    Ported from notes/design-system/ui_kits/remora-app/index.html.
-   Adaptations: composer -> status-only .rk-workstrip; diff-panel
+   Adaptations: composer dropped (terminal is the sole input); diff-panel
    empty state; sidebar search input; token-based .rk-pane-status
    placeholder; .rk-term__host xterm mount target. Reset lives in
    global.css; tokens in tokens.css.
@@ -470,18 +470,6 @@
   gap: var(--space-4);
 }
 
-/* ---------- WORKING STRIP (status-only; replaces the kit composer) ---------- */
-.rk-workstrip {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-3) var(--space-7);
-  border-top: 1px solid var(--border-hairline);
-  background: var(--bg-app);
-  font: var(--type-meta);
-  color: var(--text-secondary);
-}
-
 /* ---------- PEEK PANEL / DIFF ---------- */
 .rk-panel {
   height: 100%;
@@ -685,11 +673,6 @@
   color: var(--text-muted);
   font-size: var(--text-sm);
 }
-.rk-workstrip__kbd {
-  font-family: var(--font-mono);
-  color: var(--text-muted);
-}
-
 /* ---------- SIDEBAR: brand, banners, empty, footer, open-tab marker ---------- */
 .rk-brand,
 .rk-sidebar__brand {
