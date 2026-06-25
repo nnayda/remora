@@ -493,6 +493,20 @@ mod tests {
     }
 
     #[test]
+    fn base_argv_carries_no_ssh_connection_multiplexing_options() {
+        // #63 is scoped to direct ssh: ssh connection multiplexing
+        // (`ControlMaster`/`ControlPath`/`ControlPersist`) is an ssh-transport
+        // detail and must never leak into the kubectl argv, which reuses no
+        // ssh master and shares no socket. Belt-and-suspenders for the
+        // structural guarantee that kubectl builds its own argv from scratch.
+        let argv = kubectl_base_argv(&host("sandbox-0", None, None, None), true);
+        assert!(
+            !argv.iter().any(|a| a.starts_with("Control") || a == "-o"),
+            "kubectl argv must carry no ssh multiplexing options: {argv:?}"
+        );
+    }
+
+    #[test]
     fn run_argv_joins_tokens_under_sh_c_without_request_timeout() {
         let tokens = vec![
             "tmux".to_string(),
