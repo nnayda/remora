@@ -1,9 +1,11 @@
 import type { RefObject } from "react";
+import type { ActivityState } from "./activity-store";
 import type { Tab } from "./session-store";
 
 interface TabBarProps {
   tabs: Tab[];
   activeKey: string | null;
+  activity: ReadonlyMap<string, ActivityState>;
   onFocus: (key: string) => void;
   onClose: (key: string) => void;
   onNew: () => void;
@@ -14,6 +16,7 @@ interface TabBarProps {
 export function TabBar({
   tabs,
   activeKey,
+  activity,
   onFocus,
   onClose,
   onNew,
@@ -47,6 +50,16 @@ export function TabBar({
                 className={`tab-status tab-status--${t.status}`}
                 aria-hidden="true"
               />
+              {t.status === "live" &&
+                (() => {
+                  const a = activity.get(t.key);
+                  return a && a !== "unknown" ? (
+                    <span
+                      className={`tab-activity tab-activity--${a}`}
+                      aria-hidden="true"
+                    />
+                  ) : null;
+                })()}
               {label}
             </button>
             <button
