@@ -1,0 +1,48 @@
+.rmra-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--mono-xs);
+  font-weight: var(--weight-medium);
+  height: 20px;
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-xs);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-hairline);
+  white-space: nowrap;
+}
+.rmra-tag__icon {
+  display: inline-flex;
+  font-size: 12px;
+  opacity: 0.85;
+}
+.rmra-tag__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  margin-right: -2px;
+  margin-left: 1px;
+  padding: 0;
+  border: none;
+  background: none;
+  font: inherit;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  color: var(--text-muted);
+  transition: var(--transition-control);
+}
+.rmra-tag__close:hover {
+  background: var(--bg-active);
+  color: var(--text-primary);
+}
+.rmra-tag--branch {
+  color: var(--accent);
+}
+.rmra-tag--branch .rmra-tag__icon {
+  color: var(--accent);
+  opacity: 1;
+}

@@ -1,0 +1,137 @@
+.dmx-root {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+  --dmx-cycle: 1500ms;
+  --dmx-opacity-base: 0.16;
+  --dmx-opacity-mid: 0.32;
+  --dmx-opacity-peak: 1;
+  --dmx-halo-level: 0;
+}
+.dmx-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-rows: repeat(5, minmax(0, 1fr));
+  width: 100%;
+  height: 100%;
+  place-items: center;
+}
+.dmx-dot {
+  border-radius: 999px;
+  background: var(--dmx-dot-fill, currentColor);
+  will-change: opacity;
+  --dmx-bloom-level: 0;
+  opacity: calc(0.5 * (var(--dmx-opacity-base) + var(--dmx-opacity-mid)));
+  transition: opacity 140ms linear;
+}
+.dmx-dot.dmx-inactive {
+  /* biome-ignore lint/complexity/noImportantStyles: must override the per-dot inline opacity */
+  opacity: 0 !important;
+  /* biome-ignore lint/complexity/noImportantStyles: must override the ring/heartbeat animations */
+  animation: none !important;
+  visibility: hidden;
+}
+.dmx-outer-snake {
+  animation: dmx-ring-snake calc(var(--dmx-cycle) * var(--dmx-speed, 1)) linear
+    infinite;
+  animation-delay: calc(
+    var(--dmx-outer-order, 0) *
+    0.0625 *
+    var(--dmx-cycle) *
+    var(--dmx-speed, 1)
+  );
+}
+.dmx-middle-snake {
+  animation: dmx-ring-snake calc(var(--dmx-cycle) * var(--dmx-speed, 1)) linear
+    infinite;
+  animation-delay: calc(
+    var(--dmx-middle-order, 0) *
+    0.125 *
+    var(--dmx-cycle) *
+    var(--dmx-speed, 1)
+  );
+}
+@keyframes dmx-ring-snake {
+  0%,
+  100% {
+    opacity: calc(0.5 * var(--dmx-opacity-base));
+  }
+  10% {
+    opacity: var(--dmx-opacity-peak);
+  }
+  20% {
+    opacity: calc(
+      0.45 *
+      var(--dmx-opacity-peak) +
+      0.45 *
+      var(--dmx-opacity-mid) +
+      0.1 *
+      var(--dmx-opacity-base)
+    );
+  }
+  30% {
+    opacity: calc(
+      0.2 *
+      var(--dmx-opacity-peak) +
+      0.4 *
+      var(--dmx-opacity-mid) +
+      0.4 *
+      var(--dmx-opacity-base)
+    );
+  }
+  40% {
+    opacity: calc(0.875 * var(--dmx-opacity-base));
+  }
+}
+/* PULSE — a calm, steady breathing glow (center-out), gentle on the eyes */
+.dmx-heartbeat {
+  animation: dmx-heartbeat calc(var(--dmx-cycle) * var(--dmx-speed, 1))
+    cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  animation-delay: calc(
+    var(--dmx-dist-norm, 0) *
+    0.06 *
+    var(--dmx-cycle) *
+    var(--dmx-speed, 1)
+  );
+}
+@keyframes dmx-heartbeat {
+  0%,
+  100% {
+    opacity: var(--dmx-opacity-base);
+    --dmx-bloom-level: 0;
+  }
+  50% {
+    opacity: var(--dmx-opacity-peak);
+    --dmx-bloom-level: 0.55;
+  }
+}
+.dmx-bloom .dmx-dot {
+  filter: drop-shadow(
+      0 0
+        calc(
+          var(--dmx-dot-size, 3px) *
+          0.85 *
+          max(var(--dmx-bloom-level, 0), var(--dmx-halo-level, 0))
+        )
+        currentColor
+    )
+    drop-shadow(
+      0 0
+        calc(
+          var(--dmx-dot-size, 3px) *
+          1.5 *
+          max(var(--dmx-bloom-level, 0), var(--dmx-halo-level, 0))
+        )
+        currentColor
+    );
+}
+@media (prefers-reduced-motion: reduce) {
+  .dmx-dot,
+  .dmx-outer-snake,
+  .dmx-middle-snake,
+  .dmx-heartbeat {
+    /* biome-ignore lint/complexity/noImportantStyles: reduced-motion must override the matrix animations */
+    animation: none !important;
+  }
+}

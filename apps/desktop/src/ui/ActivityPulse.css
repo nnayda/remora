@@ -1,0 +1,78 @@
+.rmra-pulse {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+.rmra-pulse__core {
+  border-radius: 50%;
+  position: relative;
+  z-index: 1;
+}
+.rmra-pulse--sm .rmra-pulse__core {
+  width: 7px;
+  height: 7px;
+}
+.rmra-pulse--md .rmra-pulse__core {
+  width: 9px;
+  height: 9px;
+}
+.rmra-pulse--lg .rmra-pulse__core {
+  width: 11px;
+  height: 11px;
+}
+
+/* IDLE — quiet, no motion */
+.rmra-pulse--idle .rmra-pulse__core {
+  background: var(--text-muted);
+}
+
+/* DONE — calm success, no motion */
+.rmra-pulse--done .rmra-pulse__core {
+  background: var(--success);
+}
+
+/* ERROR — static danger */
+.rmra-pulse--error .rmra-pulse__core {
+  background: var(--danger);
+}
+
+/* WORKING — calm breathing accent ring (the signature) */
+.rmra-pulse--working .rmra-pulse__core {
+  background: var(--accent-bright);
+}
+.rmra-pulse--working .rmra-pulse__ring {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  border-radius: 50%;
+  width: 100%;
+  height: 100%;
+  background: var(--accent-bright);
+  animation: remora-pulse var(--dur-pulse) var(--ease-pulse) infinite;
+}
+
+/* NEEDS-YOU — faster, higher-contrast attention beat */
+.rmra-pulse--needs .rmra-pulse__core {
+  background: var(--accent-bright);
+  box-shadow: var(--glow-pulse);
+}
+.rmra-pulse--needs .rmra-pulse__ring {
+  position: absolute;
+  inset: -3px;
+  margin: auto;
+  border-radius: 50%;
+  border: 1.5px solid var(--accent-bright);
+  animation: remora-attention 900ms var(--ease-pulse) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* biome-ignore lint/style/noDescendingSpecificity: reduced-motion reset intentionally follows the animated state rules */
+  .rmra-pulse__ring {
+    /* biome-ignore lint/complexity/noImportantStyles: must override the working/needs ring animation */
+    animation: none !important;
+    /* biome-ignore lint/complexity/noImportantStyles: freeze the ring at a calm static opacity */
+    opacity: 0.4 !important;
+  }
+}

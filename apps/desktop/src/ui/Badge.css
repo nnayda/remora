@@ -1,0 +1,60 @@
+.rmra-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-family: var(--font-sans);
+  font-weight: var(--weight-semibold);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  height: 18px;
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-xs);
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.rmra-badge--neutral {
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+  border-color: var(--border-hairline);
+}
+.rmra-badge--accent {
+  background: var(--accent-subtle);
+  color: var(--accent);
+  border-color: var(--accent-border);
+}
+.rmra-badge--success {
+  background: var(--success-bg);
+  color: var(--success);
+}
+.rmra-badge--warning {
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+.rmra-badge--danger {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+.rmra-badge--info {
+  background: var(--info-bg);
+  color: var(--info);
+}
+.rmra-badge__dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.rmra-badge--solid.rmra-badge--accent {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-color: transparent;
+}
+.rmra-badge--count {
+  text-transform: none;
+  letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+  min-width: 18px;
+  justify-content: center;
+  padding: 0 var(--space-2);
+}

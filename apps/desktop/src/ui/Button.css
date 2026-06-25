@@ -1,0 +1,109 @@
+.rmra-btn {
+  font-family: var(--font-sans);
+  font-weight: var(--weight-medium);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+  transition:
+    var(--transition-control),
+    box-shadow var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out);
+  outline: none;
+}
+.rmra-btn:focus-visible {
+  box-shadow: var(--glow-accent);
+}
+.rmra-btn:active:not(:disabled) {
+  transform: translateY(0.5px);
+}
+.rmra-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* sizes */
+.rmra-btn--sm {
+  height: var(--h-control-sm);
+  padding: 0 var(--space-5);
+  font-size: var(--text-xs);
+  border-radius: var(--radius-xs);
+}
+.rmra-btn--md {
+  height: var(--h-control);
+  padding: 0 var(--space-7);
+  font-size: var(--text-sm);
+}
+.rmra-btn--lg {
+  height: var(--h-control-lg);
+  padding: 0 var(--space-10);
+  font-size: var(--text-md);
+}
+
+/* primary */
+.rmra-btn--primary {
+  background: var(--accent);
+  color: var(--on-accent);
+  box-shadow: var(--shadow-xs);
+}
+.rmra-btn--primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+.rmra-btn--primary:active:not(:disabled) {
+  background: var(--accent-press);
+}
+
+/* secondary */
+.rmra-btn--secondary {
+  background: var(--bg-panel);
+  color: var(--text-primary);
+  border-color: var(--border-default);
+  box-shadow: var(--ring-inset-top);
+}
+.rmra-btn--secondary:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+
+/* ghost */
+.rmra-btn--ghost {
+  background: transparent;
+  color: var(--text-secondary);
+}
+.rmra-btn--ghost:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+/* danger */
+.rmra-btn--danger {
+  background: transparent;
+  color: var(--danger);
+  border-color: var(--border-default);
+}
+.rmra-btn--danger:hover:not(:disabled) {
+  background: var(--danger-bg);
+  border-color: var(--danger);
+}
+
+.rmra-btn__spin {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+  border-top-color: transparent;
+  animation: rmra-spin 0.6s linear infinite;
+}
+@keyframes rmra-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.rmra-btn--full {
+  width: 100%;
+}
