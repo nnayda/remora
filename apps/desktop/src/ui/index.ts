@@ -4,7 +4,6 @@ export * from "./Badge";
 export * from "./Button";
 export * from "./Checkbox";
 export * from "./Dialog";
-export * from "./DotmLoader";
 export * from "./IconButton";
 export * from "./Input";
 export type { IconProps } from "./icons";

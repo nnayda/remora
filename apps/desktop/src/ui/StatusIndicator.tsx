@@ -1,35 +1,26 @@
 import type { IndicatorState } from "../status-state";
-import { DotmLoader } from "./DotmLoader";
+import { ActivityPulse } from "./ActivityPulse";
 
 /* ============================================================
    StatusIndicator — the canonical inline agent-state dot.
-   A thin wrapper around DotmLoader locked to the small
-   "indicator" scale. This is the SINGLE SOURCE OF TRUTH for
-   how a session's state reads inside rows, tabs and lists:
-   tune size / dotSize here and every consumer updates.
-   For the hero/booting loader, use DotmLoader directly.
+   A thin wrapper around ActivityPulse locked to the small
+   inline scale. This is the SINGLE SOURCE OF TRUTH for how a
+   session's state reads inside rows, tabs and lists: tune the
+   scale here and every consumer updates.
    ============================================================ */
 
-// Canonical inline-indicator scale. Change these to restyle
-// the dot everywhere it appears inline.
-export const STATUS_INDICATOR_SIZE = 12;
-export const STATUS_INDICATOR_DOT_SIZE = 2;
-
 export interface StatusIndicatorProps
-  extends Omit<React.HTMLAttributes<HTMLDivElement>, "color"> {
+  extends Omit<React.HTMLAttributes<HTMLSpanElement>, "color"> {
   /** Agent state — sets color token and animation. @default "idle" */
   state?: IndicatorState;
-  /** Outer box size in px (grid is always 5×5). @default 12 */
-  size?: number;
-  /** Dot diameter in px. @default 2 */
-  dotSize?: number;
+  /** Indicator scale. @default "sm" */
+  size?: "sm" | "md" | "lg";
 }
 
 export function StatusIndicator({
   state = "idle",
-  size = STATUS_INDICATOR_SIZE,
-  dotSize = STATUS_INDICATOR_DOT_SIZE,
+  size = "sm",
   ...props
 }: StatusIndicatorProps) {
-  return <DotmLoader state={state} size={size} dotSize={dotSize} {...props} />;
+  return <ActivityPulse state={state} size={size} {...props} />;
 }

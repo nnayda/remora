@@ -7,7 +7,6 @@ import {
   Button,
   Checkbox,
   Dialog,
-  DotmLoader,
   IconButton,
   Input,
   Select,
@@ -466,22 +465,6 @@ export function Showcase() {
                 style={{ display: "flex", alignItems: "center", gap: 6 }}
               >
                 <StatusIndicator state={s} />
-                <span className="sc-swatch__name">{s}</span>
-              </div>
-            ))}
-          </Row>
-          <Row label="DotmLoader — the hero loader (working / needs animate)">
-            {INDICATOR_STATES.map((s) => (
-              <div
-                key={s}
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  alignItems: "center",
-                  gap: 8,
-                }}
-              >
-                <DotmLoader state={s} size={56} />
                 <span className="sc-swatch__name">{s}</span>
               </div>
             ))}

@@ -23,9 +23,9 @@
   height: 11px;
 }
 
-/* IDLE — quiet, no motion */
+/* IDLE — quiet, no motion (lighter gray so it reads on the dark app bg) */
 .rmra-pulse--idle .rmra-pulse__core {
-  background: var(--text-muted);
+  background: var(--text-secondary);
 }
 
 /* DONE — calm success, no motion */

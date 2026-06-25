@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   elevation/motion), an inline Lucide-geometry icon set, and a TSX component
   library at `apps/desktop/src/ui/` (Button, IconButton, Tag, Badge, Avatar,
   Input, Select, Switch, Checkbox, Dialog, Toast, Tooltip, plus the session hero
-  surfaces StatusIndicator/DotmLoader/ActivityPulse/SessionRow/SessionTab). The
+  surfaces StatusIndicator/ActivityPulse/SessionRow/SessionTab). The
   shell becomes sidebar → tabs → session bar → first-class xterm terminal → a
   working-status strip, with a Files & diff peek panel (`⌘\\` toggle, empty-state
   shell until a diff backend lands) and a desktop→mobile single-pane fold. The
