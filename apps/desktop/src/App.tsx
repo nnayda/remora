@@ -5,7 +5,7 @@ import { ConfirmRemoveDialog } from "./ConfirmRemoveDialog";
 import { NewSessionDialog } from "./NewSessionDialog";
 import { SettingsDialog } from "./SettingsDialog";
 import { Sidebar } from "./Sidebar";
-import { OPEN_CANCELLED } from "./session-store";
+import { canRespawn, OPEN_CANCELLED } from "./session-store";
 import { buildTree, type SessionNode } from "./session-tree";
 import { TabBar } from "./TabBar";
 import { Terminal, type TerminalHandle } from "./Terminal";
@@ -87,6 +87,8 @@ function App() {
         projectId: node.projectId,
         sessionId: node.sessionId,
         agent: node.agent,
+        base: null,
+        workspace: node.workspace ?? "worktree",
       })
         .then((r) => {
           if (!r.ok && r.error !== OPEN_CANCELLED) {
@@ -109,6 +111,8 @@ function App() {
       projectId: node.projectId,
       sessionId: node.sessionId,
       agent: node.agent,
+      base: null,
+      workspace: node.workspace ?? "worktree",
     })
       .then((result) => {
         if (!result.ok && result.error !== OPEN_CANCELLED) {
@@ -172,12 +176,27 @@ function App() {
     });
   }
 
-  /** Dialog success callback: close it, note an attach-vs-spawn outcome, restore
+  /** Dialog success callback: close it, note an attach-vs-spawn outcome, route
    * focus, and re-list sessions now (a fresh spawn changed server state). */
   function handleOpened(attached: boolean) {
     setDialogOpen(false);
     setNotice(attached ? "Attached to an existing session." : null);
-    newButtonRef.current?.focus();
+    if (attached) {
+      // Attaching an already-running session opens no fresh terminal to type
+      // into, so keep focus on the + button (matching the cancel/fail paths).
+      newButtonRef.current?.focus();
+    } else {
+      // Fresh spawn: route into the same focus path a tab/sidebar pick uses so
+      // the new terminal grabs focus once it's live — typing the first prompt
+      // is the most common next action (#78). openSession already flipped
+      // activeKey to the new tab; arming the intent flag (a ref, set before any
+      // passive effect runs) lets the focus effect claim it post-paint. The
+      // dialog's unmount restores focus to the + button during commit, but the
+      // effect re-focuses the terminal via a deferred rAF that runs after that
+      // commit — so the terminal wins. Cancel/fail never reach here (the dialog
+      // only calls back on success), so they keep button focus.
+      focusOnSelect.current = true;
+    }
     // A fresh spawn changed server state, so re-list now rather than waiting a
     // poll tick; an attach didn't, but a redundant list is cheap and keeps the
     // call site simple.
@@ -252,12 +271,14 @@ function App() {
                   <div className="pane-status" role="status">
                     <p>Session stopped{t.error ? `: ${t.error}` : "."}</p>
                     <div className="pane-status-actions">
-                      <button
-                        type="button"
-                        onClick={() => void respawnTab(t.key)}
-                      >
-                        Respawn
-                      </button>
+                      {canRespawn(t.workspace) && (
+                        <button
+                          type="button"
+                          onClick={() => void respawnTab(t.key)}
+                        >
+                          Respawn
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => onRemoveTab(t.projectId, t.sessionId)}
@@ -270,12 +291,14 @@ function App() {
                   <div className="pane-status pane-status--error" role="alert">
                     <p>Disconnected: {t.error}</p>
                     <div className="pane-status-actions">
-                      <button
-                        type="button"
-                        onClick={() => void respawnTab(t.key)}
-                      >
-                        Respawn
-                      </button>
+                      {canRespawn(t.workspace) && (
+                        <button
+                          type="button"
+                          onClick={() => void respawnTab(t.key)}
+                        >
+                          Respawn
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => onRemoveTab(t.projectId, t.sessionId)}

@@ -4,7 +4,9 @@ use tauri::ipc::Channel;
 use tauri_specta::{collect_commands, Builder};
 
 use crate::bridge::dto::ConfigDto;
-use crate::bridge::editor_dto::{AgentInputDto, EditableConfigDto, HostInputDto, ProjectInputDto};
+use crate::bridge::editor_dto::{
+    AgentInputDto, EditableConfigDto, HostInputDto, ProjectInputDto, WorkspaceModeDto,
+};
 use crate::bridge::error::{BridgeError, SessionMetaDto};
 use crate::bridge::output::{BridgeOutput, ChannelHandle, ChannelSink};
 use crate::bridge::Bridge;
@@ -30,6 +32,8 @@ async fn session_spawn(
     project_id: String,
     session_id: String,
     agent: Option<String>,
+    base: Option<String>,
+    workspace: Option<WorkspaceModeDto>,
     on_output: Channel<BridgeOutput>,
 ) -> Result<ChannelHandle, BridgeError> {
     bridge
@@ -37,6 +41,8 @@ async fn session_spawn(
             project_id,
             session_id,
             agent,
+            base,
+            workspace.map(Into::into),
             Arc::new(ChannelSink(on_output)),
         )
         .await

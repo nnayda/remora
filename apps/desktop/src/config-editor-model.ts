@@ -61,6 +61,10 @@ export interface HostFormState {
   namespace: string;
   context: string;
   container: string;
+  podIsCommand: boolean;
+  namespaceIsCommand: boolean;
+  contextIsCommand: boolean;
+  containerIsCommand: boolean;
 }
 
 export function emptyHostForm(): HostFormState {
@@ -75,6 +79,10 @@ export function emptyHostForm(): HostFormState {
     namespace: "",
     context: "",
     container: "",
+    podIsCommand: false,
+    namespaceIsCommand: false,
+    contextIsCommand: false,
+    containerIsCommand: false,
   };
 }
 
@@ -88,10 +96,20 @@ export function hostFormFromDto(dto: EditorHostDto): HostFormState {
     form.port = t.port === null ? "" : String(t.port);
   } else {
     form.kind = "kubectl";
-    form.pod = t.pod;
-    form.namespace = t.namespace ?? "";
-    form.context = t.context ?? "";
-    form.container = t.container ?? "";
+    form.pod = t.pod.value;
+    form.podIsCommand = t.pod.command;
+    if (t.namespace) {
+      form.namespace = t.namespace.value;
+      form.namespaceIsCommand = t.namespace.command;
+    }
+    if (t.context) {
+      form.context = t.context.value;
+      form.contextIsCommand = t.context.command;
+    }
+    if (t.container) {
+      form.container = t.container.value;
+      form.containerIsCommand = t.container.command;
+    }
   }
   return form;
 }
@@ -116,6 +134,14 @@ export function validateHostForm(
   return null;
 }
 
+function fieldDto(value: string, isCommand: boolean) {
+  return { command: isCommand, value: value.trim() };
+}
+
+function optionalFieldDto(value: string, isCommand: boolean) {
+  return value.trim() === "" ? null : fieldDto(value, isCommand);
+}
+
 export function toHostInput(form: HostFormState): HostInputDto {
   const transport =
     form.kind === "ssh"
@@ -127,10 +153,10 @@ export function toHostInput(form: HostFormState): HostInputDto {
         }
       : {
           kind: "kubectl" as const,
-          pod: form.pod.trim(),
-          namespace: blankToNull(form.namespace),
-          context: blankToNull(form.context),
-          container: blankToNull(form.container),
+          pod: fieldDto(form.pod, form.podIsCommand),
+          namespace: optionalFieldDto(form.namespace, form.namespaceIsCommand),
+          context: optionalFieldDto(form.context, form.contextIsCommand),
+          container: optionalFieldDto(form.container, form.containerIsCommand),
         };
   return { name: blankToNull(form.name), transport };
 }
@@ -144,6 +170,7 @@ export interface ProjectFormState {
   path: string;
   workspace: WorkspaceModeDto;
   agent: string;
+  base: string;
 }
 
 /** A blank project form, preselecting the first existing host and agent so the
@@ -159,6 +186,7 @@ export function emptyProjectForm(
     path: "",
     workspace: "worktree",
     agent: agentIds[0] ?? "",
+    base: "",
   };
 }
 
@@ -170,6 +198,7 @@ export function projectFormFromDto(dto: EditorProjectDto): ProjectFormState {
     path: dto.path,
     workspace: dto.workspace,
     agent: dto.agent,
+    base: dto.base ?? "",
   };
 }
 
@@ -196,6 +225,7 @@ export function toProjectInput(form: ProjectFormState): ProjectInputDto {
     path: form.path.trim(),
     workspace: form.workspace,
     agent: form.agent,
+    base: blankToNull(form.base),
   };
 }
 

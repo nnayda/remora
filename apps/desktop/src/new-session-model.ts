@@ -1,4 +1,4 @@
-import type { ConfigDto } from "./bindings";
+import type { ConfigDto, WorkspaceModeDto } from "./bindings";
 
 /** One selectable project in the new-session dialog, with its host and default
  * agent resolved from config so the dialog never has to re-join. */
@@ -11,6 +11,8 @@ export interface ProjectOption {
   hostLabel: string;
   /** The project's default agent id; preselected in the agent picker. */
   defaultAgent: string;
+  /** The project's workspace mode; determines whether sessions can be respawned. */
+  defaultWorkspace: WorkspaceModeDto;
 }
 
 /** Everything the new-session dialog needs to render its pickers, derived from
@@ -31,6 +33,7 @@ export function buildNewSessionModel(config: ConfigDto): NewSessionModel {
       label: p.name ?? p.id,
       hostLabel: hostLabels.get(p.hostId) ?? p.hostId,
       defaultAgent: p.agent,
+      defaultWorkspace: p.workspace,
     })),
     agents: config.agents.map((a) => a.id),
   };
@@ -40,6 +43,7 @@ export function buildNewSessionModel(config: ConfigDto): NewSessionModel {
 export interface Selection {
   projectId: string;
   agent: string;
+  workspace: WorkspaceModeDto;
 }
 
 /**
@@ -55,5 +59,9 @@ export function resolveSelection(
 ): Selection {
   const project =
     model.projects.find((p) => p.id === projectId) ?? model.projects[0] ?? null;
-  return { projectId: project?.id ?? "", agent: project?.defaultAgent ?? "" };
+  return {
+    projectId: project?.id ?? "",
+    agent: project?.defaultAgent ?? "",
+    workspace: project?.defaultWorkspace ?? "worktree",
+  };
 }

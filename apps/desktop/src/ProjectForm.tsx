@@ -8,6 +8,7 @@ import {
   validateProjectForm,
 } from "./config-editor-model";
 import { formErrorMessage } from "./form-error";
+import { normalizeSlugInput } from "./spawn-input";
 
 interface ProjectFormProps {
   mode: FormMode;
@@ -86,7 +87,7 @@ export function ProjectForm({
           Id
           <input
             value={form.id}
-            onChange={(e) => set("id", e.target.value)}
+            onChange={(e) => set("id", normalizeSlugInput(e.target.value))}
             placeholder="api"
             // biome-ignore lint/a11y/noAutofocus: first field of an opened form
             autoFocus
@@ -146,6 +147,14 @@ export function ProjectForm({
             </option>
           ))}
         </select>
+      </label>
+      <label>
+        Base (optional)
+        <input
+          value={form.base}
+          placeholder="origin/main (auto-detected if empty)"
+          onChange={(e) => set("base", e.target.value)}
+        />
       </label>
       {error && (
         <p className="dialog-error" role="alert">

@@ -15,7 +15,7 @@ use tempfile::NamedTempFile;
 use toml_edit::{value, Array, DocumentMut, Item, Table};
 
 use super::{
-    Agent, AgentId, Config, ConfigError, Host, HostId, Project, ProjectId, Transport,
+    Agent, AgentId, Config, ConfigError, Host, HostId, KubectlField, Project, ProjectId, Transport,
     ValidationIssue,
 };
 
@@ -344,6 +344,21 @@ fn remove_entry(
     Ok(())
 }
 
+/// Converts a `KubectlField` to a `toml_edit::Item`:
+/// - `Literal` becomes a plain string value.
+/// - `Command` becomes an inline table `{ command = "…" }`.
+fn kubectl_field_item(field: &KubectlField) -> Item {
+    use toml_edit::InlineTable;
+    match field {
+        KubectlField::Literal(v) => value(v.as_str()),
+        KubectlField::Command(c) => {
+            let mut inline = InlineTable::new();
+            inline.insert("command", c.as_str().into());
+            Item::Value(toml_edit::Value::InlineTable(inline))
+        }
+    }
+}
+
 fn host_item(host: &Host) -> Item {
     let mut t = Table::new();
     if let Some(name) = &host.name {
@@ -362,15 +377,15 @@ fn host_item(host: &Host) -> Item {
         }
         Transport::Kubectl(k) => {
             t["transport"] = value("kubectl");
-            t["pod"] = value(&k.pod);
+            t["pod"] = kubectl_field_item(&k.pod);
             if let Some(ns) = &k.namespace {
-                t["namespace"] = value(ns);
+                t["namespace"] = kubectl_field_item(ns);
             }
             if let Some(ctx) = &k.context {
-                t["context"] = value(ctx);
+                t["context"] = kubectl_field_item(ctx);
             }
             if let Some(c) = &k.container {
-                t["container"] = value(c);
+                t["container"] = kubectl_field_item(c);
             }
         }
     }
@@ -390,6 +405,9 @@ fn project_item(p: &Project) -> Item {
         WorkspaceMode::Shared => "shared",
     });
     t["agent"] = value(p.agent.as_str());
+    if let Some(base) = &p.base {
+        t["base"] = value(base);
+    }
     Item::Table(t)
 }
 
@@ -505,6 +523,7 @@ mod tests {
             path: "/x".into(),
             workspace: WorkspaceMode::Worktree,
             agent: aid("nope"),
+            base: None,
         };
         let err = doc
             .insert_project(&pid("api"), &bad)
@@ -579,7 +598,7 @@ mod tests {
             &Host {
                 name: None,
                 transport: Transport::Kubectl(KubectlHost {
-                    pod: "p".into(),
+                    pod: KubectlField::Literal("p".into()),
                     namespace: None,
                     context: None,
                     container: None,
@@ -723,6 +742,7 @@ mod tests {
             path: "/x".into(),
             workspace: WorkspaceMode::Worktree,
             agent: aid("nope"),
+            base: None,
         };
         let err = doc
             .insert_project(&pid("api2"), &dangling)
@@ -819,6 +839,22 @@ mod tests {
     }
 
     #[test]
+    fn command_form_kubectl_host_round_trips() {
+        let toml = "[hosts.staging]\ntransport = \"kubectl\"\npod = { command = \"kubectl -n sb get pods -o name | head -n1\" }\nnamespace = \"sb\"\n";
+        let original = crate::config::Config::from_toml_str(toml).expect("valid");
+
+        // Rewrite the document from the parsed config, then reparse and compare.
+        let doc = ConfigDocument::parse(toml).expect("doc");
+        let rewritten = doc.to_toml();
+        let reparsed = crate::config::Config::from_toml_str(&rewritten).expect("reparse");
+        assert_eq!(original, reparsed, "command-form host must round-trip");
+        assert!(
+            rewritten.contains("command ="),
+            "command field must serialize as an inline table: {rewritten}"
+        );
+    }
+
+    #[test]
     fn insert_project_and_agent_round_trip() {
         let mut doc =
             ConfigDocument::parse("[hosts.devbox]\ntransport = \"ssh\"\nhost = \"devbox\"\n")
@@ -833,6 +869,7 @@ mod tests {
                 path: "/srv/api".into(),
                 workspace: WorkspaceMode::Worktree,
                 agent: aid("claude"),
+                base: None,
             },
         )
         .expect("project");
@@ -854,6 +891,32 @@ mod tests {
                 .command
                 .is_empty(),
             "command survives the round-trip as empty",
+        );
+    }
+
+    #[test]
+    fn project_item_writes_and_omits_base() {
+        let mut doc =
+            ConfigDocument::parse("[hosts.h]\ntransport = \"ssh\"\nhost = \"h\"\n").expect("doc");
+        doc.insert_agent(&aid("claude"), &claude_agent())
+            .expect("agent");
+        let proj = Project {
+            name: None,
+            host: hid("h"),
+            path: "/p".into(),
+            workspace: WorkspaceMode::Worktree,
+            agent: aid("claude"),
+            base: Some("origin/develop".into()),
+        };
+        doc.insert_project(&pid("api"), &proj).expect("insert");
+        let toml = doc.to_toml();
+        assert!(toml.contains("base = \"origin/develop\""), "{toml}");
+
+        let cleared = Project { base: None, ..proj };
+        doc.update_project(&pid("api"), &cleared).expect("update");
+        assert!(
+            !doc.to_toml().contains("base ="),
+            "cleared base must be omitted"
         );
     }
 }

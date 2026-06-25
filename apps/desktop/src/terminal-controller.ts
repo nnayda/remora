@@ -51,11 +51,11 @@ export class TerminalController {
     this.term = new Terminal({ cursorBlink: true });
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
+    this.term.attachCustomKeyEventHandler((e) => this.handleKeyEvent(e));
     this.term.open(element);
     this.oscDisposable = this.term.parser.registerOscHandler(52, (data) =>
       this.handleOsc52(data),
     );
-    this.term.attachCustomKeyEventHandler((e) => this.handleKeyEvent(e));
 
     this.unsubscribe = connection.subscribe((msg) => {
       if (msg.event === "bytes") this.term.write(new Uint8Array(msg.bytes));
@@ -74,6 +74,64 @@ export class TerminalController {
     this.observer = new ResizeObserver(() => this.scheduleFit());
     this.observer.observe(element);
     this.syncSize(); // initial fit
+  }
+
+  /**
+   * Custom key handling layered over xterm. Two interceptions, both returning
+   * `false` to suppress xterm's default for that key; every other key returns
+   * `true` and falls through unchanged.
+   *
+   * 1. Shift+Enter → ESC+CR (`\x1b\r`), the soft-return sequence agents expect
+   *    to insert a newline, instead of the bare CR xterm would emit (which
+   *    submits the prompt). Agent-agnostic: it's the same byte sequence a native
+   *    terminal sends for Shift+Enter, so we're faithfully forwarding the key.
+   * 2. The copy chord — Cmd+C (macOS) or Ctrl+Shift+C (Linux/Windows) — copies
+   *    the current selection to the host clipboard and swallows the key so it is
+   *    not sent to the PTY.
+   *
+   * A bare Ctrl-C matches neither branch, so it stays SIGINT. Other modifiers
+   * (Ctrl/Alt/Meta+Enter) are left alone so their own bindings reach the agent.
+   */
+  private handleKeyEvent(event: KeyboardEvent): boolean {
+    if (
+      event.type === "keydown" &&
+      event.key === "Enter" &&
+      event.shiftKey &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      !event.metaKey
+    ) {
+      // Returning false suppresses xterm's keydown handling, but xterm never
+      // calls preventDefault on our behalf, so the browser would still fire a
+      // `keypress` for Enter and xterm would emit a stray CR there. preventDefault
+      // kills that follow-up keypress — the same thing xterm's own Enter path does.
+      event.preventDefault();
+      // Suppress the default CR either way; only write while the session lives.
+      if (!this.closed) {
+        void this.connection
+          .write(encoder.encode("\x1b\r"))
+          .catch((e) => this.logTransportError("write", e));
+      }
+      return false;
+    }
+
+    const isCopyChord =
+      event.type === "keydown" &&
+      event.code === "KeyC" &&
+      !event.altKey &&
+      ((event.metaKey && !event.ctrlKey && !event.shiftKey) ||
+        (event.ctrlKey && event.shiftKey && !event.metaKey));
+    if (isCopyChord) {
+      const selection = this.term.getSelection();
+      if (selection) {
+        void this.writeClipboard(selection).catch((err) =>
+          this.logClipboardError(err),
+        );
+      }
+      return false; // consume the chord; never forward to the PTY
+    }
+
+    return true;
   }
 
   /** Move keyboard focus into the emulator so the user can type immediately.
@@ -117,27 +175,6 @@ export class TerminalController {
     }
     void this.writeClipboard(text).catch((err) => this.logClipboardError(err));
     return true;
-  }
-
-  /** Intercept the copy chord — Cmd+C (macOS) or Ctrl+Shift+C (Linux/Windows) —
-   * copy the current selection to the clipboard, and swallow the key so it is
-   * not sent to the PTY. Everything else, including a bare Ctrl-C (which must
-   * stay SIGINT), is left for xterm to handle. */
-  private handleKeyEvent(e: KeyboardEvent): boolean {
-    const isCopyChord =
-      e.type === "keydown" &&
-      e.code === "KeyC" &&
-      !e.altKey &&
-      ((e.metaKey && !e.ctrlKey && !e.shiftKey) ||
-        (e.ctrlKey && e.shiftKey && !e.metaKey));
-    if (!isCopyChord) return true; // let xterm handle it (bare Ctrl-C stays SIGINT)
-    const selection = this.term.getSelection();
-    if (selection) {
-      void this.writeClipboard(selection).catch((err) =>
-        this.logClipboardError(err),
-      );
-    }
-    return false; // consume the chord; never forward to the PTY
   }
 
   /** Surface (don't swallow) a clipboard write rejection. Log only: a denied or
