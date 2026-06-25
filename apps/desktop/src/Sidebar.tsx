@@ -1,4 +1,5 @@
 import { useState } from "react";
+import type { ActivityState } from "./activity-store";
 import type { HostNode, ProjectNode, SessionNode } from "./session-tree";
 
 interface SidebarProps {
@@ -22,6 +23,7 @@ interface SidebarProps {
   onNewSession: (projectId: string) => void;
   /** Open the config-management (Settings) modal. */
   onOpenSettings: () => void;
+  activity: ReadonlyMap<string, ActivityState>;
 }
 
 /**
@@ -44,6 +46,7 @@ export function Sidebar({
   onRemove,
   onNewSession,
   onOpenSettings,
+  activity,
 }: SidebarProps) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const toggle = (id: string) =>
@@ -99,6 +102,7 @@ export function Sidebar({
               onStop={onStop}
               onRemove={onRemove}
               onNewSession={onNewSession}
+              activity={activity}
             />
           ))}
         </ul>
@@ -118,6 +122,7 @@ function HostRow({
   onStop,
   onRemove,
   onNewSession,
+  activity,
 }: {
   host: HostNode;
   collapsed: Set<string>;
@@ -128,6 +133,7 @@ function HostRow({
   onStop: (node: SessionNode) => void;
   onRemove: (node: SessionNode) => void;
   onNewSession: (projectId: string) => void;
+  activity: ReadonlyMap<string, ActivityState>;
 }) {
   const isCollapsed = collapsed.has(host.id);
   return (
@@ -159,6 +165,7 @@ function HostRow({
                 onStop={onStop}
                 onRemove={onRemove}
                 onNewSession={onNewSession}
+                activity={activity}
               />
             ))
           )}
@@ -181,6 +188,7 @@ function ProjectRow({
   onStop,
   onRemove,
   onNewSession,
+  activity,
 }: {
   rowId: string;
   project: ProjectNode;
@@ -192,6 +200,7 @@ function ProjectRow({
   onStop: (node: SessionNode) => void;
   onRemove: (node: SessionNode) => void;
   onNewSession: (projectId: string) => void;
+  activity: ReadonlyMap<string, ActivityState>;
 }) {
   const isCollapsed = collapsed.has(rowId);
   // Only configured projects can be pre-scoped — a synthetic "Unconfigured"
@@ -234,6 +243,7 @@ function ProjectRow({
                 onOpenSession={onOpenSession}
                 onStop={onStop}
                 onRemove={onRemove}
+                activity={activity.get(session.key)}
               />
             ))
           )}
@@ -252,6 +262,7 @@ function SessionRow({
   onOpenSession,
   onStop,
   onRemove,
+  activity,
 }: {
   session: SessionNode;
   active: boolean;
@@ -259,6 +270,7 @@ function SessionRow({
   onOpenSession: (node: SessionNode) => void;
   onStop: (node: SessionNode) => void;
   onRemove: (node: SessionNode) => void;
+  activity?: ActivityState;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const stopped = session.state === "stopped";
@@ -279,7 +291,11 @@ function SessionRow({
           }}
         >
           <span
-            className={`tree-dot tree-dot--${session.state}`}
+            className={
+              open && activity && activity !== "unknown"
+                ? `tree-dot tree-dot--${session.state} tree-dot--act-${activity}`
+                : `tree-dot tree-dot--${session.state}`
+            }
             aria-hidden="true"
           />
           <span className="tree-label">{session.sessionId}</span>

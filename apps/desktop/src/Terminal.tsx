@@ -13,20 +13,22 @@ export interface TerminalHandle {
  * pane is the visible one. */
 export const Terminal = forwardRef<
   TerminalHandle,
-  { connection: SessionConnection }
->(function Terminal({ connection }, ref) {
+  { connection: SessionConnection; sessionKey?: string }
+>(function Terminal({ connection, sessionKey }, ref) {
   const elRef = useRef<HTMLDivElement>(null);
   const controllerRef = useRef<TerminalController | null>(null);
   useEffect(() => {
     const el = elRef.current;
     if (!el) return;
-    const controller = new TerminalController(el, connection);
+    const controller = new TerminalController(el, connection, undefined, {
+      sessionKey,
+    });
     controllerRef.current = controller;
     return () => {
       controller.dispose();
       controllerRef.current = null;
     };
-  }, [connection]);
+  }, [connection, sessionKey]);
   useImperativeHandle(
     ref,
     () => ({

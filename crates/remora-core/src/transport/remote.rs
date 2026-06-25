@@ -323,6 +323,11 @@ pub(crate) fn branch_delete_tokens(project_path: &str, branch: &str) -> Vec<Stri
 /// invocation as the lock so none can land in a separate, failure-prone
 /// round-trip.
 ///
+/// `allow-passthrough` is intentionally NOT chained here: it is absent on
+/// tmux < 3.3 and would cause the whole invocation to fail on those versions,
+/// orphaning the just-created session. It is applied after `create_session`
+/// succeeds via [`set_passthrough_tokens`] and tolerated on failure.
+///
 /// The `;` is **shell-quoted** (`';'`) so the remote login shell passes it to
 /// tmux as a literal separator token rather than eating it as a shell statement
 /// separator — this is tmux's argv `;`, distinct from ADR-0004's un-batching of
@@ -374,6 +379,21 @@ pub(crate) fn new_session_tokens(plan: &SpawnPlan) -> Vec<String> {
         "-t".into(),
         plan.tmux_name.clone(),
         "mouse".into(),
+        "on".into(),
+    ]
+}
+
+/// Tokens for `tmux set-option -t <name> allow-passthrough on`. Applied
+/// AFTER `create_session` succeeds — best-effort, absent on tmux < 3.3,
+/// degrades to quiescence-only activity detection, must never fail the spawn.
+/// Called by `run_spawn` and `run_respawn` with its result tolerated (ignored).
+pub(crate) fn set_passthrough_tokens(tmux_name: &str) -> Vec<String> {
+    vec![
+        "tmux".into(),
+        "set-option".into(),
+        "-t".into(),
+        tmux_name.into(),
+        "allow-passthrough".into(),
         "on".into(),
     ]
 }
@@ -665,6 +685,9 @@ pub(crate) fn run_spawn(
         return Err(err);
     }
 
+    // Best-effort: allow-passthrough is absent on tmux < 3.3 and degrades to
+    // quiescence-only activity detection. Must never fail the spawn.
+    let _ = exec.run(&set_passthrough_tokens(&plan.tmux_name));
     write_metadata(exec, plan);
     attach_channel(exec, &plan.tmux_name)
 }
@@ -702,6 +725,9 @@ pub(crate) fn run_respawn(
     }
     match create_session(exec, plan) {
         Ok(()) => {
+            // Best-effort: allow-passthrough is absent on tmux < 3.3 and
+            // degrades to quiescence-only activity detection. Must never fail.
+            let _ = exec.run(&set_passthrough_tokens(&plan.tmux_name));
             write_metadata(exec, plan);
             attach_channel(exec, &plan.tmux_name)
         }
@@ -1475,6 +1501,56 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn new_session_tokens_does_not_contain_allow_passthrough() {
+        // allow-passthrough is intentionally NOT in the atomic new-session chain:
+        // it is absent on tmux < 3.3 and would cause the whole invocation to fail
+        // on those versions, orphaning the just-created session. It is applied
+        // separately (best-effort) via set_passthrough_tokens after create_session
+        // succeeds.
+        let plan = worktree_plan();
+        let tokens = new_session_tokens(&plan);
+        assert!(
+            !tokens.iter().any(|a| a == "allow-passthrough"),
+            "allow-passthrough must not appear in the atomic new-session chain: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn set_passthrough_tokens_shape() {
+        // 6 tokens: tmux set-option -t <name> allow-passthrough on
+        let tokens = set_passthrough_tokens("remora_api_fix-login");
+        assert_eq!(tokens.len(), 6);
+        assert_eq!(tokens[0], "tmux");
+        assert_eq!(tokens[1], "set-option");
+        assert_eq!(tokens[2], "-t");
+        assert_eq!(tokens[3], "remora_api_fix-login");
+        assert_eq!(tokens[4], "allow-passthrough");
+        assert_eq!(tokens[5], "on");
+    }
+
+    #[test]
+    fn failing_passthrough_set_does_not_fail_spawn() {
+        // allow-passthrough is tolerated: a non-zero exit (tmux < 3.3 "unknown
+        // option") must never fail an already-live session.
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                 // fetch
+            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
+            Ok(FakeExec::ok()),                 // verify
+            Ok(FakeExec::ok()),                 // worktree add
+            Ok(FakeExec::ok()),                 // new-session (success)
+            Ok(FakeExec::fail("unknown option: allow-passthrough")), // passthrough — FAILS
+                                                // remaining set-environment calls succeed by default
+        ]);
+        let result = run_spawn(&fake, &plan);
+        assert!(
+            result.is_ok(),
+            "a failing allow-passthrough must not fail spawn: {result:?}"
+        );
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
+    #[test]
     fn new_session_tokens_enables_mouse_and_deep_scrollback() {
         // #53: the scroll wheel must drive tmux scrollback (mouse on), with a
         // history-limit deep enough for long agent output.
@@ -1561,8 +1637,8 @@ pub(crate) mod tests {
             .position(|a| a == "new-session")
             .expect("new-session");
         // Still exactly one agent-command token after `-c <dir>` (wrapped, not
-        // per-token), followed by two 6-token trailers (remain-on-exit, then
-        // mouse). new-session + 6 (down to agent-cmd) + 6 + 6.
+        // per-token), followed by two 6-token trailers (remain-on-exit and mouse).
+        // new-session + 6 (down to agent-cmd) + 6 + 6.
         assert_eq!(tokens.len(), n + 1 + 6 + 6 + 6);
         let fragment = join_agent_command(&plan.agent_argv);
         let inner = wrap_with_shell_fallback(&fragment);
@@ -1801,7 +1877,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn worktree_spawn_runs_add_create_metadata_then_attaches_in_order() {
+    fn worktree_spawn_runs_add_create_passthrough_metadata_then_attaches_in_order() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
             Ok(FakeExec::ok()),                 // fetch
@@ -1809,6 +1885,7 @@ pub(crate) mod tests {
             Ok(FakeExec::ok()),                 // verify
             Ok(FakeExec::ok()),                 // worktree add
             Ok(FakeExec::ok()),                 // new-session
+            Ok(FakeExec::ok()),                 // set-option allow-passthrough (best-effort)
             Ok(FakeExec::ok()),                 // set-environment REMORA_AGENT
             Ok(FakeExec::ok()),                 // set-environment REMORA_WORKSPACE
             Ok(FakeExec::ok()),                 // set-environment REMORA_CREATED_AT
@@ -1817,20 +1894,24 @@ pub(crate) mod tests {
         assert!(result.is_ok());
         let calls = fake.calls.lock().expect("lock");
         // fetch + symbolic-ref + verify + worktree add + new-session
-        // (remain-on-exit folded in atomically) + 3x set-environment = 8 blocking cmds.
-        assert_eq!(calls.len(), 8);
+        // (remain-on-exit folded in atomically) + allow-passthrough (best-effort)
+        // + 3x set-environment = 9 blocking cmds.
+        assert_eq!(calls.len(), 9);
         assert!(calls[3].iter().any(|a| a == "worktree"));
         assert!(calls[4].iter().any(|a| a == "new-session"));
         // remain-on-exit rides on the new-session call, not a follow-up exec:
         // its `set-option` lives inside calls[4], never as a standalone call.
         assert!(calls[4].iter().any(|a| a == "set-option"));
         assert!(calls[4].iter().any(|a| a == "remain-on-exit"));
-        assert!(calls[5].iter().any(|a| a == "set-environment"));
+        // calls[5] is the best-effort allow-passthrough set-option.
+        assert!(calls[5].iter().any(|a| a == "allow-passthrough"));
+        // calls[6..] are the set-environment metadata writes.
+        assert!(calls[6].iter().any(|a| a == "set-environment"));
         assert!(
-            !calls[5..]
+            !calls[6..]
                 .iter()
                 .any(|c| c.iter().any(|a| a == "set-option")),
-            "remain-on-exit is not a standalone follow-up call"
+            "remain-on-exit is not a standalone follow-up call after metadata"
         );
         assert_eq!(fake.opened.lock().expect("lock").len(), 1);
     }
@@ -1839,11 +1920,12 @@ pub(crate) mod tests {
     fn metadata_failure_is_tolerated_and_still_attaches() {
         let plan = worktree_plan();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                        // fetch
-            Ok(FakeExec::out("origin/main\n")),        // symbolic-ref
-            Ok(FakeExec::ok()),                        // verify
-            Ok(FakeExec::ok()),                        // worktree add
+            Ok(FakeExec::ok()),                                      // fetch
+            Ok(FakeExec::out("origin/main\n")),                      // symbolic-ref
+            Ok(FakeExec::ok()),                                      // verify
+            Ok(FakeExec::ok()),                                      // worktree add
             Ok(FakeExec::ok()), // new-session (live! remain-on-exit folded in)
+            Ok(FakeExec::fail("unknown option: allow-passthrough")), // passthrough — tolerated
             Ok(FakeExec::fail("set-env boom")), // REMORA_AGENT — tolerated
             Err(SourceError::Transport("net".into())), // REMORA_WORKSPACE — tolerated
             Ok(FakeExec::ok()), // REMORA_CREATED_AT

@@ -1,24 +1,16 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
+import type { ActivitySink } from "./activity-store";
 import {
   type ClipboardWriter,
   writeClipboard as defaultWriteClipboard,
 } from "./clipboard";
 import type { SessionConnection } from "./connection";
+import { parseActivityMarker } from "./osc-marker";
+import { decodeBase64Utf8 } from "./terminal-text";
+import { activityStore } from "./useActivity";
 
 const encoder = new TextEncoder();
-// fatal: a remote-supplied payload with invalid UTF-8 throws here rather than
-// silently landing U+FFFD replacement characters on the clipboard.
-const decoder = new TextDecoder("utf-8", { fatal: true });
-
-/** Decode a base64 string whose bytes are UTF-8 (OSC 52 payloads are UTF-8).
- * Throws on malformed input: `atob` on invalid base64, the decoder on invalid
- * UTF-8 — both are caught by the OSC 52 handler. */
-function decodeBase64Utf8(b64: string): string {
-  const binary = atob(b64);
-  const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
-  return decoder.decode(bytes);
-}
 
 /**
  * Owns one xterm.js Terminal bound to a SessionConnection. Wiring only — the
@@ -36,6 +28,9 @@ export class TerminalController {
   private readonly unsubscribe: () => void;
   private readonly onDataDisposable: { dispose(): void };
   private readonly oscDisposable: { dispose(): void };
+  private readonly activityDisposable: { dispose(): void };
+  private readonly sessionKey?: string;
+  private readonly activity: ActivitySink;
   private closed = false;
   private lastRows = 0;
   private lastCols = 0;
@@ -47,7 +42,11 @@ export class TerminalController {
     element: HTMLElement,
     private readonly connection: SessionConnection,
     private readonly writeClipboard: ClipboardWriter = defaultWriteClipboard,
+    opts: { sessionKey?: string; activity?: ActivitySink } = {},
   ) {
+    this.sessionKey = opts.sessionKey;
+    this.activity = opts.activity ?? activityStore;
+
     this.term = new Terminal({ cursorBlink: true });
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
@@ -56,13 +55,31 @@ export class TerminalController {
     this.oscDisposable = this.term.parser.registerOscHandler(52, (data) =>
       this.handleOsc52(data),
     );
+    this.activityDisposable = this.term.parser.registerOscHandler(
+      7366,
+      (data) => this.handleActivityMarker(data),
+    );
 
+    // `subscribe` synchronously replays buffered output (bytes already received
+    // before this terminal mounted) before returning, then streams live bytes
+    // asynchronously. The replay is a catch-up write — not live agent activity —
+    // so we must not call noteOutput for replayed bytes, or a quiet attach would
+    // falsely flip the indicator to "working" and decay to idle only after the
+    // settle window. The `replaying` flag is cleared immediately after
+    // subscribe() returns, before any async message can arrive.
+    let replaying = true;
     this.unsubscribe = connection.subscribe((msg) => {
-      if (msg.event === "bytes") this.term.write(new Uint8Array(msg.bytes));
-      else if (msg.event === "closed") this.handleClosed();
+      if (msg.event === "bytes") {
+        if (this.sessionKey && !replaying)
+          this.activity.noteOutput(this.sessionKey);
+        this.term.write(new Uint8Array(msg.bytes));
+      } else if (msg.event === "closed") {
+        this.handleClosed();
+      }
       // A future BridgeOutput variant falls through here and is ignored, rather
       // than being mislabeled as a closed session.
     });
+    replaying = false;
 
     this.onDataDisposable = this.term.onData((data) => {
       if (this.closed) return;
@@ -150,6 +167,7 @@ export class TerminalController {
   private handleClosed(): void {
     if (this.closed) return;
     this.closed = true;
+    if (this.sessionKey) this.activity.clear(this.sessionKey);
     // Dim grey notice so a dead session reads clearly, not as a frozen bug.
     this.term.write("\r\n\x1b[90m[session closed]\x1b[0m\r\n");
   }
@@ -187,6 +205,18 @@ export class TerminalController {
     console.error("terminal clipboard write failed", error);
   }
 
+  /** Handle an inbound OSC 7366 activity marker (ADR-0010). Parses generically
+   * (token `remora`, not any agent name); a non-marker / unsupported / forged
+   * payload yields null and is consumed silently — never a false state, never
+   * rendered. */
+  private handleActivityMarker(data: string): boolean {
+    const marker = parseActivityMarker(data);
+    if (marker && this.sessionKey) {
+      this.activity.noteMarker(this.sessionKey, marker.state);
+    }
+    return true;
+  }
+
   /** Coalesce a burst of ResizeObserver callbacks into one fit on the next frame. */
   private scheduleFit(): void {
     if (this.resizeRaf) return; // coalesce a burst of observe callbacks into one fit
@@ -214,6 +244,8 @@ export class TerminalController {
   /** Tear down all listeners, the ResizeObserver, and the xterm instance. */
   dispose(): void {
     this.oscDisposable.dispose();
+    this.activityDisposable.dispose();
+    if (this.sessionKey) this.activity.clear(this.sessionKey);
     if (this.resizeRaf) cancelAnimationFrame(this.resizeRaf);
     this.observer.disconnect();
     this.onDataDisposable.dispose();

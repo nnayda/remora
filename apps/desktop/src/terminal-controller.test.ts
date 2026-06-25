@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BridgeOutput, OnOutput, SessionConnection } from "./connection";
 
+// Mock activity-store and useActivity so tests don't pull in the real singleton.
+vi.mock("./activity-store");
+vi.mock("./useActivity", () => ({
+  activityStore: { noteOutput: vi.fn(), noteMarker: vi.fn(), clear: vi.fn() },
+}));
+
 // Mock xterm: capture the constructed Terminal/FitAddon so tests can inspect
 // writes, drive onData, and set rows/cols. We test our wiring, not the library.
 const xt = vi.hoisted(() => {
@@ -8,6 +14,9 @@ const xt = vi.hoisted(() => {
     term: null,
     fit: null,
   };
+  // Keyed by OSC id (52, 7366, …). Exposed so tests can drive individual handlers.
+  const oscHandlers = new Map<number, (data: string) => boolean>();
+  const oscDispose = vi.fn();
   class FakeTerminal {
     rows = 24;
     cols = 80;
@@ -19,8 +28,12 @@ const xt = vi.hoisted(() => {
     dispose = vi.fn();
     loadAddon = vi.fn();
     focus = vi.fn();
-    oscCb: ((data: string) => boolean) | null = null;
-    oscDispose = vi.fn();
+    /** Backward-compat: first handler registered (OSC 52). Tests that were
+     * written before the keyed map can still use this directly. */
+    get oscCb(): ((data: string) => boolean) | null {
+      return oscHandlers.get(52) ?? null;
+    }
+    oscDispose = oscDispose;
     keyHandler: ((e: KeyboardEvent) => boolean) | null = null;
     selection = "";
     getSelection = vi.fn(() => this.selection);
@@ -40,9 +53,14 @@ const xt = vi.hoisted(() => {
     constructor() {
       state.term = this;
       this.parser = {
-        registerOscHandler: (_id, cb) => {
-          this.oscCb = cb;
-          return { dispose: this.oscDispose };
+        registerOscHandler: (id, cb) => {
+          oscHandlers.set(id, cb);
+          return {
+            dispose: () => {
+              oscHandlers.delete(id);
+              oscDispose();
+            },
+          };
         },
       };
     }
@@ -60,7 +78,7 @@ const xt = vi.hoisted(() => {
       state.fit = this;
     }
   }
-  return { state, FakeTerminal, FakeFit };
+  return { state, FakeTerminal, FakeFit, oscHandlers };
 });
 
 vi.mock("@xterm/xterm", () => ({ Terminal: xt.FakeTerminal }));
@@ -75,6 +93,7 @@ let disconnectSpy = vi.fn();
 beforeEach(() => {
   xt.state.term = null;
   xt.state.fit = null;
+  xt.oscHandlers.clear();
   roCb = null;
   rafCb = null;
   disconnectSpy = vi.fn();
@@ -485,5 +504,103 @@ describe("TerminalController", () => {
     expect(writeClipboard).not.toHaveBeenCalled();
     expect(handled).toBe(true); // passed through to xterm → ^C
     expect(ev.preventDefault).not.toHaveBeenCalled(); // not consumed
+  });
+
+  // Reusable harness that creates a fresh fake connection + element pair.
+  function makeHarness() {
+    const conn = fakeConn();
+    const harnesEl = {} as HTMLElement;
+    return { el: harnesEl, conn };
+  }
+
+  it("notes output and parses the activity marker into the sink", () => {
+    const activity = {
+      noteOutput: vi.fn(),
+      noteMarker: vi.fn(),
+      clear: vi.fn(),
+    };
+    const { el: hEl, conn } = makeHarness();
+    new TerminalController(
+      hEl,
+      conn as unknown as SessionConnection,
+      undefined,
+      {
+        sessionKey: "api/fix",
+        activity,
+      },
+    );
+    // a bytes message → noteOutput
+    conn.emit({ event: "bytes", bytes: [...new TextEncoder().encode("hi")] });
+    expect(activity.noteOutput).toHaveBeenCalledWith("api/fix");
+    // an OSC-7366 awaiting marker → noteMarker(awaiting)
+    const handler7366 = xt.oscHandlers.get(7366);
+    if (!handler7366) throw new Error("OSC 7366 handler not registered");
+    handler7366(`remora;1;state;${btoa("awaiting_input")}`);
+    expect(activity.noteMarker).toHaveBeenCalledWith("api/fix", "awaiting");
+  });
+
+  it("clears the sink on a closed event", () => {
+    const activity = {
+      noteOutput: vi.fn(),
+      noteMarker: vi.fn(),
+      clear: vi.fn(),
+    };
+    const { el: hEl, conn } = makeHarness();
+    new TerminalController(
+      hEl,
+      conn as unknown as SessionConnection,
+      undefined,
+      {
+        sessionKey: "api/fix",
+        activity,
+      },
+    );
+    conn.emit({ event: "closed" });
+    expect(activity.clear).toHaveBeenCalledWith("api/fix");
+  });
+
+  it("does not call noteOutput for bytes replayed from the backlog on subscribe, but does for live bytes after", () => {
+    // Simulates attaching to an already-active session: the connection replays
+    // buffered bytes synchronously inside subscribe(), then delivers live bytes
+    // asynchronously. Replayed bytes must NOT count as live activity (they are
+    // catch-up output, not fresh agent work), while live bytes MUST.
+    const activity = {
+      noteOutput: vi.fn(),
+      noteMarker: vi.fn(),
+      clear: vi.fn(),
+    };
+    // A connection that replays one buffered bytes event synchronously on subscribe.
+    let sub: OnOutput | null = null;
+    const unsubscribe = vi.fn();
+    const bufferedConn = {
+      closed: false,
+      subscribe: vi.fn((cb: OnOutput) => {
+        sub = cb;
+        // Synchronous replay of buffered output — same contract as real openConnection.
+        cb({ event: "bytes", bytes: [104, 105] });
+        return unsubscribe;
+      }),
+      write: vi.fn().mockResolvedValue(undefined),
+      resize: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      unsubscribe,
+      emit: (m: BridgeOutput) => sub?.(m),
+    };
+    const hEl = {} as HTMLElement;
+    new TerminalController(
+      hEl,
+      bufferedConn as unknown as SessionConnection,
+      undefined,
+      { sessionKey: "s/attach", activity },
+    );
+    // The replayed byte must have been written to the terminal.
+    expect(xt.state.term?.written).toContainEqual(new Uint8Array([104, 105]));
+    // But noteOutput must NOT have been called for the replayed byte.
+    expect(activity.noteOutput).not.toHaveBeenCalled();
+
+    // A live byte arriving after subscribe() must call noteOutput.
+    bufferedConn.emit({ event: "bytes", bytes: [119] });
+    expect(activity.noteOutput).toHaveBeenCalledWith("s/attach");
+    expect(activity.noteOutput).toHaveBeenCalledTimes(1);
   });
 });

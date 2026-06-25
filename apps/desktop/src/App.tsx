@@ -9,6 +9,7 @@ import { canRespawn, OPEN_CANCELLED } from "./session-store";
 import { buildTree, type SessionNode } from "./session-tree";
 import { TabBar } from "./TabBar";
 import { Terminal, type TerminalHandle } from "./Terminal";
+import { activityStore, useActivity } from "./useActivity";
 import { discoveryStore, useDiscovery } from "./useDiscovery";
 import { useReconnect } from "./useReconnect";
 import { sessionStore, useSessions } from "./useSessions";
@@ -30,6 +31,11 @@ function App() {
     removeSession,
   } = useSessions();
   useReconnect(sessionStore);
+  const activity = useActivity();
+  useEffect(() => {
+    activityStore.start();
+    return () => activityStore.stop();
+  }, []);
   const { config, sessions, configError, discoveryUnavailable, refresh } =
     useDiscovery();
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -234,11 +240,13 @@ function App() {
           setNotice(null);
           setSettingsOpen(true);
         }}
+        activity={activity}
       />
       <div className="main-col">
         <TabBar
           tabs={tabs}
           activeKey={activeKey}
+          activity={activity}
           onFocus={(key) => {
             setNotice(null);
             // Re-selecting the active tab leaves activeKey unchanged, so the
@@ -319,6 +327,7 @@ function App() {
                 ) : (
                   <Terminal
                     connection={t.connection}
+                    sessionKey={t.key}
                     ref={(h) => {
                       if (h) terminals.current.set(t.key, h);
                       else terminals.current.delete(t.key);
