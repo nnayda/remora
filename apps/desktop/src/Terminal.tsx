@@ -36,5 +36,5 @@ export const Terminal = forwardRef<
     }),
     [],
   );
-  return <div ref={elRef} className="terminal" />;
+  return <div ref={elRef} className="rk-term__host" />;
 });

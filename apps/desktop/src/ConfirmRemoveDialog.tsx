@@ -1,6 +1,8 @@
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import type { WorkspaceModeDto } from "./bindings";
 import type { RemoveResult } from "./session-store";
+import { Button, Dialog } from "./ui";
+import { AlertTriangle } from "./ui/icons";
 
 interface ConfirmRemoveDialogProps {
   projectId: string;
@@ -22,7 +24,10 @@ const REASON_COPY: Record<string, string> = {
  * Stage 2 (force): shown only when the first attempt returns {ok:false, dirty};
  *   lets the user confirm with force=true.
  *
- * Buttons are disabled while a call is in flight. Esc closes. Tab is trapped. */
+ * Buttons are disabled while a call is in flight. Esc closes. Tab is trapped.
+ *
+ * The design-system <Dialog> is presentational (no focus trap / Esc / focus
+ * restore), so this component keeps that behavior itself. */
 export function ConfirmRemoveDialog({
   projectId,
   sessionId,
@@ -34,7 +39,6 @@ export function ConfirmRemoveDialog({
   const [stage, setStage] = useState<Stage>({ kind: "confirm" });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const dialogRef = useRef<HTMLDivElement>(null);
   const firstButtonRef = useRef<HTMLButtonElement>(null);
 
   // Focus the primary action button on open; restore focus on close.
@@ -50,6 +54,10 @@ export function ConfirmRemoveDialog({
       firstButtonRef.current?.focus();
     }
   }, [stage]);
+
+  function requestClose() {
+    if (!busy) onClose();
+  }
 
   async function handleConfirm(force: boolean) {
     if (busy) return;
@@ -91,14 +99,14 @@ export function ConfirmRemoveDialog({
   function onKeyDown(e: KeyboardEvent) {
     if (e.key === "Escape") {
       e.preventDefault();
-      if (!busy) onClose();
+      requestClose();
       return;
     }
     if (e.key !== "Tab") return;
-    const focusable = dialogRef.current?.querySelectorAll<HTMLElement>(
-      'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])',
+    const focusable = e.currentTarget.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
     );
-    if (!focusable || focusable.length === 0) return;
+    if (focusable.length === 0) return;
     const first = focusable[0];
     const last = focusable[focusable.length - 1];
     if (e.shiftKey && document.activeElement === first) {
@@ -113,72 +121,55 @@ export function ConfirmRemoveDialog({
   const worktreeNote =
     workspace === "worktree" ? " and deletes its worktree and branch." : ".";
 
-  return (
-    // biome-ignore lint/a11y/noStaticElementInteractions: backdrop key handling
-    <div className="dialog-backdrop" onKeyDown={onKeyDown}>
-      <div
-        ref={dialogRef}
-        className="dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-label={
-          stage.kind === "confirm" ? "Remove session" : "Confirm force remove"
-        }
+  const isForce = stage.kind === "force";
+
+  const footer = (
+    <>
+      <Button variant="ghost" onClick={onClose} disabled={busy}>
+        Cancel
+      </Button>
+      <Button
+        ref={firstButtonRef}
+        variant="danger"
+        onClick={() => void handleConfirm(isForce)}
+        disabled={busy}
+        loading={busy}
       >
-        {stage.kind === "confirm" ? (
-          <>
-            <h2>Remove session</h2>
-            <p>
-              Remove session{" "}
-              <strong>
-                {projectId}/{sessionId}
-              </strong>
-              ? This kills tmux{worktreeNote}
-            </p>
-            {error && (
-              <p className="dialog-error" role="alert">
-                {error}
-              </p>
-            )}
-            <div className="dialog-actions">
-              <button type="button" onClick={onClose} disabled={busy}>
-                Cancel
-              </button>
-              <button
-                ref={firstButtonRef}
-                type="button"
-                onClick={() => void handleConfirm(false)}
-                disabled={busy}
-              >
-                {busy ? "Removing…" : "Remove"}
-              </button>
-            </div>
-          </>
-        ) : (
-          <>
-            <h2>Remove anyway?</h2>
-            <p>This session has {stage.dirtyReason}. Remove anyway?</p>
-            {error && (
-              <p className="dialog-error" role="alert">
-                {error}
-              </p>
-            )}
-            <div className="dialog-actions">
-              <button type="button" onClick={onClose} disabled={busy}>
-                Cancel
-              </button>
-              <button
-                ref={firstButtonRef}
-                type="button"
-                onClick={() => void handleConfirm(true)}
-                disabled={busy}
-              >
-                {busy ? "Removing…" : "Remove anyway"}
-              </button>
-            </div>
-          </>
-        )}
-      </div>
-    </div>
+        {isForce ? "Remove anyway" : "Remove"}
+      </Button>
+    </>
+  );
+
+  return (
+    <Dialog
+      open
+      title={isForce ? "Remove anyway?" : "Remove session"}
+      description={
+        isForce
+          ? undefined
+          : "This kills the tmux session and cannot be undone."
+      }
+      icon={<AlertTriangle size={18} />}
+      onClose={requestClose}
+      onKeyDown={onKeyDown}
+      footer={footer}
+    >
+      {isForce ? (
+        <p>This session has {stage.dirtyReason}. Remove anyway?</p>
+      ) : (
+        <p>
+          Remove session{" "}
+          <strong style={{ fontFamily: "var(--font-mono)" }}>
+            {projectId}/{sessionId}
+          </strong>
+          ? This kills tmux{worktreeNote}
+        </p>
+      )}
+      {error && (
+        <p role="alert" style={{ color: "var(--danger)" }}>
+          {error}
+        </p>
+      )}
+    </Dialog>
   );
 }

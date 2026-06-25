@@ -9,6 +9,7 @@ import {
 } from "./config-editor-model";
 import { formErrorMessage } from "./form-error";
 import { normalizeSlugInput } from "./spawn-input";
+import { Button, Input, Select, Switch } from "./ui";
 
 interface HostFormProps {
   mode: FormMode;
@@ -51,157 +52,140 @@ export function HostForm({ mode, initial, onSubmit, onCancel }: HostFormProps) {
 
   return (
     <form
+      className="settings-form"
       onSubmit={(e) => {
         e.preventDefault();
         void submit();
       }}
     >
-      <h3>{mode === "create" ? "Add host" : `Edit host ${form.id}`}</h3>
+      <h3 className="settings-form__title">
+        {mode === "create" ? "Add host" : `Edit host ${form.id}`}
+      </h3>
       {mode === "create" && (
-        <label>
-          Id
-          <input
-            value={form.id}
-            onChange={(e) => set("id", normalizeSlugInput(e.target.value))}
-            placeholder="devbox"
-            // biome-ignore lint/a11y/noAutofocus: first field of an opened form
-            autoFocus
-          />
-        </label>
-      )}
-      <label>
-        Name
-        <input
-          value={form.name}
-          onChange={(e) => set("name", e.target.value)}
-          placeholder="optional display name"
+        <Input
+          label="Id"
+          mono
+          value={form.id}
+          onChange={(e) => set("id", normalizeSlugInput(e.target.value))}
+          placeholder="devbox"
+          // biome-ignore lint/a11y/noAutofocus: first field of an opened form
+          autoFocus
         />
-      </label>
-      <label>
-        Transport
-        <select
-          value={form.kind}
-          onChange={(e) => set("kind", e.target.value as typeof form.kind)}
-        >
-          <option value="ssh">ssh</option>
-          <option value="kubectl">kubectl</option>
-        </select>
-      </label>
+      )}
+      <Input
+        label="Name"
+        value={form.name}
+        onChange={(e) => set("name", e.target.value)}
+        placeholder="optional display name"
+      />
+      <Select
+        label="Transport"
+        mono
+        value={form.kind}
+        onChange={(value) => set("kind", value as typeof form.kind)}
+        options={[
+          { value: "ssh", label: "ssh" },
+          { value: "kubectl", label: "kubectl" },
+        ]}
+      />
       {form.kind === "ssh" ? (
         <>
-          <label>
-            Host
-            <input
-              value={form.sshHost}
-              onChange={(e) => set("sshHost", e.target.value)}
-              placeholder="hostname or ssh alias"
-            />
-          </label>
-          <label>
-            User
-            <input
-              value={form.user}
-              onChange={(e) => set("user", e.target.value)}
-              placeholder="optional"
-            />
-          </label>
-          <label>
-            Port
-            <input
-              value={form.port}
-              onChange={(e) => set("port", e.target.value)}
-              placeholder="optional (default 22)"
-            />
-          </label>
+          <Input
+            label="Host"
+            mono
+            value={form.sshHost}
+            onChange={(e) => set("sshHost", e.target.value)}
+            placeholder="hostname or ssh alias"
+          />
+          <Input
+            label="User"
+            mono
+            value={form.user}
+            onChange={(e) => set("user", e.target.value)}
+            placeholder="optional"
+          />
+          <Input
+            label="Port"
+            mono
+            value={form.port}
+            onChange={(e) => set("port", e.target.value)}
+            placeholder="optional (default 22)"
+          />
         </>
       ) : (
         <>
-          <label>
-            Pod
-            <input
-              value={form.pod}
-              onChange={(e) => set("pod", e.target.value)}
-              placeholder={
-                form.podIsCommand ? "kubectl … -o name | head -n1" : "pod name"
-              }
-            />
-          </label>
-          <label className="field-toggle">
-            <input
-              type="checkbox"
-              checked={form.podIsCommand}
-              onChange={(e) => set("podIsCommand", e.target.checked)}
-            />
-            resolve via command
-          </label>
-          <label>
-            Namespace
-            <input
-              value={form.namespace}
-              onChange={(e) => set("namespace", e.target.value)}
-              placeholder={
-                form.namespaceIsCommand ? "shell command…" : "optional"
-              }
-            />
-          </label>
-          <label className="field-toggle">
-            <input
-              type="checkbox"
-              checked={form.namespaceIsCommand}
-              onChange={(e) => set("namespaceIsCommand", e.target.checked)}
-            />
-            resolve via command
-          </label>
-          <label>
-            Context
-            <input
-              value={form.context}
-              onChange={(e) => set("context", e.target.value)}
-              placeholder={
-                form.contextIsCommand ? "shell command…" : "optional"
-              }
-            />
-          </label>
-          <label className="field-toggle">
-            <input
-              type="checkbox"
-              checked={form.contextIsCommand}
-              onChange={(e) => set("contextIsCommand", e.target.checked)}
-            />
-            resolve via command
-          </label>
-          <label>
-            Container
-            <input
-              value={form.container}
-              onChange={(e) => set("container", e.target.value)}
-              placeholder={
-                form.containerIsCommand ? "shell command…" : "optional"
-              }
-            />
-          </label>
-          <label className="field-toggle">
-            <input
-              type="checkbox"
-              checked={form.containerIsCommand}
-              onChange={(e) => set("containerIsCommand", e.target.checked)}
-            />
-            resolve via command
-          </label>
+          <Input
+            label="Pod"
+            mono
+            value={form.pod}
+            onChange={(e) => set("pod", e.target.value)}
+            placeholder={
+              form.podIsCommand ? "kubectl … -o name | head -n1" : "pod name"
+            }
+          />
+          <Switch
+            className="settings-form__toggle"
+            label="Resolve via shell command"
+            checked={form.podIsCommand}
+            onChange={(checked) => set("podIsCommand", checked)}
+          />
+          <Input
+            label="Namespace"
+            mono
+            value={form.namespace}
+            onChange={(e) => set("namespace", e.target.value)}
+            placeholder={
+              form.namespaceIsCommand ? "shell command…" : "optional"
+            }
+          />
+          <Switch
+            className="settings-form__toggle"
+            label="Resolve via shell command"
+            checked={form.namespaceIsCommand}
+            onChange={(checked) => set("namespaceIsCommand", checked)}
+          />
+          <Input
+            label="Context"
+            mono
+            value={form.context}
+            onChange={(e) => set("context", e.target.value)}
+            placeholder={form.contextIsCommand ? "shell command…" : "optional"}
+          />
+          <Switch
+            className="settings-form__toggle"
+            label="Resolve via shell command"
+            checked={form.contextIsCommand}
+            onChange={(checked) => set("contextIsCommand", checked)}
+          />
+          <Input
+            label="Container"
+            mono
+            value={form.container}
+            onChange={(e) => set("container", e.target.value)}
+            placeholder={
+              form.containerIsCommand ? "shell command…" : "optional"
+            }
+          />
+          <Switch
+            className="settings-form__toggle"
+            label="Resolve via shell command"
+            checked={form.containerIsCommand}
+            onChange={(checked) => set("containerIsCommand", checked)}
+          />
         </>
       )}
       {error && (
-        <p className="dialog-error" role="alert">
+        <p className="settings-error" role="alert">
           {error}
         </p>
       )}
-      <div className="dialog-actions">
-        <button type="button" onClick={onCancel}>
+      <div className="settings-form__actions">
+        <Button type="button" variant="ghost" onClick={onCancel}>
           Cancel
-        </button>
-        <button type="submit" disabled={submitting}>
+        </Button>
+        <Button type="submit" variant="primary" loading={submitting}>
           {submitting ? "Saving…" : "Save"}
-        </button>
+        </Button>
       </div>
     </form>
   );

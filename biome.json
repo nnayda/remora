@@ -12,7 +12,8 @@
       "!**/target",
       "!**/gen",
       "!pnpm-lock.yaml",
-      "!apps/desktop/src/bindings.ts"
+      "!apps/desktop/src/bindings.ts",
+      "!**/*.svg"
     ]
   },
   "formatter": {

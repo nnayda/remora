@@ -12,6 +12,31 @@ import { activityStore } from "./useActivity";
 
 const encoder = new TextEncoder();
 
+// Literal hex from notes/design-system/tokens/colors.css (xterm can't read CSS vars).
+const XTERM_THEME = {
+  background: "#08090C", // --ink-1000 / --term-bg
+  foreground: "#D6D9E1", // --ansi-white
+  cursor: "#6EA4FF", // --accent-bright / marine-pulse
+  cursorAccent: "#08090C",
+  selectionBackground: "rgba(30,111,245,0.30)",
+  black: "#1A1B22",
+  red: "#F0556B",
+  green: "#4ECB83",
+  yellow: "#E8A33D",
+  blue: "#54A0F0",
+  magenta: "#C77DD8",
+  cyan: "#4FC4C9",
+  white: "#D6D9E1",
+  brightBlack: "#565A68",
+  brightRed: "#F0556B",
+  brightGreen: "#4ECB83",
+  brightYellow: "#E8A33D",
+  brightBlue: "#54A0F0",
+  brightMagenta: "#C77DD8",
+  brightCyan: "#4FC4C9",
+  brightWhite: "#F4F5F8",
+};
+
 /**
  * Owns one xterm.js Terminal bound to a SessionConnection. Wiring only — the
  * emulator owns screen state; we never parse bytes.
@@ -47,7 +72,14 @@ export class TerminalController {
     this.sessionKey = opts.sessionKey;
     this.activity = opts.activity ?? activityStore;
 
-    this.term = new Terminal({ cursorBlink: true });
+    this.term = new Terminal({
+      cursorBlink: true,
+      theme: XTERM_THEME,
+      fontFamily:
+        "'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace",
+      fontSize: 13,
+      lineHeight: 1.35,
+    });
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
     this.term.attachCustomKeyEventHandler((e) => this.handleKeyEvent(e));

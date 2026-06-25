@@ -1,14 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import "./App.css";
 import type { WorkspaceModeDto } from "./bindings";
 import { ConfirmRemoveDialog } from "./ConfirmRemoveDialog";
+import { DiffPanel } from "./DiffPanel";
 import { NewSessionDialog } from "./NewSessionDialog";
 import { SettingsDialog } from "./SettingsDialog";
 import { Sidebar } from "./Sidebar";
 import { canRespawn, OPEN_CANCELLED } from "./session-store";
 import { buildTree, type SessionNode } from "./session-tree";
+import { tabIndicatorState } from "./status-state";
 import { TabBar } from "./TabBar";
 import { Terminal, type TerminalHandle } from "./Terminal";
+import { Button, IconButton, StatusIndicator, Tag } from "./ui";
+import { ChevronRight } from "./ui/icons";
 import { activityStore, useActivity } from "./useActivity";
 import { discoveryStore, useDiscovery } from "./useDiscovery";
 import { useReconnect } from "./useReconnect";
@@ -17,7 +20,7 @@ import { sessionStore, useSessions } from "./useSessions";
 export const APP_NAME = "Remora";
 
 /** Root component: wires the discovery and session stores to the sidebar, tab
- * bar, terminal panes, and the new-session dialog. */
+ * bar, terminal panes, the diff peek panel, and the new-session dialog. */
 function App() {
   const {
     tabs,
@@ -44,6 +47,11 @@ function App() {
   const [dialogProjectId, setDialogProjectId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  // Files & diff peek panel (⌘\). Closed by default — the terminal is the hero;
+  // the panel is an intentional reveal (and its data surface is empty for now).
+  const [panelOpen, setPanelOpen] = useState(false);
+  // Desktop→mobile single-pane fold: which pane the narrow layout shows.
+  const [mobilePane, setMobilePane] = useState<"list" | "session">("session");
   const [removeTarget, setRemoveTarget] = useState<{
     projectId: string;
     sessionId: string;
@@ -64,7 +72,24 @@ function App() {
   // Status of the active tab, so the focus effect re-fires when a freshly opened
   // or respawned session goes live (a stopped/reconnecting tab renders a
   // placeholder or a not-yet-ready terminal until it does).
-  const activeStatus = tabs.find((t) => t.key === activeKey)?.status ?? null;
+  const activeTab = tabs.find((t) => t.key === activeKey) ?? null;
+  const activeStatus = activeTab?.status ?? null;
+  const activeActivity = activeKey ? activity.get(activeKey) : undefined;
+
+  // ⌘\ / Ctrl+\ toggles the files & diff peek panel.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "\\" && (e.metaKey || e.ctrlKey)) {
+        // Don't hijack Ctrl+\ from a focused terminal — it's SIGQUIT to the
+        // agent. Only toggle when focus is outside the terminal hero.
+        if ((e.target as HTMLElement | null)?.closest(".rk-term")) return;
+        e.preventDefault();
+        setPanelOpen((open) => !open);
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   // Focus the now-active terminal once it's live and its pane has mounted.
   // Gated by focusOnSelect so only an explicit tab/sidebar selection grabs focus
@@ -90,6 +115,7 @@ function App() {
    * (handleOpened) refreshes. */
   function openFromSidebar(node: SessionNode) {
     setNotice(null);
+    setMobilePane("session");
     focusOnSelect.current = true;
     if (node.state === "stopped") {
       void openViaRespawn({
@@ -190,6 +216,7 @@ function App() {
   function handleOpened(attached: boolean) {
     setDialogOpen(false);
     setNotice(attached ? "Attached to an existing session." : null);
+    setMobilePane("session");
     if (attached) {
       // Attaching an already-running session opens no fresh terminal to type
       // into, so keep focus on the + button (matching the cancel/fail paths).
@@ -223,32 +250,51 @@ function App() {
     setDialogOpen(true);
   }
 
+  const working = activeTab?.status === "live" && activeActivity === "working";
+
   return (
-    <main className="app">
-      <Sidebar
-        tree={tree}
-        activeKey={activeKey}
-        openKeys={openKeys}
-        onOpenSession={openFromSidebar}
-        configError={configError}
-        discoveryUnavailable={discoveryUnavailable}
-        onRefresh={() => void refresh()}
-        onStop={onStop}
-        onRemove={onRemove}
-        onNewSession={openNewSession}
-        onOpenSettings={() => {
-          setNotice(null);
-          setSettingsOpen(true);
-        }}
-        activity={activity}
-      />
-      <div className="main-col">
+    <main className={`rk-app rk-app--${mobilePane}`}>
+      <div className="rk-app__sidebar">
+        <Sidebar
+          tree={tree}
+          activeKey={activeKey}
+          openKeys={openKeys}
+          onOpenSession={openFromSidebar}
+          configError={configError}
+          discoveryUnavailable={discoveryUnavailable}
+          onRefresh={() => void refresh()}
+          onStop={onStop}
+          onRemove={onRemove}
+          onNewSession={openNewSession}
+          onOpenSettings={() => {
+            setNotice(null);
+            setSettingsOpen(true);
+          }}
+          activity={activity}
+        />
+      </div>
+      <div className="rk-app__main">
+        <div className="rk-mobilebar">
+          <IconButton
+            label="Back to sessions"
+            size="sm"
+            onClick={() => setMobilePane("list")}
+          >
+            <ChevronRight size={16} style={{ transform: "rotate(180deg)" }} />
+          </IconButton>
+          <span className="rk-mobilebar__title">
+            {activeTab ? activeTab.sessionId : APP_NAME}
+          </span>
+        </div>
         <TabBar
           tabs={tabs}
           activeKey={activeKey}
           activity={activity}
+          panelOpen={panelOpen}
+          onTogglePanel={() => setPanelOpen((open) => !open)}
           onFocus={(key) => {
             setNotice(null);
+            setMobilePane("session");
             // Re-selecting the active tab leaves activeKey unchanged, so the
             // effect won't fire — focus its (already-visible) terminal directly
             // and leave the intent flag disarmed.
@@ -268,60 +314,88 @@ function App() {
           newButtonRef={newButtonRef}
         />
         {notice && (
-          <div className="notice" role="status">
+          <div className="rk-notice" role="status">
             {notice}
           </div>
         )}
-        <div className="panes">
+        <div className="rk-session-bar">
+          {activeTab ? (
+            <>
+              <StatusIndicator
+                state={tabIndicatorState(activeTab.status, activeActivity)}
+              />
+              <span className="rk-session-bar__id">{activeTab.sessionId}</span>
+              {activeTab.agent && <Tag>{activeTab.agent}</Tag>}
+            </>
+          ) : (
+            <span className="rk-session-bar__empty">No active session</span>
+          )}
+          <span className="rk-session-bar__spacer" />
+        </div>
+        <div className="rk-panes">
           {tabs.length === 0 ? (
-            <p className="status">
-              No sessions. Click "+ New session" to start one.
-            </p>
+            <div className="rk-term">
+              <div className="rk-term__boot">
+                <div className="rk-term__boot-txt">
+                  <div className="rk-term__boot-title">No sessions open</div>
+                  <div className="rk-term__boot-sub">
+                    Pick a session from the sidebar, or start a new one.
+                  </div>
+                </div>
+              </div>
+            </div>
           ) : (
             tabs.map((t) => (
               <div
                 key={t.key}
-                className="pane"
+                className="rk-term"
                 style={t.key === activeKey ? undefined : { display: "none" }}
               >
                 {t.status === "stopped" ? (
-                  <div className="pane-status" role="status">
+                  <div className="rk-pane-status" role="status">
                     <p>Session stopped{t.error ? `: ${t.error}` : "."}</p>
-                    <div className="pane-status-actions">
+                    <div className="rk-pane-status__actions">
                       {canRespawn(t.workspace) && (
-                        <button
-                          type="button"
+                        <Button
+                          variant="secondary"
+                          size="sm"
                           onClick={() => void respawnTab(t.key)}
                         >
                           Respawn
-                        </button>
+                        </Button>
                       )}
-                      <button
-                        type="button"
+                      <Button
+                        variant="ghost"
+                        size="sm"
                         onClick={() => onRemoveTab(t.projectId, t.sessionId)}
                       >
                         Remove…
-                      </button>
+                      </Button>
                     </div>
                   </div>
                 ) : t.status === "disconnected" ? (
-                  <div className="pane-status pane-status--error" role="alert">
+                  <div
+                    className="rk-pane-status rk-pane-status--error"
+                    role="alert"
+                  >
                     <p>Disconnected: {t.error}</p>
-                    <div className="pane-status-actions">
+                    <div className="rk-pane-status__actions">
                       {canRespawn(t.workspace) && (
-                        <button
-                          type="button"
+                        <Button
+                          variant="secondary"
+                          size="sm"
                           onClick={() => void respawnTab(t.key)}
                         >
                           Respawn
-                        </button>
+                        </Button>
                       )}
-                      <button
-                        type="button"
+                      <Button
+                        variant="ghost"
+                        size="sm"
                         onClick={() => onRemoveTab(t.projectId, t.sessionId)}
                       >
                         Remove…
-                      </button>
+                      </Button>
                     </div>
                   </div>
                 ) : (
@@ -338,7 +412,21 @@ function App() {
             ))
           )}
         </div>
+        {working && (
+          <div className="rk-workstrip" role="status">
+            <StatusIndicator state="working" />
+            <span>
+              Agent is working — <span className="rk-workstrip__kbd">⌘.</span>{" "}
+              to interrupt
+            </span>
+          </div>
+        )}
       </div>
+      {panelOpen && (
+        <div className="rk-app__panel">
+          <DiffPanel onClose={() => setPanelOpen(false)} />
+        </div>
+      )}
       {dialogOpen && (
         <NewSessionDialog
           config={config}

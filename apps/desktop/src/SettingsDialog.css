@@ -1,0 +1,196 @@
+/* Settings dialog + config forms — layout only; visuals come from tokens and the
+ * ui/ components. Imported by SettingsDialog.tsx only. The form classes live here
+ * too because the entity forms only ever render inside the settings dialog. */
+
+/* Widen the shared Dialog for the three-section config editor and keep its body
+ * scrollable (the Dialog already caps height + scrolls the body). */
+.rmra-dialog.settings-dialog {
+  max-width: 560px;
+}
+
+.settings-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-12);
+  padding-bottom: var(--space-6);
+}
+
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.settings-section__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-6);
+}
+
+.settings-section__title {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-4);
+  font: var(--type-label);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.settings-section__title svg {
+  color: var(--text-muted);
+}
+
+.settings-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.settings-empty {
+  font: var(--type-meta);
+  color: var(--text-muted);
+  padding: var(--space-3) var(--space-2);
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+}
+
+.settings-row__main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-5);
+}
+
+.settings-row__name {
+  color: var(--text-primary);
+  font-size: var(--text-md);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.settings-row__id {
+  font-family: var(--font-mono);
+  font-size: var(--mono-sm);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.settings-row__badge {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--mono-xs);
+  color: var(--text-secondary);
+  background: var(--bg-active);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-pill);
+  padding: 1px var(--space-4);
+  max-width: 14rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-row__actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.settings-issues {
+  margin: 0;
+  padding-left: var(--space-12);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  font: var(--type-meta);
+  color: var(--text-secondary);
+}
+
+.settings-error {
+  margin: 0;
+  font: var(--type-meta);
+  color: var(--danger);
+  background: var(--danger-bg);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: var(--space-4) var(--space-5);
+}
+
+.settings-loading {
+  font: var(--type-meta);
+  color: var(--text-muted);
+  padding: var(--space-6) 0;
+}
+
+/* ---- Entity forms ---- */
+
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-8);
+}
+
+.settings-form__title {
+  margin: 0;
+  font: var(--type-heading);
+  color: var(--text-primary);
+}
+
+.settings-form__toggle {
+  padding: var(--space-2) 0;
+}
+
+.settings-form__fieldlabel {
+  font: var(--type-label);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.settings-argv {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.settings-argv[aria-disabled="true"] {
+  opacity: 0.55;
+}
+
+.settings-argv__row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.settings-argv__row .rmra-field {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings-form__actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-5);
+  padding-top: var(--space-4);
+}

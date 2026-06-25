@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Desktop design system + app redesign**: the desktop frontend now renders
+  through a token-driven design system instead of the placeholder stylesheet —
+  dark-first with an OS-following light theme (the terminal stays dark in both),
+  one marine-blue accent reserved for the active session/tab, focus rings,
+  primary actions, and the agent-activity pulse, Inter for chrome and JetBrains
+  Mono for machine values. Adds committed CSS tokens (color/type/space/radius/
+  elevation/motion), an inline Lucide-geometry icon set, and a TSX component
+  library at `apps/desktop/src/ui/` (Button, IconButton, Tag, Badge, Avatar,
+  Input, Select, Switch, Checkbox, Dialog, Toast, Tooltip, plus the session hero
+  surfaces StatusIndicator/DotmLoader/ActivityPulse/SessionRow/SessionTab). The
+  shell becomes sidebar → tabs → session bar → first-class xterm terminal → a
+  working-status strip, with a Files & diff peek panel (`⌘\\` toggle, empty-state
+  shell until a diff backend lands) and a desktop→mobile single-pane fold. The
+  signature breathing pulse maps onto the real activity model — working / needs
+  you / idle — and the xterm is themed to the design's ANSI palette. Pure
+  presentation: no transport, store, or protocol changes, and the terminal stays
+  the sole input. Authored from the claude.ai/design "Remora Design System".
 - **ssh connection multiplexing** (#63): the direct ssh transport now shares one
   authenticated master across the many short-lived per-session ops (discovery,
   spawn, has-session, attach) via OpenSSH `ControlMaster=auto`,

@@ -1,15 +1,18 @@
-import {
-  type KeyboardEvent,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { type KeyboardEvent, useEffect, useMemo, useState } from "react";
 import type { ConfigDto } from "./bindings";
 import { buildNewSessionModel, resolveSelection } from "./new-session-model";
 import type { OpenResult, SpawnInput } from "./session-store";
 import { OPEN_CANCELLED } from "./session-store";
 import { isValidSlug, normalizeSlugInput } from "./spawn-input";
+import { Button, Dialog, Input, Select } from "./ui";
+import { Terminal } from "./ui/icons";
+
+/** Stable id for the dialog panel so the focus trap can query within it
+ * (the presentational <Dialog> renders its own scrim/panel and forwards
+ * neither a ref nor focus/Esc handling — this component owns that). */
+const DIALOG_ID = "new-session-dialog";
+const FOCUSABLE =
+  'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])';
 
 interface NewSessionDialogProps {
   /** Per-device config; drives the project and agent pickers. */
@@ -49,8 +52,6 @@ export function NewSessionDialog({
   const [workspace, setWorkspace] = useState(initial.workspace);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const dialogRef = useRef<HTMLDivElement>(null);
-  const firstFieldRef = useRef<HTMLSelectElement>(null);
 
   const selectedProject =
     model.projects.find((p) => p.id === projectId) ?? null;
@@ -61,16 +62,18 @@ export function NewSessionDialog({
     model.agents.includes(agent) &&
     isValidSlug(sessionId);
 
-  // Focus the first field on open; restore focus to the opener on close. Falls
-  // back to the first focusable control (e.g. Close in the no-projects state,
-  // where the project <select> isn't rendered).
+  // Focus the first field on open; restore focus to the opener on close. Prefers
+  // the first focusable control inside the dialog body (the project <select>),
+  // falling back to the panel's first focusable (e.g. the × / Close button in
+  // the no-projects state, where the body has no focusable control).
   useEffect(() => {
     const previouslyFocused = document.activeElement as HTMLElement | null;
+    const panel = document.getElementById(DIALOG_ID);
     const target =
-      firstFieldRef.current ??
-      dialogRef.current?.querySelector<HTMLElement>(
-        'button, select, input, [tabindex]:not([tabindex="-1"])',
-      );
+      panel
+        ?.querySelector(".rmra-dialog__body")
+        ?.querySelector<HTMLElement>(FOCUSABLE) ??
+      panel?.querySelector<HTMLElement>(FOCUSABLE);
     target?.focus();
     return () => previouslyFocused?.focus?.();
   }, []);
@@ -140,18 +143,18 @@ export function NewSessionDialog({
     }
   }
 
-  /** Modal keyboard handling: Esc closes, Tab is trapped within the dialog. */
-  function onKeyDown(e: KeyboardEvent) {
+  /** Modal keyboard handling: Esc closes, Tab is trapped within the dialog.
+   * The presentational <Dialog> handles neither, so we wire it here on the
+   * panel (this handler is attached to the dialog panel via the spread). */
+  function onKeyDown(e: KeyboardEvent<HTMLDivElement>) {
     if (e.key === "Escape") {
       e.preventDefault();
       onClose();
       return;
     }
     if (e.key !== "Tab") return;
-    const focusable = dialogRef.current?.querySelectorAll<HTMLElement>(
-      'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])',
-    );
-    if (!focusable || focusable.length === 0) return;
+    const focusable = e.currentTarget.querySelectorAll<HTMLElement>(FOCUSABLE);
+    if (focusable.length === 0) return;
     const first = focusable[0];
     const last = focusable[focusable.length - 1];
     if (e.shiftKey && document.activeElement === first) {
@@ -164,133 +167,144 @@ export function NewSessionDialog({
   }
 
   const hasProjects = model.projects.length > 0;
+  const createLabel = submitting ? "Connecting…" : "Open";
+
+  const footer = hasProjects ? (
+    <>
+      <Button variant="ghost" onClick={onClose}>
+        Cancel
+      </Button>
+      <Button
+        type="submit"
+        form="new-session-form"
+        variant="primary"
+        disabled={!valid}
+        loading={submitting}
+      >
+        {createLabel}
+      </Button>
+    </>
+  ) : (
+    <Button variant="ghost" onClick={onClose}>
+      Close
+    </Button>
+  );
 
   return (
-    // biome-ignore lint/a11y/noStaticElementInteractions: backdrop key handling
-    <div className="dialog-backdrop" onKeyDown={onKeyDown}>
-      <div
-        ref={dialogRef}
-        className="dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-label="New session"
-      >
-        <h2>New session</h2>
-        {!hasProjects ? (
-          <>
-            <p className="dialog-error" role="alert">
-              No projects configured. Add a project to your config.toml to start
-              a session.
-            </p>
-            <div className="dialog-actions">
-              <button type="button" onClick={onClose}>
-                Close
-              </button>
-            </div>
-          </>
-        ) : (
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              void submit();
-            }}
-          >
-            <label>
-              Project
-              <select
-                ref={firstFieldRef}
-                value={projectId}
-                onChange={(e) => selectProject(e.target.value)}
-              >
-                {model.projects.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.label} ({p.hostLabel})
-                  </option>
-                ))}
-              </select>
-            </label>
+    <Dialog
+      open
+      id={DIALOG_ID}
+      title="Start a new session"
+      description="Runs in a fresh remote sandbox attached to a workspace."
+      icon={<Terminal size={18} />}
+      onClose={onClose}
+      onKeyDown={onKeyDown}
+      footer={footer}
+    >
+      {!hasProjects ? (
+        <p className="rmra-field__hint rmra-field__hint--error" role="alert">
+          No projects configured. Add a project to your config.toml to start a
+          session.
+        </p>
+      ) : (
+        <form
+          id="new-session-form"
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "var(--space-8)",
+          }}
+          onSubmit={(e) => {
+            e.preventDefault();
+            void submit();
+          }}
+        >
+          <div className="rmra-field">
+            <Select
+              label="Project"
+              value={projectId}
+              onChange={(value) => selectProject(value)}
+              options={model.projects.map((p) => ({
+                value: p.id,
+                label: `${p.label} (${p.hostLabel})`,
+              }))}
+            />
             {selectedProject && (
-              <p className="hint">Host: {selectedProject.hostLabel}</p>
-            )}
-            <label>
-              Session
-              <input
-                value={sessionId}
-                onChange={(e) =>
-                  setSessionId(normalizeSlugInput(e.target.value))
-                }
-              />
-            </label>
-            <label>
-              Agent
-              <select value={agent} onChange={(e) => setAgent(e.target.value)}>
-                {model.agents.map((id) => (
-                  <option key={id} value={id}>
-                    {id}
-                    {selectedProject?.defaultAgent === id ? " (default)" : ""}
-                  </option>
-                ))}
-              </select>
-              <span className="hint">
-                Applies only when spawning a new session.
+              <span className="rmra-field__hint">
+                Host: {selectedProject.hostLabel}
               </span>
-            </label>
-            <label>
-              Base
-              <input
-                value={base}
-                placeholder="origin/main (auto-detected if empty)"
-                onChange={(e) => setBase(e.target.value)}
-              />
-              <span className="hint">
-                Start-point for the new worktree. Empty = project default /
-                detected.
-              </span>
-            </label>
-            <label>
-              Workspace
-              <select
-                value={workspace}
-                onChange={(e) =>
-                  setWorkspace(e.target.value as typeof workspace)
-                }
-              >
-                <option value="worktree">
-                  worktree
-                  {selectedProject?.defaultWorkspace === "worktree"
-                    ? " (default)"
-                    : ""}
-                </option>
-                <option value="shared">
-                  shared
-                  {selectedProject?.defaultWorkspace === "shared"
-                    ? " (default)"
-                    : ""}
-                </option>
-              </select>
-              {workspace === "shared" && (
-                <span className="hint">
-                  Shared sessions reuse the project directory and can clobber
-                  each other.
-                </span>
-              )}
-            </label>
-            {error && (
-              <p className="dialog-error" role="alert">
-                {error}
-              </p>
             )}
-            <div className="dialog-actions">
-              <button type="button" onClick={onClose}>
-                Cancel
-              </button>
-              <button type="submit" disabled={!valid || submitting}>
-                {submitting ? "Connecting…" : "Open"}
-              </button>
-            </div>
-          </form>
-        )}
-      </div>
-    </div>
+          </div>
+          <Input
+            label="Session"
+            value={sessionId}
+            mono
+            onChange={(e) => setSessionId(normalizeSlugInput(e.target.value))}
+          />
+          <div className="rmra-field">
+            <Select
+              label="Agent"
+              value={agent}
+              onChange={(value) => setAgent(value)}
+              options={model.agents.map((id) => ({
+                value: id,
+                label:
+                  selectedProject?.defaultAgent === id ? `${id} (default)` : id,
+              }))}
+            />
+            <span className="rmra-field__hint">
+              Applies only when spawning a new session.
+            </span>
+          </div>
+          <Input
+            label="Base"
+            value={base}
+            mono
+            placeholder="origin/main (auto-detected if empty)"
+            hint="Start-point for the new worktree. Empty = project default / detected."
+            onChange={(e) => setBase(e.target.value)}
+          />
+          <div className="rmra-field">
+            <Select
+              label="Workspace"
+              value={workspace}
+              onChange={(value) => setWorkspace(value as typeof workspace)}
+              options={[
+                {
+                  value: "worktree",
+                  label: `worktree${
+                    selectedProject?.defaultWorkspace === "worktree"
+                      ? " (default)"
+                      : ""
+                  }`,
+                },
+                {
+                  value: "shared",
+                  label: `shared${
+                    selectedProject?.defaultWorkspace === "shared"
+                      ? " (default)"
+                      : ""
+                  }`,
+                },
+              ]}
+            />
+            {workspace === "shared" && (
+              <span className="rmra-field__hint">
+                Shared sessions reuse the project directory and can clobber each
+                other.
+              </span>
+            )}
+          </div>
+          {error && (
+            <p
+              className="rmra-field__hint rmra-field__hint--error"
+              role="alert"
+            >
+              {error}
+            </p>
+          )}
+        </form>
+      )}
+    </Dialog>
   );
 }
