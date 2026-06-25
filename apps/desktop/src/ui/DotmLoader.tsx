@@ -100,7 +100,7 @@ function remapOpacity(o: number, tb: number, tm: number, tp: number): number {
 const STATE_COLOR: Record<IndicatorState, string> = {
   working: "var(--accent-bright)",
   needs: "var(--accent-bright)",
-  idle: "var(--text-muted)",
+  idle: "var(--text-secondary)",
   done: "var(--success)",
   error: "var(--danger)",
 };
@@ -108,7 +108,7 @@ const STATE_OPACITY: Record<IndicatorState, [number, number, number]> = {
   // [base, mid, peak]
   working: [0.12, 0.42, 1],
   needs: [0.2, 0.42, 0.9],
-  idle: [0.12, 0.42, 0.4],
+  idle: [0.55, 0.45, 0.6],
   done: [0.78, 0.42, 1],
   error: [0.78, 0.42, 1],
 };
