@@ -7,10 +7,9 @@ import { SettingsDialog } from "./SettingsDialog";
 import { Sidebar } from "./Sidebar";
 import { canRespawn, OPEN_CANCELLED } from "./session-store";
 import { buildTree, type SessionNode } from "./session-tree";
-import { tabIndicatorState } from "./status-state";
 import { TabBar } from "./TabBar";
 import { Terminal, type TerminalHandle } from "./Terminal";
-import { Button, IconButton, StatusIndicator, Tag } from "./ui";
+import { Button, IconButton, Tag } from "./ui";
 import { ChevronRight } from "./ui/icons";
 import { activityStore, useActivity } from "./useActivity";
 import { discoveryStore, useDiscovery } from "./useDiscovery";
@@ -74,7 +73,6 @@ function App() {
   // placeholder or a not-yet-ready terminal until it does).
   const activeTab = tabs.find((t) => t.key === activeKey) ?? null;
   const activeStatus = activeTab?.status ?? null;
-  const activeActivity = activeKey ? activity.get(activeKey) : undefined;
 
   // ⌘\ / Ctrl+\ toggles the files & diff peek panel.
   useEffect(() => {
@@ -319,9 +317,6 @@ function App() {
         <div className="rk-session-bar">
           {activeTab ? (
             <>
-              <StatusIndicator
-                state={tabIndicatorState(activeTab.status, activeActivity)}
-              />
               <span className="rk-session-bar__id">{activeTab.sessionId}</span>
               {activeTab.agent && <Tag>{activeTab.agent}</Tag>}
             </>
