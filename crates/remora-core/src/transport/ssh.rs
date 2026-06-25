@@ -88,9 +88,28 @@ fn ssh_base_argv(host: &SshHost, interactive: bool) -> Vec<String> {
     argv.push("ServerAliveCountMax=3".into());
     // Bound the connect phase so an unreachable/slow host fails fast instead
     // of parking a spawn_blocking thread. Execution-phase hangs (a wedged
-    // remote git/tmux) are not covered — see TODOS.md (execution watchdog).
+    // remote git/tmux) are not covered — see #99 (execution watchdog).
     argv.push("-o".into());
     argv.push("ConnectTimeout=10".into());
+    // Connection multiplexing (#63): discovery + spawn fan out into many
+    // short-lived ssh calls plus the long-lived attach. Sharing one
+    // authenticated master means the user authenticates once (one FIDO touch /
+    // bastion hop) and the rest skip the handshake. `auto` — not `yes` — is the
+    // safety choice: a stale or orphaned socket (host rebooted, master killed)
+    // makes ssh fall back to a fresh connection rather than wedge, and a normal
+    // idle `ControlPersist` exit removes the socket itself. `%C` is a
+    // fixed-length hash of (local-host, remote-host, port, user): unique per
+    // host and immune to the ~104-char unix-socket path limit; ssh expands it
+    // and `~` itself (this argv is exec'd directly, no shell). The warm socket
+    // lingers `ControlPersist=60s` after the last connection — a small, bounded
+    // security surface documented in ADR-0011. Scoped to direct ssh only; the
+    // relay would own masters for many users/hosts and is deferred there.
+    argv.push("-o".into());
+    argv.push("ControlMaster=auto".into());
+    argv.push("-o".into());
+    argv.push("ControlPath=~/.ssh/remora-%C".into());
+    argv.push("-o".into());
+    argv.push("ControlPersist=60s".into());
     if let Some(port) = host.port {
         argv.push("-p".into());
         argv.push(port.to_string());
@@ -322,6 +341,12 @@ mod tests {
                 "ServerAliveCountMax=3",
                 "-o",
                 "ConnectTimeout=10",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPath=~/.ssh/remora-%C",
+                "-o",
+                "ControlPersist=60s",
                 "devbox",
                 "env",
                 "LANG=C.UTF-8",
@@ -334,6 +359,42 @@ mod tests {
             ]
         );
         assert!(!argv.iter().any(|a| a == "--"), "no options terminator");
+    }
+
+    /// True if `argv` carries the OpenSSH option `-o <opt>` as an adjacent pair.
+    fn has_ssh_opt(argv: &[String], opt: &str) -> bool {
+        argv.windows(2).any(|w| w[0] == "-o" && w[1] == opt)
+    }
+
+    #[test]
+    fn ssh_compose_carries_connection_multiplexing_options() {
+        // #63: every ssh call multiplexes over one authenticated master so the
+        // user authenticates once. `auto` (not `yes`) means a stale/dead master
+        // gracefully degrades to a fresh connection instead of wedging. `%C` is
+        // a fixed-length hash of (local-host, remote-host, port, user) — unique
+        // per host and immune to the unix-socket path-length limit. ssh expands
+        // `~` and `%C` itself (the argv is exec'd directly, no shell). The flags
+        // ride BOTH the blocking setup calls and the long-lived attach so they
+        // share the same master.
+        for interactive in [true, false] {
+            let argv = ssh_compose(
+                &host("devbox", None, None),
+                interactive,
+                &attach_tokens("remora_api_s"),
+            );
+            assert!(
+                has_ssh_opt(&argv, "ControlMaster=auto"),
+                "interactive={interactive}: {argv:?}"
+            );
+            assert!(
+                has_ssh_opt(&argv, "ControlPath=~/.ssh/remora-%C"),
+                "interactive={interactive}: {argv:?}"
+            );
+            assert!(
+                has_ssh_opt(&argv, "ControlPersist=60s"),
+                "interactive={interactive}: {argv:?}"
+            );
+        }
     }
 
     #[test]

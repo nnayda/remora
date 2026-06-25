@@ -39,4 +39,4 @@ bridge (~15 files) in favor of this ~6-file, type-churn-free approach.
   the project default (stopped sessions carry no tmux env) — the same existing
   limitation as any agent override.
 - A project whose default agent has an empty command makes its default a shell;
-  a follow-up guard is tracked in `TODOS.md`.
+  a follow-up guard is tracked in #113.
