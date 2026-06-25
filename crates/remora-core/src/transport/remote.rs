@@ -1557,9 +1557,9 @@ pub(crate) mod tests {
             .position(|a| a == "new-session")
             .expect("new-session");
         // Still exactly one agent-command token after `-c <dir>` (wrapped, not
-        // per-token), followed by two 6-token trailers (remain-on-exit, then
-        // mouse). new-session + 6 (down to agent-cmd) + 6 + 6.
-        assert_eq!(tokens.len(), n + 1 + 6 + 6 + 6);
+        // per-token), followed by three 6-token trailers (remain-on-exit, mouse,
+        // then allow-passthrough). new-session + 6 (down to agent-cmd) + 6 + 6 + 6.
+        assert_eq!(tokens.len(), n + 1 + 6 + 6 + 6 + 6);
         let fragment = join_agent_command(&plan.agent_argv);
         let inner = wrap_with_shell_fallback(&fragment);
         assert_eq!(tokens[n + 6], shell_quote(&inner));
