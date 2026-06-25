@@ -254,12 +254,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Faster session discovery** (#108): listing remote sessions now reads each
-  session's `REMORA_*` metadata inline via tmux 3.0's `#{E:VAR}` expansion in a
-  single `list-sessions`, replacing the old one-`show-environment`-per-session
-  fan-out — the bulk of discovery latency on a high-RTT link. The live set comes
-  from a trusted names-only `list-sessions` (env-free, so unforgeable) and the
-  inline metadata enriches each session by name, so discovery's `1 + N`
-  round-trips collapse to two cheap ones over the shared ControlMaster (#63).
+  session's `REMORA_*` metadata inline via tmux 3.0's `#{E:VAR}` expansion,
+  replacing the old one-`show-environment`-per-session fan-out — the bulk of
+  discovery latency on a high-RTT link. Discovery runs two `list-sessions`
+  passes: a trusted names-only pass (env-free, so unforgeable) decides the live
+  set, and an inline-metadata pass enriches each session by name. That collapses
+  the old `1 + N` round-trips to two cheap ones over the shared ControlMaster
+  (#63).
   Because the live set is decided by the names listing, a forged `REMORA_*` value
   containing a newline can no longer fabricate a phantom session row. Hosts on
   tmux < 3.0 degrade gracefully: the session still lists Live, just without
