@@ -19,8 +19,32 @@ const xt = vi.hoisted(() => {
     dispose = vi.fn();
     loadAddon = vi.fn();
     focus = vi.fn();
+    oscCb: ((data: string) => boolean) | null = null;
+    oscDispose = vi.fn();
+    keyHandler: ((e: KeyboardEvent) => boolean) | null = null;
+    selection = "";
+    getSelection = vi.fn(() => this.selection);
+    // The controller registers ONE custom key handler that covers both the
+    // Shift+Enter soft-return and the copy chord. Expose it under both names the
+    // two test suites reach for (keyCb, keyHandler) so each can drive it.
+    attachCustomKeyEventHandler = vi.fn((cb: (e: KeyboardEvent) => boolean) => {
+      this.keyCb = cb;
+      this.keyHandler = cb;
+    });
+    parser: {
+      registerOscHandler: (
+        id: number,
+        cb: (d: string) => boolean,
+      ) => { dispose: () => void };
+    };
     constructor() {
       state.term = this;
+      this.parser = {
+        registerOscHandler: (_id, cb) => {
+          this.oscCb = cb;
+          return { dispose: this.oscDispose };
+        },
+      };
     }
     write(d: string | Uint8Array) {
       this.written.push(d);
@@ -28,9 +52,6 @@ const xt = vi.hoisted(() => {
     onData(cb: (d: string) => void) {
       this.dataCb = cb;
       return { dispose: this.dataDispose };
-    }
-    attachCustomKeyEventHandler(cb: (e: KeyboardEvent) => boolean) {
-      this.keyCb = cb;
     }
   }
   class FakeFit {
@@ -133,6 +154,17 @@ function term(): NonNullable<typeof xt.state.term> {
 }
 
 describe("TerminalController", () => {
+  function ctrlWithClipboard() {
+    const conn = fakeConn();
+    const writeClipboard = vi.fn().mockResolvedValue(undefined);
+    const c = new TerminalController(
+      el,
+      conn as unknown as SessionConnection,
+      writeClipboard,
+    );
+    return { c, conn, writeClipboard };
+  }
+
   it("writes incoming bytes to the terminal as a Uint8Array (not a string)", () => {
     const conn = fakeConn();
     new TerminalController(el, conn as unknown as SessionConnection);
@@ -288,6 +320,7 @@ describe("TerminalController", () => {
     expect(disconnectSpy).toHaveBeenCalled();
     expect(conn.unsubscribe).toHaveBeenCalled();
     expect(xt.state.term?.dataDispose).toHaveBeenCalled();
+    expect(xt.state.term?.oscDispose).toHaveBeenCalled();
     expect(xt.state.term?.dispose).toHaveBeenCalled();
   });
 
@@ -329,5 +362,128 @@ describe("TerminalController", () => {
     term().dataCb?.("y");
     expect(conn.write).toHaveBeenCalledTimes(2);
     errSpy.mockRestore();
+  });
+
+  it("writes the decoded OSC 52 payload to the clipboard", () => {
+    const { writeClipboard } = ctrlWithClipboard();
+    // base64("hello") = "aGVsbG8="
+    term().oscCb?.("c;aGVsbG8=");
+    expect(writeClipboard).toHaveBeenCalledWith("hello");
+  });
+
+  it("decodes UTF-8 OSC 52 payloads correctly", () => {
+    const { writeClipboard } = ctrlWithClipboard();
+    // base64(utf8("café")) = "Y2Fmw6k="
+    term().oscCb?.("c;Y2Fmw6k=");
+    expect(writeClipboard).toHaveBeenCalledWith("café");
+  });
+
+  it("ignores OSC 52 read requests (never echoes the clipboard back)", () => {
+    const { writeClipboard } = ctrlWithClipboard();
+    const handled = term().oscCb?.("c;?");
+    expect(handled).toBe(true);
+    expect(writeClipboard).not.toHaveBeenCalled();
+  });
+
+  it("logs and swallows a malformed OSC 52 payload", () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { writeClipboard } = ctrlWithClipboard();
+    const handled = term().oscCb?.("c;@@not-base64@@");
+    expect(handled).toBe(true);
+    expect(writeClipboard).not.toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it("ignores an empty OSC 52 payload (does not clobber the clipboard)", () => {
+    const { writeClipboard } = ctrlWithClipboard();
+    const handled = term().oscCb?.("c;");
+    expect(handled).toBe(true);
+    expect(writeClipboard).not.toHaveBeenCalled();
+  });
+
+  it("logs and swallows OSC 52 with valid base64 but invalid UTF-8 bytes", () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { writeClipboard } = ctrlWithClipboard();
+    // base64("\xff") = "/w==" — 0xFF is not a valid UTF-8 lead byte.
+    const handled = term().oscCb?.("c;/w==");
+    expect(handled).toBe(true);
+    expect(writeClipboard).not.toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it("logs a clipboard write rejection without throwing", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const conn = fakeConn();
+    const writeClipboard = vi.fn().mockRejectedValueOnce(new Error("denied"));
+    new TerminalController(
+      el,
+      conn as unknown as SessionConnection,
+      writeClipboard,
+    );
+    term().oscCb?.("c;aGVsbG8=");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(errSpy).toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  // A copy-chord KeyboardEvent double. `key` is matched by code, not key, so the
+  // soft-return branch is skipped; preventDefault is a spy we can assert on.
+  function copyChord(opts: {
+    metaKey?: boolean;
+    ctrlKey?: boolean;
+    shiftKey?: boolean;
+  }): KeyboardEvent {
+    return {
+      type: "keydown",
+      code: "KeyC",
+      altKey: false,
+      metaKey: opts.metaKey ?? false,
+      ctrlKey: opts.ctrlKey ?? false,
+      shiftKey: opts.shiftKey ?? false,
+      preventDefault: vi.fn(),
+    } as unknown as KeyboardEvent;
+  }
+
+  it("copies the selection and consumes Cmd+C when text is selected", () => {
+    const { writeClipboard } = ctrlWithClipboard();
+    term().selection = "selected text";
+    const ev = copyChord({ metaKey: true });
+    const handled = term().keyHandler?.(ev);
+    expect(writeClipboard).toHaveBeenCalledWith("selected text");
+    expect(handled).toBe(false); // consumed: not forwarded to the PTY
+    expect(ev.preventDefault).toHaveBeenCalled(); // also suppress native copy
+  });
+
+  it("copies the selection on Ctrl+Shift+C (Linux/Windows chord)", () => {
+    const { writeClipboard } = ctrlWithClipboard();
+    term().selection = "linux copy";
+    const handled = term().keyHandler?.(
+      copyChord({ ctrlKey: true, shiftKey: true }),
+    );
+    expect(writeClipboard).toHaveBeenCalledWith("linux copy");
+    expect(handled).toBe(false);
+  });
+
+  it("consumes the copy chord but writes nothing when there is no selection", () => {
+    const { writeClipboard } = ctrlWithClipboard();
+    term().selection = "";
+    const ev = copyChord({ metaKey: true });
+    const handled = term().keyHandler?.(ev);
+    expect(writeClipboard).not.toHaveBeenCalled();
+    expect(handled).toBe(false);
+    expect(ev.preventDefault).toHaveBeenCalled();
+  });
+
+  it("lets a bare Ctrl-C through (stays SIGINT, never copies)", () => {
+    const { writeClipboard } = ctrlWithClipboard();
+    term().selection = "ignored";
+    const ev = copyChord({ ctrlKey: true });
+    const handled = term().keyHandler?.(ev);
+    expect(writeClipboard).not.toHaveBeenCalled();
+    expect(handled).toBe(true); // passed through to xterm → ^C
+    expect(ev.preventDefault).not.toHaveBeenCalled(); // not consumed
   });
 });

@@ -1,8 +1,24 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
+import {
+  type ClipboardWriter,
+  writeClipboard as defaultWriteClipboard,
+} from "./clipboard";
 import type { SessionConnection } from "./connection";
 
 const encoder = new TextEncoder();
+// fatal: a remote-supplied payload with invalid UTF-8 throws here rather than
+// silently landing U+FFFD replacement characters on the clipboard.
+const decoder = new TextDecoder("utf-8", { fatal: true });
+
+/** Decode a base64 string whose bytes are UTF-8 (OSC 52 payloads are UTF-8).
+ * Throws on malformed input: `atob` on invalid base64, the decoder on invalid
+ * UTF-8 — both are caught by the OSC 52 handler. */
+function decodeBase64Utf8(b64: string): string {
+  const binary = atob(b64);
+  const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
+  return decoder.decode(bytes);
+}
 
 /**
  * Owns one xterm.js Terminal bound to a SessionConnection. Wiring only — the
@@ -19,6 +35,7 @@ export class TerminalController {
   private readonly observer: ResizeObserver;
   private readonly unsubscribe: () => void;
   private readonly onDataDisposable: { dispose(): void };
+  private readonly oscDisposable: { dispose(): void };
   private closed = false;
   private lastRows = 0;
   private lastCols = 0;
@@ -29,12 +46,16 @@ export class TerminalController {
   constructor(
     element: HTMLElement,
     private readonly connection: SessionConnection,
+    private readonly writeClipboard: ClipboardWriter = defaultWriteClipboard,
   ) {
     this.term = new Terminal({ cursorBlink: true });
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
     this.term.attachCustomKeyEventHandler((e) => this.handleKeyEvent(e));
     this.term.open(element);
+    this.oscDisposable = this.term.parser.registerOscHandler(52, (data) =>
+      this.handleOsc52(data),
+    );
 
     this.unsubscribe = connection.subscribe((msg) => {
       if (msg.event === "bytes") this.term.write(new Uint8Array(msg.bytes));
@@ -56,16 +77,20 @@ export class TerminalController {
   }
 
   /**
-   * Intercept Shift+Enter and forward it as ESC+CR (`\x1b\r`) — the soft-return
-   * sequence agents expect to insert a newline in their input — instead of
-   * letting xterm collapse it to a bare CR that submits the prompt. Returning
-   * `false` suppresses xterm's default handling so it doesn't also emit a CR;
-   * every other key returns `true` and falls through to xterm unchanged.
+   * Custom key handling layered over xterm. Two interceptions, both returning
+   * `false` to suppress xterm's default for that key; every other key returns
+   * `true` and falls through unchanged.
    *
-   * Stays agent-agnostic: `\x1b\r` is the same byte sequence a native terminal
-   * is configured to send for Shift+Enter, so we're faithfully forwarding the
-   * keystroke over the PTY, not special-casing any agent. Other modifiers
-   * (Ctrl/Alt/Meta) are left alone so their own bindings still reach the agent.
+   * 1. Shift+Enter → ESC+CR (`\x1b\r`), the soft-return sequence agents expect
+   *    to insert a newline, instead of the bare CR xterm would emit (which
+   *    submits the prompt). Agent-agnostic: it's the same byte sequence a native
+   *    terminal sends for Shift+Enter, so we're faithfully forwarding the key.
+   * 2. The copy chord — Cmd+C (macOS) or Ctrl+Shift+C (Linux/Windows) — copies
+   *    the current selection to the host clipboard and swallows the key so it is
+   *    not sent to the PTY.
+   *
+   * A bare Ctrl-C matches neither branch, so it stays SIGINT. Other modifiers
+   * (Ctrl/Alt/Meta+Enter) are left alone so their own bindings reach the agent.
    */
   private handleKeyEvent(event: KeyboardEvent): boolean {
     if (
@@ -89,6 +114,27 @@ export class TerminalController {
       }
       return false;
     }
+
+    const isCopyChord =
+      event.type === "keydown" &&
+      event.code === "KeyC" &&
+      !event.altKey &&
+      ((event.metaKey && !event.ctrlKey && !event.shiftKey) ||
+        (event.ctrlKey && event.shiftKey && !event.metaKey));
+    if (isCopyChord) {
+      // Suppress the browser's native copy too, not just xterm's handling:
+      // returning false only stops xterm, so without this the webview's own
+      // Cmd+C copy could also fire and race our clipboard write.
+      event.preventDefault();
+      const selection = this.term.getSelection();
+      if (selection) {
+        void this.writeClipboard(selection).catch((err) =>
+          this.logClipboardError(err),
+        );
+      }
+      return false; // consume the chord; never forward to the PTY
+    }
+
     return true;
   }
 
@@ -113,6 +159,32 @@ export class TerminalController {
    * transient rejection must not force-close an otherwise live session. */
   private logTransportError(op: "write" | "resize", error: unknown): void {
     console.error(`terminal ${op} failed`, error);
+  }
+
+  /** Handle an inbound OSC 52 clipboard sequence (`Pc;Pd`). A set request writes
+   * the decoded UTF-8 text to the host clipboard; a read request (`Pd === "?"`)
+   * is ignored so a remote can never exfiltrate the local clipboard. Always
+   * reports handled so xterm does not fall back to default processing. */
+  private handleOsc52(data: string): boolean {
+    const sep = data.indexOf(";");
+    const payload = sep === -1 ? data : data.slice(sep + 1);
+    if (payload === "?") return true; // read request: never echo the clipboard back
+    if (payload === "") return true; // empty set: ignore, don't clobber the clipboard
+    let text: string;
+    try {
+      text = decodeBase64Utf8(payload);
+    } catch (err) {
+      console.error("terminal OSC 52 decode failed", err);
+      return true;
+    }
+    void this.writeClipboard(text).catch((err) => this.logClipboardError(err));
+    return true;
+  }
+
+  /** Surface (don't swallow) a clipboard write rejection. Log only: a denied or
+   * failed clipboard write must not tear down an otherwise-live session. */
+  private logClipboardError(error: unknown): void {
+    console.error("terminal clipboard write failed", error);
   }
 
   /** Coalesce a burst of ResizeObserver callbacks into one fit on the next frame. */
@@ -141,6 +213,7 @@ export class TerminalController {
 
   /** Tear down all listeners, the ResizeObserver, and the xterm instance. */
   dispose(): void {
+    this.oscDisposable.dispose();
     if (this.resizeRaf) cancelAnimationFrame(this.resizeRaf);
     this.observer.disconnect();
     this.onDataDisposable.dispose();
