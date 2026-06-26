@@ -20,6 +20,7 @@ pub enum DetectorEvent {
 
 /// Clock-free per-session activity state machine. The settle timing lives in the
 /// caller (the bridge thread calls `on_tick` once per silent settle window).
+#[derive(Debug)]
 pub struct Detector {
     state: SessionStatus,
     scanner: MarkerScanner,

@@ -134,16 +134,18 @@ fn spawn_pty_channel_inner(
         loop {
             match raw_rx.recv_timeout(settle) {
                 Ok(bytes) => {
-                    // Raw stream first, byte-exact and never stripped.
+                    // Compute events first (borrow ends), then move-send bytes
+                    // (no clone needed). Bytes is still delivered before the
+                    // status/preview events that accompany it.
+                    let events = detector.on_bytes(&bytes); // borrow ends here
                     if output_tx
-                        .blocking_send(ChannelOutput::Bytes(bytes.clone()))
+                        .blocking_send(ChannelOutput::Bytes(bytes))
                         .is_err()
                     {
                         break; // caller dropped the channel
                     }
-                    // Then the ordered status/preview events for this chunk.
                     let mut closed = false;
-                    for ev in detector.on_bytes(&bytes) {
+                    for ev in events {
                         if output_tx.blocking_send(ev.into()).is_err() {
                             closed = true;
                             break;
@@ -425,8 +427,6 @@ mod tests {
         assert!(acc.windows(10).any(|w| w == b"remora-bye"), "got {acc:?}");
     }
 
-    use std::time::Duration as Dur;
-
     /// Drain until a StatusChange of `want` is seen; record whether any Bytes
     /// preceded it. Panics on close/timeout.
     async fn recv_status(
@@ -435,7 +435,7 @@ mod tests {
     ) -> bool {
         let mut saw_bytes_first = false;
         loop {
-            match tokio::time::timeout(Dur::from_secs(5), channel.recv()).await {
+            match tokio::time::timeout(Duration::from_secs(5), channel.recv()).await {
                 Ok(Some(ChannelOutput::Bytes(_))) => saw_bytes_first = true,
                 Ok(Some(ChannelOutput::StatusChange(s))) if s == want => return saw_bytes_first,
                 Ok(Some(_)) => {}
@@ -464,17 +464,74 @@ mod tests {
         let mut cmd = CommandBuilder::new("sh");
         cmd.arg("-c");
         cmd.arg("printf hi; sleep 2");
-        let mut channel = spawn_pty_channel_with_settle(cmd, Dur::from_millis(150)).expect("spawn");
+        let mut channel =
+            spawn_pty_channel_with_settle(cmd, Duration::from_millis(150)).expect("spawn");
         recv_status(&mut channel, remora_protocol::SessionStatus::Working).await;
         recv_status(&mut channel, remora_protocol::SessionStatus::Idle).await;
         // After the child exits, the channel must still close (recv -> None),
         // proving the detector thread drops output_tx on reader EOF.
         loop {
-            match tokio::time::timeout(Dur::from_secs(5), channel.recv()).await {
+            match tokio::time::timeout(Duration::from_secs(5), channel.recv()).await {
                 Ok(Some(_)) => {}
                 Ok(None) => break, // closed — teardown preserved
                 Err(_) => panic!("channel never closed after child exit"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn no_spurious_idle_under_backpressure() {
+        // Invariant: while the detector thread is blocked on output_tx.blocking_send
+        // (because the consumer is not reading), it cannot be in recv_timeout, so
+        // no spurious StatusChange(Idle) fires during the stall.
+        //
+        // Technique mirrors slow_reader_loses_no_output: 12 MiB of NUL bytes
+        // exceeds total in-flight capacity (CHANNEL_CAPACITY*READ_BUF +
+        // DETECT_QUEUE*READ_BUF ≈ 10 MiB), guaranteeing the detector is blocked
+        // on blocking_send for the entire stall window rather than idle in
+        // recv_timeout. Once all data is drained and the child exits, the
+        // detector gets RecvTimeoutError::Disconnected (not Timeout), so Idle
+        // is also never emitted at teardown.
+        const TOTAL: usize = 12 * 1024 * 1024;
+        let settle = Duration::from_millis(100);
+        let mut cmd = CommandBuilder::new("head");
+        cmd.args(["-c", &TOTAL.to_string(), "/dev/zero"]);
+        let mut channel = spawn_pty_channel_with_settle(cmd, settle).expect("spawn");
+
+        // Stall 4× the settle window without draining; detector must be blocked
+        // on blocking_send (not in recv_timeout), so no Idle fires.
+        std::thread::sleep(Duration::from_millis(400));
+
+        // Drain everything that accumulated while we stalled.
+        let mut saw_working = false;
+        let mut saw_idle = false;
+        let mut bytes_total = 0usize;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), channel.recv()).await {
+                Ok(Some(ChannelOutput::Bytes(b))) => {
+                    assert!(b.iter().all(|&x| x == 0), "unexpected non-NUL byte");
+                    bytes_total += b.len();
+                }
+                Ok(Some(ChannelOutput::StatusChange(remora_protocol::SessionStatus::Working))) => {
+                    saw_working = true;
+                }
+                Ok(Some(ChannelOutput::StatusChange(remora_protocol::SessionStatus::Idle))) => {
+                    saw_idle = true;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => panic!("timed out draining; got {bytes_total} of {TOTAL} bytes"),
+            }
+        }
+
+        assert!(
+            saw_working,
+            "expected StatusChange(Working) during active output"
+        );
+        assert!(
+            !saw_idle,
+            "spurious StatusChange(Idle) fired while detector was blocked under backpressure"
+        );
+        assert_eq!(bytes_total, TOTAL, "lost output under backpressure");
     }
 }

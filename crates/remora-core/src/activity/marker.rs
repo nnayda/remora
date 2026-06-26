@@ -42,11 +42,11 @@ impl MarkerScanner {
     }
 
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<MarkerHit> {
-        self.sink.hits.clear();
         // vte 0.13.1: advance takes a single byte, not a slice.
         for &byte in chunk {
             self.parser.advance(&mut self.sink, byte);
         }
+        // std::mem::take leaves self.sink.hits empty for the next call.
         std::mem::take(&mut self.sink.hits)
     }
 }
@@ -54,6 +54,16 @@ impl MarkerScanner {
 impl Default for MarkerScanner {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// vte::Parser<1024> does not implement Debug, so we provide a manual impl that
+// omits the opaque parser state.
+impl std::fmt::Debug for MarkerScanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MarkerScanner")
+            .field("hits_pending", &self.sink.hits.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -79,7 +89,9 @@ fn parse_marker(params: &[&[u8]]) -> Option<MarkerHit> {
     if params[0] != CODE || params[1] != TOKEN || params[2] != VERSION || params[3] != TYPE_STATE {
         return None;
     }
-    let status = decode_token(params[4]).and_then(status_from_token)?;
+    let status = decode_token(params[4])
+        .as_deref()
+        .and_then(status_from_token)?;
     let preview = params.get(5).and_then(|seg| {
         let text = decode_utf8(seg)?;
         let s = sanitize(&text, PAYLOAD_CAP);
@@ -99,8 +111,8 @@ fn decode_utf8(seg: &[u8]) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-fn status_from_token(token: String) -> Option<SessionStatus> {
-    match token.as_str() {
+fn status_from_token(token: &str) -> Option<SessionStatus> {
+    match token {
         "working" => Some(SessionStatus::Working),
         "idle" => Some(SessionStatus::Idle),
         "awaiting_input" => Some(SessionStatus::Awaiting),
