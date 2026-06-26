@@ -130,14 +130,14 @@ describe("NewSessionDialog — Branch name field", () => {
 
   it("Open button is disabled when branch produces a null sessionId (too long)", () => {
     renderDialog();
-    // A branch that slugifies to a slug longer than 64 chars will overflow
+    // A branch that slugifies to a slug longer than 64 chars overflows; the
+    // derived id is null and submit must stay disabled.
     const longBranch = `feat/${"x".repeat(60)}-and-more-to-overflow`;
+    // Precondition: confirm the test data actually yields a null derived id,
+    // so the assertion below is never silently skipped.
+    expect(deriveSessionId(longBranch)).toBeNull();
     fillBranch(longBranch);
-    // deriveSessionId appends -<8hex> so even a shortened slug may still fit;
-    // only assert the derived id is null to set expectations correctly.
-    if (deriveSessionId(longBranch) === null) {
-      expect(openButton().getAttribute("disabled")).not.toBeNull();
-    }
+    expect(openButton().getAttribute("disabled")).not.toBeNull();
   });
 
   it("submit sends sessionId = deriveSessionId(branch) and branch = 'feat/login'", async () => {
@@ -194,15 +194,14 @@ describe("NewSessionDialog — Branch name field", () => {
 
   it("shows an inline hint when a non-empty branch yields null sessionId", () => {
     renderDialog();
-    // A branch that exceeds the max length after slugification
-    // We need 64+ chars after slugification + 9 for "-XXXXXXXX"
+    // A branch that exceeds the max length after slugification (64+ chars of
+    // slug plus the 9-char "-XXXXXXXX" hash suffix), so the derived id is null.
     const longBranch = `feat/${"a".repeat(60)}-overflow`;
+    // Precondition: confirm the test data actually yields a null derived id.
+    expect(deriveSessionId(longBranch)).toBeNull();
     fillBranch(longBranch);
-    if (deriveSessionId(longBranch) === null) {
-      const hint = screen.queryByText(/too long|not a valid/i);
-      // Hint is optional per spec but confirm it doesn't crash
-      expect(hint !== null || true).toBe(true); // at minimum it renders without crash
-    }
+    const hint = screen.queryByText(/too long|not a valid/i);
+    expect(hint).not.toBeNull();
   });
 });
 
