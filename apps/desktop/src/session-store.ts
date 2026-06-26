@@ -374,6 +374,28 @@ export class SessionStore {
     this.commit();
   };
 
+  /**
+   * Drag-to-reorder: move the `key` tab to the `targetKey` tab's position. The
+   * dragged tab lands on the side the drag came from — after the target when
+   * moving rightward, before it when moving leftward — so a tab dropped on a
+   * neighbour swaps with it. Order is the `tabs` array order, which the
+   * app-scoped store holds for the session (survives React remounts). No-op for
+   * a self-drop or an unknown key; `activeKey` is untouched (reordering doesn't
+   * change which session is focused).
+   */
+  reorderTab = (key: string, targetKey: string): void => {
+    if (key === targetKey) return;
+    const from = this.tabs.findIndex((t) => t.key === key);
+    const to = this.tabs.findIndex((t) => t.key === targetKey);
+    if (from === -1 || to === -1) return;
+    const next = [...this.tabs];
+    const [moved] = next.splice(from, 1);
+    const target = next.findIndex((t) => t.key === targetKey);
+    next.splice(from < to ? target + 1 : target, 0, moved);
+    this.tabs = next;
+    this.commit();
+  };
+
   /** Make `key` the active tab (no-op if already active or unknown). */
   focusTab = (key: string): void => {
     if (this.activeKey === key) return;

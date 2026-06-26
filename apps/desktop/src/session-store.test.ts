@@ -267,6 +267,93 @@ describe("SessionStore", () => {
   });
 });
 
+// ─── reorderTab (drag-to-reorder) ────────────────────────────────────────────
+
+describe("SessionStore reorderTab", () => {
+  // Open `keys` in order and return the store. activeKey ends on the last open.
+  async function storeWith(keys: Array<[string, string]>) {
+    const store = new SessionStore(instantOpeners());
+    for (const [p, s] of keys) await store.openSession(spec(p, s));
+    return store;
+  }
+  const order = (store: SessionStore) =>
+    store.getSnapshot().tabs.map((t) => t.key);
+
+  it("moving a tab right drops it after the target", async () => {
+    const store = await storeWith([
+      ["a", "1"],
+      ["b", "2"],
+      ["c", "3"],
+      ["d", "4"],
+    ]);
+    store.reorderTab("a/1", "c/3");
+    expect(order(store)).toEqual(["b/2", "c/3", "a/1", "d/4"]);
+  });
+
+  it("moving a tab left drops it before the target", async () => {
+    const store = await storeWith([
+      ["a", "1"],
+      ["b", "2"],
+      ["c", "3"],
+      ["d", "4"],
+    ]);
+    store.reorderTab("d/4", "b/2");
+    expect(order(store)).toEqual(["a/1", "d/4", "b/2", "c/3"]);
+  });
+
+  it("dropping a tab onto an adjacent tab swaps the two", async () => {
+    const store = await storeWith([
+      ["a", "1"],
+      ["b", "2"],
+      ["c", "3"],
+    ]);
+    store.reorderTab("a/1", "b/2");
+    expect(order(store)).toEqual(["b/2", "a/1", "c/3"]);
+  });
+
+  it("dropping a tab on itself is a no-op", async () => {
+    const store = await storeWith([
+      ["a", "1"],
+      ["b", "2"],
+    ]);
+    store.reorderTab("a/1", "a/1");
+    expect(order(store)).toEqual(["a/1", "b/2"]);
+  });
+
+  it("ignores unknown drag/target keys", async () => {
+    const store = await storeWith([
+      ["a", "1"],
+      ["b", "2"],
+    ]);
+    store.reorderTab("ghost", "b/2");
+    store.reorderTab("a/1", "ghost");
+    expect(order(store)).toEqual(["a/1", "b/2"]);
+  });
+
+  it("reordering leaves the active tab unchanged", async () => {
+    const store = await storeWith([
+      ["a", "1"],
+      ["b", "2"],
+      ["c", "3"],
+    ]);
+    store.focusTab("a/1");
+    store.reorderTab("c/3", "a/1");
+    expect(store.getSnapshot().activeKey).toBe("a/1");
+    expect(order(store)).toEqual(["c/3", "a/1", "b/2"]);
+  });
+
+  it("notifies subscribers when the order changes", async () => {
+    const store = await storeWith([
+      ["a", "1"],
+      ["b", "2"],
+    ]);
+    const listener = vi.fn();
+    store.subscribe(listener);
+    store.reorderTab("a/1", "b/2");
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+});
+
 // ─── canRespawn + workspace threading ────────────────────────────────────────
 
 describe("canRespawn", () => {
