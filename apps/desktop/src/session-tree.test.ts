@@ -269,6 +269,17 @@ describe("buildTree", () => {
     expect(node?.workspace).toBe("worktree");
   });
 
+  it("marks a session reconnecting when its key is in the reconnecting set", () => {
+    const tree = buildTree(
+      cfg([host("devbox", "ssh")], [project("api", "devbox")]),
+      [session("api", "fix"), session("api", "other")],
+      new Set([tabKey("api", "fix")]),
+    );
+    const rows = tree[0].sessions;
+    expect(rows.find((s) => s.sessionId === "fix")?.reconnecting).toBe(true);
+    expect(rows.find((s) => s.sessionId === "other")?.reconnecting).toBe(false);
+  });
+
   it("falls back to the project default when discovered workspace is null", () => {
     const tree = buildTree(
       cfg(

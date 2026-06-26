@@ -37,8 +37,14 @@ function App() {
   } = useSessions();
   useReconnect(sessionStore);
   const activity = useActivity();
-  const { config, sessions, configError, discoveryUnavailable, refresh } =
-    useDiscovery();
+  const {
+    config,
+    sessions,
+    configError,
+    discoveryUnavailable,
+    reconnectingKeys,
+    refresh,
+  } = useDiscovery();
 
   // Live-reload the sidebar when the config file changes on disk (backend
   // watcher emits ConfigChanged). Mirrors the manual refresh button.
@@ -93,7 +99,14 @@ function App() {
   const [focusRequest, setFocusRequest] = useState(0);
 
   // Recompute the tree only when config or the polled session list changes.
-  const tree = useMemo(() => buildTree(config, sessions), [config, sessions]);
+  const reconnectingSet = useMemo(
+    () => new Set(reconnectingKeys),
+    [reconnectingKeys],
+  );
+  const tree = useMemo(
+    () => buildTree(config, sessions, reconnectingSet),
+    [config, sessions, reconnectingSet],
+  );
   // Which sessions are open as tabs — the only ones we have a live terminal for
   // and can therefore report an activity status. Drives the sidebar's "show the
   // status dot only when connected" rule.

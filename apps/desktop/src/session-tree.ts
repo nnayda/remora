@@ -40,6 +40,9 @@ export interface SessionNode {
    * UI to gate the Stop action (worktree-mode live sessions only).
    */
   workspace: WorkspaceModeDto | null;
+  /** Host of this session is currently unavailable; its row is retained and
+   * shown dimmed/"reconnecting" rather than removed (#159). */
+  reconnecting: boolean;
 }
 
 export interface ProjectNode {
@@ -74,6 +77,7 @@ export type HostTransport = ConfigDto["hosts"][number]["transport"] | null;
 function sessionNode(
   s: SessionMetaDto,
   workspace: WorkspaceModeDto | null,
+  reconnecting: boolean,
 ): SessionNode {
   return {
     projectId: s.projectId,
@@ -82,6 +86,7 @@ function sessionNode(
     agent: s.agent,
     key: tabKey(s.projectId, s.sessionId),
     workspace,
+    reconnecting,
   };
 }
 
@@ -92,6 +97,7 @@ function sessionNode(
 export function buildTree(
   config: ConfigDto,
   sessions: SessionMetaDto[],
+  reconnectingKeys: Set<string> = new Set(),
 ): ProjectNode[] {
   const projectWorkspace = new Map<string, WorkspaceModeDto>(
     config.projects.map((p) => [p.id, p.workspace]),
@@ -134,6 +140,7 @@ export function buildTree(
         sessionNode(
           s,
           s.workspace ?? projectWorkspace.get(s.projectId) ?? null,
+          reconnectingKeys.has(tabKey(s.projectId, s.sessionId)),
         ),
       );
       continue;
@@ -152,7 +159,13 @@ export function buildTree(
       synthetic.set(s.projectId, syn);
       syntheticOrder.push(syn);
     }
-    syn.sessions.push(sessionNode(s, s.workspace ?? null));
+    syn.sessions.push(
+      sessionNode(
+        s,
+        s.workspace ?? null,
+        reconnectingKeys.has(tabKey(s.projectId, s.sessionId)),
+      ),
+    );
   }
 
   // 3. Bucket projects by host (config.hosts order seeds the buckets so empty

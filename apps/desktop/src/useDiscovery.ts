@@ -50,6 +50,7 @@ export function useDiscovery() {
     sessions: snapshot.sessions,
     configError: snapshot.configError,
     discoveryUnavailable: snapshot.discoveryUnavailable,
+    reconnectingKeys: snapshot.reconnectingKeys,
     refresh: discoveryStore.refresh,
     refreshAfterOpen: discoveryStore.refreshAfterOpen,
   };
