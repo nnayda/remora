@@ -74,6 +74,9 @@ function App() {
 
   // Recompute the tree only when config or the polled session list changes.
   const tree = useMemo(() => buildTree(config, sessions), [config, sessions]);
+  // Which sessions are open as tabs — the only ones we have a live terminal for
+  // and can therefore report an activity status. Drives the sidebar's "show the
+  // status dot only when connected" rule.
   const openKeys = useMemo(() => new Set(tabs.map((t) => t.key)), [tabs]);
 
   // Status of the active tab, so the focus effect re-fires when a freshly opened
