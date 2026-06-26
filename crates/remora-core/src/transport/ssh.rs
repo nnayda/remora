@@ -697,11 +697,14 @@ mod tests {
         let config = test_config();
         // Discovery is two listings then the worktree scan (#108): trusted
         // names, then inline `name\tagent\tworkspace\tcreated_at` metadata.
+        // workspace_path is set so the path-anchored join can match (#124).
         let fake = Arc::new(FakeExec::new(vec![
             Ok(FakeExec::out(
                 "remora_api_fix-login\nremora_ghost_x\nmain\nremora__bad\n",
             )),
-            Ok(FakeExec::out("remora_api_fix-login\tclaude\t\t1765500000\n")),
+            Ok(FakeExec::out(
+                "remora_api_fix-login\tclaude\t/home/dev/.remora/worktrees/api/fix-login\t1765500000\n",
+            )),
             Ok(FakeExec::out(
                 "worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n\n\
                  worktree /home/dev/.remora/worktrees/api/add-tests\nbranch refs/heads/remora/add-tests\n",

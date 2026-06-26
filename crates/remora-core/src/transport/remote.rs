@@ -826,26 +826,37 @@ pub(crate) fn run_list(
         live.push((project, session, env));
     }
 
-    let mut worktrees = Vec::new();
+    // TODO(Task6): this stub satisfies the new `join` signature introduced in
+    // Task 5 but does not yet wire up `project_paths` or `home`. Task 6 will
+    // replace this loop with the full path-anchored scan (ADR-0015, #124).
+    let mut worktrees: Vec<(ProjectId, discovery::WorktreeInfo)> = Vec::new();
     let mut scanned = std::collections::HashSet::new();
     for (project_id, project) in &config.projects {
         // Scan EVERY project: a worktree-override session can live on a
-        // shared-default project. `parse_worktree_list` rejects the main
-        // checkout and foreign paths, so a project with no remora worktrees
-        // yields nothing. Record which projects scanned cleanly so `join` can
-        // tell "scanned, no worktree" (⇒ Shared) apart from "scan failed"
-        // (⇒ unknown), instead of conflating a transient failure with Shared.
+        // shared-default project. Record which projects scanned cleanly so
+        // `join` can tell "scanned, no worktree" (⇒ Shared) apart from "scan
+        // failed" (⇒ unknown), instead of conflating a transient failure with
+        // Shared.
         if let Ok(out) = exec.run(&worktree_list_tokens(&project.path)) {
             if out.success {
                 scanned.insert(project_id.clone());
-                for (session, path) in discovery::parse_worktree_list(&out.stdout, project_id) {
-                    worktrees.push((project_id.clone(), session, path));
+                for wt in discovery::parse_worktree_porcelain(&out.stdout) {
+                    worktrees.push((project_id.clone(), wt));
                 }
             }
         }
     }
 
-    Ok(discovery::join(live, worktrees, &scanned))
+    // TODO(Task6): pass real project_paths (canonicalized per project) and
+    // the remote $HOME string so path-anchored join and primary-checkout
+    // detection work correctly.
+    Ok(discovery::join(
+        live,
+        worktrees,
+        &std::collections::HashMap::new(),
+        "",
+        &scanned,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2139,12 +2150,15 @@ pub(crate) mod tests {
         //  1) list-sessions names -> api (configured) + ghost (unconfigured) +
         //     `main` & `remora__bad` (unparseable). Only api survives.
         //  2) list-sessions inline metadata -> enrichment keyed by trusted name.
+        //     workspace_path is set so the path-anchored join can match (#124).
         //  3) git worktree list for api -> fix-login (live) + add-tests (stopped)
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out(
                 "remora_api_fix-login\nremora_ghost_x\nmain\nremora__bad\n",
             )),
-            Ok(FakeExec::out("remora_api_fix-login\tclaude\t\t1765500000\n")),
+            Ok(FakeExec::out(
+                "remora_api_fix-login\tclaude\t/home/dev/.remora/worktrees/api/fix-login\t1765500000\n",
+            )),
             Ok(FakeExec::out(
                 "worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n\n\
                  worktree /home/dev/.remora/worktrees/api/add-tests\nbranch refs/heads/remora/add-tests\n",
