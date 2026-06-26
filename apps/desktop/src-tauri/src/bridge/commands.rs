@@ -33,6 +33,7 @@ async fn config_get(bridge: tauri::State<'_, Bridge>) -> Result<ConfigDto, Bridg
 
 #[tauri::command]
 #[specta::specta]
+#[allow(clippy::too_many_arguments)]
 async fn session_spawn(
     bridge: tauri::State<'_, Bridge>,
     project_id: String,
@@ -40,6 +41,8 @@ async fn session_spawn(
     agent: Option<String>,
     base: Option<String>,
     workspace: Option<WorkspaceModeDto>,
+    branch: Option<String>,
+    worktree_root: Option<String>,
     on_output: Channel<BridgeOutput>,
 ) -> Result<ChannelHandle, BridgeError> {
     bridge
@@ -49,6 +52,8 @@ async fn session_spawn(
             agent,
             base,
             workspace.map(Into::into),
+            branch,
+            worktree_root,
             Arc::new(ChannelSink(on_output)),
         )
         .await
