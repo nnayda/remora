@@ -1,4 +1,4 @@
-# 0013. Watch the config file and push changes via a typed Rust→frontend event
+# 0014. Watch the config file and push changes via a typed Rust→frontend event
 
 - **Status:** Accepted
 - **Date:** 2026-06-26
