@@ -57,8 +57,8 @@ TypeScript state machine in ADR-0012 into Rust):
 - `on_bytes(&[u8]) → Vec<DetectorEvent>` — feeds the chunk to a `vte`-backed
   `MarkerScanner` and emits status/preview events. Bytes drive the state to
   `Working` unless a marker in the same chunk asserts a different state (the
-  last marker in a chunk wins). `vte` is reused from the existing dep graph for
-  correct incremental OSC assembly across PTY read boundaries; it also provides
+  last marker in a chunk wins). The detector uses `vte` (newly added in this
+  change) for correct incremental OSC assembly across PTY read boundaries, with
   a free DoS bound (bounded internal buffer, ignores oversized sequences).
 
 - `on_tick() → Vec<DetectorEvent>` — called by the bridge thread after one
@@ -177,9 +177,10 @@ understand them.
 - **Hand-rolled OSC scanner (no `vte` dependency).**
   The sequences split across PTY read boundaries in non-obvious ways, and a
   naive `memchr`-based scanner would need to re-implement the same incremental
-  state machine `vte` already provides. `vte` is already in the dep graph (other
-  crates), gives correct incremental assembly, and caps buffer size
-  automatically (DoS bound). No benefit to hand-rolling.
+  state machine `vte` already provides. Adding `vte` (a small, proven
+  terminal-parser crate) gives correct incremental assembly and caps buffer size
+  automatically (DoS bound), so the one new dependency is worth it versus
+  re-implementing and maintaining the same state machine by hand.
 
 - **Byte-scraping the screen snapshot for preview text.**
   Would require maintaining a full VT100 screen model and scanning for
