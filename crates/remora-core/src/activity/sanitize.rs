@@ -35,7 +35,7 @@ impl SanitizedText {
 /// Strip control characters (C0/C1/DEL incl. ESC, tab, newline, CR) then cap to
 /// `cap` chars, marking truncation with a trailing `…`. `cap == 0` clamps to 1.
 pub fn sanitize(text: &str, cap: usize) -> SanitizedText {
-    let stripped: String = text.chars().filter(|c| !c.is_control()).collect();
+    let stripped: String = text.chars().filter(|c| !is_stripped(*c)).collect();
     let limit = cap.max(1);
     let capped = if stripped.chars().count() <= limit {
         stripped
@@ -44,6 +44,21 @@ pub fn sanitize(text: &str, cap: usize) -> SanitizedText {
         format!("{head}…")
     };
     SanitizedText(capped)
+}
+
+/// True for characters dropped by [`sanitize`]: C0/C1/DEL control chars (incl.
+/// ESC, tab, newline, CR) plus the Unicode *format* characters that pass
+/// `is_control()` but can spoof rendered text — bidi overrides/embeddings/
+/// isolates, zero-width joiners/spaces, and the BOM/annotation marks.
+fn is_stripped(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{200B}'..='\u{200F}'   // zero-width space/joiner, LRM/RLM
+            | '\u{202A}'..='\u{202E}' // bidi embeddings + LRO/RLO overrides
+            | '\u{2066}'..='\u{2069}' // bidi isolates
+            | '\u{FEFF}'              // BOM / zero-width no-break space
+            | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation marks
+        )
 }
 
 #[cfg(test)]
@@ -71,5 +86,15 @@ mod tests {
         // A non-positive cap clamps to 1 rather than panicking or empty-slicing.
         let out = sanitize("abc", 0).into_string();
         assert!(out.chars().count() >= 1);
+    }
+
+    #[test]
+    fn strips_unicode_format_chars() {
+        // Bidi override / zero-width / BOM pass char::is_control() but can spoof
+        // rendered text — they must be stripped too.
+        assert_eq!(sanitize("ab\u{202e}cd", 80).into_string(), "abcd"); // RLO
+        assert_eq!(sanitize("a\u{200b}b\u{200d}c", 80).into_string(), "abc"); // ZWSP/ZWJ
+        assert_eq!(sanitize("\u{feff}done", 80).into_string(), "done"); // BOM
+        assert_eq!(sanitize("a\u{2066}b\u{2069}c", 80).into_string(), "abc"); // isolates
     }
 }

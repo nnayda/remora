@@ -28,7 +28,11 @@ thiserror = "2"
 tokio = { version = "1", default-features = false }
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 toml_edit = "0.25.12"
-vte = "0.13"
+# `no_std` is what makes vte's OSC buffer a bounded ArrayVec<1024> (the DoS
+# bound ADR-0013 relies on); it is vte's default today, but pin it explicitly
+# so a future `default-features = false` can't silently turn osc_raw into an
+# unbounded Vec.
+vte = { version = "0.13", features = ["no_std"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

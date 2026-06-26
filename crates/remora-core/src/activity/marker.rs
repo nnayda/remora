@@ -89,7 +89,12 @@ fn parse_marker(params: &[&[u8]]) -> Option<MarkerHit> {
     if params[0] != CODE || params[1] != TOKEN || params[2] != VERSION || params[3] != TYPE_STATE {
         return None;
     }
-    let status = decode_token(params[4])
+    // The state token is matched against a fixed allowlist, so it is decoded
+    // RAW (no sanitize): scrubbing control chars first would let a forged
+    // `working\x00` normalize to a valid `working`. The allowlist is the
+    // validation; anything not exactly equal is ignored. Only the free-text
+    // preview below is sanitized (control/format-stripped, capped).
+    let status = decode_utf8(params[4])
         .as_deref()
         .and_then(status_from_token)?;
     let preview = params.get(5).and_then(|seg| {
@@ -98,12 +103,6 @@ fn parse_marker(params: &[&[u8]]) -> Option<MarkerHit> {
         (!s.is_empty()).then_some(s)
     });
     Some(MarkerHit { status, preview })
-}
-
-/// base64 → UTF-8 → sanitized token string (control-stripped, capped).
-fn decode_token(seg: &[u8]) -> Option<String> {
-    let text = decode_utf8(seg)?;
-    Some(sanitize(&text, PAYLOAD_CAP).into_string())
 }
 
 fn decode_utf8(seg: &[u8]) -> Option<String> {
@@ -195,5 +194,15 @@ mod tests {
         let mut s = MarkerScanner::new();
         let seq = format!("\x1b]7366;remora;1;state;{big}\x07");
         assert!(s.feed(seq.as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn state_token_with_embedded_control_does_not_match() {
+        // The state token is matched RAW against the allowlist, so "working\0"
+        // is not "working" → no hit. (Sanitizing the token first would strip the
+        // NUL and falsely accept the forged value.)
+        let b64 = base64::engine::general_purpose::STANDARD.encode("working\0");
+        let mut s = MarkerScanner::new();
+        assert!(s.feed(&marker(&b64)).is_empty());
     }
 }
