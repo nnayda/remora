@@ -519,8 +519,21 @@ async fn forward(
                         break;
                     }
                 }
-                Some(_) => {}        // ChannelOutput is #[non_exhaustive]
-                None => break,        // transport death
+                Some(ChannelOutput::StatusChange(status)) => {
+                    if sink
+                        .send(BridgeOutput::StatusChange { status: status.into() })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Some(ChannelOutput::PreviewUpdate(preview)) => {
+                    if sink.send(BridgeOutput::PreviewUpdate { preview }).is_err() {
+                        break;
+                    }
+                }
+                Some(_) => {} // ChannelOutput is #[non_exhaustive]
+                None => break, // transport death
             }
         }
     }

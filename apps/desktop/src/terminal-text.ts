@@ -1,8 +1,8 @@
 /**
  * Shared terminal-text scrubbing: strip the escape/control bytes the emulator
  * would have consumed, cap length, and base64-decode UTF-8 payloads. Extracted
- * from `last-output.ts` (#28) so `last-output` and the OSC-7366 marker parser
- * (#55) share one trusted, security-relevant scrubber instead of two that drift.
+ * from `last-output.ts` (#28) so that `last-output` and `terminal-controller`'s
+ * OSC-52 clipboard path share one trusted, security-relevant scrubber.
  */
 
 // CSI: ESC [ , params/intermediates, final byte @-~.

@@ -1,99 +1,52 @@
-import { describe, expect, it } from "vitest";
-import { ActivityStore, SETTLE_WINDOW_MS } from "./activity-store";
+import { describe, expect, it, vi } from "vitest";
+import { ActivityStore } from "./activity-store";
 
-function fixture() {
-  let clock = 1000;
-  const store = new ActivityStore({ now: () => clock });
-  return {
-    store,
-    set: (t: number) => {
-      clock = t;
-    },
-    advance: (d: number) => {
-      clock += d;
-    },
-  };
-}
-const K = "api/fix";
-
-describe("ActivityStore", () => {
-  it("first output -> working", () => {
-    const { store } = fixture();
-    store.noteOutput(K);
-    expect(store.getSnapshot().get(K)).toBe("working");
+describe("ActivityStore (passive recorder)", () => {
+  it("records the latest status per key and snapshots it", () => {
+    const s = new ActivityStore();
+    s.setStatus("p/a", "working");
+    s.setStatus("p/b", "awaiting");
+    s.setStatus("p/a", "idle");
+    expect(s.getSnapshot().get("p/a")).toBe("idle");
+    expect(s.getSnapshot().get("p/b")).toBe("awaiting");
   });
 
-  it("working -> idle after the settle window via sweep", () => {
-    const { store, advance } = fixture();
-    store.noteOutput(K);
-    advance(SETTLE_WINDOW_MS - 1);
-    store.sweep();
-    expect(store.getSnapshot().get(K)).toBe("working"); // not yet
-    advance(1);
-    store.sweep();
-    expect(store.getSnapshot().get(K)).toBe("idle");
+  it("notifies subscribers only on an actual change", () => {
+    const s = new ActivityStore();
+    const cb = vi.fn();
+    s.subscribe(cb);
+    s.setStatus("p/a", "working");
+    expect(cb).toHaveBeenCalledTimes(1);
+    s.setStatus("p/a", "working"); // same value → no notification
+    expect(cb).toHaveBeenCalledTimes(1);
+    s.setStatus("p/a", "idle");
+    expect(cb).toHaveBeenCalledTimes(2);
   });
 
-  it("an awaiting marker settles immediately to red, sweep leaves it", () => {
-    const { store, advance } = fixture();
-    store.noteOutput(K); // working
-    store.noteMarker(K, "awaiting");
-    expect(store.getSnapshot().get(K)).toBe("awaiting");
-    advance(SETTLE_WINDOW_MS + 10);
-    store.sweep(); // sweep only touches `working`
-    expect(store.getSnapshot().get(K)).toBe("awaiting");
+  it("stores preview text separately and clears both on clear", () => {
+    const s = new ActivityStore();
+    s.setStatus("p/a", "awaiting");
+    s.setPreview("p/a", "run tests?");
+    expect(s.getPreview("p/a")).toBe("run tests?");
+    s.clear("p/a");
+    expect(s.getSnapshot().has("p/a")).toBe(false);
+    expect(s.getPreview("p/a")).toBeUndefined();
   });
 
-  it("output supersedes a stale awaiting marker back to working", () => {
-    const { store } = fixture();
-    store.noteMarker(K, "awaiting");
-    store.noteOutput(K);
-    expect(store.getSnapshot().get(K)).toBe("working");
+  it("setPreview does not notify subscribers (preview is not part of the status snapshot)", () => {
+    const s = new ActivityStore();
+    const cb = vi.fn();
+    s.subscribe(cb);
+    s.setPreview("p/a", "run tests?");
+    expect(cb).not.toHaveBeenCalled();
   });
 
-  it("an idle marker settles to blue, never red", () => {
-    const { store } = fixture();
-    store.noteMarker(K, "idle");
-    expect(store.getSnapshot().get(K)).toBe("idle");
-  });
-
-  it("clear removes the entry", () => {
-    const { store } = fixture();
-    store.noteOutput(K);
-    store.clear(K);
-    expect(store.getSnapshot().has(K)).toBe(false);
-  });
-
-  it("tracks two sessions independently", () => {
-    const { store, advance } = fixture();
-    store.noteOutput("a");
-    advance(SETTLE_WINDOW_MS + 1);
-    store.noteOutput("b"); // b just spoke
-    store.sweep();
-    expect(store.getSnapshot().get("a")).toBe("idle");
-    expect(store.getSnapshot().get("b")).toBe("working");
-  });
-
-  it("notifies subscribers only on state change, not every output", () => {
-    const { store } = fixture();
-    let n = 0;
-    store.subscribe(() => {
-      n += 1;
-    });
-    store.noteOutput(K); // unknown -> working: 1 notify
-    store.noteOutput(K); // still working: no notify
-    expect(n).toBe(1);
-  });
-
-  it("noteMarker does not notify on same-state flood", () => {
-    const { store } = fixture();
-    let n = 0;
-    store.subscribe(() => {
-      n += 1;
-    });
-    store.noteMarker(K, "awaiting"); // unknown -> awaiting: 1 notify
-    store.noteMarker(K, "awaiting"); // still awaiting: no notify
-    store.noteMarker(K, "awaiting"); // still awaiting: no notify
-    expect(n).toBe(1);
+  it("getSnapshot returns a stable reference until a change", () => {
+    const s = new ActivityStore();
+    s.setStatus("p/a", "working");
+    const snap = s.getSnapshot();
+    expect(s.getSnapshot()).toBe(snap); // useSyncExternalStore identity stability
+    s.setStatus("p/a", "idle");
+    expect(s.getSnapshot()).not.toBe(snap);
   });
 });

@@ -13,7 +13,7 @@ import { TabBar } from "./TabBar";
 import { Terminal, type TerminalHandle } from "./Terminal";
 import { Button, IconButton, Tag } from "./ui";
 import { ChevronRight } from "./ui/icons";
-import { activityStore, useActivity } from "./useActivity";
+import { useActivity } from "./useActivity";
 import { discoveryStore, useDiscovery } from "./useDiscovery";
 import { useReconnect } from "./useReconnect";
 import { sessionStore, useSessions } from "./useSessions";
@@ -36,10 +36,6 @@ function App() {
   } = useSessions();
   useReconnect(sessionStore);
   const activity = useActivity();
-  useEffect(() => {
-    activityStore.start();
-    return () => activityStore.stop();
-  }, []);
   const { config, sessions, configError, discoveryUnavailable, refresh } =
     useDiscovery();
 
