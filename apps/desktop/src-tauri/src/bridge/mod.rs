@@ -126,6 +126,8 @@ impl Bridge {
             // validator — every transport and the future relay cross it.
             base,
             workspace,
+            branch: None,
+            worktree_root: None,
         };
         let source = self.resolve_for(&spec.project_id)?;
         let channel = source.spawn(spec).await?;
@@ -842,6 +844,8 @@ mod tests {
             agent: None,
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         })
         .await
         .expect("spawn");
@@ -1206,6 +1210,8 @@ mod tests {
             agent: None,
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         })
         .await
         .expect("spawn");
@@ -1241,6 +1247,7 @@ mod tests {
                 user: Some("rootuser".into()),
                 port: Some(2222),
             },
+            worktree_root: None,
         }
     }
     fn project_input() -> ProjectInputDto {
@@ -1251,6 +1258,7 @@ mod tests {
             workspace: WorkspaceModeDto::Worktree,
             agent: "claude".into(),
             base: None,
+            worktree_root: None,
         }
     }
     fn agent_input() -> AgentInputDto {
@@ -1585,6 +1593,8 @@ mod tests {
             agent: None,
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         })
         .await
         .expect("spawn");
@@ -1605,6 +1615,8 @@ mod tests {
             agent: None,
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         })
         .await
         .expect("spawn");
@@ -1624,6 +1636,8 @@ mod tests {
             agent: None,
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         })
         .await
         .expect("spawn");

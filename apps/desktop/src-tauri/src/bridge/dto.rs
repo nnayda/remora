@@ -130,6 +130,7 @@ mod tests {
                 user: Some("rootuser".into()),
                 port: Some(2222),
             }),
+            worktree_root: None,
         }
     }
 
@@ -142,6 +143,7 @@ mod tests {
                 context: Some(KubectlField::Literal("secret-context".into())),
                 container: Some(KubectlField::Literal("secret-container".into())),
             }),
+            worktree_root: None,
         }
     }
 
@@ -163,6 +165,7 @@ mod tests {
                 workspace: WorkspaceMode::Worktree,
                 agent: AgentId::new("claude").expect("id"),
                 base: None,
+                worktree_root: None,
             },
         );
         config.agents.insert(
@@ -229,6 +232,7 @@ mod tests {
                 workspace: WorkspaceMode::Shared,
                 agent: AgentId::new("claude").expect("id"),
                 base: None,
+                worktree_root: None,
             },
         );
         let dto = ConfigDto::from(config);

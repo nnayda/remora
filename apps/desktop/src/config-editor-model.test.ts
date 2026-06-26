@@ -41,6 +41,7 @@ const sshHostDto: EditorHostDto = {
   id: "devbox",
   name: "Dev box",
   transport: { kind: "ssh", host: "h", user: "u", port: 2222 },
+  worktreeRoot: null,
 };
 
 describe("buildSettingsModel", () => {
@@ -99,6 +100,7 @@ describe("host form", () => {
         context: null,
         container: null,
       },
+      worktreeRoot: null,
     });
     expect(form.kind).toBe("kubectl");
     expect(form.pod).toBe("p");
@@ -191,6 +193,7 @@ describe("project form", () => {
       workspace: "shared",
       agent: "claude",
       base: null,
+      worktreeRoot: null,
     });
     expect(form.id).toBe("api");
     expect(form.path).toBe("/srv/api");
@@ -240,6 +243,7 @@ describe("project form", () => {
       workspace: "worktree",
       agent: "claude",
       base: "origin/dev",
+      worktreeRoot: null,
     } as import("./bindings").EditorProjectDto;
     const form = projectFormFromDto(dto);
     expect(form.base).toBe("origin/dev");
@@ -265,6 +269,7 @@ describe("kubectl command-form fields", () => {
         context: null,
         container: null,
       },
+      worktreeRoot: null,
     };
     const form = hostFormFromDto(dto);
     expect(form.podIsCommand).toBe(true);
@@ -335,6 +340,7 @@ describe("kubectl command-form fields", () => {
         context: null,
         container: null,
       },
+      worktreeRoot: null,
     });
     expect(form.podIsCommand).toBe(true);
     expect(form.pod).toBe("kubectl get pods -o name | head -n1");

@@ -324,6 +324,8 @@ mod tests {
             agent: Some(AgentId::new("claude").expect("valid slug")),
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         }
     }
 

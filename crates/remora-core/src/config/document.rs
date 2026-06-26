@@ -444,6 +444,7 @@ mod tests {
                 user: None,
                 port: None,
             }),
+            worktree_root: None,
         }
     }
     fn claude_agent() -> Agent {
@@ -503,6 +504,7 @@ mod tests {
                 user: None,
                 port: None,
             }),
+            worktree_root: None,
         };
         doc.update_host(&hid("devbox"), &renamed).expect("update");
         let out = doc.to_toml();
@@ -524,6 +526,7 @@ mod tests {
             workspace: WorkspaceMode::Worktree,
             agent: aid("nope"),
             base: None,
+            worktree_root: None,
         };
         let err = doc
             .insert_project(&pid("api"), &bad)
@@ -603,6 +606,7 @@ mod tests {
                     context: None,
                     container: None,
                 }),
+                worktree_root: None,
             },
         )
         .expect("transport switch");
@@ -675,6 +679,7 @@ mod tests {
                     user: None,
                     port: None,
                 }),
+                worktree_root: None,
             },
         )
         .expect("update");
@@ -743,6 +748,7 @@ mod tests {
             workspace: WorkspaceMode::Worktree,
             agent: aid("nope"),
             base: None,
+            worktree_root: None,
         };
         let err = doc
             .insert_project(&pid("api2"), &dangling)
@@ -870,6 +876,7 @@ mod tests {
                 workspace: WorkspaceMode::Worktree,
                 agent: aid("claude"),
                 base: None,
+                worktree_root: None,
             },
         )
         .expect("project");
@@ -907,6 +914,7 @@ mod tests {
             workspace: WorkspaceMode::Worktree,
             agent: aid("claude"),
             base: Some("origin/develop".into()),
+            worktree_root: None,
         };
         doc.insert_project(&pid("api"), &proj).expect("insert");
         let toml = doc.to_toml();
