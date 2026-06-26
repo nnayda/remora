@@ -65,7 +65,7 @@ What becomes harder, and what we are committed to:
 
 PR B1 implements the spawn-time override of `branch` and `worktree_root`:
 
-1. **`SpawnSpec` gains `branch` and `worktree_root` fields**, with a three-tier cascade: per-session overrides (supplied at spawn) flow to per-project defaults to per-host defaults to the convention path `~/.remora/worktrees/<project-id>`. When `branch` is `None`, the worktree is created at the conventional path `<worktree_root>/<remora>/<session_id>`, exactly as pre-B1; when supplied, it is created at `<worktree_root>/<branch>` (no `remora/` prefix).
+1. **`SpawnSpec` gains `branch` and `worktree_root` fields**. `worktree_root` cascades: per-session overrides (supplied at spawn) flow to per-project defaults to per-host defaults to the convention `~/.remora/worktrees/<project-id>`. `branch` is chosen per-session at spawn, with no project or host default. When `branch` is `None`, the worktree is created at the back-compat path `~/.remora/worktrees/<project>/<session_id>` with branch `remora/<session_id>` (exactly as pre-B1); when `branch` is supplied, the worktree is created at `<worktree_root>/<branch>` with the supplied branch name.
 
 2. **`derive_session_id` moves from `DefaultHasher` to FNV-1a/32**, making the id stable across Rust rebuilds and reproducible in TypeScript (B2's client-side session minting). This closes the hasher item of #153.
 
