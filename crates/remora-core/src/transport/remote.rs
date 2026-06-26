@@ -741,6 +741,13 @@ pub(crate) fn run_spawn(
 /// vanished start directory across tmux versions (the pane can chdir-fail and
 /// exit, self-destructing the session), so a gone worktree surfaces here as
 /// `SessionNotFound` rather than a confusing post-attach channel death.
+///
+/// Resolves the real worktree dir/branch from `git worktree list` (ADR-0015,
+/// #124): sessions spawned with a custom `worktree_root` or `branch` live at
+/// a non-convention path, so the plan's convention dir/branch would be wrong.
+/// Falls back to the convention plan when the session isn't found in the
+/// listing (shared session, or worktree already gone — the `test -d` preflight
+/// maps the latter to `SessionNotFound`).
 pub(crate) fn run_respawn(
     exec: &dyn RemoteExec,
     plan: &SpawnPlan,
@@ -748,29 +755,69 @@ pub(crate) fn run_respawn(
     if plan.branch.is_none() {
         return Err(PlanError::NotWorktreeProject(plan.project_id.clone()).into());
     }
-    let probe = exec.run(&dir_exists_tokens(&plan.dir))?;
+
+    // Best-effort home fetch for path canonicalization (same policy as
+    // run_remove): empty/non-absolute result falls back to "~".
+    let home = exec
+        .run(&remote_home_tokens())
+        .ok()
+        .filter(|o| o.success)
+        .map(|o| o.stdout.trim().to_string())
+        .filter(|h| h.starts_with('/'))
+        .unwrap_or_else(|| "~".to_string());
+
+    // Build the effective plan: real dir/branch if found, convention otherwise.
+    let overridden;
+    let effective = match resolve_worktree(exec, &plan.project_path, &plan.session_id, &home)? {
+        Some((real_dir, real_branch)) => {
+            // Also update REMORA_WORKSPACE so post-respawn discovery reports
+            // the correct path (metadata is display-only — ADR-0004 — but
+            // showing the convention path for a custom-root session is wrong).
+            let env = plan
+                .env
+                .iter()
+                .map(|(k, v)| {
+                    if k == ENV_WORKSPACE {
+                        (k.clone(), real_dir.clone())
+                    } else {
+                        (k.clone(), v.clone())
+                    }
+                })
+                .collect();
+            overridden = SpawnPlan {
+                dir: real_dir,
+                branch: Some(real_branch),
+                env,
+                ..plan.clone()
+            };
+            &overridden
+        }
+        None => plan,
+    };
+
+    let probe = exec.run(&dir_exists_tokens(&effective.dir))?;
     if !probe.success {
         // `test -d` is silent; empty stderr means the dir is gone (nothing to
         // respawn), non-empty means the probe itself couldn't run.
         return if probe.stderr.trim().is_empty() {
             Err(SourceError::SessionNotFound {
-                project_id: plan.project_id.clone(),
-                session_id: plan.session_id.clone(),
+                project_id: effective.project_id.clone(),
+                session_id: effective.session_id.clone(),
             })
         } else {
             Err(SourceError::Transport(probe.stderr))
         };
     }
-    match create_session(exec, plan) {
+    match create_session(exec, effective) {
         Ok(()) => {
             // Best-effort: allow-passthrough is absent on tmux < 3.3 and
             // degrades to quiescence-only activity detection. Must never fail.
-            let _ = exec.run(&set_passthrough_tokens(&plan.tmux_name));
-            write_metadata(exec, plan);
-            attach_channel(exec, &plan.tmux_name)
+            let _ = exec.run(&set_passthrough_tokens(&effective.tmux_name));
+            write_metadata(exec, effective);
+            attach_channel(exec, &effective.tmux_name)
         }
         // Concurrent respawner already created it: attach to the live session.
-        Err(SourceError::SessionExists { .. }) => attach_channel(exec, &plan.tmux_name),
+        Err(SourceError::SessionExists { .. }) => attach_channel(exec, &effective.tmux_name),
         Err(err) => Err(err),
     }
 }
@@ -3347,5 +3394,138 @@ pub(crate) mod tests {
             "must not branch -D on not-found"
         );
         assert_eq!(fake.calls.lock().expect("lock").len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 6: run_respawn uses the real worktree path for custom-root sessions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn run_respawn_uses_real_worktree_path_for_custom_path_session() {
+        // Task 6 RED→GREEN: a session spawned with a custom `worktree_root`
+        // lives at a non-convention path. `resolve_worktree` finds it via
+        // `git worktree list`; `run_respawn` must probe/attach at the REAL
+        // path, not the convention path.
+        //
+        // Session: branch `feat/login` → session_id `feat-login-<hash>`.
+        // Convention plan dir: `~/.remora/worktrees/api/feat-login-<hash>`.
+        // Real worktree dir: `/mnt/work/feat/login`.
+        //
+        // FakeExec call order:
+        //   1) printf $HOME  → "/home/dev"
+        //   2) git worktree list → primary (main) + custom path (feat/login)
+        //   3) test -d /mnt/work/feat/login → success
+        //   4) tmux new-session  → success
+        //   (5-N) best-effort set-option + setenv calls use FakeExec default ok
+        let session_id = derive_session_id(Some("feat/login")).expect("slug");
+        let project_id = ProjectId::new("api").expect("slug");
+        let tmux_name = tmux_session_name(&project_id, &session_id);
+        let convention_dir = format!("~/.remora/worktrees/api/{}", session_id.as_str());
+        let plan = SpawnPlan {
+            project_id: project_id.clone(),
+            session_id: session_id.clone(),
+            tmux_name: tmux_name.clone(),
+            workspace: WorkspaceMode::Worktree,
+            project_path: "/home/dev/api".into(),
+            dir: convention_dir.clone(), // CONVENTION path — wrong for this session
+            branch: Some(format!("remora/{}", session_id.as_str())), // CONVENTION branch
+            base: None,
+            env: vec![
+                ("REMORA_AGENT".into(), "claude".into()),
+                ("REMORA_WORKSPACE".into(), convention_dir.clone()),
+                ("REMORA_CREATED_AT".into(), "1700000000".into()),
+            ],
+            agent_argv: vec!["claude".into(), "--continue".into()],
+        };
+        let porcelain = "worktree /home/dev/api\n\
+                         HEAD abc\n\
+                         branch refs/heads/main\n\
+                         \n\
+                         worktree /mnt/work/feat/login\n\
+                         HEAD def\n\
+                         branch refs/heads/feat/login\n";
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out(porcelain)),   // git worktree list
+            Ok(FakeExec::ok()),             // test -d REAL path
+            Ok(FakeExec::ok()),             // tmux new-session
+        ]);
+        assert!(
+            run_respawn(&fake, &plan).is_ok(),
+            "respawn of custom-path session must succeed"
+        );
+        let calls = fake.calls.lock().expect("lock");
+        // The `test -d` probe MUST target the REAL path, not the convention one.
+        let probe = calls
+            .iter()
+            .find(|c| c.iter().any(|a| a == "test"))
+            .expect("test -d probe must run");
+        assert!(
+            probe.iter().any(|a| a.contains("mnt/work/feat/login")),
+            "preflight must probe the REAL path: {probe:?}"
+        );
+        assert!(
+            !probe.iter().any(|a| a.contains(".remora/worktrees")),
+            "preflight must NOT probe the convention path: {probe:?}"
+        );
+        // new-session must also reference the REAL path as the start directory.
+        let new_session = calls
+            .iter()
+            .find(|c| c.iter().any(|a| a == "new-session"))
+            .expect("new-session must run");
+        assert!(
+            new_session
+                .iter()
+                .any(|a| a.contains("mnt/work/feat/login")),
+            "new-session must target the REAL path: {new_session:?}"
+        );
+        assert_eq!(
+            fake.opened.lock().expect("lock").len(),
+            1,
+            "must open exactly one channel"
+        );
+    }
+
+    #[test]
+    fn run_respawn_falls_back_to_convention_when_worktree_not_found() {
+        // If `git worktree list` has no entry matching the session_id (shared
+        // session, convention session without a custom root, or already-gone
+        // worktree), run_respawn must fall back to the convention plan dir.
+        //
+        // FakeExec call order:
+        //   1) printf $HOME → "/home/dev"
+        //   2) git worktree list → no entry for remora/fix-login → None
+        //   3) test -d CONVENTION dir → success
+        //   4) tmux new-session → success
+        let plan = worktree_plan(); // convention dir: ~/.remora/worktrees/api/fix-login
+        let porcelain = "worktree /home/dev/api\n\
+                         HEAD abc\n\
+                         branch refs/heads/main\n"; // no remora/fix-login entry
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out(porcelain)),   // git worktree list → no match → None
+            Ok(FakeExec::ok()),             // test -d convention dir
+            Ok(FakeExec::ok()),             // tmux new-session
+        ]);
+        assert!(
+            run_respawn(&fake, &plan).is_ok(),
+            "convention fallback must succeed"
+        );
+        let calls = fake.calls.lock().expect("lock");
+        let probe = calls
+            .iter()
+            .find(|c| c.iter().any(|a| a == "test"))
+            .expect("test -d probe must run");
+        assert!(
+            probe
+                .iter()
+                .any(|a| a.contains(".remora/worktrees/api/fix-login")),
+            "fallback must probe the CONVENTION path: {probe:?}"
+        );
+        assert_eq!(
+            fake.opened.lock().expect("lock").len(),
+            1,
+            "must open exactly one channel"
+        );
     }
 }
