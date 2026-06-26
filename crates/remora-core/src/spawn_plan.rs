@@ -193,14 +193,38 @@ pub(crate) fn normalize_branch(raw: Option<String>) -> Result<Option<String>, Pl
     let Some(b) = normalize_override(raw, "branch")? else {
         return Ok(None);
     };
+    // Reject the ref-name forms git itself bans (`git check-ref-format`): `..`,
+    // `@{`, a leading `.`/`/`, a trailing `.`/`/`, a `.lock` suffix, whitespace,
+    // and the special/glob characters `~ ^ : ? * [ \`. The shell metacharacters
+    // (`; $ ` & | ( ) < >`) are a superset hazard on the teardown command path
+    // (defense in depth; that path is also hardened via shell_quote). Rejecting
+    // early gives a clear error instead of a downstream `git worktree add` failure.
     if b.contains("..")
+        || b.contains("@{")
+        || b.starts_with('.')
+        || b.starts_with('/')
         || b.ends_with('/')
+        || b.ends_with('.')
         || b.ends_with(".lock")
         || b.chars().any(char::is_whitespace)
         || b.chars().any(|c| {
             matches!(
                 c,
-                ';' | '$' | '`' | '&' | '|' | '(' | ')' | '<' | '>' | '\\'
+                ';' | '$'
+                    | '`'
+                    | '&'
+                    | '|'
+                    | '('
+                    | ')'
+                    | '<'
+                    | '>'
+                    | '\\'
+                    | ':'
+                    | '?'
+                    | '*'
+                    | '['
+                    | '~'
+                    | '^'
             )
         })
     {
@@ -479,6 +503,23 @@ mod tests {
         assert!(normalize_branch(Some("a..b".into())).is_err()); // double dot
         assert!(normalize_branch(Some("a b".into())).is_err()); // whitespace
         assert!(normalize_branch(Some("x.lock".into())).is_err()); // .lock suffix
+                                                                   // git-invalid ref forms (`git check-ref-format`): special/glob chars,
+                                                                   // `@{`, and leading/trailing `.`/`/`.
+        assert!(normalize_branch(Some("feat:login".into())).is_err()); // colon
+        assert!(normalize_branch(Some("a?b".into())).is_err()); // question mark
+        assert!(normalize_branch(Some("a*b".into())).is_err()); // glob star
+        assert!(normalize_branch(Some("a[b".into())).is_err()); // glob bracket
+        assert!(normalize_branch(Some("a~b".into())).is_err()); // tilde
+        assert!(normalize_branch(Some("a^b".into())).is_err()); // caret
+        assert!(normalize_branch(Some("a@{b".into())).is_err()); // @{ sequence
+        assert!(normalize_branch(Some(".foo".into())).is_err()); // leading dot
+        assert!(normalize_branch(Some("/foo".into())).is_err()); // leading slash
+        assert!(normalize_branch(Some("foo.".into())).is_err()); // trailing dot
+                                                                 // A normal feature branch still passes.
+        assert_eq!(
+            normalize_branch(Some("feature/JIRA-123-add-auth".into())).expect("ok"),
+            Some("feature/JIRA-123-add-auth".into())
+        );
     }
 
     #[test]
