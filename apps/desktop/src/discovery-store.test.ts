@@ -1,16 +1,32 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ConfigDto, SessionMetaDto } from "./bindings";
-import { type DiscoveryDeps, DiscoveryStore } from "./discovery-store";
+import type { ConfigDto, SessionListDto, SessionMetaDto } from "./bindings";
+import {
+  type DiscoveryDeps,
+  DiscoveryStore,
+  RECONNECT_GRACE_MS,
+} from "./discovery-store";
 
 const emptyConfig: ConfigDto = { hosts: [], projects: [], agents: [] };
-const session = (sessionId: string): SessionMetaDto => ({
-  projectId: "api",
+
+const session = (projectId: string, sessionId: string): SessionMetaDto => ({
+  projectId,
   sessionId,
   state: "live",
   agent: null,
   createdAt: null,
   workspacePath: null,
   workspace: null,
+});
+
+/** Build a host-grouped poll result. */
+const listResult = (
+  hosts: { hostId: string; available?: boolean; sessions?: SessionMetaDto[] }[],
+): SessionListDto => ({
+  hosts: hosts.map((h) => ({
+    hostId: h.hostId,
+    available: h.available ?? true,
+    sessions: h.sessions ?? [],
+  })),
 });
 
 /** A promise whose resolution the test controls, to model in-flight/late results. */
@@ -27,7 +43,7 @@ function deferred<T>() {
 function makeStore(overrides: Partial<DiscoveryDeps> = {}) {
   const deps: DiscoveryDeps = {
     loadConfig: vi.fn(async () => emptyConfig),
-    listSessions: vi.fn(async () => [] as SessionMetaDto[]),
+    listSessions: vi.fn(async () => listResult([])),
     intervalMs: 1000,
     ...overrides,
   };
@@ -52,7 +68,9 @@ describe("DiscoveryStore", () => {
           agents: [],
         }),
       ),
-      listSessions: vi.fn(async () => [session("fix")]),
+      listSessions: vi.fn(async () =>
+        listResult([{ hostId: "h", sessions: [session("api", "fix")] }]),
+      ),
     });
     await store.start();
     expect(loadConfig).toHaveBeenCalledTimes(1);
@@ -86,12 +104,12 @@ describe("DiscoveryStore", () => {
   });
 
   it("skips an interval tick while a previous list() is still in flight (D3)", async () => {
-    const d = deferred<SessionMetaDto[]>();
+    const d = deferred<SessionListDto>();
     let calls = 0;
     // Initial poll resolves; the second poll (first interval tick) hangs.
     const listSessions = vi.fn(async () => {
       calls++;
-      return calls === 1 ? [] : d.promise;
+      return calls === 1 ? listResult([]) : d.promise;
     });
     const { store } = makeStore({ listSessions });
     await store.start(); // call 1 resolves
@@ -99,7 +117,7 @@ describe("DiscoveryStore", () => {
     await vi.advanceTimersByTimeAsync(1000); // tick while in-flight → skipped
     await vi.advanceTimersByTimeAsync(1000); // tick while in-flight → skipped
     expect(listSessions).toHaveBeenCalledTimes(2); // guard held
-    d.resolve([session("fix")]);
+    d.resolve(listResult([{ hostId: "h", sessions: [session("api", "fix")] }]));
     await Promise.resolve();
     await vi.advanceTimersByTimeAsync(1000); // now free → polls again
     expect(listSessions).toHaveBeenCalledTimes(3);
@@ -126,7 +144,9 @@ describe("DiscoveryStore", () => {
       loadConfig: vi.fn(async () => {
         throw { kind: "config", message: "bad toml" };
       }),
-      listSessions: vi.fn(async () => [session("fix")]),
+      listSessions: vi.fn(async () =>
+        listResult([{ hostId: "h", sessions: [session("api", "fix")] }]),
+      ),
     });
     await store.start();
     expect(store.getSnapshot().configError).toBe("bad toml");
@@ -136,8 +156,9 @@ describe("DiscoveryStore", () => {
 
   it("keeps the last good sessions and flags discovery on a list() failure, clearing on recovery", async () => {
     let ok = true;
-    const listSessions = vi.fn(async () => {
-      if (ok) return [session("fix")];
+    const listSessions = vi.fn(async (): Promise<SessionListDto> => {
+      if (ok)
+        return listResult([{ hostId: "h", sessions: [session("api", "fix")] }]);
       throw { kind: "transport", message: "down" };
     });
     const { store } = makeStore({ listSessions });
@@ -154,12 +175,14 @@ describe("DiscoveryStore", () => {
   });
 
   it("ignores a list() result that resolves after stop()", async () => {
-    const d = deferred<SessionMetaDto[]>();
+    const d = deferred<SessionListDto>();
     const listSessions = vi.fn(async () => d.promise);
     const { store } = makeStore({ listSessions });
     const started = store.start();
     store.stop(); // dispose before the in-flight list resolves
-    d.resolve([session("late")]);
+    d.resolve(
+      listResult([{ hostId: "h", sessions: [session("api", "late")] }]),
+    );
     await started;
     await Promise.resolve();
     expect(store.getSnapshot().sessions).toHaveLength(0);
@@ -182,5 +205,105 @@ describe("DiscoveryStore", () => {
     expect(loadConfig).toHaveBeenCalledTimes(1); // config untouched
     expect(listSessions).toHaveBeenCalledTimes(2);
     store.stop();
+  });
+});
+
+describe("DiscoveryStore per-host retention", () => {
+  let clock = 0;
+  const now = () => clock;
+  beforeEach(() => {
+    clock = 0;
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  const a1 = session("a", "1");
+  const b1 = session("b", "2");
+
+  it("retains a transiently-down host's rows and flags them reconnecting", async () => {
+    const list = vi
+      .fn<() => Promise<SessionListDto>>()
+      .mockResolvedValueOnce(
+        listResult([
+          { hostId: "A", sessions: [a1] },
+          { hostId: "B", sessions: [b1] },
+        ]),
+      )
+      .mockResolvedValueOnce(
+        listResult([
+          { hostId: "A", sessions: [a1] },
+          { hostId: "B", available: false },
+        ]),
+      );
+    const { store } = makeStore({ listSessions: list, now });
+    await store.start();
+    await store.refreshAfterOpen(); // second poll: B down
+    const snap = store.getSnapshot();
+    expect(snap.sessions).toEqual(expect.arrayContaining([a1, b1])); // B retained
+    expect(snap.reconnectingKeys).toEqual(["b/2"]);
+    expect(snap.discoveryUnavailable).toBe(false);
+  });
+
+  it("prunes a host that stays down past the grace window", async () => {
+    const list = vi
+      .fn<() => Promise<SessionListDto>>()
+      .mockResolvedValue(listResult([{ hostId: "B", available: false }]))
+      .mockResolvedValueOnce(listResult([{ hostId: "B", sessions: [b1] }]));
+    const { store } = makeStore({ listSessions: list, now });
+    await store.start(); // B has b1
+    clock += RECONNECT_GRACE_MS + 1;
+    await store.refreshAfterOpen(); // B down past grace
+    expect(store.getSnapshot().sessions).toEqual([]);
+    expect(store.getSnapshot().reconnectingKeys).toEqual([]);
+  });
+
+  it("[CRITICAL] clears rows when a reachable host returns zero sessions", async () => {
+    const list = vi
+      .fn<() => Promise<SessionListDto>>()
+      .mockResolvedValueOnce(listResult([{ hostId: "A", sessions: [a1] }]))
+      .mockResolvedValueOnce(listResult([{ hostId: "A", sessions: [] }]));
+    const { store } = makeStore({ listSessions: list, now });
+    await store.start();
+    await store.refreshAfterOpen();
+    expect(store.getSnapshot().sessions).toEqual([]); // not over-retained
+    expect(store.getSnapshot().reconnectingKeys).toEqual([]);
+  });
+
+  it("[Finding 1] drops rows for a host removed from config", async () => {
+    const list = vi
+      .fn<() => Promise<SessionListDto>>()
+      .mockResolvedValueOnce(
+        listResult([
+          { hostId: "A", sessions: [a1] },
+          { hostId: "B", sessions: [b1] },
+        ]),
+      )
+      .mockResolvedValueOnce(listResult([{ hostId: "A", sessions: [a1] }])); // B gone
+    const { store } = makeStore({ listSessions: list, now });
+    await store.start();
+    await store.refreshAfterOpen();
+    expect(store.getSnapshot().sessions).toEqual([a1]); // B not flattened forever
+  });
+
+  it("[Finding 3] does not re-arm reconnecting for an already-pruned dead host", async () => {
+    const list = vi
+      .fn<() => Promise<SessionListDto>>()
+      .mockResolvedValue(listResult([{ hostId: "B", available: false }]));
+    const { store } = makeStore({ listSessions: list, now });
+    await store.start(); // B never had rows
+    await store.refreshAfterOpen();
+    expect(store.getSnapshot().reconnectingKeys).toEqual([]);
+  });
+
+  it("all hosts down throws → discoveryUnavailable, rows retained", async () => {
+    const list = vi
+      .fn<() => Promise<SessionListDto>>()
+      .mockResolvedValueOnce(listResult([{ hostId: "A", sessions: [a1] }]))
+      .mockRejectedValueOnce(new Error("all hosts unreachable"));
+    const { store } = makeStore({ listSessions: list, now });
+    await store.start();
+    await store.refreshAfterOpen();
+    expect(store.getSnapshot().sessions).toEqual([a1]);
+    expect(store.getSnapshot().discoveryUnavailable).toBe(true);
   });
 });

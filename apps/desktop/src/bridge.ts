@@ -11,6 +11,7 @@ import {
   type HostInputDto,
   type ProjectInputDto,
   type Result,
+  type SessionListDto,
   type SessionMetaDto,
   type SessionStateDto,
   type WorkspaceModeDto,
@@ -26,6 +27,7 @@ export type {
   EditableConfigDto,
   HostInputDto,
   ProjectInputDto,
+  SessionListDto,
   SessionMetaDto,
   SessionStateDto,
   WorkspaceModeDto,
@@ -46,8 +48,9 @@ function unwrap<T>(r: Result<T, BridgeError>): T {
   return r.data;
 }
 
-/** Discover the sessions known to every configured host (sidebar polling). */
-export async function listSessions(): Promise<SessionMetaDto[]> {
+/** Discover sessions across every configured host, grouped per host with each
+ * host's reachability for this poll (sidebar polling). */
+export async function listSessions(): Promise<SessionListDto> {
   return unwrap(await commands.sessionList());
 }
 
