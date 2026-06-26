@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Spawn-time worktree path and branch overrides** (#124): when spawning a
+  session, you can now specify a custom worktree root path and branch name,
+  overriding the project and host defaults (which cascade to the convention
+  `~/.remora/worktrees/<project-id>`). The branch can be any valid git ref —
+  feature branch, device label, personal naming scheme — without the fixed
+  `remora/<session-id>` prefix; when not specified, the worktree is created at
+  the convention path with the conventional branch, so existing workflows are
+  unchanged. The `session_id` derivation moved from `DefaultHasher` to FNV-1a/32,
+  making ids stable across Rust rebuilds and reproducible in TypeScript (closes
+  #153's hasher item); client-side session id minting and the "Branch name" +
+  `worktree_root` form fields land in a follow-up desktop PR.
 - **Branch-identified session discovery** (#124, ADR-0015): the discovery
   foundation that will let a future release place worktrees at custom paths and
   name their branches freely. Discovery no longer parses the
