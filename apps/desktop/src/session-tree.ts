@@ -40,6 +40,12 @@ export interface SessionNode {
    * UI to gate the Stop action (worktree-mode live sessions only).
    */
   workspace: WorkspaceModeDto | null;
+  /**
+   * Git branch the session advertises (ADR-0015). This is the user-facing
+   * identity shown in the sidebar; falls back to sessionId when null
+   * (e.g. detached HEAD).
+   */
+  branch: string | null;
 }
 
 export interface ProjectNode {
@@ -82,6 +88,7 @@ function sessionNode(
     agent: s.agent,
     key: tabKey(s.projectId, s.sessionId),
     workspace,
+    branch: s.branch,
   };
 }
 

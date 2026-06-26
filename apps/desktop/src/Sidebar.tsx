@@ -279,7 +279,7 @@ function ProjectGroup({
             return (
               <SessionRow
                 key={session.key}
-                name={session.sessionId}
+                name={session.branch ?? session.sessionId}
                 agent={session.agent ?? undefined}
                 branch={null}
                 state={sessionIndicatorState(
