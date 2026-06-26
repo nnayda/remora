@@ -1,4 +1,5 @@
 pub mod bridge;
+pub mod config_watch;
 
 use std::sync::Arc;
 
