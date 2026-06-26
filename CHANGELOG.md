@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Config file watcher for live sidebar reload** (#112): the desktop app now
+  watches the per-device `config.toml` on disk and auto-refreshes the read-only
+  sidebar when it changes, instead of waiting for the manual refresh button or an
+  app restart — an external edit (hand-adding a host or project) shows up live.
+  The Tauri shell watches the config file's *parent directory* (so editor
+  atomic-rename saves are caught, not just inode writes) via `notify` +
+  `notify-debouncer-full`, debounces bursty writes over 500ms, and emits a typed
+  `ConfigChanged` event — the first Rust→frontend push channel, via
+  `tauri-specta` `collect_events`. The event is a no-payload ping: the frontend
+  re-reads through the existing `config_get`/discovery-refresh path rather than
+  the event carrying a config snapshot. Watcher startup is non-fatal (a failure
+  is logged and the app still runs with manual refresh), and the watch attaches
+  even on a fresh device whose `remora/` config dir does not exist yet. Scoped to
+  the read-only sidebar; the Settings editor stays manual so a disk edit can't
+  clobber an in-progress form edit. See
+  [ADR-0013](docs/adr/0013-config-file-watcher-and-typed-event-channel.md).
 - **Desktop design system + app redesign**: the desktop frontend now renders
   through a token-driven design system instead of the placeholder stylesheet —
   dark-first with an OS-following light theme (the terminal stays dark in both),
