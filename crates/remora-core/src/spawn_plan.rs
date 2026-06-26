@@ -202,7 +202,13 @@ pub(crate) fn normalize_worktree_root(raw: Option<String>) -> Result<Option<Stri
             "must be absolute or `~/`-relative",
         ));
     }
-    Ok(Some(r.trim_end_matches('/').to_string()))
+    let trimmed = r.trim_end_matches('/').to_string();
+    // Guard degenerate roots: "/" trims to "" and "~/" trims to "~" — both
+    // would produce broken paths (filesystem root or bare-tilde expansion).
+    if trimmed.is_empty() || trimmed == "~" {
+        return Err(PlanError::Invalid("worktree_root", "must not be empty"));
+    }
+    Ok(Some(trimmed))
 }
 
 /// Wall-clock unix seconds, client-stamped (display-only / untrusted per
@@ -462,6 +468,18 @@ mod tests {
         );
         assert!(normalize_worktree_root(Some("relative/x".into())).is_err());
         assert!(normalize_worktree_root(Some("-x".into())).is_err());
+        // Fix 2: trailing slash is trimmed.
+        assert_eq!(
+            normalize_worktree_root(Some("~/work/".into())).expect("ok"),
+            Some("~/work".into())
+        );
+    }
+
+    #[test]
+    fn normalize_worktree_root_rejects_degenerate_roots() {
+        // Fix 3: "/" trims to "" and "~/" trims to "~" — both must be rejected.
+        assert!(normalize_worktree_root(Some("/".into())).is_err());
+        assert!(normalize_worktree_root(Some("~/".into())).is_err());
     }
 
     #[test]
@@ -526,6 +544,40 @@ mod tests {
         };
         let plan2 = plan_spawn(&cfg2, &spec2).expect("plan");
         assert_eq!(plan2.dir, "~/.remora/worktrees/api/feat/login");
+    }
+
+    #[test]
+    fn plan_spawn_worktree_root_cascades_host_level() {
+        // Fix 1: host-level worktree_root is consulted when both session and
+        // project leave it unset.  A bug that short-circuits the cascade before
+        // the host check would produce the convention path instead.
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            worktree_root = "~/host-root"
+
+            [projects.api]
+            host = "devbox"
+            path = "/home/dev/api"
+            workspace = "worktree"
+            agent = "claude"
+
+            [agents.claude]
+            command = ["claude", "--continue"]
+        "#;
+        let cfg = Config::from_toml_str(toml).expect("valid config");
+        let spec = SpawnSpec {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("s1").expect("slug"),
+            agent: None,
+            base: None,
+            workspace: None,
+            branch: Some("feat/login".into()),
+            worktree_root: None, // session unset → falls to project (also unset) → host
+        };
+        let plan = plan_spawn(&cfg, &spec).expect("plan");
+        assert_eq!(plan.dir, "~/host-root/feat/login");
     }
 
     #[test]
