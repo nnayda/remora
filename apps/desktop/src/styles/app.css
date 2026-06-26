@@ -295,9 +295,25 @@
 }
 .rk-tabbar__tabs {
   display: flex;
+  /* Overflow scrolls horizontally only; never grow a second row / vertical
+     scrollbar. Tabs keep their width (flex: none below) and the row scrolls. */
   overflow-x: auto;
+  overflow-y: hidden;
   flex: 1;
   min-width: 0;
+  /* Thin, unobtrusive horizontal scrollbar (Firefox + WebKit/Blink). */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+.rk-tabbar__tabs::-webkit-scrollbar {
+  height: 6px;
+}
+.rk-tabbar__tabs::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 3px;
+}
+.rk-tabbar__tabs::-webkit-scrollbar-track {
+  background: transparent;
 }
 .rk-tabbar__actions {
   display: flex;

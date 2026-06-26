@@ -6,10 +6,36 @@
   background: transparent;
   border-right: 1px solid var(--border-hairline);
   position: relative;
+  /* Hold the tab's natural width (clamped below) so the row scrolls
+     horizontally instead of squishing tabs when the bar overflows. */
+  flex: none;
   max-width: 220px;
   min-width: 120px;
   font-family: var(--font-sans);
   transition: background-color var(--dur-fast) var(--ease-out);
+}
+/* Drag-to-reorder: the dragged tab is dimmed; the tab under the cursor shows a
+   drop-indicator bar on the edge the dragged tab would land on. */
+.rmra-tab--dragging {
+  opacity: 0.4;
+}
+/* One indicator bar via ::before (a tab is only ever one drop side at a time),
+   so it never collides with the active tab's ::after underline. */
+.rmra-tab--drop-before::before,
+.rmra-tab--drop-after::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent);
+  z-index: 1;
+}
+.rmra-tab--drop-before::before {
+  left: -1px;
+}
+.rmra-tab--drop-after::before {
+  right: -1px;
 }
 .rmra-tab__main {
   display: inline-flex;
@@ -24,6 +50,11 @@
   cursor: pointer;
   font: inherit;
   color: inherit;
+}
+/* Grab cursor signals the tab is a drag handle (placed after .rmra-tab__main so
+   it overrides the base `cursor: pointer` without a descending-specificity warning). */
+.rmra-tab[draggable="true"] .rmra-tab__main {
+  cursor: grab;
 }
 .rmra-tab:hover {
   background: var(--bg-hover);

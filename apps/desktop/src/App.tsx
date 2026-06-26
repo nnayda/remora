@@ -30,6 +30,7 @@ function App() {
     openViaRespawn,
     closeTab,
     focusTab,
+    reorderTab,
     respawnTab,
     stopSession,
     removeSession,
@@ -361,6 +362,7 @@ function App() {
             setNotice(null);
             closeTab(key);
           }}
+          onReorder={reorderTab}
           onNew={() => openNewSession(null)}
           newButtonRef={newButtonRef}
         />
