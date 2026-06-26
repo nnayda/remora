@@ -141,9 +141,3 @@ post-attach `open_pty` PTY byte path but differs in PTY flags and an in-pod
 TERM/locale preamble, and was not live-run — RBAC); add an integration test that
 a marker split across PTY read boundaries still never renders; update
 ARCHITECTURE.md when the parser lands.
-
-**#69 (ADR-0013):** The parser/event/sanitizer landed **core-side** in #69 via
-`vte` — not only the client — superseding the open "parse-location" question for
-the attached path. `ChannelOutput` gained `StatusChange`/`PreviewUpdate` variants
-on the single ordered stream, and the detector thread is the sole `output_tx`
-sender. The client TS parser (`osc-marker.ts`) is retired in PR2.

@@ -19,11 +19,14 @@ ADR-0010's follow-up list also left two protocol costs unsettled: the
 `ChannelOutput` variant(s) for surfacing activity events, and the
 `PROTOCOL_VERSION` bump those variants force.
 
-#69 resolves both: it adds the byte-inspection seam in the one place where
+Issue #69 resolves both: it adds the byte-inspection seam in the one place where
 ADR-0003 permits it (core's own PTY bridge, not the transport-layer interface),
 extends `ChannelOutput` with two typed variants on the existing stream, and runs
 a single detector thread as the sole sender to `output_tx` — which is what
-preserves both byte→status ordering and the `recv()→None` teardown signal.
+preserves both byte→status ordering and the `recv()→None` teardown signal. This
+also supersedes ADR-0010's open "where does the parser run" question for the
+attached path (it runs core-side, via `vte`); the client-side TS parser is
+retired in PR2.
 
 ## Decision
 
@@ -40,9 +43,13 @@ alongside the existing `Bytes(Vec<u8>)`. `SessionStatus` is a new enum
 (`Unknown | Working | Idle | Awaiting`) in `remora-protocol`. These variants
 ride the **same channel** as `Bytes` — one `mpsc` receiver, ordered delivery —
 which is the load-bearing property (see single-sender rationale below).
-`PROTOCOL_VERSION` advances from 0 to 1 to signal the extension; unknown
-variants in older clients/servers must be silently ignored (unknown
-`<type>`/`<ver>` policy from ADR-0010 applies symmetrically here).
+`PROTOCOL_VERSION` advances from 0 to 1 because this is a breaking change:
+`ChannelOutput` is an externally tagged serde enum, so an older peer **fails
+closed** on the unknown `status_change`/`preview_update` variants rather than
+skipping them — compatibility is gated on the version bump, not on silent
+tolerance. That is deliberately distinct from the OSC **marker** parser, which
+*does* silently ignore an unknown `<type>`/`<ver>` (ADR-0010), because a forged
+or garbage marker must never produce a false state.
 
 `SessionStatus` is **not** added to `SessionMeta` or `list()` in this issue.
 Status is attached-only in PR1: it flows to consumers that hold an open

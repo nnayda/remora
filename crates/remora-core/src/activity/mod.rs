@@ -41,15 +41,27 @@ impl Detector {
         let hits = self.scanner.feed(chunk);
         let mut out = Vec::new();
 
-        // The last status marker in the chunk (if any) decides the chunk's
-        // resulting state; otherwise the mere arrival of bytes means Working.
-        let marker_status = hits.last().map(|h| h.status);
-        let new_state = marker_status.unwrap_or(SessionStatus::Working);
-        if self.state != new_state {
-            self.state = new_state;
-            out.push(DetectorEvent::Status(new_state));
+        // No marker in this chunk: the mere arrival of bytes means Working
+        // (emitted only on transition, so a byte firehose doesn't churn).
+        if hits.is_empty() {
+            if self.state != SessionStatus::Working {
+                self.state = SessionStatus::Working;
+                out.push(DetectorEvent::Status(SessionStatus::Working));
+            }
+            return out;
         }
+
+        // Markers present: replay them in arrival order, each emitting its
+        // status transition (if changed) immediately followed by its own
+        // preview. PTY read boundaries are arbitrary, so two markers
+        // (working+preview, then awaiting+preview) can coalesce into one chunk;
+        // ordering per hit keeps each preview attached to its own state rather
+        // than collapsing to the last status with all previews trailing.
         for h in hits {
+            if self.state != h.status {
+                self.state = h.status;
+                out.push(DetectorEvent::Status(h.status));
+            }
             if let Some(preview) = h.preview {
                 out.push(DetectorEvent::Preview(preview));
             }
@@ -147,5 +159,26 @@ mod detector_tests {
             })
             .collect();
         assert_eq!(previews, vec!["Run tests?".to_string()]);
+    }
+
+    #[test]
+    fn multi_marker_chunk_preserves_order() {
+        // Two complete markers coalesced into one chunk:
+        //   working + preview "A"  (b64 "A" = "QQ==")
+        //   idle    + preview "B"  (b64 "B" = "Qg==")
+        // must stay ordered: Status(Working), Preview(A), Status(Idle), Preview(B)
+        // — not Status(Idle) then both previews.
+        let mut d = Detector::new();
+        let chunk = b"\x1b]7366;remora;1;state;d29ya2luZw==;QQ==\x07\
+\x1b]7366;remora;1;state;aWRsZQ==;Qg==\x07";
+        let evs = d.on_bytes(chunk);
+        assert_eq!(evs.len(), 4, "got {evs:?}");
+        assert!(matches!(
+            evs[0],
+            DetectorEvent::Status(SessionStatus::Working)
+        ));
+        assert!(matches!(&evs[1], DetectorEvent::Preview(t) if t.as_str() == "A"));
+        assert!(matches!(evs[2], DetectorEvent::Status(SessionStatus::Idle)));
+        assert!(matches!(&evs[3], DetectorEvent::Preview(t) if t.as_str() == "B"));
     }
 }
