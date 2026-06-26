@@ -285,6 +285,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Opening the New Session dialog from a project **+** now lands focus on the
+  session **name** field instead of the project picker, so you can name and
+  create a session keyboard-only (closes #125). The project is already implied
+  by which **+** was clicked, so the picker no longer needs focus; the global
+  **+ New session** entry point is unchanged and still focuses the project
+  select first. The on-open focus effect consults a small pure helper
+  (`shouldFocusNameField`) that keys off whether the dialog was pre-scoped to a
+  project, falling back to the prior first-focusable behavior when it wasn't
+  (e.g. the no-projects state). This is the focus half of the per-project **+**
+  (#98).
 - Creating a session through the New Session dialog now focuses its terminal, so
   you can type the first prompt without clicking into the pane first (closes
   #78). A successful spawn previously restored focus to the **+ New session**
