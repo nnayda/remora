@@ -1,5 +1,6 @@
 import { type KeyboardEvent, useEffect, useMemo, useState } from "react";
 import type { ConfigDto } from "./bindings";
+import { NAME_INPUT_ID, shouldFocusNameField } from "./new-session-focus";
 import { buildNewSessionModel, resolveSelection } from "./new-session-model";
 import type { OpenResult, SpawnInput } from "./session-store";
 import { OPEN_CANCELLED } from "./session-store";
@@ -22,7 +23,7 @@ interface NewSessionDialogProps {
    * the global "+ New session" entry point (which passes nothing). */
   initialProjectId?: string;
   openSession: (input: SpawnInput) => Promise<OpenResult>;
-  onOpened: (attached: boolean) => void;
+  onOpened: (result: { attached: boolean; opened: boolean }) => void;
   onClose: () => void;
 }
 
@@ -62,21 +63,27 @@ export function NewSessionDialog({
     model.agents.includes(agent) &&
     isValidSlug(sessionId);
 
-  // Focus the first field on open; restore focus to the opener on close. Prefers
-  // the first focusable control inside the dialog body (the project <select>),
-  // falling back to the panel's first focusable (e.g. the × / Close button in
-  // the no-projects state, where the body has no focusable control).
+  // Focus a field on open; restore focus to the opener on close. Opened from a
+  // project "+" the project is already implied, so focus the session-name input
+  // directly (name-and-create keyboard-only). Otherwise prefer the first
+  // focusable control inside the dialog body (the project <select>), falling
+  // back to the panel's first focusable (e.g. the × / Close button in the
+  // no-projects state, where the body has no focusable control).
   useEffect(() => {
     const previouslyFocused = document.activeElement as HTMLElement | null;
     const panel = document.getElementById(DIALOG_ID);
+    const nameField = shouldFocusNameField(initialProjectId)
+      ? panel?.querySelector<HTMLElement>(`#${NAME_INPUT_ID}`)
+      : null;
     const target =
+      nameField ??
       panel
         ?.querySelector(".rmra-dialog__body")
         ?.querySelector<HTMLElement>(FOCUSABLE) ??
       panel?.querySelector<HTMLElement>(FOCUSABLE);
     target?.focus();
     return () => previouslyFocused?.focus?.();
-  }, []);
+  }, [initialProjectId]);
 
   // Re-clamp the selection if config changes while the dialog is open (manual
   // refresh, or the first config load arriving after open). A no-op while
@@ -123,7 +130,7 @@ export function NewSessionDialog({
         workspace,
       });
       if (result.ok) {
-        onOpened(result.attached);
+        onOpened({ attached: result.attached, opened: result.opened });
         return; // App closes the dialog
       }
       // OPEN_CANCELLED means the open was cancelled externally (e.g. app
@@ -236,6 +243,7 @@ export function NewSessionDialog({
             )}
           </div>
           <Input
+            id={NAME_INPUT_ID}
             label="Session"
             value={sessionId}
             mono

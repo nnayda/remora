@@ -514,6 +514,11 @@ export function Showcase() {
                   </IconButton>
                 }
               />
+              <SessionRow
+                name="archive-logs"
+                agent="Claude Code"
+                connected={false}
+              />
             </div>
           </Row>
           <Row label="SessionTab — the workspace tab bar">

@@ -1048,7 +1048,7 @@ pub(crate) fn resolve_local_command(
     let out = runner.run_local(command)?;
     if !out.success {
         return Err(SourceError::Transport(format!(
-            "kubectl `{field}` resolution command failed: {}",
+            "kubectl `{field}` resolution command failed (`{command}`): {}",
             out.stderr.trim()
         )));
     }
@@ -2859,7 +2859,11 @@ pub(crate) mod tests {
         let runner = ShellRunner::new();
         let err = resolve_local_command(&runner, "pod", "echo boom >&2; exit 1")
             .expect_err("nonzero exit");
-        assert!(format!("{err}").contains("boom"), "{err}");
+        let msg = format!("{err}");
+        // Surfaces the stderr AND the command that ran, so a failure reads as a
+        // command problem rather than a mysterious cluster error (#127).
+        assert!(msg.contains("boom"), "{msg}");
+        assert!(msg.contains("echo boom"), "{msg}");
     }
 
     #[test]

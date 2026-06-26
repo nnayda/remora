@@ -122,6 +122,11 @@ export function HostForm({ mode, initial, onSubmit, onCancel }: HostFormProps) {
             placeholder={
               form.podIsCommand ? "kubectl … -o name | head -n1" : "pod name"
             }
+            hint={
+              form.podIsCommand
+                ? "The command itself (a bare pipeline) — don't wrap it in $(…) or backticks."
+                : undefined
+            }
           />
           <Switch
             className="settings-form__toggle"
