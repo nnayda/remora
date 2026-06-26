@@ -693,13 +693,16 @@ mod tests {
 
     #[tokio::test]
     async fn list_joins_live_metadata_stopped_and_filters_unconfigured() {
-        // Config has project `api` (worktree). `ghost` is NOT configured.
+        // Config has project `api` (worktree, path /home/dev/api). `ghost` is NOT configured.
         let config = test_config();
-        // Discovery is two listings then the worktree scan (#108): trusted
-        // names, then inline `name\tagent\tworkspace\tcreated_at` metadata.
-        // workspace_path is set so the path-anchored join can match (#124).
-        // The worktree list uses realistic output: primary checkout first (as
-        // real git always emits), followed by worktree entries.
+        // Discovery call order: names, metadata, printf $HOME, worktree scan (#108, #124):
+        //  1) list-sessions names -> api (configured) + ghost (unconfigured) +
+        //     `main` & `remora__bad` (unparseable). Only api survives.
+        //  2) list-sessions inline metadata -> enrichment keyed by trusted name.
+        //     workspace_path is absolute so the path-anchored join can match (#124).
+        //  3) printf $HOME -> "/home/dev" for A2′ primary-checkout detection.
+        //  4) git worktree list for api -> realistic output: primary checkout first
+        //     (as real git always emits), followed by worktree entries.
         let fake = Arc::new(FakeExec::new(vec![
             Ok(FakeExec::out(
                 "remora_api_fix-login\nremora_ghost_x\nmain\nremora__bad\n",
@@ -707,6 +710,7 @@ mod tests {
             Ok(FakeExec::out(
                 "remora_api_fix-login\tclaude\t/home/dev/.remora/worktrees/api/fix-login\t1765500000\n",
             )),
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
             Ok(FakeExec::out(
                 "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n\n\
                  worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n\n\
@@ -716,20 +720,21 @@ mod tests {
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let metas = source.list().await.expect("list");
 
-        // ghost filtered out (R1). api/add-tests is Stopped; api/fix-login is Live.
-        // The realistic main-checkout leading entry surfaces as an extra Stopped row
-        // because project_paths is the stubbed-empty map.
-        // INTERIM (Task 6): project_paths is stubbed empty, so the primary checkout is
-        // mis-surfaced as a Worktree row here; Task 6 wires project_paths so A2′
-        // reclassifies it as Shared and this assertion must be updated.
+        // ghost filtered out (R1). api/add-tests is Stopped+Worktree; api/fix-login is Live+Worktree.
+        // The primary checkout (/home/dev/api == project path) surfaces as Stopped+Shared (A2′).
         assert_eq!(
             metas.len(),
             3,
-            "expected 3 rows (add-tests, fix-login, main-checkout interim), got: {metas:?}"
+            "expected 3 rows (add-tests, fix-login, main-checkout), got: {metas:?}"
         );
-        assert!(
-            metas.iter().any(|m| m.branch.as_deref() == Some("main")),
-            "primary-checkout main row missing: {metas:?}"
+        let main_row = metas
+            .iter()
+            .find(|m| m.branch.as_deref() == Some("main"))
+            .expect("primary-checkout main row missing");
+        assert_eq!(
+            main_row.workspace,
+            Some(WorkspaceMode::Shared),
+            "primary checkout must be Shared (A2′): {main_row:?}"
         );
         let add_tests = metas
             .iter()

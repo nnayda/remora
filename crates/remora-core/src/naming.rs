@@ -27,33 +27,6 @@ pub fn parse_tmux_session_name(name: &str) -> Option<(ProjectId, SessionId)> {
     Some((project, session))
 }
 
-/// Parses a worktree path back to its session id — the inverse of
-/// [`worktree_path`]. Returns `Some` only when `abs_path`'s trailing
-/// components are `… / .remora / worktrees / <project> / <session>` with
-/// `<project>` equal to `project` (the trusted caller id) and `<session>` a
-/// valid slug. Matched on the path so a detached-HEAD worktree still resolves
-/// (decision 3); only `<session>` comes from discovered bytes.
-pub fn parse_worktree_path(abs_path: &str, project: &ProjectId) -> Option<SessionId> {
-    // Discovery input is untrusted (ADR-0004) and this matches on *trailing*
-    // segments, so require a real absolute (`/…`) or `~/…` path first —
-    // otherwise a forged relative path whose tail happens to match the
-    // convention (e.g. `tmp/.remora/worktrees/api/s1`) would parse.
-    if !(abs_path.starts_with('/') || abs_path.starts_with("~/")) {
-        return None;
-    }
-    let segments: Vec<&str> = abs_path.split('/').filter(|s| !s.is_empty()).collect();
-    match segments.as_slice() {
-        [.., dot_remora, worktrees, proj, session]
-            if *dot_remora == ".remora"
-                && *worktrees == "worktrees"
-                && *proj == project.as_str() =>
-        {
-            SessionId::new(*session).ok()
-        }
-        _ => None,
-    }
-}
-
 /// Worktree path convention (ADR-0004, versioned wire format):
 /// `~/.remora/worktrees/<project-id>/<session-id>`. The `~` is expanded by
 /// the transport, never stored expanded (stage-6 discovery round-trips it).
@@ -196,44 +169,6 @@ mod tests {
             "",
         ] {
             assert_eq!(parse_tmux_session_name(bad), None, "should reject {bad:?}");
-        }
-    }
-
-    #[test]
-    fn parses_a_worktree_path_to_its_session() {
-        let api = ProjectId::new("api").expect("slug");
-        // Absolute (git-expanded) path matches the trailing convention.
-        assert_eq!(
-            parse_worktree_path("/home/dev/.remora/worktrees/api/fix-login", &api)
-                .map(|s| s.as_str().to_string()),
-            Some("fix-login".to_string())
-        );
-        // The `~`-prefixed convention form parses too (same trailing 4 segments).
-        assert_eq!(
-            parse_worktree_path("~/.remora/worktrees/api/fix-login", &api)
-                .map(|s| s.as_str().to_string()),
-            Some("fix-login".to_string())
-        );
-        // A detached-HEAD worktree has the same path, so it still resolves.
-    }
-
-    #[test]
-    fn rejects_non_convention_worktree_paths() {
-        let api = ProjectId::new("api").expect("slug");
-        for bad in [
-            "/home/dev/api",                            // the main worktree
-            "/home/dev/.remora/worktrees/api",          // missing session
-            "/home/dev/.remora/worktrees/other/x",      // wrong project
-            "/home/dev/.config/worktrees/api/x",        // not `.remora`
-            "/home/dev/.remora/worktrees/api/Bad_Slug", // session not a slug
-            "tmp/.remora/worktrees/api/s1",             // relative, not absolute
-            "~user/.remora/worktrees/api/s1",           // `~user`, not `~/`
-        ] {
-            assert_eq!(
-                parse_worktree_path(bad, &api),
-                None,
-                "should reject {bad:?}"
-            );
         }
     }
 

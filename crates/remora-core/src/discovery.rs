@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use remora_protocol::{ProjectId, SessionId, SessionMeta, SessionState, WorkspaceMode};
 
-use crate::naming::{self, parse_worktree_path};
+use crate::naming;
 
 /// Upper bound on a discovered metadata string echoed into UI/logs. Forged
 /// env can be arbitrarily large; bound it like `InvalidIdError` does.
@@ -92,25 +92,6 @@ pub fn parse_session_line(line: &str) -> (&str, DiscoveredEnv) {
             workspace_path,
         },
     )
-}
-
-/// Parses `git worktree list --porcelain` for one project, returning each
-/// surviving remora worktree as `(session id, real absolute path)`. The path
-/// comes from the porcelain `worktree <abs-path>` line; the convention match
-/// is delegated to [`parse_worktree_path`]. `project` is the trusted config
-/// id; non-remora worktrees (the repo's own checkout, foreign paths) are
-/// skipped.
-pub fn parse_worktree_list(output: &str, project: &ProjectId) -> Vec<(SessionId, String)> {
-    let mut found = Vec::new();
-    for line in output.lines() {
-        let Some(path) = line.strip_prefix("worktree ") else {
-            continue;
-        };
-        if let Some(session) = parse_worktree_path(path, project) {
-            found.push((session, path.to_string()));
-        }
-    }
-    found
 }
 
 /// One worktree as reported by `git worktree list --porcelain`. `branch` is the
@@ -357,19 +338,6 @@ mod tests {
         assert_eq!(env.agent, None);
         assert_eq!(env.workspace_path, None);
         assert_eq!(env.created_at, None);
-    }
-
-    #[test]
-    fn parses_worktree_list_porcelain() {
-        let api = ProjectId::new("api").expect("slug");
-        let out = "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n\n\
-                   worktree /home/dev/.remora/worktrees/api/fix-login\nHEAD def\nbranch refs/heads/remora/fix-login\n\n\
-                   worktree /home/dev/.remora/worktrees/api/detached\nHEAD 123\ndetached\n";
-        let found = parse_worktree_list(out, &api);
-        let sessions: Vec<&str> = found.iter().map(|(s, _)| s.as_str()).collect();
-        // Main worktree skipped; both remora worktrees found incl. the detached one.
-        assert_eq!(sessions, vec!["fix-login", "detached"]);
-        assert_eq!(found[0].1, "/home/dev/.remora/worktrees/api/fix-login");
     }
 
     use std::collections::HashMap;
