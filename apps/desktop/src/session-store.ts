@@ -114,6 +114,24 @@ export class SessionStore {
   private listeners = new Set<() => void>();
   private snapshot: Snapshot = { tabs: [], activeKey: null };
   private teardownPending = new Set<string>();
+  // Per-key count of in-flight respawns. A respawn is an "open" for
+  // mutual-exclusion purposes but, unlike `openTab`, isn't tracked in `pending`
+  // (it cancels via the reconnect token, not the pending token — see
+  // `respawnTab`). A count (not a Set) keeps the key marked for the whole
+  // overlap when two respawns race (newest-wins), so a teardown can't slip in.
+  private respawning = new Map<string, number>();
+
+  /** True while any open, respawn, or teardown for `key` is in flight. The
+   * single cross-cutting lock: opens use `pending`, respawns `respawning`,
+   * teardowns `teardownPending`. Prevents an open racing a teardown into an
+   * orphaned session (live tmux with no worktree/branch). */
+  private busy(key: string): boolean {
+    return (
+      this.pending.has(key) ||
+      this.respawning.has(key) ||
+      this.teardownPending.has(key)
+    );
+  }
 
   /** Inject the openers (spawn/attach/respawn + timer) so tests can fake them. */
   constructor(private readonly openers: StoreOpeners) {}
@@ -279,8 +297,10 @@ export class SessionStore {
 
     // A second open of a key whose open is still in flight would overwrite
     // the pending token and could commit a duplicate tab. The dialog prevents
-    // it (submit disabled while connecting), but the store guards it too.
-    if (this.pending.has(key)) {
+    // it (submit disabled while connecting), but the store guards it too. The
+    // wider `busy` check also refuses an open while a respawn or teardown for
+    // the same key is in flight (the cross-guard against orphaning).
+    if (this.busy(key)) {
       return { ok: false, error: OPEN_CANCELLED };
     }
     const token = { cancelled: false };
@@ -466,7 +486,13 @@ export class SessionStore {
   respawnTab = async (key: string): Promise<void> => {
     const tab = this.tabs.find((t) => t.key === key);
     if (!tab || this.disposed) return;
+    // Refuse to respawn while a spawn-open or a teardown for this key is in
+    // flight: a respawn racing a remove re-creates tmux in a worktree the
+    // remove is deleting, leaving an orphan. A concurrent *respawn* is allowed
+    // (newest-wins via the reconnect token below); only opens/teardowns block.
+    if (this.pending.has(key) || this.teardownPending.has(key)) return;
     const token = this.newReconnectToken(key); // cancel any reconnect loop
+    this.respawning.set(key, (this.respawning.get(key) ?? 0) + 1);
     this.setStatus(key, "reconnecting", null);
     let next: SessionConnection;
     try {
@@ -476,16 +502,25 @@ export class SessionStore {
         tab.agent,
       );
     } catch (e) {
+      this.endRespawn(key);
       if (token.cancelled || this.disposed) return;
       this.setStatus(key, "disconnected", errorMessage(e));
       return;
     }
+    this.endRespawn(key);
     if (token.cancelled || this.disposed) {
       void next.close().catch(() => {});
       return;
     }
     this.swapConnection(key, next, "live");
   };
+
+  /** Decrement the in-flight respawn count for `key`, dropping the entry at 0. */
+  private endRespawn(key: string): void {
+    const n = (this.respawning.get(key) ?? 1) - 1;
+    if (n <= 0) this.respawning.delete(key);
+    else this.respawning.set(key, n);
+  }
 
   /** Stop a session (kill tmux, keep the worktree). An open tab flips to
    * "stopped" directly — we do NOT wait for the channel-death path, which would
@@ -496,7 +531,9 @@ export class SessionStore {
   ): Promise<TeardownResult> => {
     if (this.disposed) return { ok: false };
     const key = tabKey(projectId, sessionId);
-    if (this.teardownPending.has(key)) return { ok: false };
+    // Refuse if any open/respawn/teardown for this key is already in flight —
+    // tearing down a session mid-spawn is the orphaning race.
+    if (this.busy(key)) return { ok: false };
     this.teardownPending.add(key);
     try {
       await this.openers.stop(projectId, sessionId);
@@ -524,7 +561,9 @@ export class SessionStore {
   ): Promise<RemoveResult> => {
     if (this.disposed) return { ok: false };
     const key = tabKey(projectId, sessionId);
-    if (this.teardownPending.has(key)) return { ok: false };
+    // Refuse if any open/respawn/teardown for this key is already in flight —
+    // removing a session mid-spawn is the orphaning race.
+    if (this.busy(key)) return { ok: false };
     this.teardownPending.add(key);
     try {
       await this.openers.remove(projectId, sessionId, force);
@@ -547,6 +586,8 @@ export class SessionStore {
     // Cancel all reconnect tokens
     for (const token of this.reconnectTokens.values()) token.cancelled = true;
     this.reconnectTokens.clear();
+    // In-flight respawns observe `disposed` post-await and bail; drop the marks.
+    this.respawning.clear();
     for (const tab of this.tabs) void tab.connection.close().catch(() => {});
     this.tabs = [];
     this.activeKey = null;
@@ -558,4 +599,19 @@ export class SessionStore {
  * Pure so the App pane can gate the Respawn affordance without rendering tests. */
 export function canRespawn(workspace: WorkspaceModeDto): boolean {
   return workspace !== "shared";
+}
+
+/** UI copy for a failed remove. A genuine backend failure is a tauri-specta
+ * `BridgeError` — a typed *plain object*, not an `Error` — so an `instanceof
+ * Error` check alone drops its message and shows a generic string, hiding the
+ * real reason (e.g. "kill tmux: permission denied"). Surface the message when
+ * there is one; fall back to friendly copy for a bare `{ok:false}` (the
+ * in-flight guard / disposed store, which aren't real failures). */
+export function removeErrorMessage(result: RemoveResult): string {
+  if ("error" in result && result.error !== undefined) {
+    const e = result.error;
+    if (e instanceof Error) return e.message;
+    return errorMessage(e); // BridgeError → its message; string → itself
+  }
+  return "Could not remove the session.";
 }

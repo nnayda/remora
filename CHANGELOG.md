@@ -390,6 +390,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Open-vs-teardown race that orphaned a session.** Clicking Remove on a session
+  and then clicking its row (which respawns) could interleave: the remove killed
+  tmux and deleted the worktree + branch while the respawn re-created tmux in that
+  same worktree, leaving a live tmux with no worktree or branch behind it. The
+  orphan then showed no Stop affordance (discovery classifies a backing-less live
+  session as Shared) and was awkward to clear. `SessionStore` had two independent
+  in-flight guards — `pending` (open-vs-open) and `teardownPending`
+  (teardown-vs-teardown) — with nothing serializing an open against a teardown,
+  and `respawnTab` checked neither. Added a per-key `busy()` cross-lock (opens use
+  `pending`, respawns a new `respawning` count, teardowns `teardownPending`):
+  `openTab`/`stop`/`remove` refuse while busy, and `respawnTab` bails if an open
+  or teardown is in flight while still allowing a concurrent respawn (newest-wins
+  via the reconnect token). The `respawning` map is a count, not a set, so two
+  overlapping respawns keep the key locked until both settle.
+- **Remove dialog showed a generic error instead of the real reason.** A failed
+  remove surfaced "Could not remove the session." even when the backend returned
+  a specific cause, because the dialog only rendered `Error` instances and
+  strings — a tauri-specta `BridgeError` is a typed plain object, so its message
+  was dropped. A new `removeErrorMessage` helper surfaces the `BridgeError`
+  message (falling back to the friendly copy only for a bare `{ok:false}`).
 - A kubectl `{ command }` field accidentally wrapped in command substitution —
   `pod = { command = "$(kubectl … | head -n1)" }` — is now rejected at config
   time with a targeted message ("must be the command itself, not wrapped in

@@ -1,6 +1,6 @@
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import type { WorkspaceModeDto } from "./bindings";
-import type { RemoveResult } from "./session-store";
+import { type RemoveResult, removeErrorMessage } from "./session-store";
 import { Button, Dialog } from "./ui";
 import { AlertTriangle } from "./ui/icons";
 
@@ -85,14 +85,9 @@ export function ConfirmRemoveDialog({
       });
       return;
     }
-    // Error from a force attempt (or unexpected non-dirty error on first attempt).
-    const msg =
-      result.error instanceof Error
-        ? result.error.message
-        : typeof result.error === "string"
-          ? result.error
-          : "Could not remove the session.";
-    setError(msg);
+    // Error from a force attempt (or unexpected non-dirty error on first
+    // attempt). Surfaces a BridgeError's message instead of a generic string.
+    setError(removeErrorMessage(result));
   }
 
   /** Modal keyboard handling: Esc closes, Tab is trapped within the dialog. */
