@@ -15,8 +15,8 @@ use super::pty_process::spawn_pty_channel;
 use crate::config::Config;
 use crate::discovery::{self, DiscoveredEnv};
 use crate::naming::{
-    branch_name, parse_tmux_session_name, tmux_session_name, worktree_path, ENV_AGENT,
-    ENV_CREATED_AT, ENV_WORKSPACE,
+    derive_session_id, parse_tmux_session_name, tmux_session_name, ENV_AGENT, ENV_CREATED_AT,
+    ENV_WORKSPACE,
 };
 use crate::spawn_plan::{PlanError, SpawnPlan};
 use crate::{DirtyReason, SessionChannel, SourceError};
@@ -1257,12 +1257,56 @@ pub(crate) fn run_stop(
     kill_session(exec, &paths.tmux_name)
 }
 
-/// Ends a session for good. Mode is determined from REAL remote state (not
-/// project config): a worktree-override session on a shared-default project
-/// must still be cleaned up. If the canonical worktree directory exists →
-/// worktree session: optional dirty gate (unless force) → kill tmux →
-/// idempotent worktree remove → idempotent branch delete. If not → kill tmux
-/// only (shared session, or worktree already gone).
+/// Resolves the real worktree path and branch for `session_id` by querying
+/// `git worktree list --porcelain` for the project. Returns the first entry
+/// whose branch derives (via [`derive_session_id`]) to `session_id`, as
+/// `(canonical_path, branch)`.
+///
+/// Returns `Ok(None)` when no matching entry is found (shared or already-gone
+/// session). Returns `Err(Transport)` if the listing fails with non-empty
+/// stderr — fail-safe: an ambiguous probe must never read as "no worktree",
+/// which would silently orphan a live worktree + branch (ADR-0015, #124).
+fn resolve_worktree(
+    exec: &dyn RemoteExec,
+    project_path: &str,
+    session_id: &SessionId,
+    home: &str,
+) -> Result<Option<(String, String)>, SourceError> {
+    let out = exec.run(&worktree_list_tokens(project_path))?;
+    if !out.success {
+        // Non-empty stderr → transport/auth/git error; fail closed.
+        // Empty stderr → no worktrees or empty output; treat as not found.
+        if !out.stderr.trim().is_empty() {
+            return Err(SourceError::Transport(out.stderr));
+        }
+        return Ok(None);
+    }
+    for wt in discovery::parse_worktree_porcelain(&out.stdout) {
+        if let Some(branch) = wt.branch {
+            if derive_session_id(Some(&branch)) == Some(session_id.clone()) {
+                let canonical = discovery::canonicalize_remote_path(&wt.path, home);
+                return Ok(Some((canonical, branch)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Ends a session for good. Mode is determined from REAL remote git state (not
+/// project config or naming convention): `git worktree list --porcelain` finds
+/// the worktree whose branch derives to `session_id`. This is the correct
+/// approach for sessions with a custom `worktree_root` or `branch` — the
+/// convention path would be wrong and would silently orphan the real worktree.
+///
+/// Outcomes:
+/// - `Some((real_dir, real_branch))` and `real_dir == project.path` → **A2′**:
+///   the matched worktree IS the primary checkout; kill tmux only, never
+///   `worktree remove` or `branch -D` it.
+/// - `Some((real_dir, real_branch))` (non-primary) → dirty gate (unless
+///   `force`) → kill tmux → idempotent `worktree remove real_dir` → idempotent
+///   `branch -D real_branch`.
+/// - `None` (no matching worktree in the listing) → shared or already-gone
+///   session; kill tmux only.
 ///
 /// Accepted limitation: the dirty probe and the kill are separate round-trips,
 /// so a still-running agent could write new uncommitted work in the window
@@ -1280,46 +1324,63 @@ pub(crate) fn run_remove(
     force: bool,
 ) -> Result<(), SourceError> {
     let paths = teardown_paths(config, project_id, session_id)?;
-    // Determine mode from REAL remote state, not project config: a per-session
-    // override means the project's default doesn't decide whether this session
-    // has a worktree. The canonical path is recomputed from validated ids
-    // (never from discovered metadata — ADR-0004).
-    let worktree_dir = worktree_path(project_id, session_id);
-    let probe = exec.run(&dir_exists_tokens(&worktree_dir))?;
-    // `test -d` is silent: a clean non-zero exit (empty stderr) means the dir is
-    // absent (shared session, or worktree already gone). A non-empty stderr
-    // means the probe itself couldn't run (ssh/kubectl/auth/shell error) — fail
-    // closed rather than mistaking a transport error for "no worktree" and
-    // orphaning a live worktree + branch (mirrors `run_respawn`).
-    if !probe.success && !probe.stderr.trim().is_empty() {
-        return Err(SourceError::Transport(probe.stderr));
-    }
-    let has_worktree = probe.success;
 
-    if has_worktree && !force {
-        if let Some(reason) = worktree_has_work(exec, &worktree_dir)? {
-            return Err(SourceError::WorkspaceDirty {
-                project_id: project_id.clone(),
-                session_id: session_id.clone(),
-                reason,
-            });
+    // Remote $HOME for path canonicalization. Best-effort: on failure (exec
+    // error, non-zero exit, or a non-absolute result), fall back to "~" —
+    // same degradation policy as `run_list`. Validates `starts_with('/')` per
+    // ADR-0004's never-trust rule. Fetched once; passed into `resolve_worktree`
+    // and reused for the A2' primary-path comparison below.
+    let home = exec
+        .run(&remote_home_tokens())
+        .ok()
+        .filter(|o| o.success)
+        .map(|o| o.stdout.trim().to_string())
+        .filter(|h| h.starts_with('/'))
+        .unwrap_or_else(|| "~".to_string());
+
+    // Determine mode from git's authoritative listing (ADR-0015, #124): find
+    // the worktree whose branch derives to this session_id. A convention-path
+    // recompute (the old approach) breaks when the session was spawned with a
+    // custom worktree_root or branch.
+    let resolved = resolve_worktree(exec, &paths.project_path, session_id, &home)?;
+
+    match resolved {
+        None => {
+            // No discoverable worktree: shared session or worktree already gone.
+            // Kill tmux only (idempotent — absent session is tolerated).
+            kill_session(exec, &paths.tmux_name)
+        }
+        Some((real_dir, real_branch)) => {
+            // A2' (ADR-0015): the worktree at `project.path` is the PRIMARY
+            // checkout. Never `worktree remove` or `branch -D` it — killing
+            // tmux is all teardown should do here.
+            let primary_path = discovery::canonicalize_remote_path(&paths.project_path, &home);
+            if real_dir == primary_path {
+                return kill_session(exec, &paths.tmux_name);
+            }
+
+            // Non-primary worktree: dirty gate (unless force), kill, remove, delete.
+            if !force {
+                if let Some(reason) = worktree_has_work(exec, &real_dir)? {
+                    return Err(SourceError::WorkspaceDirty {
+                        project_id: project_id.clone(),
+                        session_id: session_id.clone(),
+                        reason,
+                    });
+                }
+            }
+            kill_session(exec, &paths.tmux_name)?;
+            let rm = exec.run(&worktree_remove_tokens(&paths.project_path, &real_dir))?;
+            if !rm.success && !stderr_signals_worktree_absent(&rm.stderr) {
+                return Err(SourceError::Transport(rm.stderr));
+            }
+            let del = exec.run(&branch_delete_tokens(&paths.project_path, &real_branch))?;
+            if !del.success && !stderr_signals_branch_absent(&del.stderr) {
+                return Err(SourceError::Transport(del.stderr));
+            }
+            Ok(())
         }
     }
-
-    kill_session(exec, &paths.tmux_name)?;
-
-    if has_worktree {
-        let rm = exec.run(&worktree_remove_tokens(&paths.project_path, &worktree_dir))?;
-        if !rm.success && !stderr_signals_worktree_absent(&rm.stderr) {
-            return Err(SourceError::Transport(rm.stderr));
-        }
-        let branch = branch_name(session_id);
-        let del = exec.run(&branch_delete_tokens(&paths.project_path, &branch))?;
-        if !del.success && !stderr_signals_branch_absent(&del.stderr) {
-            return Err(SourceError::Transport(del.stderr));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -2743,28 +2804,62 @@ pub(crate) mod tests {
 
     #[test]
     fn run_remove_clean_worktree_runs_probe_kill_remove_delete_in_order() {
+        // Call order: printf $HOME, git worktree list, status, rev-list,
+        // kill-session, worktree remove, branch -D.
+        let porcelain = "worktree /home/dev/.remora/worktrees/api/fix-login\n\
+                         HEAD abc\n\
+                         branch refs/heads/remora/fix-login\n";
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),       // test -d worktree probe: exists
-            Ok(FakeExec::out("")),    // status --porcelain (clean)
-            Ok(FakeExec::out("0\n")), // rev-list (on remote)
-            Ok(FakeExec::ok()),       // kill-session
-            Ok(FakeExec::ok()),       // worktree remove
-            Ok(FakeExec::ok()),       // branch -D
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out(porcelain)),   // git worktree list
+            Ok(FakeExec::out("")),          // status --porcelain (clean)
+            Ok(FakeExec::out("0\n")),       // rev-list (on remote)
+            Ok(FakeExec::ok()),             // kill-session
+            Ok(FakeExec::ok()),             // worktree remove
+            Ok(FakeExec::ok()),             // branch -D
         ]);
         assert!(run_remove(&fake, &test_config(), &pid("api"), &sid("fix-login"), false).is_ok());
         let calls = fake.calls.lock().expect("lock");
-        assert!(calls[0].iter().any(|a| a == "test") && calls[0].iter().any(|a| a == "-d"));
-        assert!(calls[1].iter().any(|a| a == "status"));
-        assert!(calls[2].iter().any(|a| a == "rev-list"));
-        assert!(calls[3].iter().any(|a| a == "kill-session"));
-        assert!(calls[4].iter().any(|a| a == "remove")); // worktree remove
-        assert!(calls[5].iter().any(|a| a == "-D")); // branch -D
+        // call 0: home fetch (printf)
+        assert!(
+            calls[0].iter().any(|a| a == "printf"),
+            "call 0 must be printf: {:?}",
+            calls[0]
+        );
+        // call 1: git worktree list
+        assert!(
+            calls[1].iter().any(|a| a == "worktree") && calls[1].iter().any(|a| a == "list"),
+            "call 1 must be worktree list: {:?}",
+            calls[1]
+        );
+        // calls 2–3: dirty probe
+        assert!(calls[2].iter().any(|a| a == "status"));
+        assert!(calls[3].iter().any(|a| a == "rev-list"));
+        // call 4: kill-session
+        assert!(calls[4].iter().any(|a| a == "kill-session"));
+        // call 5: worktree remove (uses real path from git)
+        assert!(
+            calls[5].iter().any(|a| a == "remove"),
+            "call 5 must be worktree remove: {:?}",
+            calls[5]
+        );
+        // call 6: branch -D (uses real branch from git)
+        assert!(
+            calls[6].iter().any(|a| a == "-D"),
+            "call 6 must be branch -D: {:?}",
+            calls[6]
+        );
     }
 
     #[test]
     fn run_remove_refuses_dirty_without_force_and_touches_nothing() {
+        // Call order: printf $HOME, git worktree list (found), status (dirty), rev-list.
+        let porcelain = "worktree /home/dev/.remora/worktrees/api/fix-login\n\
+                         HEAD abc\n\
+                         branch refs/heads/remora/fix-login\n";
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                 // test -d worktree probe: exists
+            Ok(FakeExec::out("/home/dev")),     // printf $HOME
+            Ok(FakeExec::out(porcelain)),       // git worktree list: found
             Ok(FakeExec::out(" M src/x.rs\n")), // status dirty
             Ok(FakeExec::out("0\n")),           // rev-list
         ]);
@@ -2782,14 +2877,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn run_remove_force_skips_the_dirty_probe_but_still_probes_existence() {
-        // force=true skips the dirty-check (status/rev-list) but the `test -d`
-        // existence probe still runs — it decides whether to do worktree cleanup.
+    fn run_remove_force_skips_the_dirty_probe() {
+        // force=true skips the dirty-check (status/rev-list); the worktree is
+        // discovered via `git worktree list`, not `test -d`.
+        // Call order: printf $HOME, git worktree list (found), kill-session,
+        // worktree remove, branch -D.
+        let porcelain = "worktree /home/dev/.remora/worktrees/api/fix-login\n\
+                         HEAD abc\n\
+                         branch refs/heads/remora/fix-login\n";
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()), // test -d worktree probe: exists
-            Ok(FakeExec::ok()), // kill-session
-            Ok(FakeExec::ok()), // worktree remove
-            Ok(FakeExec::ok()), // branch -D
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out(porcelain)),   // git worktree list: found
+            Ok(FakeExec::ok()),             // kill-session
+            Ok(FakeExec::ok()),             // worktree remove
+            Ok(FakeExec::ok()),             // branch -D
         ]);
         assert!(run_remove(&fake, &test_config(), &pid("api"), &sid("fix-login"), true).is_ok());
         assert_eq!(fake.count_calls_with("status"), 0);
@@ -2800,11 +2901,20 @@ pub(crate) mod tests {
 
     #[test]
     fn run_remove_idempotent_when_worktree_and_branch_already_gone() {
+        // `git worktree list` still lists the entry (admin entry survives a bare
+        // `rm -rf`), but the subsequent `worktree remove` and `branch -D` find
+        // nothing and emit the "already gone" stderr — both must be tolerated.
+        // Call order: printf $HOME, git worktree list (found), status, rev-list,
+        // kill-session, worktree remove (gone), branch -D (gone).
+        let porcelain = "worktree /home/dev/.remora/worktrees/api/fix-login\n\
+                         HEAD abc\n\
+                         branch refs/heads/remora/fix-login\n";
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),       // test -d worktree probe: exists
-            Ok(FakeExec::out("")),    // status --porcelain (clean)
-            Ok(FakeExec::out("0\n")), // rev-list
-            Ok(FakeExec::ok()),       // kill-session
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out(porcelain)),   // git worktree list: found
+            Ok(FakeExec::out("")),          // status --porcelain (clean)
+            Ok(FakeExec::out("0\n")),       // rev-list
+            Ok(FakeExec::ok()),             // kill-session
             Ok(FakeExec::fail(
                 "fatal: '~/.remora/worktrees/api/fix-login' is not a working tree",
             )), // already gone
@@ -2817,8 +2927,9 @@ pub(crate) mod tests {
 
     #[test]
     fn run_remove_shared_session_skips_worktree_and_branch() {
-        // A genuinely shared session (no worktree dir on disk): `test -d` fails,
-        // so only kill-session runs — no worktree remove, no branch delete.
+        // No matching worktree in `git worktree list` → shared/gone session:
+        // kill tmux only (no worktree remove, no branch delete).
+        // Call order: printf $HOME, git worktree list (no match), kill-session.
         let toml = r#"
             [hosts.devbox]
             transport = "ssh"
@@ -2833,13 +2944,12 @@ pub(crate) mod tests {
         "#;
         let config = Arc::new(Config::from_toml_str(toml).expect("config"));
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::fail("")), // test -d: no worktree dir
-            Ok(FakeExec::ok()),     // kill-session
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out("")),          // git worktree list: no matching entry
+            Ok(FakeExec::ok()),             // kill-session
         ]);
         assert!(run_remove(&fake, &config, &pid("scratch"), &sid("s1"), false).is_ok());
         assert_eq!(fake.count_calls_with("kill-session"), 1);
-        // Use "worktree remove" (the git subcommand pair) rather than the path
-        // substring "worktree", which also appears in the `test -d` probe argv.
         assert_eq!(fake.count_calls_with("remove"), 0);
         assert_eq!(fake.count_calls_with("-D"), 0);
     }
@@ -3007,10 +3117,12 @@ pub(crate) mod tests {
 
     #[test]
     fn run_remove_fails_closed_when_the_worktree_probe_errors() {
-        // The `test -d` probe fails with a non-empty stderr (ssh/auth/shell
-        // error, not a clean "dir absent"). run_remove must NOT mistake that for
-        // "no worktree" and proceed to kill tmux while skipping cleanup — that
-        // would orphan a live worktree + branch. It fails closed with Transport.
+        // `git worktree list` fails with a non-empty stderr (ssh/auth/shell
+        // error, not "no results"). run_remove must NOT mistake that for "no
+        // worktree" and proceed to kill tmux while skipping cleanup — that would
+        // orphan a live worktree + branch. It fails closed with Transport.
+        // Call order: printf $HOME (best-effort, falls back), git worktree list
+        // (transport error → Err(Transport)).
         let toml = r#"
             [hosts.devbox]
             transport = "ssh"
@@ -3025,7 +3137,8 @@ pub(crate) mod tests {
         "#;
         let config = Arc::new(Config::from_toml_str(toml).expect("config"));
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::fail("ssh: connect: connection refused")), // test -d: probe error
+            Ok(FakeExec::out("/home/dev")),                         // printf $HOME
+            Ok(FakeExec::fail("ssh: connect: connection refused")), // git worktree list: error
         ]);
         let err = run_remove(&fake, &config, &pid("scratch"), &sid("s1"), true).expect_err("err");
         assert!(matches!(err, SourceError::Transport(_)));
@@ -3036,10 +3149,12 @@ pub(crate) mod tests {
 
     #[test]
     fn run_remove_worktree_session_on_shared_config_project_cleans_up_worktree() {
-        // RED → GREEN: a worktree session spawned on a shared-default project
-        // must still be cleaned up. The probe (`test -d`) finds the worktree dir
-        // exists, so run_remove issues worktree remove + branch -D regardless of
-        // the project config's workspace setting.
+        // A worktree session spawned on a shared-default project must still be
+        // cleaned up: `git worktree list` finds the worktree, so run_remove
+        // issues worktree remove + branch -D regardless of the project config's
+        // workspace setting.
+        // Call order: printf $HOME, git worktree list (found), kill-session
+        // (force=true, no dirty-check), worktree remove, branch -D.
         let toml = r#"
             [hosts.devbox]
             transport = "ssh"
@@ -3053,8 +3168,12 @@ pub(crate) mod tests {
             command = ["claude"]
         "#;
         let config = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let porcelain = "worktree /home/dev/.remora/worktrees/scratch/s1\n\
+                         HEAD abc\n\
+                         branch refs/heads/remora/s1\n";
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()), // test -d: worktree dir EXISTS (override case)
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out(porcelain)),   // git worktree list: found
             // force=true: no dirty-check
             Ok(FakeExec::ok()), // kill-session
             Ok(FakeExec::ok()), // worktree remove
@@ -3072,12 +3191,161 @@ pub(crate) mod tests {
         assert_eq!(
             fake.count_calls_with("remove"),
             1,
-            "worktree remove must run for an existing worktree dir"
+            "worktree remove must run for an existing worktree"
         );
         assert_eq!(
             fake.count_calls_with("-D"),
             1,
             "branch delete must run for an existing worktree"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 5: resolve_worktree — custom path, A2′, not-found (#124)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn run_remove_custom_path_session_uses_real_worktree_path_and_branch() {
+        // Task 5 RED→GREEN: a session with a non-convention worktree path (e.g.
+        // spawned with a custom `worktree_root`). `git worktree list` returns the
+        // REAL path; run_remove must remove that path, not the convention one.
+        //
+        // FakeExec call order:
+        //   1) printf $HOME → "/home/dev"
+        //   2) git worktree list → primary checkout at /home/dev/api (main branch)
+        //      + custom-path worktree at /home/dev/mywork/fix-login (remora/fix-login)
+        //   3) git status (clean)
+        //   4) git rev-list (0)
+        //   5) kill-session
+        //   6) git worktree remove /home/dev/mywork/fix-login  ← REAL path, not convention
+        //   7) git branch -D remora/fix-login
+        let porcelain = "worktree /home/dev/api\n\
+                         HEAD abc\n\
+                         branch refs/heads/main\n\
+                         \n\
+                         worktree /home/dev/mywork/fix-login\n\
+                         HEAD def\n\
+                         branch refs/heads/remora/fix-login\n";
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out(porcelain)),   // git worktree list
+            Ok(FakeExec::out("")),          // git status (clean)
+            Ok(FakeExec::out("0\n")),       // git rev-list
+            Ok(FakeExec::ok()),             // kill-session
+            Ok(FakeExec::ok()),             // git worktree remove
+            Ok(FakeExec::ok()),             // git branch -D
+        ]);
+        assert!(
+            run_remove(&fake, &test_config(), &pid("api"), &sid("fix-login"), false).is_ok(),
+            "custom-path session must be fully cleaned up"
+        );
+        let calls = fake.calls.lock().expect("lock");
+        // worktree remove must use the REAL path, NOT the convention path.
+        let rm_call = calls
+            .iter()
+            .find(|c| c.iter().any(|a| a == "remove"))
+            .expect("worktree remove call must be present");
+        assert!(
+            rm_call.iter().any(|a| a.contains("mywork/fix-login")),
+            "worktree remove must target the real path: {rm_call:?}"
+        );
+        assert!(
+            !rm_call.iter().any(|a| a.contains(".remora/worktrees")),
+            "worktree remove must NOT use the convention path: {rm_call:?}"
+        );
+        // branch -D must use the REAL branch from git.
+        let del_call = calls
+            .iter()
+            .find(|c| c.iter().any(|a| a == "-D"))
+            .expect("branch -D call must be present");
+        assert!(
+            del_call.iter().any(|a| a == "remora/fix-login"),
+            "branch -D must use the real branch: {del_call:?}"
+        );
+    }
+
+    #[test]
+    fn run_remove_primary_checkout_kills_tmux_only_never_removes_worktree() {
+        // Task 5 A2′ guard: if the session's resolved worktree path equals
+        // `project.path` (the primary checkout), teardown must kill tmux only —
+        // never `git worktree remove` or `branch -D` the primary checkout.
+        //
+        // Scenario: project `api` at `/home/dev/api`; the primary checkout happens
+        // to be on branch `remora/fix-login` (maps to session_id `fix-login`).
+        //
+        // FakeExec call order:
+        //   1) printf $HOME → "/home/dev"
+        //   2) git worktree list → one entry: /home/dev/api on remora/fix-login
+        //      → real_dir == primary_path → A2′ path
+        //   3) kill-session (only op)
+        let porcelain = "worktree /home/dev/api\n\
+                         HEAD abc\n\
+                         branch refs/heads/remora/fix-login\n";
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out(porcelain)),   // git worktree list
+            Ok(FakeExec::ok()),             // kill-session
+        ]);
+        assert!(
+            run_remove(&fake, &test_config(), &pid("api"), &sid("fix-login"), false).is_ok(),
+            "A2' path must succeed with kill-session only"
+        );
+        assert_eq!(
+            fake.count_calls_with("kill-session"),
+            1,
+            "kill-session must run exactly once"
+        );
+        assert_eq!(
+            fake.count_calls_with("remove"),
+            0,
+            "A2': must NOT git-worktree-remove the primary checkout"
+        );
+        assert_eq!(
+            fake.count_calls_with("-D"),
+            0,
+            "A2': must NOT branch -D the primary checkout"
+        );
+        // Exactly 3 calls total: printf, worktree list, kill-session.
+        assert_eq!(
+            fake.calls.lock().expect("lock").len(),
+            3,
+            "A2' must make exactly 3 remote calls (printf, worktree list, kill-session)"
+        );
+    }
+
+    #[test]
+    fn run_remove_not_found_in_worktree_list_kills_tmux_only() {
+        // If `git worktree list` returns no entry matching the session_id (shared
+        // session, or worktree already physically gone), run_remove kills tmux
+        // only and does not attempt worktree remove or branch delete.
+        //
+        // FakeExec call order:
+        //   1) printf $HOME → "/home/dev"
+        //   2) git worktree list → only the primary checkout (no remora/fix-login)
+        //   3) kill-session
+        let porcelain = "worktree /home/dev/api\n\
+                         HEAD abc\n\
+                         branch refs/heads/main\n";
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out(porcelain)),   // git worktree list: no match for fix-login
+            Ok(FakeExec::ok()),             // kill-session
+        ]);
+        assert!(
+            run_remove(&fake, &test_config(), &pid("api"), &sid("fix-login"), false).is_ok(),
+            "not-found session must succeed with kill-session only"
+        );
+        assert_eq!(fake.count_calls_with("kill-session"), 1);
+        assert_eq!(
+            fake.count_calls_with("remove"),
+            0,
+            "must not worktree-remove on not-found"
+        );
+        assert_eq!(
+            fake.count_calls_with("-D"),
+            0,
+            "must not branch -D on not-found"
+        );
+        assert_eq!(fake.calls.lock().expect("lock").len(), 3);
     }
 }
