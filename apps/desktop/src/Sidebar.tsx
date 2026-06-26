@@ -1,26 +1,29 @@
 import { useEffect, useRef, useState } from "react";
 import type { ActivityState } from "./activity-store";
 import wordmark from "./assets/remora-wordmark.svg";
-import type { HostNode, ProjectNode, SessionNode } from "./session-tree";
+import { filterTree } from "./filter-tree";
+import type { HostTransport, ProjectNode, SessionNode } from "./session-tree";
 import { sessionIndicatorState } from "./status-state";
-import { Avatar, IconButton, SessionRow, Tag, useTheme } from "./ui";
+import { Avatar, IconButton, SessionRow, useTheme } from "./ui";
 import {
   AlertTriangle,
   ChevronRight,
   Folder,
+  Kubectl,
   Moon,
   More,
   Plus,
   RotateCw,
   Search,
   Settings,
+  Ssh,
   Sun,
   Trash,
   Unplug,
 } from "./ui/icons";
 
 interface SidebarProps {
-  tree: HostNode[];
+  tree: ProjectNode[];
   /** Tab key of the active tab, highlighted in the tree. */
   activeKey: string | null;
   /** Tab keys currently open — the sessions we have a live terminal for. Only
@@ -44,13 +47,27 @@ interface SidebarProps {
   activity: ReadonlyMap<string, ActivityState>;
 }
 
+/** The transport glyph folded into the host label. null/unknown → no glyph. */
+function transportGlyph(transport: HostTransport) {
+  switch (transport) {
+    case "ssh":
+      return <Ssh size={11} className="rk-proj__hostglyph" />;
+    case "kubectl":
+      return <Kubectl size={11} className="rk-proj__hostglyph" />;
+    default:
+      return null;
+  }
+}
+
 /**
- * Host → Project → Session tree. A thin renderer over the `buildTree` model:
- * it owns only collapse state, an inline search filter, and click routing. Live
- * sessions open as tabs; stopped sessions are clickable and route through App's
- * openFromSidebar which branches on node.state to trigger respawn. Component-
- * render behaviour is covered by manual QA + a deferred e2e (vitest runs in node
- * with no DOM); the tree model and store are unit-tested.
+ * Project → Session list. A thin renderer over the `buildTree` model: it owns
+ * only collapse state, an inline search filter, and click routing. Host is a
+ * bare label on each project row, not a tree level; projects are pre-grouped by
+ * host in the model. Live sessions open as tabs; stopped sessions are clickable
+ * and route through App's openFromSidebar which branches on node.state to trigger
+ * respawn. Component-render behaviour is covered by manual QA + a deferred e2e
+ * (vitest runs in node with no DOM); the tree model, filter, and store are
+ * unit-tested.
  */
 export function Sidebar({
   tree,
@@ -141,14 +158,14 @@ export function Sidebar({
       )}
 
       <div className="rk-sidebar__scroll">
-        <div className="rk-sidebar__label">Hosts</div>
+        <div className="rk-sidebar__label">Projects</div>
         {filtered.length === 0 ? (
-          <p className="rk-sidebar__empty">No hosts configured.</p>
+          <p className="rk-sidebar__empty">No projects yet.</p>
         ) : (
-          filtered.map((host) => (
-            <HostGroup
-              key={host.id}
-              host={host}
+          filtered.map((project) => (
+            <ProjectGroup
+              key={project.id}
+              project={project}
               collapsed={collapsed}
               toggle={toggle}
               activeKey={activeKey}
@@ -179,110 +196,12 @@ export function Sidebar({
   );
 }
 
-/** Filter the rendered tree client-side by case-insensitive substring over host
- * label, project label, and sessionId. A host or project that matches keeps all
- * of its descendants; otherwise only matching sessions survive. Empty query →
- * the tree unchanged. */
-function filterTree(tree: HostNode[], query: string): HostNode[] {
-  const q = query.trim().toLowerCase();
-  if (!q) return tree;
-  const out: HostNode[] = [];
-  for (const host of tree) {
-    const hostMatch = host.label.toLowerCase().includes(q);
-    const projects: ProjectNode[] = [];
-    for (const project of host.projects) {
-      const projMatch = project.label.toLowerCase().includes(q);
-      const sessions =
-        hostMatch || projMatch
-          ? project.sessions
-          : project.sessions.filter((s) =>
-              s.sessionId.toLowerCase().includes(q),
-            );
-      if (hostMatch || projMatch || sessions.length > 0) {
-        projects.push(
-          sessions === project.sessions ? project : { ...project, sessions },
-        );
-      }
-    }
-    if (hostMatch || projects.length > 0) {
-      out.push({ ...host, projects });
-    }
-  }
-  return out;
-}
-
-/** One host group: a collapse header (chevron + avatar + name + the transport
- * tag) plus its project groups. */
-function HostGroup({
-  host,
-  collapsed,
-  toggle,
-  activeKey,
-  openKeys,
-  onOpenSession,
-  onStop,
-  onRemove,
-  onNewSession,
-  activity,
-}: {
-  host: HostNode;
-  collapsed: Set<string>;
-  toggle: (id: string) => void;
-  activeKey: string | null;
-  openKeys: Set<string>;
-  onOpenSession: (node: SessionNode) => void;
-  onStop: (node: SessionNode) => void;
-  onRemove: (node: SessionNode) => void;
-  onNewSession: (projectId: string) => void;
-  activity: ReadonlyMap<string, ActivityState>;
-}) {
-  const open = !collapsed.has(host.id);
-  return (
-    <div className="rk-host">
-      <button
-        type="button"
-        className="rk-host__hdr"
-        onClick={() => toggle(host.id)}
-      >
-        <span
-          className="rk-host__chev"
-          style={{ transform: open ? "rotate(90deg)" : "none" }}
-        >
-          <ChevronRight size={12} />
-        </span>
-        <Avatar host name={host.label} size="sm" />
-        <span className="rk-host__name">{host.label}</span>
-        {host.transport && <Tag>{host.transport}</Tag>}
-      </button>
-      {open && (
-        <div className="rk-host__rows">
-          {host.projects.map((project) => (
-            <ProjectGroup
-              key={`${host.id}/${project.id}`}
-              rowId={`${host.id}/${project.id}`}
-              project={project}
-              collapsed={collapsed}
-              toggle={toggle}
-              activeKey={activeKey}
-              openKeys={openKeys}
-              onOpenSession={onOpenSession}
-              onStop={onStop}
-              onRemove={onRemove}
-              onNewSession={onNewSession}
-              activity={activity}
-            />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** One project group: a collapse header (chevron + folder + name) with a
- * hover-revealed per-project "+" to start a session pre-scoped to it, plus its
- * session leaves. */
+/** One project group: a collapse header (chevron + folder + name + a bare muted
+ * host label with its transport glyph) plus its session leaves. A hover-revealed
+ * per-project "+" starts a session pre-scoped to it — shown only for fully
+ * configured projects (a synthetic or dangling-host project can't be resolved by
+ * the New Session dialog). */
 function ProjectGroup({
-  rowId,
   project,
   collapsed,
   toggle,
@@ -294,7 +213,6 @@ function ProjectGroup({
   onNewSession,
   activity,
 }: {
-  rowId: string;
   project: ProjectNode;
   collapsed: Set<string>;
   toggle: (id: string) => void;
@@ -306,17 +224,21 @@ function ProjectGroup({
   onNewSession: (projectId: string) => void;
   activity: ReadonlyMap<string, ActivityState>;
 }) {
-  const open = !collapsed.has(rowId);
-  // Only configured projects can be pre-scoped — a synthetic "Unconfigured"
-  // project (agent === null) isn't in config, so the dialog couldn't resolve it.
-  const canStartSession = project.agent !== null;
+  const open = !collapsed.has(project.id);
+  // Only fully configured projects can be pre-scoped: synthetic projects have
+  // agent === null, and a dangling-host configured project (unconfigured) points
+  // at a host the New Session dialog can't resolve, so it would spawn into
+  // nowhere. Guard on both.
+  const canStartSession = project.agent !== null && !project.unconfigured;
   return (
     <div className="rk-proj">
       <div className="rk-proj__hdr">
         <button
           type="button"
           className="rk-proj__toggle"
-          onClick={() => toggle(rowId)}
+          aria-label={`${project.label} on ${project.hostLabel}`}
+          aria-expanded={open}
+          onClick={() => toggle(project.id)}
         >
           <span
             className="rk-proj__chev"
@@ -326,6 +248,17 @@ function ProjectGroup({
           </span>
           <Folder size={13} className="rk-proj__icon" />
           <span className="rk-proj__name">{project.label}</span>
+          <span
+            className={
+              project.unconfigured
+                ? "rk-proj__host rk-proj__host--unconfigured"
+                : "rk-proj__host"
+            }
+            title={project.hostLabel}
+          >
+            {transportGlyph(project.transport)}
+            {project.hostLabel}
+          </span>
         </button>
         {canStartSession && (
           <span className="rk-proj__actions">

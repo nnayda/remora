@@ -7,26 +7,24 @@ import type {
 import { tabKey } from "./session-store";
 
 /**
- * Pure config-and-discovery join (stage 10). Folds the per-device config
- * (hosts/projects) and the live discovery list (sessions) into the
- * Host → Project → Session tree the sidebar renders.
+ * Pure config-and-discovery join. Folds the per-device config (hosts/projects)
+ * and the live discovery list (sessions) into the flat, host-grouped
+ * `ProjectNode[]` the sidebar renders.
  *
- *   config.hosts ─┐
- *   config.projects ─┼─▶ buildTree ─▶ HostNode[] (config order, Unconfigured last)
- *   sessions ────────┘
+ *   config.hosts ────┐   (host label + transport stamped onto each project)
+ *   config.projects ─┼─▶ buildTree ─▶ ProjectNode[]
+ *   sessions ────────┘                  ├─ host A's projects (config order)
+ *                                       ├─ host B's projects (config order)
+ *                                       ├─ dangling-host projects (host id not in config)
+ *                                       └─ synthetic projects (sessions with no config project)
  *
- * No React, no I/O — node-testable. Determinism comes from the inputs:
+ * The host level is a label on each project row, not a tree level: projects are
+ * grouped adjacently by host via a bucket pass (NOT a sort — no reliance on
+ * `Array.sort` stability). Order is deterministic from the inputs:
  * `config.hosts`/`config.projects` arrive in BTreeMap order from the bridge and
- * `sessions` arrive sorted by (projectId, sessionId), so the tree order is
- * stable without re-sorting here.
+ * `sessions` arrive sorted by (projectId, sessionId), so within-host order and
+ * the trailing buckets are stable without re-sorting.
  */
-
-/**
- * Synthetic host id for discovered sessions whose project is not in config.
- * Underscores are deliberate: real host ids are `[a-z0-9-]+` (no underscores),
- * so this can never collide with a configured host.
- */
-export const UNCONFIGURED_HOST_ID = "__unconfigured__";
 
 export interface SessionNode {
   projectId: string;
@@ -47,22 +45,27 @@ export interface SessionNode {
 export interface ProjectNode {
   id: string;
   label: string;
-  /** Default agent from config; null for a synthetic (unconfigured) project. */
+  /** Default agent from config; null for a synthetic (discovered) project. */
   agent: string | null;
+  /**
+   * Host display name, rendered as a bare muted label on the project row. For a
+   * project whose `hostId` is missing from config (dangling reference) this is
+   * the raw `hostId`; for a synthetic discovered project it is "Unconfigured".
+   */
+  hostLabel: string;
+  /** Transport of the owning host; null for dangling/synthetic projects. */
+  transport: HostTransport;
+  /**
+   * True when the project is not fully configured: either a discovered session
+   * with no config project (synthetic), or a configured project whose host id is
+   * absent from config (dangling). The UI reads this flag to render the dim
+   * treatment and suppress the "+" new-session affordance.
+   */
+  unconfigured: boolean;
   sessions: SessionNode[];
 }
 
-export interface HostNode {
-  id: string;
-  label: string;
-  /** Transport discriminant from config; null for the synthetic Unconfigured host. */
-  transport: HostTransport;
-  /** True only for the synthetic Unconfigured group. */
-  unconfigured: boolean;
-  projects: ProjectNode[];
-}
-
-type HostTransport = ConfigDto["hosts"][number]["transport"] | null;
+export type HostTransport = ConfigDto["hosts"][number]["transport"] | null;
 
 /** Project a discovered `SessionMetaDto` into a tree leaf, stamping the
  * tab-store `key` so the sidebar can match it against open/active tabs.
@@ -82,65 +85,52 @@ function sessionNode(
   };
 }
 
-/** Fold config and the discovery list into the Host → Project → Session tree
- * the sidebar renders. Sessions whose project isn't in config gather under a
- * synthetic "Unconfigured" host, which renders last and only when non-empty.
+/** Fold config and the discovery list into the flat, host-grouped
+ * `ProjectNode[]` the sidebar renders. Projects cluster by host (config.hosts
+ * order); dangling-host projects then synthetic discovered projects trail last.
  * Duplicate (project, session) tuples are deduped first-wins (see module doc). */
 export function buildTree(
   config: ConfigDto,
   sessions: SessionMetaDto[],
-): HostNode[] {
-  // 1. Seed one ProjectNode per configured project, indexed by id. Sessions
-  //    append into these in pass 3; hosts adopt them in pass 4.
-  //    Also build a workspace-mode lookup so sessionNode can carry it.
+): ProjectNode[] {
   const projectWorkspace = new Map<string, WorkspaceModeDto>(
     config.projects.map((p) => [p.id, p.workspace]),
   );
+  // Host lookup for stamping label/transport onto projects — not for grouping.
+  const hostLookup = new Map(config.hosts.map((h) => [h.id, h]));
+
+  // 1. Seed one ProjectNode per configured project, indexed by id. A project
+  //    whose host id is absent from config is a dangling reference: stamp the
+  //    raw hostId and mark it unconfigured.
   const projectNodes = new Map<string, ProjectNode>();
   for (const p of config.projects) {
+    const host = hostLookup.get(p.hostId);
     projectNodes.set(p.id, {
       id: p.id,
       label: p.name ?? p.id,
       agent: p.agent,
+      hostLabel: host ? (host.name ?? host.id) : p.hostId,
+      transport: host ? host.transport : null,
+      unconfigured: host === undefined,
       sessions: [],
     });
   }
 
-  // 2. Seed host nodes in config order; empty hosts still render (T3).
-  const hostNodes = new Map<string, HostNode>();
-  const hosts: HostNode[] = config.hosts.map((h) => {
-    const node: HostNode = {
-      id: h.id,
-      label: h.name ?? h.id,
-      transport: h.transport,
-      unconfigured: false,
-      projects: [],
-    };
-    hostNodes.set(h.id, node);
-    return node;
-  });
-
-  // 3. Place each session: into its configured project, or into the synthetic
-  //    Unconfigured host (grouped into a synthetic project per unknown id).
-  const unconfigured: HostNode = {
-    id: UNCONFIGURED_HOST_ID,
-    label: "Unconfigured",
-    transport: null,
-    unconfigured: true,
-    projects: [],
-  };
-  const unconfiguredProjects = new Map<string, ProjectNode>();
-  // The SessionSource trait does not promise unique (project, session) tuples
-  // (multi-host discovery can surface the same one twice), so dedup by key to
-  // keep React keys unique. Sessions arrive sorted, so first-wins is stable.
+  // 2. Place each session: into its configured project, or into a synthetic
+  //    project (one per unknown projectId, kept in discovery order).
+  //    The SessionSource trait does not promise unique (project, session) tuples
+  //    (multi-host discovery can surface the same one twice), so dedup by key to
+  //    keep React keys unique. Sessions arrive sorted, so first-wins is stable.
+  const synthetic = new Map<string, ProjectNode>();
+  const syntheticOrder: ProjectNode[] = [];
   const seen = new Set<string>();
   for (const s of sessions) {
     const key = tabKey(s.projectId, s.sessionId);
     if (seen.has(key)) continue;
     seen.add(key);
-    const project = projectNodes.get(s.projectId);
-    if (project) {
-      project.sessions.push(
+    const configured = projectNodes.get(s.projectId);
+    if (configured) {
+      configured.sessions.push(
         sessionNode(
           s,
           s.workspace ?? projectWorkspace.get(s.projectId) ?? null,
@@ -148,33 +138,41 @@ export function buildTree(
       );
       continue;
     }
-    let synthetic = unconfiguredProjects.get(s.projectId);
-    if (!synthetic) {
-      synthetic = {
+    let syn = synthetic.get(s.projectId);
+    if (!syn) {
+      syn = {
         id: s.projectId,
         label: s.projectId,
         agent: null,
+        hostLabel: "Unconfigured",
+        transport: null,
+        unconfigured: true,
         sessions: [],
       };
-      unconfiguredProjects.set(s.projectId, synthetic);
-      unconfigured.projects.push(synthetic);
+      synthetic.set(s.projectId, syn);
+      syntheticOrder.push(syn);
     }
-    synthetic.sessions.push(sessionNode(s, s.workspace ?? null));
+    syn.sessions.push(sessionNode(s, s.workspace ?? null));
   }
 
-  // 4. Attach configured projects to their hosts (config order preserved). A
-  //    project whose host id is absent from config is itself unconfigured.
+  // 3. Bucket projects by host (config.hosts order seeds the buckets so empty
+  //    hosts contribute nothing and host order is preserved). Within a host,
+  //    config.projects order is preserved. Dangling-host projects collect
+  //    separately and trail the configured hosts.
+  const byHost = new Map<string, ProjectNode[]>();
+  for (const h of config.hosts) byHost.set(h.id, []);
+  const dangling: ProjectNode[] = [];
   for (const p of config.projects) {
     const node = projectNodes.get(p.id);
     if (!node) continue;
-    const hostNode = hostNodes.get(p.hostId);
-    if (hostNode) {
-      hostNode.projects.push(node);
-    } else {
-      unconfigured.projects.push(node);
-    }
+    const bucket = byHost.get(p.hostId);
+    if (bucket) bucket.push(node);
+    else dangling.push(node);
   }
 
-  // 5. Unconfigured group renders last, only when it has content.
-  return unconfigured.projects.length > 0 ? [...hosts, unconfigured] : hosts;
+  // 4. Flatten: configured hosts in order, then dangling, then synthetic.
+  const result: ProjectNode[] = [];
+  for (const h of config.hosts) result.push(...(byHost.get(h.id) ?? []));
+  result.push(...dangling, ...syntheticOrder);
+  return result;
 }
