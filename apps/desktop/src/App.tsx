@@ -224,13 +224,25 @@ function App() {
 
   /** Dialog success callback: close it, note an attach-vs-spawn outcome, route
    * focus, and re-list sessions now (a fresh spawn changed server state). */
-  function handleOpened(attached: boolean) {
+  function handleOpened({
+    attached,
+    opened,
+  }: {
+    attached: boolean;
+    opened: boolean;
+  }) {
     setDialogOpen(false);
     setNotice(attached ? "Attached to an existing session." : null);
     setMobilePane("session");
-    if (attached) {
-      // Attaching an already-running session opens no fresh terminal to type
-      // into, so keep focus on the + button (matching the cancel/fail paths).
+    if (attached || !opened) {
+      // No fresh terminal was opened — either we attached to an already-running
+      // session, or the dialog deduped to an already-open tab (live or not).
+      // Keep focus on the + button and do NOT arm focusOnSelect: the dialog
+      // opened nothing new to type into, and arming for a non-live tab would
+      // leave the flag set, stealing focus when the pane later goes live (#133).
+      // Matches the cancel/fail paths. (Re-submitting the dialog for an already-
+      // open live session thus keeps button focus, by design — the sidebar, not
+      // the dialog, is the path for focusing an existing session.)
       newButtonRef.current?.focus();
     } else {
       // Fresh spawn: route into the same focus path a tab/sidebar pick uses so

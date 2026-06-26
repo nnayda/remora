@@ -74,8 +74,16 @@ export interface StoreOpeners {
  * mid-connect). The connection is closed by the store; callers ignore it. */
 export const OPEN_CANCELLED = Symbol("open-cancelled");
 
+/**
+ * `opened` is true only when this call committed a **new** tab (a fresh, live
+ * terminal); it is false when the call short-circuited to focus an
+ * already-open tab. The UI needs this to decide whether a spawn produced a
+ * terminal worth focusing — focusing an existing non-live tab must NOT arm
+ * focus, or the armed flag survives to steal focus when the pane later goes
+ * live (#133). `attached` distinguishes spawn-vs-attach within a fresh open.
+ */
 export type OpenResult =
-  | { ok: true; attached: boolean }
+  | { ok: true; attached: boolean; opened: boolean }
   | { ok: false; error: unknown };
 
 const BACKOFF_MS = [1000, 2000, 4000, 8000] as const;
@@ -312,7 +320,7 @@ export class SessionStore {
     this.activeKey = key;
     this.commit();
     this.registerDeath(tab);
-    return { ok: true, attached: opened.attached };
+    return { ok: true, attached: opened.attached, opened: true };
   }
 
   /** Open (or focus, if already open) a session via the spawn opener — spawn
@@ -329,7 +337,11 @@ export class SessionStore {
     if (existing) {
       this.activeKey = key;
       this.commit();
-      return { ok: true, attached: existing.attached };
+      // Focused an already-open tab — no NEW tab was committed, so report
+      // opened:false (the store doesn't reason about liveness here). The dialog
+      // uses this to keep focus on the + button rather than arm focus for a tab
+      // it didn't open, which would leak if that tab isn't live (#133).
+      return { ok: true, attached: existing.attached, opened: false };
     }
 
     return this.openTab(input, (p, s, a, b, w) =>
@@ -419,7 +431,7 @@ export class SessionStore {
       if (existing.status === "stopped" || existing.status === "disconnected") {
         void this.respawnTab(key);
       }
-      return { ok: true, attached: false };
+      return { ok: true, attached: false, opened: false };
     }
 
     return this.openTab(input, (p, s, a, _b, _w) =>

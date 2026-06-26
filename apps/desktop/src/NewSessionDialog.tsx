@@ -23,7 +23,7 @@ interface NewSessionDialogProps {
    * the global "+ New session" entry point (which passes nothing). */
   initialProjectId?: string;
   openSession: (input: SpawnInput) => Promise<OpenResult>;
-  onOpened: (attached: boolean) => void;
+  onOpened: (result: { attached: boolean; opened: boolean }) => void;
   onClose: () => void;
 }
 
@@ -130,7 +130,7 @@ export function NewSessionDialog({
         workspace,
       });
       if (result.ok) {
-        onOpened(result.attached);
+        onOpened({ attached: result.attached, opened: result.opened });
         return; // App closes the dialog
       }
       // OPEN_CANCELLED means the open was cancelled externally (e.g. app
