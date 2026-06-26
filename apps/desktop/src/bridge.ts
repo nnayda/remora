@@ -135,6 +135,8 @@ export async function spawnSession(
   agent: string | null,
   base: string | null,
   workspace: WorkspaceModeDto,
+  branch: string | null,
+  worktreeRoot: string | null,
   onOutput: OnOutput,
 ): Promise<ChannelHandle> {
   return unwrap(
@@ -144,6 +146,8 @@ export async function spawnSession(
       agent,
       base,
       workspace,
+      branch,
+      worktreeRoot,
       makeChannel(onOutput),
     ),
   );

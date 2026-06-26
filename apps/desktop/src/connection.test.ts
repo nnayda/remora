@@ -253,6 +253,8 @@ describe("connection.ts — openSession (spawn-first)", () => {
       "claude",
       null,
       "worktree",
+      null,
+      null,
     );
     expect(attached).toBe(false);
     expect(connection.closed).toBe(false);
@@ -263,6 +265,8 @@ describe("connection.ts — openSession (spawn-first)", () => {
       "claude",
       null,
       "worktree",
+      null,
+      null,
       expect.anything(),
     );
     expect(b.attachSession).not.toHaveBeenCalled();
@@ -270,13 +274,15 @@ describe("connection.ts — openSession (spawn-first)", () => {
 
   it("spawns with a specific base branch", async () => {
     b.spawnSession.mockResolvedValue(5);
-    await openSession("p", "s", null, "origin/dev", "worktree");
+    await openSession("p", "s", null, "origin/dev", "worktree", null, null);
     expect(b.spawnSession).toHaveBeenCalledWith(
       "p",
       "s",
       null,
       "origin/dev",
       "worktree",
+      null,
+      null,
       expect.anything(),
     );
   });
@@ -284,7 +290,15 @@ describe("connection.ts — openSession (spawn-first)", () => {
   it("attaches and reports attached:true when the session already exists", async () => {
     b.spawnSession.mockRejectedValueOnce({ kind: "sessionExists" });
     b.attachSession.mockResolvedValue(6);
-    const { attached } = await openSession("p", "s", null, null, "worktree");
+    const { attached } = await openSession(
+      "p",
+      "s",
+      null,
+      null,
+      "worktree",
+      null,
+      null,
+    );
     expect(attached).toBe(true);
     expect(b.spawnSession).toHaveBeenCalledTimes(1);
     expect(b.attachSession).toHaveBeenCalledTimes(1);
@@ -293,7 +307,7 @@ describe("connection.ts — openSession (spawn-first)", () => {
   it("propagates unexpected spawn errors", async () => {
     b.spawnSession.mockRejectedValueOnce({ kind: "transport", message: "net" });
     await expect(
-      openSession("p", "s", null, null, "worktree"),
+      openSession("p", "s", null, null, "worktree", null, null),
     ).rejects.toMatchObject({
       kind: "transport",
     });
@@ -307,7 +321,7 @@ describe("connection.ts — openSession (spawn-first)", () => {
       message: "net",
     });
     await expect(
-      openSession("p", "s", null, null, "worktree"),
+      openSession("p", "s", null, null, "worktree", null, null),
     ).rejects.toMatchObject({
       kind: "transport",
     });

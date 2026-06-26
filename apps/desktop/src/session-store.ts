@@ -28,6 +28,8 @@ export interface SpawnInput {
   agent: string | null;
   base: string | null;
   workspace: WorkspaceModeDto;
+  branch?: string | null;
+  worktreeRoot?: string | null;
 }
 
 export type TabStatus = "live" | "reconnecting" | "stopped" | "disconnected";
@@ -57,6 +59,8 @@ export interface StoreOpeners {
     agent: string | null,
     base: string | null,
     workspace: WorkspaceModeDto,
+    branch: string | null,
+    worktreeRoot: string | null,
   ): Promise<{ connection: SessionConnection; attached: boolean }>;
   attach(projectId: string, sessionId: string): Promise<SessionConnection>;
   respawn(
@@ -273,6 +277,8 @@ export class SessionStore {
       a: string | null,
       b: string | null,
       w: WorkspaceModeDto,
+      branch: string | null,
+      worktreeRoot: string | null,
     ) => Promise<{ connection: SessionConnection; attached: boolean }>,
   ): Promise<OpenResult> {
     const key = tabKey(input.projectId, input.sessionId);
@@ -293,6 +299,8 @@ export class SessionStore {
         input.agent,
         input.base,
         input.workspace,
+        input.branch ?? null,
+        input.worktreeRoot ?? null,
       );
     } catch (error) {
       this.pending.delete(key);
@@ -344,8 +352,8 @@ export class SessionStore {
       return { ok: true, attached: existing.attached, opened: false };
     }
 
-    return this.openTab(input, (p, s, a, b, w) =>
-      this.openers.spawn(p, s, a, b, w),
+    return this.openTab(input, (p, s, a, b, w, branch, worktreeRoot) =>
+      this.openers.spawn(p, s, a, b, w, branch, worktreeRoot),
     );
   };
 
@@ -456,7 +464,7 @@ export class SessionStore {
       return { ok: true, attached: false, opened: false };
     }
 
-    return this.openTab(input, (p, s, a, _b, _w) =>
+    return this.openTab(input, (p, s, a, _b, _w, _branch, _worktreeRoot) =>
       this.openers
         .respawn(p, s, a)
         .then((connection) => ({ connection, attached: false })),
