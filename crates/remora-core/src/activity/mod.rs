@@ -3,6 +3,8 @@
 //! sanitized previews. The settle clock lives in the bridge thread that drives
 //! it (`transport::pty_process`), not here.
 
+mod marker;
 mod sanitize;
 
+pub use marker::{MarkerHit, MarkerScanner};
 pub use sanitize::{sanitize, SanitizedText};
