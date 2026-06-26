@@ -63,6 +63,14 @@ function App() {
   // change was a user pick (focus its terminal) versus a dialog spawn or
   // background reconnect (leave focus alone). Consumed once per selection.
   const focusOnSelect = useRef(false);
+  // Bumped to re-run the focus effect when intent is armed *after* activeKey has
+  // already settled. The tab/sidebar paths arm focusOnSelect before they flip
+  // activeKey, so the activeKey change itself re-runs the effect. The dialog
+  // spawn path can't: it only learns it opened a fresh terminal once openSession
+  // resolves (handleOpened), by which point activeKey/activeStatus have stopped
+  // changing — so without this nudge the effect would never re-fire to consume
+  // the flag, and a new session's terminal would never take focus (#126).
+  const [focusRequest, setFocusRequest] = useState(0);
 
   // Recompute the tree only when config or the polled session list changes.
   const tree = useMemo(() => buildTree(config, sessions), [config, sessions]);
@@ -94,7 +102,9 @@ function App() {
   // (not consumed) until the terminal exists, so opening a new session or
   // reopening a stopped one — which mount the terminal a tick or two after
   // activeKey flips — still lands focus. Focus is deferred to the next frame so a
-  // just-opened xterm has its input ready to accept it.
+  // just-opened xterm has its input ready to accept it. focusRequest lets the
+  // dialog-spawn path re-trigger this effect after it arms the flag late.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: focusRequest is a re-arm nudge, not read in the body
   useEffect(() => {
     if (!focusOnSelect.current) return;
     if (activeKey === null || activeStatus !== "live") return; // wait for live
@@ -103,7 +113,7 @@ function App() {
     focusOnSelect.current = false;
     const raf = requestAnimationFrame(() => handle.focus());
     return () => cancelAnimationFrame(raf);
-  }, [activeKey, activeStatus]);
+  }, [activeKey, activeStatus, focusRequest]);
 
   /** Open a session clicked in the sidebar, routing by its discovered state:
    * live → attach/focus, stopped → respawn. Reuses the dialog's deduping path
@@ -222,13 +232,14 @@ function App() {
       // Fresh spawn: route into the same focus path a tab/sidebar pick uses so
       // the new terminal grabs focus once it's live — typing the first prompt
       // is the most common next action (#78). openSession already flipped
-      // activeKey to the new tab; arming the intent flag (a ref, set before any
-      // passive effect runs) lets the focus effect claim it post-paint. The
+      // activeKey to the new tab, so arming the intent flag (a ref) alone won't
+      // re-run the activeKey-gated focus effect; bumping focusRequest does. The
       // dialog's unmount restores focus to the + button during commit, but the
       // effect re-focuses the terminal via a deferred rAF that runs after that
       // commit — so the terminal wins. Cancel/fail never reach here (the dialog
       // only calls back on success), so they keep button focus.
       focusOnSelect.current = true;
+      setFocusRequest((n) => n + 1);
     }
     // A fresh spawn changed server state, so re-list now rather than waiting a
     // poll tick; an attach didn't, but a redundant list is cheap and keeps the
