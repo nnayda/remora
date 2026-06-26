@@ -1,8 +1,6 @@
 //! The versioned tmux session name shared by every transport and (later)
 //! discovery. The name *is* the session's identity on the sandbox.
 
-use std::hash::{Hash, Hasher};
-
 use remora_protocol::{ProjectId, SessionId};
 
 /// Builds the tmux session name for a session (ADR-0004):
@@ -76,13 +74,17 @@ pub fn derive_session_id(branch: Option<&str>) -> Option<SessionId> {
     if base.is_empty() {
         base.push('x');
     }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    branch.hash(&mut hasher);
-    let suffix = format!("{:08x}", hasher.finish() as u32);
-    // `DefaultHasher` is not portable across Rust versions; that is fine — the id
-    // only needs to be stable within one running discovery process, and is
-    // recomputed every poll. (If cross-version stability is ever needed, swap in
-    // a fixed hash.)
+    // FNV-1a (32-bit) — fixed, version-stable, and trivially reproducible in
+    // the TS client (PR B2). Replaces std DefaultHasher, which is not portable
+    // across Rust versions (#153). Offset basis 0x811c9dc5, prime 0x01000193.
+    let suffix = {
+        let mut h: u32 = 0x811c_9dc5;
+        for b in branch.as_bytes() {
+            h ^= u32::from(*b);
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        format!("{h:08x}")
+    };
     SessionId::new(format!("{base}-{suffix}")).ok()
 }
 
@@ -202,9 +204,42 @@ mod tests {
     }
 
     #[test]
+    fn derive_session_id_fnv_suffix_is_exact_and_stable() {
+        // Pins the FNV-1a/32 suffix so the TS port (PR B2) can match byte-for-byte.
+        // If this changes, the cross-language test vector must change too.
+        assert_eq!(
+            derive_session_id(Some("feat/login")).map(|s| s.as_str().to_string()),
+            Some("feat-login-a15997df".to_string())
+        );
+    }
+
+    #[test]
     fn derive_session_id_remora_prefix_with_invalid_slug_falls_through() {
         // `remora/` followed by a non-slug is NOT treated as a round-trip.
         let s = derive_session_id(Some("remora/Bad_Slug")).expect("slug");
         assert!(s.as_str().starts_with("remora-bad-slug-"));
+    }
+
+    #[test]
+    fn derive_session_id_matches_cross_language_vectors() {
+        // Loads the shared fixture that B2's TS port will also test, so
+        // derive-session-id-vectors.json can never drift from Rust's output.
+        let fixture_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/remora-protocol/tests/fixtures/derive-session-id-vectors.json"
+        );
+        let content = std::fs::read_to_string(fixture_path).expect("fixture file must exist");
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&content).expect("fixture must be valid JSON");
+        for row in &rows {
+            let branch = row["branch"].as_str().expect("branch field");
+            let expected = row["session_id"].as_str().expect("session_id field");
+            let actual = derive_session_id(Some(branch)).map(|s| s.as_str().to_string());
+            assert_eq!(
+                actual,
+                Some(expected.to_string()),
+                "branch {branch:?} must derive to {expected:?}"
+            );
+        }
     }
 }
