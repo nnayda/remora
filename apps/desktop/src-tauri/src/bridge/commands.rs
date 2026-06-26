@@ -7,7 +7,7 @@ use crate::bridge::dto::ConfigDto;
 use crate::bridge::editor_dto::{
     AgentInputDto, EditableConfigDto, HostInputDto, ProjectInputDto, WorkspaceModeDto,
 };
-use crate::bridge::error::{BridgeError, SessionMetaDto};
+use crate::bridge::error::{BridgeError, SessionListDto};
 use crate::bridge::output::{BridgeOutput, ChannelHandle, ChannelSink};
 use crate::bridge::Bridge;
 
@@ -19,9 +19,7 @@ pub struct ConfigChanged;
 
 #[tauri::command]
 #[specta::specta]
-async fn session_list(
-    bridge: tauri::State<'_, Bridge>,
-) -> Result<Vec<SessionMetaDto>, BridgeError> {
+async fn session_list(bridge: tauri::State<'_, Bridge>) -> Result<SessionListDto, BridgeError> {
     bridge.list().await
 }
 

@@ -6,7 +6,7 @@
 
 
 export const commands = {
-async sessionList() : Promise<Result<SessionMetaDto[], BridgeError>> {
+async sessionList() : Promise<Result<SessionListDto, BridgeError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("session_list") };
 } catch (e) {
@@ -277,6 +277,12 @@ export type HostDto = { id: string; name: string | null; transport: TransportKin
  */
 export type HostInputDto = { name: string | null; transport: TransportDto }
 /**
+ * One host's discovery outcome for a single `Bridge::list` poll. `available`
+ * is false when the host's `source.list()` errored (then `sessions` is empty);
+ * retention of last-good rows for a transiently-down host is the frontend's job.
+ */
+export type HostSessionsDto = { hostId: string; available: boolean; sessions: SessionMetaDto[] }
+/**
  * A kubectl connection field for the editor: `command = false` is a literal
  * value, `command = true` means `value` is a shell command line resolved at
  * connect time. Flat + form-friendly for the TS toggle.
@@ -301,6 +307,12 @@ export type ProjectDto = { id: string; name: string | null; hostId: string; work
  * references to existing entries; converting parses them into ids.
  */
 export type ProjectInputDto = { name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string; base?: string | null }
+/**
+ * Result of a discovery poll: one bucket per host attempted this poll, in
+ * config order. Sessions are sorted by (project_id, session_id) within each
+ * bucket (the frontend re-sorts after flattening across hosts).
+ */
+export type SessionListDto = { hosts: HostSessionsDto[] }
 export type SessionMetaDto = { projectId: string; sessionId: string; state: SessionStateDto; 
 /**
  * Agent id the sandbox advertises for this session. Untrusted,
