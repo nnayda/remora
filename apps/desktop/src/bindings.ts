@@ -260,12 +260,12 @@ export type EditorConfigDto = { hosts: EditorHostDto[]; projects: EditorProjectD
 /**
  * A host with its full connection details (the editable form state).
  */
-export type EditorHostDto = { id: string; name: string | null; transport: TransportDto }
+export type EditorHostDto = { id: string; name: string | null; transport: TransportDto; worktreeRoot: string | null }
 /**
  * A project with every editable field, including the on-host `path` and
  * `workspace` mode that the display `ProjectDto` omits.
  */
-export type EditorProjectDto = { id: string; name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string; base: string | null }
+export type EditorProjectDto = { id: string; name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string; base: string | null; worktreeRoot: string | null }
 /**
  * A configured host, label-only. The `transport` discriminant is all the UI
  * needs (an icon/badge); the connection details never cross.
@@ -275,7 +275,14 @@ export type HostDto = { id: string; name: string | null; transport: TransportKin
  * Form payload for create/edit of a host. The entry id is a separate command
  * argument, so it is not carried here.
  */
-export type HostInputDto = { name: string | null; transport: TransportDto }
+export type HostInputDto = { name: string | null; transport: TransportDto; 
+/**
+ * Preserved across the editor round-trip so that a TOML-set `worktree_root`
+ * is not silently cleared when the user edits an unrelated field. B2 will
+ * add the form input; here we just thread the value through so the save
+ * path does not destroy it.
+ */
+worktreeRoot?: string | null }
 /**
  * A kubectl connection field for the editor: `command = false` is a literal
  * value, `command = true` means `value` is a shell command line resolved at
@@ -300,7 +307,14 @@ export type ProjectDto = { id: string; name: string | null; hostId: string; work
  * Form payload for create/edit of a project. `host_id` and `agent` are
  * references to existing entries; converting parses them into ids.
  */
-export type ProjectInputDto = { name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string; base?: string | null }
+export type ProjectInputDto = { name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string; base?: string | null; 
+/**
+ * Preserved across the editor round-trip so that a TOML-set `worktree_root`
+ * is not silently cleared when the user edits an unrelated field. B2 will
+ * add the form input; here we just thread the value through so the save
+ * path does not destroy it.
+ */
+worktreeRoot?: string | null }
 export type SessionMetaDto = { projectId: string; sessionId: string; state: SessionStateDto; 
 /**
  * Agent id the sandbox advertises for this session. Untrusted,

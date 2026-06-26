@@ -1247,6 +1247,7 @@ mod tests {
                 user: Some("rootuser".into()),
                 port: Some(2222),
             },
+            worktree_root: None,
         }
     }
     fn project_input() -> ProjectInputDto {
@@ -1257,6 +1258,7 @@ mod tests {
             workspace: WorkspaceModeDto::Worktree,
             agent: "claude".into(),
             base: None,
+            worktree_root: None,
         }
     }
     fn agent_input() -> AgentInputDto {
