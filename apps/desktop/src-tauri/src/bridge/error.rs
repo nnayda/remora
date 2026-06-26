@@ -199,6 +199,7 @@ mod tests {
             created_at: Some(1_765_500_000),
             workspace_path: None,
             workspace: Some(remora_protocol::WorkspaceMode::Worktree),
+            branch: None,
         };
         let dto = SessionMetaDto::from(meta);
         let json = serde_json::to_string(&dto).expect("serialize");

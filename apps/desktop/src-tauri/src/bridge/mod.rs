@@ -894,6 +894,7 @@ mod tests {
                     created_at: None,
                     workspace_path: None,
                     workspace: None,
+                    branch: None,
                 },
                 SessionMeta {
                     project_id: pid("api"),
@@ -903,6 +904,7 @@ mod tests {
                     created_at: None,
                     workspace_path: None,
                     workspace: None,
+                    branch: None,
                 },
             ])
         }

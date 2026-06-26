@@ -173,11 +173,6 @@ pub fn join(
 
     for (project, wt) in worktrees {
         let cpath = canonicalize_remote_path(&wt.path, home);
-        // Derive the session_id from the branch; skip detached / nameless
-        // worktrees — they have no identity to surface (PR-A limitation).
-        let Some(session_id) = naming::derive_session_id(wt.branch.as_deref()) else {
-            continue;
-        };
         let is_primary = project_paths
             .get(&project)
             .map(|pp| pp == &cpath)
@@ -186,9 +181,21 @@ pub fn join(
         // Remove the matching live entry: using `remove` both consumes the match
         // (preventing a second worktree from claiming the same live session) and
         // leaves only unmatched entries in `live_by_path` for the next phase.
-        let (state, agent, created_at) = match live_by_path.remove(&key) {
-            Some((_sid, env)) => (SessionState::Live, env.agent, env.created_at),
-            None => (SessionState::Stopped, None, None),
+        //
+        // LIVE match → use the real tmux slug as `session_id` so that reconnect
+        // resolves correctly even after a branch rename (the tmux name never
+        // changes mid-session). A live detached worktree is also surfaced (the
+        // caller can still reconnect via the real slug).
+        // STOPPED (no live match) → derive from the branch as before; skip
+        // detached / nameless worktrees since they have no identity to respawn.
+        let (session_id, state, agent, created_at) = match live_by_path.remove(&key) {
+            Some((sid, env)) => (sid, SessionState::Live, env.agent, env.created_at),
+            None => {
+                let Some(sid) = naming::derive_session_id(wt.branch.as_deref()) else {
+                    continue;
+                };
+                (sid, SessionState::Stopped, None, None)
+            }
         };
         metas.push(SessionMeta {
             project_id: project,
@@ -456,7 +463,92 @@ mod tests {
             "/home/dev",
             &scanned,
         );
-        assert!(metas.is_empty()); // nameless → not surfaced (PR-A limitation)
+        assert!(metas.is_empty()); // nameless stopped → not surfaced (PR-A limitation)
+    }
+
+    /// CRITICAL: A live session whose tmux slug is `fix-login` but whose
+    /// worktree branch was renamed to `feat/renamed` must surface with
+    /// `session_id == "fix-login"` (the real tmux name, so reconnect resolves)
+    /// and `branch == Some("feat/renamed")` (current branch for display).
+    /// The old code discarded the real sid and derived from the branch instead,
+    /// which broke reconnect the moment the branch name changed (#124).
+    #[test]
+    fn live_worktree_uses_tmux_session_id_not_branch_after_rename() {
+        let proj = ProjectId::new("api").expect("slug");
+        // The tmux session was created when the branch was `remora/fix-login`,
+        // so its slug is `fix-login`. The user later ran `git branch -m` so
+        // the porcelain now reports `feat/renamed` — but the tmux name is
+        // unchanged.
+        let live = vec![(
+            proj.clone(),
+            SessionId::new("fix-login").expect("slug"),
+            DiscoveredEnv {
+                agent: Some("claude".into()),
+                created_at: Some(2),
+                workspace_path: Some("~/.remora/worktrees/api/fix-login".into()),
+            },
+        )];
+        let wts = vec![(
+            proj.clone(),
+            WorktreeInfo {
+                path: "/home/dev/.remora/worktrees/api/fix-login".into(),
+                branch: Some("feat/renamed".into()),
+            },
+        )];
+        let scanned: HashSet<ProjectId> = [proj.clone()].into_iter().collect();
+        let metas = join(
+            live,
+            wts,
+            &paths(&[("api", "/home/dev/api")]),
+            "/home/dev",
+            &scanned,
+        );
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].state, SessionState::Live);
+        // session_id MUST be the real tmux slug, not a value derived from the
+        // renamed branch — otherwise `naming::tmux_session_name(project, id)`
+        // rebuilds a nonexistent session name.
+        assert_eq!(metas[0].session_id.as_str(), "fix-login");
+        // branch follows the worktree porcelain (display / future respawn hint).
+        assert_eq!(metas[0].branch.as_deref(), Some("feat/renamed"));
+        assert_eq!(metas[0].agent.as_deref(), Some("claude"));
+    }
+
+    /// A LIVE worktree that is detached (branch: None) must still be surfaced
+    /// as Live with the real tmux session_id — the caller can reconnect via
+    /// the tmux name even without a branch. The stopped-detached path (no live
+    /// match) is what gets dropped; a live-detached worktree must not be.
+    #[test]
+    fn live_detached_worktree_is_surfaced_not_dropped() {
+        let proj = ProjectId::new("api").expect("slug");
+        let live = vec![(
+            proj.clone(),
+            SessionId::new("my-session").expect("slug"),
+            DiscoveredEnv {
+                agent: None,
+                created_at: None,
+                workspace_path: Some("/home/dev/.remora/worktrees/api/detached".into()),
+            },
+        )];
+        let wts = vec![(
+            proj.clone(),
+            WorktreeInfo {
+                path: "/home/dev/.remora/worktrees/api/detached".into(),
+                branch: None, // detached HEAD
+            },
+        )];
+        let scanned: HashSet<ProjectId> = [proj.clone()].into_iter().collect();
+        let metas = join(
+            live,
+            wts,
+            &paths(&[("api", "/home/dev/api")]),
+            "/home/dev",
+            &scanned,
+        );
+        assert_eq!(metas.len(), 1, "live detached worktree must not be dropped");
+        assert_eq!(metas[0].state, SessionState::Live);
+        assert_eq!(metas[0].session_id.as_str(), "my-session");
+        assert_eq!(metas[0].branch, None);
     }
 
     // Migrated from old join tests — behavior still holds under the new design.
