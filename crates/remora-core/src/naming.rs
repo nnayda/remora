@@ -255,7 +255,10 @@ mod tests {
         // what slugification would otherwise collide).
         assert!(a.as_str().starts_with("feat-login-"));
         assert_ne!(a.as_str(), b.as_str());
-        assert_eq!(derive_session_id(Some("feat/login")).expect("deterministic"), a); // deterministic
+        assert_eq!(
+            derive_session_id(Some("feat/login")).expect("deterministic"),
+            a
+        ); // deterministic
     }
 
     #[test]
