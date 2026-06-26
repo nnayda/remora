@@ -67,7 +67,7 @@ a type or code path in core
 | --- | --- | --- |
 | `crates/remora-protocol` | Wire types every client speaks (session ids, messages). Deliberately dependency-light — it is the contract third-party clients build against. | `serde` only |
 | `crates/remora-core` | Session model, the `SessionSource` trait, and its direct-mode implementations (ssh, kubectl exec). | `remora-protocol`, `tokio`, `async-trait` |
-| `apps/desktop/src-tauri` | Tauri 2 shell: owns the `SessionSource` instance(s) and an open-channel registry; exposes `session_*` Tauri commands (spawn/attach/list/write/resize/respawn/close) that stream PTY output to the frontend over `ipc::Channel`. The channel also carries typed activity events — a status value and a sanitized preview — produced by the core-side detector ([ADR-0013](adr/0013-activity-detection-in-core.md)) and consumed by the UI, which renders them and performs no detection of its own. The UI talks only to this layer. | `remora-core` |
+| `apps/desktop/src-tauri` | Tauri 2 shell: owns the `SessionSource` instance(s) and an open-channel registry; exposes `session_*` Tauri commands (spawn/attach/list/write/resize/respawn/close) that stream PTY output to the frontend over `ipc::Channel`. The channel also carries typed activity events — a status value and a sanitized preview — produced by the core-side detector ([ADR-0013](adr/0013-core-side-activity-detector.md)) and consumed by the UI, which renders them and performs no detection of its own. The UI talks only to this layer. | `remora-core` |
 | `apps/desktop/src` | React UI: tabs, embedded terminal, file/diff/PR panels. Talks only to the Tauri layer. | `@tauri-apps/api` |
 
 A future `relay` binary will host `remora-core` behind a WebSocket and speak
