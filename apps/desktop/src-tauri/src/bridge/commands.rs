@@ -1,7 +1,13 @@
 //! Thin #[tauri::command] shims + the tauri-specta builder.
 use std::sync::Arc;
 use tauri::ipc::Channel;
-use tauri_specta::{collect_commands, Builder};
+use tauri_specta::{collect_commands, collect_events, Builder, Event};
+
+/// Emitted when the per-device config file changes on disk (file watcher).
+/// Carries no payload — the frontend re-reads via `config_get` (its existing
+/// refresh path), so the event is a ping, not a config snapshot.
+#[derive(Clone, serde::Serialize, serde::Deserialize, specta::Type, Event)]
+pub struct ConfigChanged;
 
 use crate::bridge::dto::ConfigDto;
 use crate::bridge::editor_dto::{
@@ -231,28 +237,30 @@ async fn config_remove_agent(
 
 /// Shared by `run()` and the bindings export test, so the command list lives once.
 pub fn builder() -> Builder<tauri::Wry> {
-    Builder::<tauri::Wry>::new().commands(collect_commands![
-        session_list,
-        config_get,
-        session_spawn,
-        session_attach,
-        session_respawn,
-        session_stop,
-        session_remove,
-        session_write,
-        session_resize,
-        session_close,
-        config_get_editable,
-        config_insert_host,
-        config_update_host,
-        config_remove_host,
-        config_insert_project,
-        config_update_project,
-        config_remove_project,
-        config_insert_agent,
-        config_update_agent,
-        config_remove_agent
-    ])
+    Builder::<tauri::Wry>::new()
+        .commands(collect_commands![
+            session_list,
+            config_get,
+            session_spawn,
+            session_attach,
+            session_respawn,
+            session_stop,
+            session_remove,
+            session_write,
+            session_resize,
+            session_close,
+            config_get_editable,
+            config_insert_host,
+            config_update_host,
+            config_remove_host,
+            config_insert_project,
+            config_update_project,
+            config_remove_project,
+            config_insert_agent,
+            config_update_agent,
+            config_remove_agent
+        ])
+        .events(collect_events![ConfigChanged])
 }
 
 #[cfg(test)]
