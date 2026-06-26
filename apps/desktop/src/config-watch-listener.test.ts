@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { listen } = vi.hoisted(() => ({
   listen: vi.fn(async (_handler: () => void) => () => {}),
@@ -10,6 +10,8 @@ vi.mock("./bindings", () => ({
 import { subscribeConfigChanged } from "./config-watch-listener";
 
 describe("subscribeConfigChanged", () => {
+  beforeEach(() => vi.clearAllMocks());
+
   it("invokes onChange whenever the event fires", async () => {
     const onChange = vi.fn();
     await subscribeConfigChanged(onChange);

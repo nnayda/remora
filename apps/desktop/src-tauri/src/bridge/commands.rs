@@ -3,12 +3,6 @@ use std::sync::Arc;
 use tauri::ipc::Channel;
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
-/// Emitted when the per-device config file changes on disk (file watcher).
-/// Carries no payload — the frontend re-reads via `config_get` (its existing
-/// refresh path), so the event is a ping, not a config snapshot.
-#[derive(Clone, serde::Serialize, serde::Deserialize, specta::Type, Event)]
-pub struct ConfigChanged;
-
 use crate::bridge::dto::ConfigDto;
 use crate::bridge::editor_dto::{
     AgentInputDto, EditableConfigDto, HostInputDto, ProjectInputDto, WorkspaceModeDto,
@@ -16,6 +10,12 @@ use crate::bridge::editor_dto::{
 use crate::bridge::error::{BridgeError, SessionMetaDto};
 use crate::bridge::output::{BridgeOutput, ChannelHandle, ChannelSink};
 use crate::bridge::Bridge;
+
+/// Emitted when the per-device config file changes on disk (file watcher).
+/// Carries no payload — the frontend re-reads via `config_get` (its existing
+/// refresh path), so the event is a ping, not a config snapshot.
+#[derive(Clone, serde::Serialize, serde::Deserialize, specta::Type, Event)]
+pub struct ConfigChanged;
 
 #[tauri::command]
 #[specta::specta]
