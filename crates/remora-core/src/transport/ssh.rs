@@ -693,38 +693,62 @@ mod tests {
 
     #[tokio::test]
     async fn list_joins_live_metadata_stopped_and_filters_unconfigured() {
-        // Config has project `api` (worktree). `ghost` is NOT configured.
+        // Config has project `api` (worktree, path /home/dev/api). `ghost` is NOT configured.
         let config = test_config();
-        // Discovery is two listings then the worktree scan (#108): trusted
-        // names, then inline `name\tagent\tworkspace\tcreated_at` metadata.
+        // Discovery call order: names, metadata, printf $HOME, worktree scan (#108, #124):
+        //  1) list-sessions names -> api (configured) + ghost (unconfigured) +
+        //     `main` & `remora__bad` (unparseable). Only api survives.
+        //  2) list-sessions inline metadata -> enrichment keyed by trusted name.
+        //     workspace_path is absolute so the path-anchored join can match (#124).
+        //  3) printf $HOME -> "/home/dev" for A2′ primary-checkout detection.
+        //  4) git worktree list for api -> realistic output: primary checkout first
+        //     (as real git always emits), followed by worktree entries.
         let fake = Arc::new(FakeExec::new(vec![
             Ok(FakeExec::out(
                 "remora_api_fix-login\nremora_ghost_x\nmain\nremora__bad\n",
             )),
-            Ok(FakeExec::out("remora_api_fix-login\tclaude\t\t1765500000\n")),
             Ok(FakeExec::out(
-                "worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n\n\
+                "remora_api_fix-login\tclaude\t/home/dev/.remora/worktrees/api/fix-login\t1765500000\n",
+            )),
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out(
+                "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n\n\
+                 worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n\n\
                  worktree /home/dev/.remora/worktrees/api/add-tests\nbranch refs/heads/remora/add-tests\n",
             )),
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let metas = source.list().await.expect("list");
 
-        let keys: Vec<(&str, &str, SessionState)> = metas
-            .iter()
-            .map(|m| (m.project_id.as_str(), m.session_id.as_str(), m.state))
-            .collect();
+        // ghost filtered out (R1). api/add-tests is Stopped+Worktree; api/fix-login is Live+Worktree.
+        // The primary checkout (/home/dev/api == project path) surfaces as Stopped+Shared (A2′).
         assert_eq!(
-            keys,
-            vec![
-                ("api", "add-tests", SessionState::Stopped),
-                ("api", "fix-login", SessionState::Live),
-            ]
+            metas.len(),
+            3,
+            "expected 3 rows (add-tests, fix-login, main-checkout), got: {metas:?}"
         );
-        let live = &metas[1];
-        assert_eq!(live.agent.as_deref(), Some("claude"));
+        let main_row = metas
+            .iter()
+            .find(|m| m.branch.as_deref() == Some("main"))
+            .expect("primary-checkout main row missing");
         assert_eq!(
-            metas[0].workspace_path.as_deref(),
+            main_row.workspace,
+            Some(WorkspaceMode::Shared),
+            "primary checkout must be Shared (A2′): {main_row:?}"
+        );
+        let add_tests = metas
+            .iter()
+            .find(|m| m.session_id.as_str() == "add-tests")
+            .expect("add-tests row");
+        let fix_login = metas
+            .iter()
+            .find(|m| m.session_id.as_str() == "fix-login")
+            .expect("fix-login row");
+        assert_eq!(add_tests.state, SessionState::Stopped);
+        assert_eq!(fix_login.state, SessionState::Live);
+        assert_eq!(fix_login.agent.as_deref(), Some("claude"));
+        assert_eq!(
+            add_tests.workspace_path.as_deref(),
             Some("/home/dev/.remora/worktrees/api/add-tests")
         );
     }
@@ -744,11 +768,13 @@ mod tests {
         // The session is in the trusted names listing, but the inline-metadata
         // read flakes (transient, or tmux < 3.0). It must still list as Live with
         // empty metadata — metadata is best-effort enrichment (#108).
+        // Call order: 1) names, 2) metadata (flakes), 3) printf $HOME, 4) worktree list.
         let config = test_config();
         let fake = Arc::new(FakeExec::new(vec![
             Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names
             Ok(FakeExec::fail("connection reset")),      // 2) metadata flakes
-            Ok(FakeExec::out("")),                       // 3) worktree empty
+            Ok(FakeExec::out("/home/dev")),              // 3) printf $HOME (#124)
+            Ok(FakeExec::out("")),                       // 4) worktree empty
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let metas = source.list().await.expect("list");
@@ -760,11 +786,15 @@ mod tests {
 
     #[tokio::test]
     async fn list_survives_worktree_list_failure_per_decision_8() {
+        // Call order: 1) names, 2) metadata, 3) printf $HOME, 4) worktree list (FAILS).
+        // The FakeExec::fail at position 4 must land on the WORKTREE LIST call —
+        // not on $HOME — so decision 8 is actually exercised.
         let config = test_config();
         let fake = Arc::new(FakeExec::new(vec![
             Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names
             Ok(FakeExec::out("remora_api_fix-login\tclaude\t\t\n")), // 2) metadata
-            Ok(FakeExec::fail("fatal: not a git repository")), // 3) worktree fails
+            Ok(FakeExec::out("/home/dev")),              // 3) printf $HOME (#124)
+            Ok(FakeExec::fail("fatal: not a git repository")), // 4) worktree list FAILS → decision 8
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let metas = source.list().await.expect("list must not fail");

@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use remora_protocol::{ProjectId, SessionId, SessionMeta, SessionState, WorkspaceMode};
 
-use crate::naming::parse_worktree_path;
+use crate::naming;
 
 /// Upper bound on a discovered metadata string echoed into UI/logs. Forged
 /// env can be arbitrarily large; bound it like `InvalidIdError` does.
@@ -94,88 +94,172 @@ pub fn parse_session_line(line: &str) -> (&str, DiscoveredEnv) {
     )
 }
 
-/// Parses `git worktree list --porcelain` for one project, returning each
-/// surviving remora worktree as `(session id, real absolute path)`. The path
-/// comes from the porcelain `worktree <abs-path>` line; the convention match
-/// is delegated to [`parse_worktree_path`]. `project` is the trusted config
-/// id; non-remora worktrees (the repo's own checkout, foreign paths) are
-/// skipped.
-pub fn parse_worktree_list(output: &str, project: &ProjectId) -> Vec<(SessionId, String)> {
-    let mut found = Vec::new();
+/// One worktree as reported by `git worktree list --porcelain`. `branch` is the
+/// short branch name (no `refs/heads/`), or `None` when the worktree is detached
+/// or bare. Untrusted (ADR-0004): used as a discovery hint, cross-checked, never
+/// turned into a command blindly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeInfo {
+    pub path: String,
+    pub branch: Option<String>,
+}
+
+/// Parse `git worktree list --porcelain` into one [`WorktreeInfo`] per worktree.
+/// Records are blank-line separated; a record starts at `worktree <path>` and a
+/// `branch refs/heads/<name>` line (if any, before the next `worktree`) gives the
+/// branch. `detached`/`bare` records yield `branch: None`.
+pub fn parse_worktree_porcelain(output: &str) -> Vec<WorktreeInfo> {
+    let mut out = Vec::new();
+    let mut cur: Option<WorktreeInfo> = None;
     for line in output.lines() {
-        let Some(path) = line.strip_prefix("worktree ") else {
-            continue;
-        };
-        if let Some(session) = parse_worktree_path(path, project) {
-            found.push((session, path.to_string()));
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(done) = cur.take() {
+                out.push(done);
+            }
+            cur = Some(WorktreeInfo {
+                path: path.to_string(),
+                branch: None,
+            });
+        } else if let Some(refname) = line.strip_prefix("branch refs/heads/") {
+            if let Some(c) = cur.as_mut() {
+                c.branch = Some(refname.to_string());
+            }
         }
+        // `HEAD`, `detached`, `bare`, `locked`, blank lines: ignored (branch
+        // stays None for detached/bare, which is the intended "nameless").
     }
-    found
+    if let Some(done) = cur.take() {
+        out.push(done);
+    }
+    out
 }
 
 /// Joins live sessions (with metadata) and the full worktree set (live+stopped)
-/// into the session list. A key present in both is `Live` (live wins). Each
-/// session's `workspace` is `Some(Worktree)` iff a real worktree exists for it,
-/// else `Some(Shared)`. Stopped sessions (worktree only) have no tmux env, so
-/// `agent`/`created_at` are `None` and `workspace_path` is the sanitized real
-/// path (R6). Sorted by `(project, session)` for determinism (matches the
-/// fake).
+/// into the session list (A2′, #124). Matching is path-anchored: a live
+/// session's `REMORA_WORKSPACE` is canonicalized and compared against each
+/// worktree's real path. The primary checkout (canonical path == `project_paths`
+/// entry) surfaces as `Shared`; other worktrees as `Worktree`. Branch identity
+/// comes from the porcelain (`wt.branch`); `derive_session_id` derives the tmux
+/// slug. Detached/nameless worktrees are skipped. Live sessions whose
+/// `REMORA_WORKSPACE` matches no worktree become Shared rows (branch `None`).
+/// Sorted by `(project, session)` for determinism (matches the fake).
 pub fn join(
     live: Vec<(ProjectId, SessionId, DiscoveredEnv)>,
-    worktrees: Vec<(ProjectId, SessionId, String)>,
+    worktrees: Vec<(ProjectId, WorktreeInfo)>,
+    project_paths: &std::collections::HashMap<ProjectId, String>,
+    home: &str,
     scanned: &HashSet<ProjectId>,
 ) -> Vec<SessionMeta> {
-    let worktree_keys: HashSet<(ProjectId, SessionId)> = worktrees
-        .iter()
-        .map(|(p, s, _)| (p.clone(), s.clone()))
-        .collect();
-    let live_keys: HashSet<(ProjectId, SessionId)> = live
-        .iter()
-        .map(|(p, s, _)| (p.clone(), s.clone()))
-        .collect();
+    // Index live sessions by their canonical workspace path so the join is
+    // O(worktrees) rather than O(live × worktrees). Sessions with no
+    // REMORA_WORKSPACE go into a separate bucket; they can never match a
+    // worktree path so they always surface as unmatched-live rows.
+    // Multiple live sessions can share the same canonical workspace path: shared-
+    // mode sessions all set REMORA_WORKSPACE to the project root, so two+ shared
+    // sessions on one project map to the same key. Using Vec avoids silently
+    // overwriting all but one (the old single-value HashMap behaviour).
+    let mut live_by_path: std::collections::HashMap<
+        (ProjectId, String),
+        Vec<(SessionId, DiscoveredEnv)>,
+    > = std::collections::HashMap::new();
+    let mut live_unmatched: Vec<(ProjectId, SessionId, DiscoveredEnv)> = Vec::new();
+    for (p, s, env) in live {
+        match env.workspace_path.as_deref() {
+            Some(wp) => {
+                let key = (p.clone(), canonicalize_remote_path(wp, home));
+                live_by_path.entry(key).or_default().push((s, env));
+            }
+            None => live_unmatched.push((p, s, env)),
+        }
+    }
 
-    let mut metas: Vec<SessionMeta> = live
-        .into_iter()
-        .map(|(project_id, session_id, env)| {
-            // Effective mode from real state. A surviving worktree ⇒ Worktree.
-            // "No worktree" only proves Shared when the project was actually
-            // scanned: a failed/absent worktree scan leaves the mode `None`
-            // (unknown) so the client falls back to the project default, rather
-            // than mislabeling a live worktree session as shared on a transient
-            // scan error (which would wrongly hide Stop/Respawn).
-            let has_worktree = worktree_keys.contains(&(project_id.clone(), session_id.clone()));
-            let workspace = if has_worktree {
-                Some(WorkspaceMode::Worktree)
-            } else if scanned.contains(&project_id) {
+    let mut metas = Vec::new();
+
+    for (project, wt) in worktrees {
+        let cpath = canonicalize_remote_path(&wt.path, home);
+        let is_primary = project_paths
+            .get(&project)
+            .map(|pp| pp == &cpath)
+            .unwrap_or(false);
+        let key = (project.clone(), cpath.clone());
+        // Pop ONE live entry for this key: a worktree can be claimed by at most
+        // one live session (the physical checkout is exclusive). Using `get_mut`
+        // + `pop` rather than `remove` leaves remaining sessions in the vec for
+        // the drain phase below, so none are silently dropped.
+        //
+        // LIVE match → use the real tmux slug as `session_id` so that reconnect
+        // resolves correctly even after a branch rename (the tmux name never
+        // changes mid-session). A live detached worktree is also surfaced (the
+        // caller can still reconnect via the real slug).
+        // STOPPED (no live match) → derive from the branch as before; skip
+        // detached / nameless worktrees since they have no identity to respawn.
+        let (session_id, state, agent, created_at) =
+            match live_by_path.get_mut(&key).and_then(|v| v.pop()) {
+                Some((sid, env)) => (sid, SessionState::Live, env.agent, env.created_at),
+                None => {
+                    let Some(sid) = naming::derive_session_id(wt.branch.as_deref()) else {
+                        continue;
+                    };
+                    (sid, SessionState::Stopped, None, None)
+                }
+            };
+        metas.push(SessionMeta {
+            project_id: project,
+            session_id,
+            state,
+            agent,
+            created_at,
+            workspace_path: clean_metadata(&cpath),
+            workspace: Some(if is_primary {
+                WorkspaceMode::Shared
+            } else {
+                WorkspaceMode::Worktree
+            }),
+            branch: wt.branch.as_deref().and_then(clean_metadata),
+        });
+    }
+
+    // Live sessions whose REMORA_WORKSPACE matched no worktree → Shared rows.
+    // "No worktree" only proves Shared when the project was actually scanned:
+    // a failed scan leaves the mode `None` so the client falls back to the
+    // project default rather than mislabeling a live session on a transient
+    // scan error (which would wrongly hide Stop/Respawn).
+    // Flatten: each vec entry is a session that was not claimed by a worktree,
+    // so every one becomes its own Shared row (none are silently dropped).
+    for ((project, _cpath), sessions) in live_by_path {
+        for (sid, env) in sessions {
+            let workspace = if scanned.contains(&project) {
                 Some(WorkspaceMode::Shared)
             } else {
                 None
             };
-            SessionMeta {
-                workspace,
-                project_id,
-                session_id,
+            metas.push(SessionMeta {
+                project_id: project.clone(),
+                session_id: sid,
                 state: SessionState::Live,
                 agent: env.agent,
                 created_at: env.created_at,
-                workspace_path: env.workspace_path,
-            }
-        })
-        .collect();
-
-    for (project_id, session_id, path) in worktrees {
-        if live_keys.contains(&(project_id.clone(), session_id.clone())) {
-            continue; // live wins; already stamped Worktree above
+                workspace_path: env.workspace_path.as_deref().and_then(clean_metadata),
+                workspace,
+                branch: None,
+            });
         }
+    }
+    for (project, sid, env) in live_unmatched {
+        let workspace = if scanned.contains(&project) {
+            Some(WorkspaceMode::Shared)
+        } else {
+            None
+        };
         metas.push(SessionMeta {
-            project_id,
-            session_id,
-            state: SessionState::Stopped,
-            agent: None,
-            created_at: None,
-            workspace_path: clean_metadata(&path),
-            // A surviving worktree IS a worktree session.
-            workspace: Some(WorkspaceMode::Worktree),
+            project_id: project,
+            session_id: sid,
+            state: SessionState::Live,
+            agent: env.agent,
+            created_at: env.created_at,
+            workspace_path: env.workspace_path.as_deref().and_then(clean_metadata),
+            workspace,
+            branch: None,
         });
     }
 
@@ -184,6 +268,18 @@ pub fn join(
             .cmp(&(b.project_id.as_str(), b.session_id.as_str()))
     });
     metas
+}
+
+/// Make a worktree path comparable for the discovery join: expand a single
+/// leading `~/` against the remote `$HOME`, and drop a trailing `/`. Porcelain
+/// paths are already absolute (idempotent here); a live session's
+/// `REMORA_WORKSPACE` is logical (`~/…`) and needs the expansion (A1, #124).
+pub fn canonicalize_remote_path(path: &str, home: &str) -> String {
+    let expanded = match path.strip_prefix("~/") {
+        Some(rest) => format!("{}/{}", home.trim_end_matches('/'), rest),
+        None => path.to_string(),
+    };
+    expanded.trim_end_matches('/').to_string()
 }
 
 #[cfg(test)]
@@ -261,95 +357,227 @@ mod tests {
         assert_eq!(env.created_at, None);
     }
 
-    #[test]
-    fn parses_worktree_list_porcelain() {
-        let api = ProjectId::new("api").expect("slug");
-        let out = "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n\n\
-                   worktree /home/dev/.remora/worktrees/api/fix-login\nHEAD def\nbranch refs/heads/remora/fix-login\n\n\
-                   worktree /home/dev/.remora/worktrees/api/detached\nHEAD 123\ndetached\n";
-        let found = parse_worktree_list(out, &api);
-        let sessions: Vec<&str> = found.iter().map(|(s, _)| s.as_str()).collect();
-        // Main worktree skipped; both remora worktrees found incl. the detached one.
-        assert_eq!(sessions, vec!["fix-login", "detached"]);
-        assert_eq!(found[0].1, "/home/dev/.remora/worktrees/api/fix-login");
+    use std::collections::HashMap;
+
+    fn paths(pairs: &[(&str, &str)]) -> HashMap<ProjectId, String> {
+        pairs
+            .iter()
+            .map(|&(p, path)| (ProjectId::new(p).expect("slug"), path.to_string()))
+            .collect()
     }
 
+    // -----------------------------------------------------------------------
+    // join tests — new path-anchored, branch-identity design (A2′, #124)
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn join_live_wins_over_stopped_and_sorts() {
-        let (ap, af) = ids("api", "fix-login");
-        let (ap2, aa) = ids("api", "add-tests");
+    fn live_worktree_join_uses_canonical_path_and_branch_identity() {
+        let (proj, _sid) = ids("api", "ignored");
+        // live REMORA_WORKSPACE is logical `~/…`; porcelain is absolute.
         let live = vec![(
-            ap.clone(),
-            af.clone(),
+            proj.clone(),
+            SessionId::new("fix-login").expect("slug"),
             DiscoveredEnv {
                 agent: Some("claude".into()),
                 created_at: Some(1),
-                workspace_path: Some("/wt/api/fix-login".into()),
+                workspace_path: Some("~/.remora/worktrees/api/fix-login".into()),
             },
         )];
-        // add-tests is stopped; fix-login appears in BOTH (live must win).
-        let stopped = vec![
-            (
-                ap2,
-                aa,
-                "/home/dev/.remora/worktrees/api/add-tests".to_string(),
-            ),
-            (
-                ap,
-                af,
-                "/home/dev/.remora/worktrees/api/fix-login".to_string(),
-            ),
-        ];
-        let metas = join(live, stopped, &std::collections::HashSet::new());
-        // Sorted: add-tests then fix-login. fix-login is Live (not duplicated).
-        assert_eq!(metas.len(), 2);
-        assert_eq!(metas[0].session_id.as_str(), "add-tests");
-        assert_eq!(metas[0].state, SessionState::Stopped);
-        assert_eq!(
-            metas[0].workspace_path.as_deref(),
-            Some("/home/dev/.remora/worktrees/api/add-tests")
+        let wts = vec![(
+            proj.clone(),
+            WorktreeInfo {
+                path: "/home/dev/.remora/worktrees/api/fix-login".into(),
+                branch: Some("remora/fix-login".into()),
+            },
+        )];
+        let scanned: HashSet<ProjectId> = [proj.clone()].into_iter().collect();
+        let metas = join(
+            live,
+            wts,
+            &paths(&[("api", "/home/dev/api")]),
+            "/home/dev",
+            &scanned,
         );
-        assert_eq!(metas[0].agent, None);
-        assert_eq!(metas[1].session_id.as_str(), "fix-login");
-        assert_eq!(metas[1].state, SessionState::Live);
-        assert_eq!(metas[1].agent.as_deref(), Some("claude"));
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].state, SessionState::Live);
+        assert_eq!(metas[0].workspace, Some(WorkspaceMode::Worktree));
+        assert_eq!(metas[0].branch.as_deref(), Some("remora/fix-login"));
+        assert_eq!(metas[0].session_id.as_str(), "fix-login"); // remora/ round-trips
+        assert_eq!(metas[0].agent.as_deref(), Some("claude"));
     }
 
     #[test]
-    fn join_stamps_worktree_mode_for_live_session_with_a_worktree() {
-        let p = ProjectId::new("api").expect("slug");
-        let s = SessionId::new("s1").expect("slug");
-        let live = vec![(p.clone(), s.clone(), DiscoveredEnv::default())];
-        let worktrees = vec![(p.clone(), s.clone(), "~/.remora/worktrees/api/s1".into())];
+    fn primary_checkout_surfaces_as_shared_named_by_branch() {
+        let proj = ProjectId::new("api").expect("slug");
+        let wts = vec![(
+            proj.clone(),
+            WorktreeInfo {
+                path: "/home/dev/api".into(),
+                branch: Some("main".into()),
+            },
+        )];
+        let scanned: HashSet<ProjectId> = [proj.clone()].into_iter().collect();
+        let metas = join(
+            vec![],
+            wts,
+            &paths(&[("api", "/home/dev/api")]),
+            "/home/dev",
+            &scanned,
+        );
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].workspace, Some(WorkspaceMode::Shared)); // A2′
+        assert_eq!(metas[0].branch.as_deref(), Some("main"));
+        assert_eq!(metas[0].state, SessionState::Stopped); // no live session on it
+    }
+
+    #[test]
+    fn hand_made_worktree_surfaces_as_stopped_worktree_session() {
+        let proj = ProjectId::new("api").expect("slug");
+        let wts = vec![(
+            proj.clone(),
+            WorktreeInfo {
+                path: "/home/dev/scratch/spike".into(),
+                branch: Some("feat/spike".into()),
+            },
+        )];
+        let scanned: HashSet<ProjectId> = [proj.clone()].into_iter().collect();
+        let metas = join(
+            vec![],
+            wts,
+            &paths(&[("api", "/home/dev/api")]),
+            "/home/dev",
+            &scanned,
+        );
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].state, SessionState::Stopped);
+        assert_eq!(metas[0].workspace, Some(WorkspaceMode::Worktree));
+        assert_eq!(metas[0].branch.as_deref(), Some("feat/spike"));
+        assert!(metas[0].session_id.as_str().starts_with("feat-spike-"));
+    }
+
+    #[test]
+    fn detached_worktree_is_dropped() {
+        let proj = ProjectId::new("api").expect("slug");
+        let wts = vec![(
+            proj.clone(),
+            WorktreeInfo {
+                path: "/home/dev/scratch/x".into(),
+                branch: None,
+            },
+        )];
+        let scanned: HashSet<ProjectId> = [proj.clone()].into_iter().collect();
+        let metas = join(
+            vec![],
+            wts,
+            &paths(&[("api", "/home/dev/api")]),
+            "/home/dev",
+            &scanned,
+        );
+        assert!(metas.is_empty()); // nameless stopped → not surfaced (PR-A limitation)
+    }
+
+    /// CRITICAL: A live session whose tmux slug is `fix-login` but whose
+    /// worktree branch was renamed to `feat/renamed` must surface with
+    /// `session_id == "fix-login"` (the real tmux name, so reconnect resolves)
+    /// and `branch == Some("feat/renamed")` (current branch for display).
+    /// The old code discarded the real sid and derived from the branch instead,
+    /// which broke reconnect the moment the branch name changed (#124).
+    #[test]
+    fn live_worktree_uses_tmux_session_id_not_branch_after_rename() {
+        let proj = ProjectId::new("api").expect("slug");
+        // The tmux session was created when the branch was `remora/fix-login`,
+        // so its slug is `fix-login`. The user later ran `git branch -m` so
+        // the porcelain now reports `feat/renamed` — but the tmux name is
+        // unchanged.
+        let live = vec![(
+            proj.clone(),
+            SessionId::new("fix-login").expect("slug"),
+            DiscoveredEnv {
+                agent: Some("claude".into()),
+                created_at: Some(2),
+                workspace_path: Some("~/.remora/worktrees/api/fix-login".into()),
+            },
+        )];
+        let wts = vec![(
+            proj.clone(),
+            WorktreeInfo {
+                path: "/home/dev/.remora/worktrees/api/fix-login".into(),
+                branch: Some("feat/renamed".into()),
+            },
+        )];
+        let scanned: HashSet<ProjectId> = [proj.clone()].into_iter().collect();
         let metas = join(
             live,
-            worktrees,
-            &std::collections::HashSet::from([p.clone()]),
+            wts,
+            &paths(&[("api", "/home/dev/api")]),
+            "/home/dev",
+            &scanned,
         );
+        assert_eq!(metas.len(), 1);
         assert_eq!(metas[0].state, SessionState::Live);
-        assert_eq!(metas[0].workspace, Some(WorkspaceMode::Worktree));
+        // session_id MUST be the real tmux slug, not a value derived from the
+        // renamed branch — otherwise `naming::tmux_session_name(project, id)`
+        // rebuilds a nonexistent session name.
+        assert_eq!(metas[0].session_id.as_str(), "fix-login");
+        // branch follows the worktree porcelain (display / future respawn hint).
+        assert_eq!(metas[0].branch.as_deref(), Some("feat/renamed"));
+        assert_eq!(metas[0].agent.as_deref(), Some("claude"));
     }
+
+    /// A LIVE worktree that is detached (branch: None) must still be surfaced
+    /// as Live with the real tmux session_id — the caller can reconnect via
+    /// the tmux name even without a branch. The stopped-detached path (no live
+    /// match) is what gets dropped; a live-detached worktree must not be.
+    #[test]
+    fn live_detached_worktree_is_surfaced_not_dropped() {
+        let proj = ProjectId::new("api").expect("slug");
+        let live = vec![(
+            proj.clone(),
+            SessionId::new("my-session").expect("slug"),
+            DiscoveredEnv {
+                agent: None,
+                created_at: None,
+                workspace_path: Some("/home/dev/.remora/worktrees/api/detached".into()),
+            },
+        )];
+        let wts = vec![(
+            proj.clone(),
+            WorktreeInfo {
+                path: "/home/dev/.remora/worktrees/api/detached".into(),
+                branch: None, // detached HEAD
+            },
+        )];
+        let scanned: HashSet<ProjectId> = [proj.clone()].into_iter().collect();
+        let metas = join(
+            live,
+            wts,
+            &paths(&[("api", "/home/dev/api")]),
+            "/home/dev",
+            &scanned,
+        );
+        assert_eq!(metas.len(), 1, "live detached worktree must not be dropped");
+        assert_eq!(metas[0].state, SessionState::Live);
+        assert_eq!(metas[0].session_id.as_str(), "my-session");
+        assert_eq!(metas[0].branch, None);
+    }
+
+    // Migrated from old join tests — behavior still holds under the new design.
 
     #[test]
     fn join_stamps_shared_mode_for_live_session_without_a_worktree() {
+        // A live session not matched by any worktree path, but whose project
+        // was scanned, surfaces as Shared (branch None).
         let p = ProjectId::new("scratch").expect("slug");
         let s = SessionId::new("s1").expect("slug");
         let scanned = std::collections::HashSet::from([p.clone()]);
-        let metas = join(vec![(p, s, DiscoveredEnv::default())], vec![], &scanned);
-        assert_eq!(metas[0].workspace, Some(WorkspaceMode::Shared));
-    }
-
-    #[test]
-    fn join_stamps_worktree_mode_for_stopped_session() {
-        let p = ProjectId::new("api").expect("slug");
-        let s = SessionId::new("s1").expect("slug");
         let metas = join(
+            vec![(p, s, DiscoveredEnv::default())],
             vec![],
-            vec![(p, s, "~/.remora/worktrees/api/s1".into())],
-            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            "/home/dev",
+            &scanned,
         );
-        assert_eq!(metas[0].state, SessionState::Stopped);
-        assert_eq!(metas[0].workspace, Some(WorkspaceMode::Worktree));
+        assert_eq!(metas[0].workspace, Some(WorkspaceMode::Shared));
     }
 
     #[test]
@@ -362,8 +590,132 @@ mod tests {
         let metas = join(
             vec![(p, s, DiscoveredEnv::default())],
             vec![],
+            &std::collections::HashMap::new(),
+            "/home/dev",
             &std::collections::HashSet::new(), // project not scanned
         );
         assert_eq!(metas[0].workspace, None);
+    }
+
+    /// REGRESSION GUARD: shared-mode sessions all set `REMORA_WORKSPACE` to the
+    /// project root, so two+ shared sessions on one project resolve to the same
+    /// `(project, canonical_path)` key. The old single-value HashMap silently
+    /// dropped all but one; this test verifies that BOTH appear in the output.
+    #[test]
+    fn join_surfaces_all_live_sessions_sharing_a_path() {
+        let proj = ProjectId::new("api").expect("slug");
+        let s1 = SessionId::new("s1").expect("slug");
+        let s2 = SessionId::new("s2").expect("slug");
+        // Both sessions share the same workspace_path (the project root — the
+        // shared-mode pattern: spawn_plan.rs WorkspaceMode::Shared => project.path).
+        let live = vec![
+            (
+                proj.clone(),
+                s1.clone(),
+                DiscoveredEnv {
+                    agent: Some("claude".into()),
+                    created_at: Some(1),
+                    workspace_path: Some("/home/dev/api".into()),
+                },
+            ),
+            (
+                proj.clone(),
+                s2.clone(),
+                DiscoveredEnv {
+                    agent: Some("codex".into()),
+                    created_at: Some(2),
+                    workspace_path: Some("/home/dev/api".into()),
+                },
+            ),
+        ];
+        // Primary checkout at the project path; one worktree row claims one of them.
+        let wts = vec![(
+            proj.clone(),
+            WorktreeInfo {
+                path: "/home/dev/api".into(),
+                branch: Some("main".into()),
+            },
+        )];
+        let scanned: HashSet<ProjectId> = [proj.clone()].into_iter().collect();
+        let metas = join(
+            live,
+            wts,
+            &paths(&[("api", "/home/dev/api")]),
+            "/home/dev",
+            &scanned,
+        );
+        // Both sessions must appear — none silently dropped.
+        assert_eq!(metas.len(), 2, "both sessions must surface: {metas:?}");
+        let ids: HashSet<&str> = metas.iter().map(|m| m.session_id.as_str()).collect();
+        assert!(ids.contains("s1"), "s1 missing from: {metas:?}");
+        assert!(ids.contains("s2"), "s2 missing from: {metas:?}");
+        // All rows are Live.
+        assert!(
+            metas.iter().all(|m| m.state == SessionState::Live),
+            "all rows must be Live: {metas:?}"
+        );
+    }
+
+    #[test]
+    fn parses_path_and_branch_per_worktree() {
+        let out = "\
+worktree /home/dev/api
+HEAD abc123
+branch refs/heads/main
+
+worktree /home/dev/.remora/worktrees/api/fix-login
+HEAD def456
+branch refs/heads/remora/fix-login
+
+worktree /home/dev/scratch/spike
+HEAD 999aaa
+detached
+";
+        let got = parse_worktree_porcelain(out);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].path, "/home/dev/api");
+        assert_eq!(got[0].branch.as_deref(), Some("main"));
+        assert_eq!(got[1].branch.as_deref(), Some("remora/fix-login"));
+        assert_eq!(got[2].path, "/home/dev/scratch/spike");
+        assert_eq!(got[2].branch, None); // detached → nameless
+    }
+
+    #[test]
+    fn parse_worktree_porcelain_handles_bare_and_trailing_newline() {
+        let out = "worktree /home/dev/api\nbare\n\n";
+        let got = parse_worktree_porcelain(out);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].branch, None);
+    }
+
+    #[test]
+    fn parse_worktree_porcelain_empty_input_is_empty() {
+        assert!(parse_worktree_porcelain("").is_empty());
+    }
+
+    #[test]
+    fn canonicalize_expands_leading_tilde() {
+        assert_eq!(
+            canonicalize_remote_path("~/work/feat/login", "/home/dev"),
+            "/home/dev/work/feat/login"
+        );
+    }
+
+    #[test]
+    fn canonicalize_leaves_absolute_untouched_and_trims_trailing_slash() {
+        assert_eq!(
+            canonicalize_remote_path("/home/dev/api/", "/home/dev"),
+            "/home/dev/api"
+        );
+        assert_eq!(
+            canonicalize_remote_path("/mnt/x/wt", "/home/dev"),
+            "/mnt/x/wt"
+        );
+    }
+
+    #[test]
+    fn canonicalize_does_not_expand_bare_tilde_user() {
+        // `~user` is not ours to expand; leave it (it will simply fail to match).
+        assert_eq!(canonicalize_remote_path("~bob/x", "/home/dev"), "~bob/x");
     }
 }

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Branch-identified session discovery** (#124, ADR-0015): the discovery
+  foundation that will let a future release place worktrees at custom paths and
+  name their branches freely. Discovery no longer parses the
+  `~/.remora/worktrees/<project>/<session>` path convention; it joins live tmux
+  sessions to their worktrees on the canonical worktree *path*
+  (`REMORA_WORKSPACE` ↔ `git worktree list --porcelain`) and reads each
+  worktree's *branch* as the session's display identity, so a `git branch -m`
+  rename is reflected on the row while reconnect still resolves by the unchanged
+  tmux name. Two observable shifts: every worktree of a configured project now
+  surfaces — including ones created by hand outside Remora (a whole-workspace
+  view) — and a project's primary checkout appears as a Shared session so you can
+  work on `main` directly (its remove only closes the session, never touches the
+  repo). `SessionMeta` gains an optional `branch`; the internal `session_id` is
+  derived from the branch (Mechanism A) so the transport and respawn/teardown
+  signatures are unchanged. Spawn behaviour and the path/branch defaults are
+  unchanged here — the user-facing `worktree_root`/`branch` override fields land
+  in the follow-up PR. Supersedes ADR-0004's path/branch discovery contract;
+  hardening and extra test coverage tracked in #153 and #154.
 - **Flatten the session sidebar to project rows with a host label**: the sidebar
   was a three-level `host → project → session` tree; it is now a flat
   `project → session` list with the host demoted to a small muted label on each

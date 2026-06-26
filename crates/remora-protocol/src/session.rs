@@ -85,6 +85,11 @@ pub struct SessionMeta {
     /// worktree ⇒ `Worktree`). Drives display gating. `None` from an older
     /// sender; the client then falls back to the project's configured mode.
     pub workspace: Option<WorkspaceMode>,
+    /// Branch checked out in the worktree, as advertised by the sandbox
+    /// (`git worktree list`). The session's display identity. Untrusted;
+    /// display only. `None` for a shared session or a detached-HEAD worktree.
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 /// Request to create a new session.
@@ -123,6 +128,7 @@ mod tests {
             created_at: Some(1_765_500_000),
             workspace_path: Some("/home/dev/.remora/worktrees/api/fix-login".to_string()),
             workspace: None,
+            branch: None,
         }
     }
 
@@ -139,8 +145,26 @@ mod tests {
         let json = serde_json::to_string(&meta()).expect("serialize");
         assert_eq!(
             json,
-            r#"{"project_id":"api","session_id":"fix-login","state":"live","agent":"claude","created_at":1765500000,"workspace_path":"/home/dev/.remora/worktrees/api/fix-login","workspace":null}"#
+            r#"{"project_id":"api","session_id":"fix-login","state":"live","agent":"claude","created_at":1765500000,"workspace_path":"/home/dev/.remora/worktrees/api/fix-login","workspace":null,"branch":null}"#
         );
+    }
+
+    #[test]
+    fn session_meta_carries_optional_branch() {
+        let mut m = meta();
+        m.branch = Some("feat/login".to_string());
+        let json = serde_json::to_string(&m).expect("serialize");
+        assert!(json.contains(r#""branch":"feat/login""#));
+        let back: SessionMeta = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.branch.as_deref(), Some("feat/login"));
+    }
+
+    #[test]
+    fn session_meta_branch_defaults_to_none_when_absent() {
+        // Older senders omit the key entirely.
+        let json = r#"{"project_id":"api","session_id":"fix-login","state":"stopped"}"#;
+        let m: SessionMeta = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(m.branch, None);
     }
 
     #[test]

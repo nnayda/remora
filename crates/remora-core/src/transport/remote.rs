@@ -472,6 +472,16 @@ pub(crate) fn worktree_list_tokens(project_path: &str) -> Vec<String> {
     ]
 }
 
+/// Tokens for `printf %s $HOME` — the remote home directory, used to
+/// canonicalize `~/…` worktree paths for the discovery join (A1, #124).
+/// Cheap; one per poll. Both the SSH transport (which runs tokens through
+/// the remote login shell via `ssh host cmd args…`) and the kubectl transport
+/// (which joins tokens and runs them as `sh -c "…"`) expand `$HOME`; the bare
+/// token is correct for both.
+pub(crate) fn remote_home_tokens() -> Vec<String> {
+    vec!["printf".into(), "%s".into(), "$HOME".into()]
+}
+
 /// Tokens for `test -d <dir>` — the respawn preflight that the worktree
 /// directory still exists. `git worktree list` is the wrong probe here: it
 /// reports git's admin entry, which survives a bare `rm -rf` of the worktree,
@@ -826,26 +836,50 @@ pub(crate) fn run_list(
         live.push((project, session, env));
     }
 
-    let mut worktrees = Vec::new();
+    // Remote $HOME for path canonicalization (A1, #124). Best-effort: on
+    // failure (exec error, non-zero exit, or a non-absolute result), fall back
+    // to "~", which makes only `~/…` logical paths fail to canonicalize —
+    // they won't match any worktree, which is acceptable degradation and never
+    // a panic. Validates `starts_with('/')` per ADR-0004's never-trust rule.
+    let home = exec
+        .run(&remote_home_tokens())
+        .ok()
+        .filter(|o| o.success)
+        .map(|o| o.stdout.trim().to_string())
+        .filter(|h| h.starts_with('/'))
+        .unwrap_or_else(|| "~".to_string());
+
+    let mut worktrees: Vec<(ProjectId, discovery::WorktreeInfo)> = Vec::new();
+    let mut project_paths: std::collections::HashMap<ProjectId, String> =
+        std::collections::HashMap::new();
     let mut scanned = std::collections::HashSet::new();
     for (project_id, project) in &config.projects {
         // Scan EVERY project: a worktree-override session can live on a
-        // shared-default project. `parse_worktree_list` rejects the main
-        // checkout and foreign paths, so a project with no remora worktrees
-        // yields nothing. Record which projects scanned cleanly so `join` can
-        // tell "scanned, no worktree" (⇒ Shared) apart from "scan failed"
-        // (⇒ unknown), instead of conflating a transient failure with Shared.
+        // shared-default project. Record which projects scanned cleanly so
+        // `join` can tell "scanned, no worktree" (⇒ Shared) apart from "scan
+        // failed" (⇒ unknown), instead of conflating a transient failure with
+        // Shared.
         if let Ok(out) = exec.run(&worktree_list_tokens(&project.path)) {
             if out.success {
                 scanned.insert(project_id.clone());
-                for (session, path) in discovery::parse_worktree_list(&out.stdout, project_id) {
-                    worktrees.push((project_id.clone(), session, path));
+                project_paths.insert(
+                    project_id.clone(),
+                    discovery::canonicalize_remote_path(&project.path, &home),
+                );
+                for wt in discovery::parse_worktree_porcelain(&out.stdout) {
+                    worktrees.push((project_id.clone(), wt));
                 }
             }
         }
     }
 
-    Ok(discovery::join(live, worktrees, &scanned))
+    Ok(discovery::join(
+        live,
+        worktrees,
+        &project_paths,
+        &home,
+        &scanned,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1481,6 +1515,21 @@ pub(crate) mod tests {
     // -----------------------------------------------------------------------
     // token builder tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn remote_home_tokens_contains_home_for_shell_expansion() {
+        // The exec layer (SSH: joins tokens and passes to remote login shell;
+        // kubectl: joins under `sh -c`) expands `$HOME`. The token must be the
+        // bare unquoted form so the remote shell resolves it to the actual home
+        // directory; a double-quoted or escaped form would also work but the bare
+        // form is idiomatic for shell-expanded invocations.
+        let tokens = remote_home_tokens();
+        assert_eq!(tokens[0], "printf", "must invoke printf");
+        assert!(
+            tokens.iter().any(|t| t.contains("$HOME")),
+            "tokens must reference $HOME for shell expansion: {tokens:?}"
+        );
+    }
 
     #[test]
     fn attach_tokens_builds_correct_tmux_command() {
@@ -2133,42 +2182,63 @@ pub(crate) mod tests {
 
     #[test]
     fn list_joins_live_metadata_stopped_and_filters_unconfigured() {
-        // Config has project `api` (worktree). `ghost` is NOT configured.
+        // Config has project `api` (worktree, path /home/dev/api). `ghost` is NOT configured.
         let config = test_config();
-        // Scripted exec, in call order (two listings then the worktree scan, #108):
+        // Scripted exec, in call order (two listings, HOME fetch, then worktree scan, #108, #124):
         //  1) list-sessions names -> api (configured) + ghost (unconfigured) +
         //     `main` & `remora__bad` (unparseable). Only api survives.
         //  2) list-sessions inline metadata -> enrichment keyed by trusted name.
-        //  3) git worktree list for api -> fix-login (live) + add-tests (stopped)
+        //     workspace_path is absolute so the path-anchored join can match (#124).
+        //  3) printf $HOME -> "/home/dev" so paths beginning with /home/dev/api
+        //     canonicalize correctly for the A2′ primary-checkout detection.
+        //  4) git worktree list for api -> realistic output: primary checkout first
+        //     (as real git always emits), then fix-login (live) + add-tests (stopped).
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out(
                 "remora_api_fix-login\nremora_ghost_x\nmain\nremora__bad\n",
             )),
-            Ok(FakeExec::out("remora_api_fix-login\tclaude\t\t1765500000\n")),
             Ok(FakeExec::out(
-                "worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n\n\
+                "remora_api_fix-login\tclaude\t/home/dev/.remora/worktrees/api/fix-login\t1765500000\n",
+            )),
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out(
+                "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n\n\
+                 worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n\n\
                  worktree /home/dev/.remora/worktrees/api/add-tests\nbranch refs/heads/remora/add-tests\n",
             )),
         ]);
         let metas = run_list(&fake, &config).expect("list");
 
-        // ghost filtered out (R1). api/add-tests is Stopped; api/fix-login is Live.
-        let keys: Vec<(&str, &str, SessionState)> = metas
-            .iter()
-            .map(|m| (m.project_id.as_str(), m.session_id.as_str(), m.state))
-            .collect();
+        // ghost filtered out (R1). api/add-tests is Stopped+Worktree; api/fix-login is Live+Worktree.
+        // The primary checkout (/home/dev/api == project path) surfaces as Stopped+Shared (A2′).
         assert_eq!(
-            keys,
-            vec![
-                ("api", "add-tests", SessionState::Stopped),
-                ("api", "fix-login", SessionState::Live),
-            ]
+            metas.len(),
+            3,
+            "expected 3 rows (add-tests, fix-login, main-checkout), got: {metas:?}"
         );
-        let live = &metas[1];
-        assert_eq!(live.agent.as_deref(), Some("claude"));
+        let main_row = metas
+            .iter()
+            .find(|m| m.branch.as_deref() == Some("main"))
+            .expect("primary-checkout main row missing");
+        assert_eq!(
+            main_row.workspace,
+            Some(WorkspaceMode::Shared),
+            "primary checkout must be Shared (A2′): {main_row:?}"
+        );
+        let add_tests = metas
+            .iter()
+            .find(|m| m.session_id.as_str() == "add-tests")
+            .expect("add-tests row");
+        let fix_login = metas
+            .iter()
+            .find(|m| m.session_id.as_str() == "fix-login")
+            .expect("fix-login row");
+        assert_eq!(add_tests.state, SessionState::Stopped);
+        assert_eq!(fix_login.state, SessionState::Live);
+        assert_eq!(fix_login.agent.as_deref(), Some("claude"));
         // Stopped carries the real discovered worktree path (R6).
         assert_eq!(
-            metas[0].workspace_path.as_deref(),
+            add_tests.workspace_path.as_deref(),
             Some("/home/dev/.remora/worktrees/api/add-tests")
         );
     }
@@ -2366,11 +2436,13 @@ pub(crate) mod tests {
         // The session is in the trusted names listing, but the inline-metadata
         // read flakes (transient, or tmux < 3.0). It must stay Live with empty
         // metadata, not be downgraded — metadata is best-effort enrichment (#108).
+        // Call order: 1) names, 2) metadata (flakes), 3) printf $HOME, 4) worktree list.
         let config = test_config();
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names: live set
             Ok(FakeExec::fail("connection reset")),      // 2) metadata read flakes
-            Ok(FakeExec::out("")),                       // 3) worktree list: empty
+            Ok(FakeExec::out("/home/dev")),              // 3) printf $HOME (#124)
+            Ok(FakeExec::out("")),                       // 4) worktree list: empty
         ]);
         let metas = run_list(&fake, &config).expect("list");
         assert_eq!(metas.len(), 1);
@@ -2385,6 +2457,7 @@ pub(crate) mod tests {
         // metadata row (`remora_api_evil...`). Because the live set comes from the
         // trusted names-only listing, the phantom name — absent there — must be
         // dropped, never surfaced as a Live session (#108 regression guard).
+        // Call order: 1) names, 2) metadata (with injected phantom), 3) printf $HOME, 4) worktree list.
         let config = test_config();
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names: ONLY the real session
@@ -2392,7 +2465,8 @@ pub(crate) mod tests {
                 "remora_api_fix-login\tx\t\t\n\
                  remora_api_evil\t/ws\t9999999999\t\n", // 2) metadata: real + injected phantom
             )),
-            Ok(FakeExec::out("")), // 3) worktree list: empty
+            Ok(FakeExec::out("/home/dev")), // 3) printf $HOME (#124)
+            Ok(FakeExec::out("")),          // 4) worktree list: empty
         ]);
         let metas = run_list(&fake, &config).expect("list");
         assert_eq!(metas.len(), 1, "phantom must not appear: {metas:?}");
@@ -2404,11 +2478,15 @@ pub(crate) mod tests {
         // A failed `git worktree list` for one project yields empty for that
         // project, never a failed discovery (decision 8): the live session
         // still lists, just with no Stopped twin.
+        // Call order: 1) names, 2) metadata, 3) printf $HOME, 4) worktree list (FAILS).
+        // The FakeExec::fail at position 4 must land on the WORKTREE LIST call —
+        // not on $HOME — so decision 8 is actually exercised.
         let config = test_config();
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names: live set
             Ok(FakeExec::out("remora_api_fix-login\tclaude\t\t\n")), // 2) inline metadata
-            Ok(FakeExec::fail("fatal: not a git repository")), // 3) worktree list fails
+            Ok(FakeExec::out("/home/dev")),              // 3) printf $HOME (#124)
+            Ok(FakeExec::fail("fatal: not a git repository")), // 4) worktree list FAILS → decision 8
         ]);
         let metas = run_list(&fake, &config).expect("list must not fail");
         assert_eq!(metas.len(), 1);
@@ -2431,8 +2509,9 @@ pub(crate) mod tests {
         //
         // FakeExec call order (config is a BTreeMap, sorted: api first, scratch second):
         //   1) list-sessions        -> empty (no live sessions)
-        //   2) git worktree list for `api`     -> empty
-        //   3) git worktree list for `scratch` -> s1 worktree entry
+        //   2) printf $HOME         -> "/home/dev" for path canonicalization (#124)
+        //   3) git worktree list for `api`     -> empty
+        //   4) git worktree list for `scratch` -> s1 worktree entry
         let toml = r#"
             [hosts.devbox]
             transport = "ssh"
@@ -2452,8 +2531,9 @@ pub(crate) mod tests {
         "#;
         let config = Arc::new(Config::from_toml_str(toml).expect("config"));
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::out("")), // list-sessions: no live sessions
-            Ok(FakeExec::out("")), // worktree list for api: empty
+            Ok(FakeExec::out("")),          // list-sessions: no live sessions
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out("")),          // worktree list for api: empty
             Ok(FakeExec::out(
                 "worktree /home/dev/.remora/worktrees/scratch/s1\nbranch refs/heads/remora/s1\n",
             )), // worktree list for scratch: one worktree session
