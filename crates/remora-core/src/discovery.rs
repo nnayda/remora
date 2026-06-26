@@ -113,6 +113,46 @@ pub fn parse_worktree_list(output: &str, project: &ProjectId) -> Vec<(SessionId,
     found
 }
 
+/// One worktree as reported by `git worktree list --porcelain`. `branch` is the
+/// short branch name (no `refs/heads/`), or `None` when the worktree is detached
+/// or bare. Untrusted (ADR-0004): used as a discovery hint, cross-checked, never
+/// turned into a command blindly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeInfo {
+    pub path: String,
+    pub branch: Option<String>,
+}
+
+/// Parse `git worktree list --porcelain` into one [`WorktreeInfo`] per worktree.
+/// Records are blank-line separated; a record starts at `worktree <path>` and a
+/// `branch refs/heads/<name>` line (if any, before the next `worktree`) gives the
+/// branch. `detached`/`bare` records yield `branch: None`.
+pub fn parse_worktree_porcelain(output: &str) -> Vec<WorktreeInfo> {
+    let mut out = Vec::new();
+    let mut cur: Option<WorktreeInfo> = None;
+    for line in output.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(done) = cur.take() {
+                out.push(done);
+            }
+            cur = Some(WorktreeInfo {
+                path: path.to_string(),
+                branch: None,
+            });
+        } else if let Some(refname) = line.strip_prefix("branch refs/heads/") {
+            if let Some(c) = cur.as_mut() {
+                c.branch = Some(refname.to_string());
+            }
+        }
+        // `HEAD`, `detached`, `bare`, `locked`, blank lines: ignored (branch
+        // stays None for detached/bare, which is the intended "nameless").
+    }
+    if let Some(done) = cur.take() {
+        out.push(done);
+    }
+    out
+}
+
 /// Joins live sessions (with metadata) and the full worktree set (live+stopped)
 /// into the session list. A key present in both is `Live` (live wins). Each
 /// session's `workspace` is `Some(Worktree)` iff a real worktree exists for it,
@@ -367,5 +407,42 @@ mod tests {
             &std::collections::HashSet::new(), // project not scanned
         );
         assert_eq!(metas[0].workspace, None);
+    }
+
+    #[test]
+    fn parses_path_and_branch_per_worktree() {
+        let out = "\
+worktree /home/dev/api
+HEAD abc123
+branch refs/heads/main
+
+worktree /home/dev/.remora/worktrees/api/fix-login
+HEAD def456
+branch refs/heads/remora/fix-login
+
+worktree /home/dev/scratch/spike
+HEAD 999aaa
+detached
+";
+        let got = parse_worktree_porcelain(out);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].path, "/home/dev/api");
+        assert_eq!(got[0].branch.as_deref(), Some("main"));
+        assert_eq!(got[1].branch.as_deref(), Some("remora/fix-login"));
+        assert_eq!(got[2].path, "/home/dev/scratch/spike");
+        assert_eq!(got[2].branch, None); // detached → nameless
+    }
+
+    #[test]
+    fn parse_worktree_porcelain_handles_bare_and_trailing_newline() {
+        let out = "worktree /home/dev/api\nbare\n\n";
+        let got = parse_worktree_porcelain(out);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].branch, None);
+    }
+
+    #[test]
+    fn parse_worktree_porcelain_empty_input_is_empty() {
+        assert!(parse_worktree_porcelain("").is_empty());
     }
 }
