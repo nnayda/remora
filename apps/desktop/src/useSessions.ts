@@ -31,6 +31,7 @@ export function useSessions() {
     openViaRespawn: sessionStore.openViaRespawn,
     closeTab: sessionStore.closeTab,
     focusTab: sessionStore.focusTab,
+    reorderTab: sessionStore.reorderTab,
     respawnTab: sessionStore.respawnTab,
     stopSession: sessionStore.stop,
     removeSession: sessionStore.remove,

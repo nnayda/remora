@@ -314,3 +314,24 @@ export function Moon(props: IconProps): JSX.Element {
     </Svg>
   );
 }
+
+/* Transport glyphs for the sidebar host label. ssh = a shell window;
+ * kubectl = a container hull with a hub (the k8s helm metaphor). */
+export function Ssh(props: IconProps): JSX.Element {
+  return (
+    <Svg {...props}>
+      <rect x={2} y={4} width={20} height={16} rx={2} />
+      <polyline points="6 9 9 12 6 15" />
+      <line x1={12} y1={15} x2={16} y2={15} />
+    </Svg>
+  );
+}
+
+export function Kubectl(props: IconProps): JSX.Element {
+  return (
+    <Svg {...props}>
+      <polygon points="12 2 21 7 21 17 12 22 3 17 3 7 12 2" />
+      <circle cx={12} cy={12} r={3} />
+    </Svg>
+  );
+}

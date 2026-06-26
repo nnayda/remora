@@ -30,6 +30,7 @@ function App() {
     openViaRespawn,
     closeTab,
     focusTab,
+    reorderTab,
     respawnTab,
     stopSession,
     removeSession,
@@ -241,7 +242,6 @@ function App() {
     setNotice(null);
     // Find the workspace from the tree if available.
     const node = tree
-      .flatMap((h) => h.projects)
       .flatMap((p) => p.sessions)
       .find((s) => s.projectId === projectId && s.sessionId === sessionId);
     setRemoveTarget({
@@ -361,6 +361,7 @@ function App() {
             setNotice(null);
             closeTab(key);
           }}
+          onReorder={reorderTab}
           onNew={() => openNewSession(null)}
           newButtonRef={newButtonRef}
         />

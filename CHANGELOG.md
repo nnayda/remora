@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Flatten the session sidebar to project rows with a host label**: the sidebar
+  was a three-level `host → project → session` tree; it is now a flat
+  `project → session` list with the host demoted to a small muted label on each
+  project row (carrying an ssh/kubectl transport glyph), in the same visual
+  family as the per-session agent label. Host stays only where it earns its keep
+  — disambiguating two projects that share a name across hosts — without the
+  extra nesting and collapse target. `buildTree` now returns a flat
+  `ProjectNode[]` grouped by host via a bucket pass (config-host order;
+  dangling-host then synthetic projects trail last), so same-host projects stay
+  adjacent and the label confirms identity rather than carrying it; each project
+  carries `hostLabel` / `transport` / `unconfigured`. The project name claims the
+  top-level weight (600), the host is folded into the row's accessible name so a
+  screen reader can tell colliding names apart, and the per-project "+" is now
+  gated on `agent !== null && !unconfigured` so it can't spawn into a host that
+  isn't in config. `filterTree` moved to its own pure, unit-tested module and
+  matches project label, host label, and session id. A configured host with no
+  projects no longer renders a row (the empty state reads "No projects yet").
+- **Drag to reorder tabs; horizontal-only tab bar** (#86): open session tabs can
+  now be dragged to a new position in the tab bar, browser/editor style, instead
+  of being fixed in creation order. Reordering is pure frontend — a `reorderTab`
+  method on the app-scoped session store moves a tab to the drop target's slot
+  (landing after when dragged rightward, before when leftward, so a drop onto a
+  neighbour swaps the two), and the order is held in the store array, so it
+  persists for the session across React remounts. The dragged tab dims and an
+  accent bar marks where it will land; a reset effect clears drag state if the
+  dragged tab is closed mid-drag. The tab bar no longer scrolls vertically
+  (`overflow-y: hidden`); tabs keep their natural width (`flex: none`) and a thin
+  horizontal scrollbar scrolls the row when there are more tabs than fit. Native
+  HTML5 drag-and-drop, no new dependency. Keyboard reordering and the full
+  WAI-ARIA tab keyboard model are deferred to #111.
 - **Config file watcher for live sidebar reload** (#112): the desktop app now
   watches the per-device `config.toml` on disk and auto-refreshes the read-only
   sidebar when it changes, instead of waiting for the manual refresh button or an
