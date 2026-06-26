@@ -23,8 +23,6 @@ interface SidebarProps {
   tree: HostNode[];
   /** Tab key of the active tab, highlighted in the tree. */
   activeKey: string | null;
-  /** Tab keys currently open, marked so the user sees what's already a tab. */
-  openKeys: Set<string>;
   /** Open (attach/focus) a session. App routes by node.state: live→attach, stopped→respawn. */
   onOpenSession: (node: SessionNode) => void;
   /** Non-fatal config read error; shown as a banner above the tree. */
@@ -54,7 +52,6 @@ interface SidebarProps {
 export function Sidebar({
   tree,
   activeKey,
-  openKeys,
   onOpenSession,
   configError,
   discoveryUnavailable,
@@ -151,7 +148,6 @@ export function Sidebar({
               collapsed={collapsed}
               toggle={toggle}
               activeKey={activeKey}
-              openKeys={openKeys}
               onOpenSession={onOpenSession}
               onStop={onStop}
               onRemove={onRemove}
@@ -210,14 +206,13 @@ function filterTree(tree: HostNode[], query: string): HostNode[] {
   return out;
 }
 
-/** One host group: a collapse header (chevron + avatar + name + count + the
- * transport tag) plus its project groups. */
+/** One host group: a collapse header (chevron + avatar + name + the transport
+ * tag) plus its project groups. */
 function HostGroup({
   host,
   collapsed,
   toggle,
   activeKey,
-  openKeys,
   onOpenSession,
   onStop,
   onRemove,
@@ -228,7 +223,6 @@ function HostGroup({
   collapsed: Set<string>;
   toggle: (id: string) => void;
   activeKey: string | null;
-  openKeys: Set<string>;
   onOpenSession: (node: SessionNode) => void;
   onStop: (node: SessionNode) => void;
   onRemove: (node: SessionNode) => void;
@@ -236,7 +230,6 @@ function HostGroup({
   activity: ReadonlyMap<string, ActivityState>;
 }) {
   const open = !collapsed.has(host.id);
-  const count = host.projects.reduce((n, p) => n + p.sessions.length, 0);
   return (
     <div className="rk-host">
       <button
@@ -252,7 +245,6 @@ function HostGroup({
         </span>
         <Avatar host name={host.label} size="sm" />
         <span className="rk-host__name">{host.label}</span>
-        <span className="rk-host__count">{count}</span>
         {host.transport && <Tag>{host.transport}</Tag>}
       </button>
       {open && (
@@ -265,7 +257,6 @@ function HostGroup({
               collapsed={collapsed}
               toggle={toggle}
               activeKey={activeKey}
-              openKeys={openKeys}
               onOpenSession={onOpenSession}
               onStop={onStop}
               onRemove={onRemove}
@@ -279,7 +270,7 @@ function HostGroup({
   );
 }
 
-/** One project group: a collapse header (chevron + folder + name + count) with a
+/** One project group: a collapse header (chevron + folder + name) with a
  * hover-revealed per-project "+" to start a session pre-scoped to it, plus its
  * session leaves. */
 function ProjectGroup({
@@ -288,7 +279,6 @@ function ProjectGroup({
   collapsed,
   toggle,
   activeKey,
-  openKeys,
   onOpenSession,
   onStop,
   onRemove,
@@ -300,7 +290,6 @@ function ProjectGroup({
   collapsed: Set<string>;
   toggle: (id: string) => void;
   activeKey: string | null;
-  openKeys: Set<string>;
   onOpenSession: (node: SessionNode) => void;
   onStop: (node: SessionNode) => void;
   onRemove: (node: SessionNode) => void;
@@ -327,7 +316,6 @@ function ProjectGroup({
           </span>
           <Folder size={13} className="rk-proj__icon" />
           <span className="rk-proj__name">{project.label}</span>
-          <span className="rk-proj__count">{project.sessions.length}</span>
         </button>
         {canStartSession && (
           <span className="rk-proj__actions">
@@ -360,21 +348,11 @@ function ProjectGroup({
                 title={stopped ? "Stopped — click to respawn" : undefined}
                 onClick={() => onOpenSession(session)}
                 actions={
-                  <span className="rk-srow-trail">
-                    {openKeys.has(session.key) && (
-                      <span
-                        className="rk-srow__open"
-                        role="img"
-                        aria-label="Open tab"
-                        title="Open in a tab"
-                      />
-                    )}
-                    <SessionMenu
-                      session={session}
-                      onStop={onStop}
-                      onRemove={onRemove}
-                    />
-                  </span>
+                  <SessionMenu
+                    session={session}
+                    onStop={onStop}
+                    onRemove={onRemove}
+                  />
                 }
               />
             );

@@ -66,7 +66,6 @@ function App() {
 
   // Recompute the tree only when config or the polled session list changes.
   const tree = useMemo(() => buildTree(config, sessions), [config, sessions]);
-  const openKeys = useMemo(() => new Set(tabs.map((t) => t.key)), [tabs]);
 
   // Status of the active tab, so the focus effect re-fires when a freshly opened
   // or respawned session goes live (a stopped/reconnecting tab renders a
@@ -254,7 +253,6 @@ function App() {
         <Sidebar
           tree={tree}
           activeKey={activeKey}
-          openKeys={openKeys}
           onOpenSession={openFromSidebar}
           configError={configError}
           discoveryUnavailable={discoveryUnavailable}
