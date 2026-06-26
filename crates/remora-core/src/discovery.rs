@@ -193,15 +193,16 @@ pub fn join(
         // caller can still reconnect via the real slug).
         // STOPPED (no live match) → derive from the branch as before; skip
         // detached / nameless worktrees since they have no identity to respawn.
-        let (session_id, state, agent, created_at) = match live_by_path.get_mut(&key).and_then(|v| v.pop()) {
-            Some((sid, env)) => (sid, SessionState::Live, env.agent, env.created_at),
-            None => {
-                let Some(sid) = naming::derive_session_id(wt.branch.as_deref()) else {
-                    continue;
-                };
-                (sid, SessionState::Stopped, None, None)
-            }
-        };
+        let (session_id, state, agent, created_at) =
+            match live_by_path.get_mut(&key).and_then(|v| v.pop()) {
+                Some((sid, env)) => (sid, SessionState::Live, env.agent, env.created_at),
+                None => {
+                    let Some(sid) = naming::derive_session_id(wt.branch.as_deref()) else {
+                        continue;
+                    };
+                    (sid, SessionState::Stopped, None, None)
+                }
+            };
         metas.push(SessionMeta {
             project_id: project,
             session_id,

@@ -2483,10 +2483,10 @@ pub(crate) mod tests {
         // not on $HOME — so decision 8 is actually exercised.
         let config = test_config();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")),          // 1) names: live set
+            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names: live set
             Ok(FakeExec::out("remora_api_fix-login\tclaude\t\t\n")), // 2) inline metadata
-            Ok(FakeExec::out("/home/dev")),                        // 3) printf $HOME (#124)
-            Ok(FakeExec::fail("fatal: not a git repository")),     // 4) worktree list FAILS → decision 8
+            Ok(FakeExec::out("/home/dev")),              // 3) printf $HOME (#124)
+            Ok(FakeExec::fail("fatal: not a git repository")), // 4) worktree list FAILS → decision 8
         ]);
         let metas = run_list(&fake, &config).expect("list must not fail");
         assert_eq!(metas.len(), 1);

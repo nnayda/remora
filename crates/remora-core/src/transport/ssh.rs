@@ -791,10 +791,10 @@ mod tests {
         // not on $HOME — so decision 8 is actually exercised.
         let config = test_config();
         let fake = Arc::new(FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")),          // 1) names
+            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names
             Ok(FakeExec::out("remora_api_fix-login\tclaude\t\t\n")), // 2) metadata
-            Ok(FakeExec::out("/home/dev")),                        // 3) printf $HOME (#124)
-            Ok(FakeExec::fail("fatal: not a git repository")),     // 4) worktree list FAILS → decision 8
+            Ok(FakeExec::out("/home/dev")),              // 3) printf $HOME (#124)
+            Ok(FakeExec::fail("fatal: not a git repository")), // 4) worktree list FAILS → decision 8
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let metas = source.list().await.expect("list must not fail");
