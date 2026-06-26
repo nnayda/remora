@@ -123,6 +123,9 @@ pub struct SessionMetaDto {
     /// Effective workspace mode discovered for this session (real state), or
     /// null from an older sender. Drives sidebar/tab gating.
     pub workspace: Option<WorkspaceModeDto>,
+    /// Git branch the sandbox advertises for this session. Untrusted,
+    /// display-only (same rule as `agent`/`workspace_path`).
+    pub branch: Option<String>,
 }
 
 impl From<SessionMeta> for SessionMetaDto {
@@ -135,6 +138,7 @@ impl From<SessionMeta> for SessionMetaDto {
             created_at: m.created_at,
             workspace_path: m.workspace_path,
             workspace: m.workspace.map(Into::into),
+            branch: m.branch,
         }
     }
 }
@@ -206,5 +210,23 @@ mod tests {
         assert!(json.contains(r#""projectId":"api""#));
         assert!(json.contains(r#""state":"stopped""#));
         assert!(json.contains(r#""workspace":"worktree""#));
+    }
+
+    #[test]
+    fn session_meta_branch_is_copied_to_dto() {
+        let meta = SessionMeta {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("fix-login").expect("slug"),
+            state: SessionState::Live,
+            agent: None,
+            created_at: None,
+            workspace_path: None,
+            workspace: None,
+            branch: Some("feat/login".into()),
+        };
+        let dto = SessionMetaDto::from(meta);
+        assert_eq!(dto.branch, Some("feat/login".to_string()));
+        let json = serde_json::to_string(&dto).expect("serialize");
+        assert!(json.contains(r#""branch":"feat/login""#));
     }
 }

@@ -331,7 +331,12 @@ workspacePath: string | null;
  * Effective workspace mode discovered for this session (real state), or
  * null from an older sender. Drives sidebar/tab gating.
  */
-workspace: WorkspaceModeDto | null }
+workspace: WorkspaceModeDto | null; 
+/**
+ * Git branch the sandbox advertises for this session. Untrusted,
+ * display-only (same rule as `agent`/`workspace_path`).
+ */
+branch: string | null }
 export type SessionStateDto = "live" | "stopped"
 /**
  * Frontend-facing mirror of `remora_protocol::SessionStatus` (which is
