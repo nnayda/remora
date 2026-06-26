@@ -438,15 +438,37 @@ pub(crate) fn literal_field_problem(value: &str) -> Option<&'static str> {
 
 /// The looser guard for a `{ command }` field at config time: it is a shell
 /// command line, so dashes and internal/edge whitespace are allowed; only an
-/// empty/whitespace-only command or control characters fail.
+/// empty/whitespace-only command, control characters, or a value fully wrapped
+/// in command substitution (`$(...)` or backticks) fail. The field holds the
+/// command itself, so wrapping the whole thing in substitution is
+/// double-evaluation: `sh -c` substitutes the inner pipeline and then runs its
+/// output (e.g. a pod name) as a command, surfacing a misleading
+/// `sh: pod/...: No such file or directory` at resolve time. An *interior*
+/// `$(...)` (resolving part of the pipeline inline) is legitimate shell and is
+/// intentionally allowed. See #127.
 pub(crate) fn command_field_problem(value: &str) -> Option<&'static str> {
-    if value.trim().is_empty() {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
         Some("must not be empty")
     } else if value.chars().any(char::is_control) {
         Some("must not contain control characters")
+    } else if is_fully_command_substituted(trimmed) {
+        Some("must be the command itself, not wrapped in $(...) or backticks")
     } else {
         None
     }
+}
+
+/// Whether `trimmed` (already-trimmed, control-free) is one whole command
+/// substitution — `$(...)` or `` `...` `` — rather than a bare command line.
+/// This is the #127 double-evaluation mistake. Matched by exact outer shape:
+/// an *interior* substitution (`kubectl -n $(cat ns) get …`) does not start
+/// with the opener, so it is correctly left alone. The trailing-`)`/backtick
+/// forms with extra suffix (`$(...)x`) are deliberately not caught here — they
+/// are rare and still surface the legible resolve-time error.
+fn is_fully_command_substituted(trimmed: &str) -> bool {
+    (trimmed.starts_with("$(") && trimmed.ends_with(')'))
+        || (trimmed.len() >= 2 && trimmed.starts_with('`') && trimmed.ends_with('`'))
 }
 
 /// Validates an optional display name (hosts and projects), returning the
@@ -1600,6 +1622,41 @@ mod tests {
             Config::from_toml_str("[hosts.k]\ntransport = \"kubectl\"\npod = { command = \"\" }\n")
                 .expect_err("empty command rejected");
         assert!(format!("{err}").contains("pod"), "{err}");
+    }
+
+    #[test]
+    fn kubectl_command_wrapped_in_substitution_is_rejected() {
+        // The field holds the command itself; wrapping the whole thing in
+        // `$(...)` is double-evaluation — the shell substitutes the inner
+        // pipeline, then tries to run its output (a pod name) as a command,
+        // yielding a misleading `sh: pod/...: No such file or directory` at
+        // resolve time. Catch it loudly at config time instead (#127).
+        let err = Config::from_toml_str(
+            "[hosts.k]\ntransport = \"kubectl\"\npod = { command = \"$(kubectl get pods -o name | head -n1)\" }\n",
+        )
+        .expect_err("fully wrapped $(...) rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("pod") && msg.contains("$(...)"), "{msg}");
+
+        // The backtick form is the identical double-evaluation mistake and must
+        // be caught too, not just `$(...)`.
+        Config::from_toml_str(
+            "[hosts.k]\ntransport = \"kubectl\"\npod = { command = \"`kubectl get pods -o name | head -n1`\" }\n",
+        )
+        .expect_err("fully wrapped backticks rejected");
+
+        // Leading/trailing whitespace around the wrap is still the mistake.
+        Config::from_toml_str(
+            "[hosts.k]\ntransport = \"kubectl\"\npod = { command = \"  $(echo sandbox)  \" }\n",
+        )
+        .expect_err("wrap with edge whitespace rejected");
+
+        // A command substitution *within* a larger pipeline is legitimate shell
+        // (resolve a namespace inline) and must NOT be rejected.
+        Config::from_toml_str(
+            "[hosts.k]\ntransport = \"kubectl\"\npod = { command = \"kubectl -n $(cat ns) get pods -o name | head -n1\" }\n",
+        )
+        .expect("interior $(...) is valid shell");
     }
 
     #[test]

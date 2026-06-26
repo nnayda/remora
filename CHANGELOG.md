@@ -285,6 +285,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A kubectl `{ command }` field accidentally wrapped in command substitution —
+  `pod = { command = "$(kubectl … | head -n1)" }` — is now rejected at config
+  time with a targeted message ("must be the command itself, not wrapped in
+  $(...) or backticks") instead of failing cryptically at resolve time with a
+  misleading `sh: pod/…: No such file or directory` (closes #127). The field
+  holds the command itself, so wrapping the whole thing is double-evaluation:
+  `sh -c` substitutes the inner pipeline and then tries to run its output (a pod
+  name) as a command. The guard catches both `$(...)` and backtick wraps while
+  leaving a legitimate *interior* substitution (e.g. `kubectl -n $(cat ns) …`)
+  alone. As a secondary aid, the resolve-time error now includes the command
+  that ran so any failure reads as a command problem rather than a cluster one,
+  and the host form's command-mode hint documents the bare-pipeline format.
+  Follow-up to #84 (command-form resolution) and #121 (clearer multi-match
+  errors).
 - Opening the New Session dialog from a project **+** now lands focus on the
   session **name** field instead of the project picker, so you can name and
   create a session keyboard-only (closes #125). The project is already implied
