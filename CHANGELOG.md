@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Flatten the session sidebar to project rows with a host label**: the sidebar
+  was a three-level `host → project → session` tree; it is now a flat
+  `project → session` list with the host demoted to a small muted label on each
+  project row (carrying an ssh/kubectl transport glyph), in the same visual
+  family as the per-session agent label. Host stays only where it earns its keep
+  — disambiguating two projects that share a name across hosts — without the
+  extra nesting and collapse target. `buildTree` now returns a flat
+  `ProjectNode[]` grouped by host via a bucket pass (config-host order;
+  dangling-host then synthetic projects trail last), so same-host projects stay
+  adjacent and the label confirms identity rather than carrying it; each project
+  carries `hostLabel` / `transport` / `unconfigured`. The project name claims the
+  top-level weight (600), the host is folded into the row's accessible name so a
+  screen reader can tell colliding names apart, and the per-project "+" is now
+  gated on `agent !== null && !unconfigured` so it can't spawn into a host that
+  isn't in config. `filterTree` moved to its own pure, unit-tested module and
+  matches project label, host label, and session id. A configured host with no
+  projects no longer renders a row (the empty state reads "No projects yet").
 - **Drag to reorder tabs; horizontal-only tab bar** (#86): open session tabs can
   now be dragged to a new position in the tab bar, browser/editor style, instead
   of being fixed in creation order. Reordering is pure frontend — a `reorderTab`

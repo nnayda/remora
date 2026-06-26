@@ -96,49 +96,7 @@
   box-shadow: var(--glow-accent);
 }
 
-.rk-host {
-  margin-bottom: 6px;
-}
-.rk-host__hdr {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  background: none;
-  border: none;
-  cursor: pointer;
-  padding: 5px 8px;
-  border-radius: var(--radius-sm);
-  color: var(--text-secondary);
-}
-.rk-host__hdr:hover {
-  background: var(--bg-hover);
-}
-.rk-host__chev {
-  display: inline-flex;
-  color: var(--text-muted);
-  transition: transform var(--dur-fast) var(--ease-out);
-}
-.rk-host__name {
-  font-size: var(--text-sm);
-  font-weight: 600;
-  color: var(--text-primary);
-  flex: 1;
-  text-align: left;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.rk-host__rows {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  margin: 2px 0 0 6px;
-  padding-left: 8px;
-  border-left: 1px solid var(--border-hairline);
-}
-
-/* project group (repo/folder under a host) */
+/* project group (repo/folder — top level; host is a label on the row) */
 .rk-proj {
   margin: 1px 0;
 }
@@ -174,13 +132,42 @@
 }
 .rk-proj__name {
   font-size: var(--text-sm);
-  font-weight: 500;
+  /* 600 (was 500): the project row is now the top-level anchor (host header gone). */
+  font-weight: var(--weight-semibold);
   color: var(--text-primary);
-  flex: 1;
+  /* shrink + truncate before the host label (which stays flex:none). */
+  flex: 0 1 auto;
+  min-width: 0;
   text-align: left;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* Bare muted host label on the project row — same treatment as the session-row
+   agent meta, not a Tag chip. Transport glyph folded in. */
+.rk-proj__host {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  /* shrinkable + capped so a long/dangling host label can't starve the project
+     name or overflow the row; name (flex:0 1 auto) still truncates first. */
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 50%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.rk-proj__host--unconfigured {
+  font-style: italic;
+  opacity: 0.75;
+}
+.rk-proj__hostglyph {
+  opacity: 0.7;
+  flex: none;
 }
 .rk-proj__actions {
   display: inline-flex;

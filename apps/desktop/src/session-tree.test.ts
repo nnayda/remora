@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ConfigDto, SessionMetaDto, WorkspaceModeDto } from "./bindings";
 import { tabKey } from "./session-store";
-import { buildTree, UNCONFIGURED_HOST_ID } from "./session-tree";
+import { buildTree } from "./session-tree";
 
 const host = (
   id: string,
@@ -46,23 +46,21 @@ const cfg = (
 ): ConfigDto => ({ hosts, projects, agents: [] });
 
 describe("buildTree", () => {
-  it("nests projects under their configured host", () => {
+  it("stamps host label + transport onto a configured project", () => {
     const tree = buildTree(
       cfg([host("devbox", "ssh", "Dev box")], [project("api", "devbox")]),
       [session("api", "fix")],
     );
     expect(tree).toHaveLength(1);
     expect(tree[0]).toMatchObject({
-      id: "devbox",
-      label: "Dev box",
-      unconfigured: false,
-    });
-    expect(tree[0].projects[0]).toMatchObject({
       id: "api",
       label: "api",
       agent: "claude",
+      hostLabel: "Dev box",
+      transport: "ssh",
+      unconfigured: false,
     });
-    expect(tree[0].projects[0].sessions[0]).toMatchObject({
+    expect(tree[0].sessions[0]).toMatchObject({
       projectId: "api",
       sessionId: "fix",
       state: "live",
@@ -70,11 +68,20 @@ describe("buildTree", () => {
     });
   });
 
-  it("renders a configured host with no projects (T3)", () => {
+  it("falls back to host id when the host has no display name", () => {
+    const tree = buildTree(
+      cfg([host("devbox", "kubectl")], [project("api", "devbox")]),
+      [],
+    );
+    expect(tree[0]).toMatchObject({
+      hostLabel: "devbox",
+      transport: "kubectl",
+    });
+  });
+
+  it("a configured host with no projects produces no row (was T3)", () => {
     const tree = buildTree(cfg([host("empty", "ssh")], []), []);
-    expect(tree).toHaveLength(1);
-    expect(tree[0].id).toBe("empty");
-    expect(tree[0].projects).toHaveLength(0);
+    expect(tree).toHaveLength(0);
   });
 
   it("renders a configured project with no sessions", () => {
@@ -82,32 +89,101 @@ describe("buildTree", () => {
       cfg([host("devbox", "ssh")], [project("api", "devbox")]),
       [],
     );
-    expect(tree[0].projects[0].sessions).toHaveLength(0);
+    expect(tree).toHaveLength(1);
+    expect(tree[0].sessions).toHaveLength(0);
   });
 
-  it("buckets sessions with no config project under a synthetic Unconfigured host, rendered last", () => {
+  it("groups projects by host adjacently regardless of config interleaving", () => {
+    // config interleaves hosts: api@h1, web@h2, db@h1 — output must cluster by host.
+    const tree = buildTree(
+      cfg(
+        [host("h1", "ssh"), host("h2", "kubectl")],
+        [project("api", "h1"), project("web", "h2"), project("db", "h1")],
+      ),
+      [],
+    );
+    expect(tree.map((p) => p.id)).toEqual(["api", "db", "web"]);
+    expect(tree.map((p) => p.hostLabel)).toEqual(["h1", "h1", "h2"]);
+  });
+
+  it("preserves config order within a host and host order across hosts", () => {
+    const tree = buildTree(
+      cfg(
+        [host("alpha", "kubectl"), host("zeta", "ssh")],
+        [project("z2", "zeta"), project("z1", "zeta"), project("a1", "alpha")],
+      ),
+      [],
+    );
+    // alpha's projects first (host order), zeta's in config order (z2 before z1)
+    expect(tree.map((p) => p.id)).toEqual(["a1", "z2", "z1"]);
+  });
+
+  it("collision: same project label on two hosts yields two distinct, host-tagged rows", () => {
+    const tree = buildTree(
+      cfg(
+        [host("hermes", "ssh"), host("atlas", "kubectl")],
+        [
+          project("remora-hermes", "hermes", "claude", "remora"),
+          project("remora-atlas", "atlas", "claude", "remora"),
+        ],
+      ),
+      [],
+    );
+    expect(tree).toHaveLength(2);
+    expect(tree.map((p) => p.label)).toEqual(["remora", "remora"]);
+    expect(tree.map((p) => p.hostLabel)).toEqual(["hermes", "atlas"]);
+    // distinct ids → distinct React keys
+    expect(new Set(tree.map((p) => p.id)).size).toBe(2);
+  });
+
+  it("dangling-host project: raw hostId label, unconfigured, before synthetic", () => {
+    const tree = buildTree(
+      cfg([host("devbox", "ssh")], [project("ghost-proj", "missing-host")]),
+      [session("ghost-proj", "s1"), session("orphan", "s2")],
+    );
+    // configured-but-dangling 'ghost-proj' comes before synthetic 'orphan'
+    const ids = tree.map((p) => p.id);
+    expect(ids).toEqual(["ghost-proj", "orphan"]);
+    expect(tree[0]).toMatchObject({
+      hostLabel: "missing-host",
+      transport: null,
+      unconfigured: true,
+    });
+    expect(tree[1]).toMatchObject({
+      hostLabel: "Unconfigured",
+      unconfigured: true,
+      agent: null,
+    });
+    // a dangling project is still configured, so its session flows through the
+    // configured branch (and onto the dangling node), not the synthetic one.
+    expect(tree[0].sessions.map((s) => s.sessionId)).toEqual(["s1"]);
+    expect(tree[1].sessions.map((s) => s.sessionId)).toEqual(["s2"]);
+  });
+
+  it("buckets sessions with no config project under a synthetic project, last", () => {
     const tree = buildTree(
       cfg([host("devbox", "ssh")], [project("api", "devbox")]),
       [session("api", "fix"), session("ghost", "x")],
     );
     expect(tree).toHaveLength(2);
     const last = tree[tree.length - 1];
-    expect(last.id).toBe(UNCONFIGURED_HOST_ID);
-    expect(last.unconfigured).toBe(true);
-    expect(last.projects[0].id).toBe("ghost");
-    expect(last.projects[0].sessions[0].sessionId).toBe("x");
+    expect(last).toMatchObject({
+      id: "ghost",
+      unconfigured: true,
+      hostLabel: "Unconfigured",
+    });
+    expect(last.sessions[0].sessionId).toBe("x");
   });
 
-  it("with empty config, every session is Unconfigured", () => {
+  it("with empty config, every session is a synthetic unconfigured project", () => {
     const tree = buildTree(cfg([], []), [
       session("api", "fix"),
       session("api", "feat"),
     ]);
     expect(tree).toHaveLength(1);
-    expect(tree[0].id).toBe(UNCONFIGURED_HOST_ID);
+    expect(tree[0]).toMatchObject({ id: "api", unconfigured: true });
     // both sessions of project "api" grouped under one synthetic project
-    expect(tree[0].projects).toHaveLength(1);
-    expect(tree[0].projects[0].sessions).toHaveLength(2);
+    expect(tree[0].sessions).toHaveLength(2);
   });
 
   it("carries live and stopped state through to nodes", () => {
@@ -115,10 +191,10 @@ describe("buildTree", () => {
       cfg([host("devbox", "ssh")], [project("api", "devbox")]),
       [session("api", "fix", "live"), session("api", "old", "stopped")],
     );
-    const states = tree[0].projects[0].sessions.map((s) => s.state);
-    expect(states).toEqual(
-      ["fix", "old"].map((id) => (id === "old" ? "stopped" : "live")),
+    const byId = Object.fromEntries(
+      tree[0].sessions.map((s) => [s.sessionId, s.state]),
     );
+    expect(byId).toEqual({ fix: "live", old: "stopped" });
   });
 
   it("dedupes sessions sharing a (projectId, sessionId) so React keys stay unique", () => {
@@ -129,9 +205,8 @@ describe("buildTree", () => {
       cfg([host("devbox", "ssh")], [project("api", "devbox")]),
       [session("api", "fix"), session("api", "fix")],
     );
-    const sessions = tree[0].projects[0].sessions;
-    expect(sessions).toHaveLength(1);
-    expect(sessions[0].key).toBe(tabKey("api", "fix"));
+    expect(tree[0].sessions).toHaveLength(1);
+    expect(tree[0].sessions[0].key).toBe(tabKey("api", "fix"));
   });
 
   it("dedupes unconfigured sessions sharing a key too", () => {
@@ -139,19 +214,7 @@ describe("buildTree", () => {
       session("ghost", "x"),
       session("ghost", "x"),
     ]);
-    expect(tree[0].projects[0].sessions).toHaveLength(1);
-  });
-
-  it("preserves config host order and does not invent an Unconfigured host when all sessions map", () => {
-    const tree = buildTree(
-      cfg(
-        [host("alpha", "kubectl"), host("zeta", "ssh")],
-        [project("api", "zeta"), project("web", "alpha")],
-      ),
-      [session("api", "s1"), session("web", "s2")],
-    );
-    expect(tree.map((h) => h.id)).toEqual(["alpha", "zeta"]);
-    expect(tree.some((h) => h.unconfigured)).toBe(false);
+    expect(tree[0].sessions).toHaveLength(1);
   });
 
   it("carries workspace mode from a configured worktree project onto its session leaf", () => {
@@ -162,7 +225,7 @@ describe("buildTree", () => {
       ),
       [session("api", "fix")],
     );
-    expect(tree[0].projects[0].sessions[0].workspace).toBe("worktree");
+    expect(tree[0].sessions[0].workspace).toBe("worktree");
   });
 
   it("carries workspace mode 'shared' from a configured shared project onto its session leaf", () => {
@@ -173,12 +236,12 @@ describe("buildTree", () => {
       ),
       [session("api", "fix")],
     );
-    expect(tree[0].projects[0].sessions[0].workspace).toBe("shared");
+    expect(tree[0].sessions[0].workspace).toBe("shared");
   });
 
   it("carries null workspace for unconfigured-project sessions", () => {
     const tree = buildTree(cfg([], []), [session("ghost", "x")]);
-    expect(tree[0].projects[0].sessions[0].workspace).toBeNull();
+    expect(tree[0].sessions[0].workspace).toBeNull();
   });
 
   it("stamps node.workspace from discovered meta, overriding the project default", () => {
@@ -201,7 +264,6 @@ describe("buildTree", () => {
       ],
     );
     const node = tree
-      .flatMap((h) => h.projects)
       .flatMap((p) => p.sessions)
       .find((s) => s.sessionId === "s1");
     expect(node?.workspace).toBe("worktree");
@@ -226,7 +288,6 @@ describe("buildTree", () => {
       ],
     );
     const node = tree
-      .flatMap((h) => h.projects)
       .flatMap((p) => p.sessions)
       .find((s) => s.sessionId === "s1");
     expect(node?.workspace).toBe("worktree"); // api is worktree-default
