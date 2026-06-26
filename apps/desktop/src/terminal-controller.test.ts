@@ -4,7 +4,7 @@ import type { BridgeOutput, OnOutput, SessionConnection } from "./connection";
 // Mock activity-store and useActivity so tests don't pull in the real singleton.
 vi.mock("./activity-store");
 vi.mock("./useActivity", () => ({
-  activityStore: { noteOutput: vi.fn(), noteMarker: vi.fn(), clear: vi.fn() },
+  activityStore: { setStatus: vi.fn(), setPreview: vi.fn(), clear: vi.fn() },
 }));
 
 // Mock xterm: capture the constructed Terminal/FitAddon so tests can inspect
@@ -513,94 +513,49 @@ describe("TerminalController", () => {
     return { el: harnesEl, conn };
   }
 
-  it("notes output and parses the activity marker into the sink", () => {
-    const activity = {
-      noteOutput: vi.fn(),
-      noteMarker: vi.fn(),
-      clear: vi.fn(),
-    };
+  it("records core statusChange and previewUpdate events into the activity sink", () => {
+    const sink = { setStatus: vi.fn(), setPreview: vi.fn(), clear: vi.fn() };
     const { el: hEl, conn } = makeHarness();
     new TerminalController(
       hEl,
       conn as unknown as SessionConnection,
       undefined,
-      {
-        sessionKey: "api/fix",
-        activity,
-      },
+      { sessionKey: "p/a", activity: sink },
     );
-    // a bytes message → noteOutput
-    conn.emit({ event: "bytes", bytes: [...new TextEncoder().encode("hi")] });
-    expect(activity.noteOutput).toHaveBeenCalledWith("api/fix");
-    // an OSC-7366 awaiting marker → noteMarker(awaiting)
-    const handler7366 = xt.oscHandlers.get(7366);
-    if (!handler7366) throw new Error("OSC 7366 handler not registered");
-    handler7366(`remora;1;state;${btoa("awaiting_input")}`);
-    expect(activity.noteMarker).toHaveBeenCalledWith("api/fix", "awaiting");
+    conn.emit({ event: "statusChange", status: "working" });
+    conn.emit({ event: "previewUpdate", preview: "run tests?" });
+    expect(sink.setStatus).toHaveBeenCalledWith("p/a", "working");
+    expect(sink.setPreview).toHaveBeenCalledWith("p/a", "run tests?");
   });
 
   it("clears the sink on a closed event", () => {
-    const activity = {
-      noteOutput: vi.fn(),
-      noteMarker: vi.fn(),
-      clear: vi.fn(),
-    };
+    const sink = { setStatus: vi.fn(), setPreview: vi.fn(), clear: vi.fn() };
     const { el: hEl, conn } = makeHarness();
     new TerminalController(
       hEl,
       conn as unknown as SessionConnection,
       undefined,
-      {
-        sessionKey: "api/fix",
-        activity,
-      },
+      { sessionKey: "p/a", activity: sink },
     );
     conn.emit({ event: "closed" });
-    expect(activity.clear).toHaveBeenCalledWith("api/fix");
+    expect(sink.clear).toHaveBeenCalledWith("p/a");
   });
 
-  it("does not call noteOutput for bytes replayed from the backlog on subscribe, but does for live bytes after", () => {
-    // Simulates attaching to an already-active session: the connection replays
-    // buffered bytes synchronously inside subscribe(), then delivers live bytes
-    // asynchronously. Replayed bytes must NOT count as live activity (they are
-    // catch-up output, not fresh agent work), while live bytes MUST.
-    const activity = {
-      noteOutput: vi.fn(),
-      noteMarker: vi.fn(),
-      clear: vi.fn(),
-    };
-    // A connection that replays one buffered bytes event synchronously on subscribe.
-    let sub: OnOutput | null = null;
-    const unsubscribe = vi.fn();
-    const bufferedConn = {
-      closed: false,
-      subscribe: vi.fn((cb: OnOutput) => {
-        sub = cb;
-        // Synchronous replay of buffered output — same contract as real openConnection.
-        cb({ event: "bytes", bytes: [104, 105] });
-        return unsubscribe;
-      }),
-      write: vi.fn().mockResolvedValue(undefined),
-      resize: vi.fn().mockResolvedValue(undefined),
-      close: vi.fn().mockResolvedValue(undefined),
-      unsubscribe,
-      emit: (m: BridgeOutput) => sub?.(m),
-    };
-    const hEl = {} as HTMLElement;
-    new TerminalController(
-      hEl,
-      bufferedConn as unknown as SessionConnection,
-      undefined,
-      { sessionKey: "s/attach", activity },
-    );
-    // The replayed byte must have been written to the terminal.
-    expect(xt.state.term?.written).toContainEqual(new Uint8Array([104, 105]));
-    // But noteOutput must NOT have been called for the replayed byte.
-    expect(activity.noteOutput).not.toHaveBeenCalled();
-
-    // A live byte arriving after subscribe() must call noteOutput.
-    bufferedConn.emit({ event: "bytes", bytes: [119] });
-    expect(activity.noteOutput).toHaveBeenCalledWith("s/attach");
-    expect(activity.noteOutput).toHaveBeenCalledTimes(1);
+  it("does not treat the OSC-7366 marker bytes as renderable output", () => {
+    // The no-op swallow handler returns true so xterm knows the sequence is
+    // handled and never renders the marker bytes as visible terminal text.
+    const { el: hEl, conn } = makeHarness();
+    new TerminalController(hEl, conn as unknown as SessionConnection);
+    const handler = xt.oscHandlers.get(7366);
+    expect(handler).toBeDefined();
+    // Returning true marks the sequence as handled; xterm does not fall back
+    // to rendering the raw bytes.
+    const result = handler?.(`remora;1;state;${btoa("working")}`);
+    expect(result).toBe(true);
+    // The no-op handler must not write any additional content to the terminal.
+    const textWritten = term()
+      .written.filter((w): w is string => typeof w === "string")
+      .join("");
+    expect(textWritten).not.toContain("7366");
   });
 });

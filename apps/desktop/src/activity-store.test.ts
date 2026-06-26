@@ -33,6 +33,14 @@ describe("ActivityStore (passive recorder)", () => {
     expect(s.getPreview("p/a")).toBeUndefined();
   });
 
+  it("setPreview does not notify subscribers (preview is not part of the status snapshot)", () => {
+    const s = new ActivityStore();
+    const cb = vi.fn();
+    s.subscribe(cb);
+    s.setPreview("p/a", "run tests?");
+    expect(cb).not.toHaveBeenCalled();
+  });
+
   it("getSnapshot returns a stable reference until a change", () => {
     const s = new ActivityStore();
     s.setStatus("p/a", "working");
