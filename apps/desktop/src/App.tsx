@@ -6,8 +6,9 @@ import { DiffPanel } from "./DiffPanel";
 import { NewSessionDialog } from "./NewSessionDialog";
 import { SettingsDialog } from "./SettingsDialog";
 import { Sidebar } from "./Sidebar";
-import { canRespawn, OPEN_CANCELLED } from "./session-store";
+import { canRespawn, OPEN_CANCELLED, tabKey } from "./session-store";
 import { buildTree, type SessionNode } from "./session-tree";
+import { shouldDisarmAfterSidebarOpen } from "./sidebar-focus";
 import { TabBar } from "./TabBar";
 import { Terminal, type TerminalHandle } from "./Terminal";
 import { Button, IconButton, Tag } from "./ui";
@@ -171,9 +172,19 @@ function App() {
       workspace: node.workspace ?? "worktree",
     })
       .then((result) => {
-        if (!result.ok && result.error !== OPEN_CANCELLED) {
-          // See the respawn path: disarm so a no-op open can't leak focus.
+        // A no-op open (failure, or a dedupe to a non-live tab) leaves the
+        // intent flag armed where the focus effect can't consume it, so it
+        // would steal focus on the next change. Disarm those — but keep the arm
+        // when deduping to a *live* tab: clicking an open live session in the
+        // sidebar should focus its terminal (#136). Read the tab's status fresh
+        // since the dedupe target may have changed since render.
+        const existing = sessionStore
+          .getSnapshot()
+          .tabs.find((t) => t.key === tabKey(node.projectId, node.sessionId));
+        if (shouldDisarmAfterSidebarOpen(result, existing?.status ?? null)) {
           focusOnSelect.current = false;
+        }
+        if (!result.ok && result.error !== OPEN_CANCELLED) {
           setNotice("Could not open the session. It may have stopped.");
         }
       })
