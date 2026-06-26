@@ -1,0 +1,33 @@
+<svg width="300" height="104" viewBox="0 0 300 104" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Remora">
+  <defs>
+    <linearGradient id="w-body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4D8DFF"></stop>
+      <stop offset="1" stop-color="#155CD9"></stop>
+    </linearGradient>
+    <linearGradient id="w-disc" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#AFCCFF"></stop>
+      <stop offset="1" stop-color="#6EA4FF"></stop>
+    </linearGradient>
+  </defs>
+  <g transform="translate(47.6 47.2) scale(1.45)">
+    <path d="M50 19 L31 21 L35 13 Z" fill="#1048AD"></path>
+    <path d="M45 27 L30 28 L33 34 Z" fill="#1048AD"></path>
+    <path d="M69 28 C64 33 60 35 57 35 C61 31 64 29 68 27 Z" fill="#1048AD"></path>
+    <path d="M92 25 C86 20.5 80 19.5 73 19.5 C58 19.5 38 21.3 22 22.4 L6 14 C10.5 20 10.5 27.5 6 33 L22 25.6 C38 26.7 58 28.5 73 28.5 C81 28.5 87 28.5 92 25 Z" fill="url(#w-body)"></path>
+    <path d="M22 25.6 C38 26.7 58 28.5 73 28.5 C81 28.5 87 28.5 92 25 C87 26.4 81 26.6 73 26.6 C58 26.6 38 25 22 24 Z" fill="#1048AD" opacity=".5"></path>
+    <g transform="rotate(8 72 17.8)">
+      <ellipse cx="72" cy="17.8" rx="14" ry="5.1" fill="url(#w-disc)" stroke="#155CD9" stroke-width="1"></ellipse>
+      <line x1="60" y1="17.8" x2="84" y2="17.8" stroke="#155CD9" stroke-width="0.9" opacity=".7"></line>
+      <g stroke="#155CD9" stroke-width="0.9" opacity=".55" stroke-linecap="round">
+        <line x1="64" y1="17.8" x2="61.8" y2="15.2"></line><line x1="64" y1="17.8" x2="61.8" y2="20.4"></line>
+        <line x1="68" y1="17.8" x2="65.8" y2="14.9"></line><line x1="68" y1="17.8" x2="65.8" y2="20.7"></line>
+        <line x1="72" y1="17.8" x2="69.8" y2="14.8"></line><line x1="72" y1="17.8" x2="69.8" y2="20.8"></line>
+        <line x1="76" y1="17.8" x2="73.8" y2="14.9"></line><line x1="76" y1="17.8" x2="73.8" y2="20.7"></line>
+        <line x1="80" y1="17.8" x2="77.8" y2="15.2"></line><line x1="80" y1="17.8" x2="77.8" y2="20.4"></line>
+      </g>
+    </g>
+    <circle cx="85" cy="23.4" r="2.1" fill="#0c0d12"></circle>
+    <circle cx="85.7" cy="22.7" r=".7" fill="#fff"></circle>
+  </g>
+  <text x="20" y="74" font-family="Inter, system-ui, sans-serif" font-size="62" font-weight="650" letter-spacing="-0.02em" fill="#EAF1FF">remora</text>
+</svg>
