@@ -296,12 +296,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (e.g. the no-projects state). This is the focus half of the per-project **+**
   (#98).
 - Creating a session through the New Session dialog now focuses its terminal, so
-  you can type the first prompt without clicking into the pane first (closes
-  #78). A successful spawn previously restored focus to the **+ New session**
+  you can type the first prompt without clicking into the pane first (closes #78,
+  #126). A successful spawn previously restored focus to the **+ New session**
   button; it now routes into the same focus path a tab/sidebar selection uses
   (arming `focusOnSelect` so the activeKey effect focuses the terminal once it's
-  live). Attach, cancel, and open-failure keep focus on the + button — there's no
-  fresh terminal to type into in those cases.
+  live). The spawn path arms that flag only after `openSession` has already
+  flipped `activeKey`, so it also bumps a `focusRequest` counter to re-run the
+  focus effect and claim the flag — without that nudge the effect never re-fired
+  and focus never landed. Attach, cancel, and open-failure keep focus on the +
+  button — there's no fresh terminal to type into in those cases.
 - Session, project, host, and agent ids now accept uppercase letters and
   canonicalize them to lowercase as you type, instead of rejecting them (closes
   #80). Ids must be lowercase `[a-z0-9-]` slugs (ADR-0004), so a keyboard that
