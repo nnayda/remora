@@ -159,6 +159,7 @@ pub fn join(
                 agent: env.agent,
                 created_at: env.created_at,
                 workspace_path: env.workspace_path,
+                branch: None,
             }
         })
         .collect();
@@ -176,6 +177,7 @@ pub fn join(
             workspace_path: clean_metadata(&path),
             // A surviving worktree IS a worktree session.
             workspace: Some(WorkspaceMode::Worktree),
+            branch: None,
         });
     }
 

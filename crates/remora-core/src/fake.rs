@@ -257,6 +257,7 @@ impl SessionSource for FakeSessionSource {
                 created_at: None,
                 workspace_path: None,
                 workspace: None,
+                branch: None,
             })
             .collect();
         // Deterministic order for callers and tests.
