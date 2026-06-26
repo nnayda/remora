@@ -917,8 +917,8 @@ mod tests {
     #[tokio::test]
     async fn respawn_preflight_probe_failure_is_transport() {
         let config = test_config();
-        // printf $HOME: success=false, swallowed → home = "~"; worktree list:
-        // empty → None → convention; test -d: fails with stderr → Transport.
+        // printf $HOME: success=true, empty stdout → not absolute → home = "~" (fallback);
+        // worktree list: empty → None → convention; test -d: fails with stderr → Transport.
         let fake = Arc::new(FakeExec::new(vec![
             Ok(FakeExec::ok()), // printf $HOME → home = "~" (fallback)
             Ok(FakeExec::ok()), // git worktree list → empty → None → convention

@@ -8,7 +8,8 @@ use remora_protocol::{AgentId, ProjectId, SessionId, SpawnSpec};
 
 use crate::config::{Config, HostId, WorkspaceMode};
 use crate::naming::{
-    branch_name, tmux_session_name, worktree_path, ENV_AGENT, ENV_CREATED_AT, ENV_WORKSPACE,
+    branch_name, derive_session_id, tmux_session_name, worktree_path, ENV_AGENT, ENV_CREATED_AT,
+    ENV_WORKSPACE,
 };
 
 /// Why a spawn could not be planned from local config. Typed (not a string)
@@ -97,6 +98,17 @@ pub fn plan_spawn(config: &Config, spec: &SpawnSpec) -> Result<SpawnPlan, PlanEr
             };
             match branch {
                 Some(branch) => {
+                    // Enforce branch-as-identity: session_id must equal
+                    // derive_session_id(branch). Catches too-long branches
+                    // (derive returns None → guaranteed mismatch) and any
+                    // mismatched relay/client mint. Back-compat arm (branch ==
+                    // None) is unchanged.
+                    if derive_session_id(Some(&branch)) != Some(spec.session_id.clone()) {
+                        return Err(PlanError::Invalid(
+                            "branch",
+                            "session_id must equal derive_session_id(branch)",
+                        ));
+                    }
                     // New: <root or convention-root>/<branch>, raw branch (no remora/ prefix).
                     let root = root.unwrap_or_else(|| {
                         format!("~/.remora/worktrees/{}", spec.project_id.as_str())
@@ -185,8 +197,12 @@ pub(crate) fn normalize_branch(raw: Option<String>) -> Result<Option<String>, Pl
         || b.ends_with('/')
         || b.ends_with(".lock")
         || b.chars().any(char::is_whitespace)
-        || b.chars()
-            .any(|c| matches!(c, ';' | '$' | '`' | '&' | '|' | '(' | ')' | '<' | '>'))
+        || b.chars().any(|c| {
+            matches!(
+                c,
+                ';' | '$' | '`' | '&' | '|' | '(' | ')' | '<' | '>' | '\\'
+            )
+        })
     {
         return Err(PlanError::Invalid("branch", "is not a valid git ref name"));
     }
@@ -206,6 +222,9 @@ pub(crate) fn normalize_worktree_root(raw: Option<String>) -> Result<Option<Stri
             "worktree_root",
             "must be absolute or `~/`-relative",
         ));
+    }
+    if r.split('/').any(|c| c == "..") {
+        return Err(PlanError::Invalid("worktree_root", "must not contain `..`"));
     }
     let trimmed = r.trim_end_matches('/').to_string();
     // Guard degenerate roots: "/" trims to "" and "~/" trims to "~" — both
@@ -229,6 +248,7 @@ fn now_unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::naming::derive_session_id;
 
     fn config() -> Config {
         let toml = r#"
@@ -509,7 +529,8 @@ mod tests {
         let cfg = config();
         let spec = SpawnSpec {
             project_id: ProjectId::new("api").expect("slug"),
-            session_id: SessionId::new("s1").expect("slug"),
+            // session_id must equal derive_session_id(branch) (Fix 1 enforcement).
+            session_id: derive_session_id(Some("feat/login")).expect("derive"),
             agent: None,
             base: None,
             workspace: None,
@@ -542,7 +563,8 @@ mod tests {
         let cfg = Config::from_toml_str(toml).expect("valid config");
         let spec = SpawnSpec {
             project_id: ProjectId::new("api").expect("slug"),
-            session_id: SessionId::new("s1").expect("slug"),
+            // session_id must equal derive_session_id(branch) (Fix 1 enforcement).
+            session_id: derive_session_id(Some("feat/login")).expect("derive"),
             agent: None,
             base: None,
             workspace: None,
@@ -556,7 +578,8 @@ mod tests {
         let cfg2 = config(); // api project has no worktree_root; host has none either
         let spec2 = SpawnSpec {
             project_id: ProjectId::new("api").expect("slug"),
-            session_id: SessionId::new("s1").expect("slug"),
+            // session_id must equal derive_session_id(branch) (Fix 1 enforcement).
+            session_id: derive_session_id(Some("feat/login")).expect("derive"),
             agent: None,
             base: None,
             workspace: None,
@@ -590,7 +613,8 @@ mod tests {
         let cfg = Config::from_toml_str(toml).expect("valid config");
         let spec = SpawnSpec {
             project_id: ProjectId::new("api").expect("slug"),
-            session_id: SessionId::new("s1").expect("slug"),
+            // session_id must equal derive_session_id(branch) (Fix 1 enforcement).
+            session_id: derive_session_id(Some("feat/login")).expect("derive"),
             agent: None,
             base: None,
             workspace: None,
@@ -617,5 +641,118 @@ mod tests {
         let plan = plan_spawn(&cfg, &spec).expect("plan");
         assert_eq!(plan.branch.as_deref(), Some("remora/s1"));
         assert_eq!(plan.dir, "~/.remora/worktrees/api/s1");
+    }
+
+    // ── Fix 1 new tests: branch-as-identity enforcement ─────────────────────
+
+    #[test]
+    fn plan_spawn_branch_mismatched_session_id_rejects() {
+        // A branch with a session_id that doesn't equal derive_session_id(branch)
+        // must be rejected at spawn — not silently produce an un-teardownable session.
+        let cfg = config();
+        let spec = SpawnSpec {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("s1").expect("slug"), // wrong: derive("feat/login") != "s1"
+            agent: None,
+            base: None,
+            workspace: None,
+            branch: Some("feat/login".into()),
+            worktree_root: None,
+        };
+        let err = plan_spawn(&cfg, &spec).expect_err("should reject mismatched session_id");
+        assert!(
+            matches!(err, PlanError::Invalid("branch", _)),
+            "expected Invalid(branch, _), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn plan_spawn_branch_too_long_rejects() {
+        // A branch whose slug exceeds SessionId's max length makes derive_session_id
+        // return None → guaranteed mismatch → loud error at spawn (not silent orphan).
+        let cfg = config();
+        let long_branch = format!("feature/{}", "a".repeat(60));
+        let spec = SpawnSpec {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("s1").expect("slug"),
+            agent: None,
+            base: None,
+            workspace: None,
+            branch: Some(long_branch),
+            worktree_root: None,
+        };
+        let err = plan_spawn(&cfg, &spec).expect_err("too-long branch should fail");
+        assert!(
+            matches!(err, PlanError::Invalid("branch", _)),
+            "expected Invalid(branch, _), got {err:?}"
+        );
+    }
+
+    // ── Fix 2 new tests: `..` rejection in normalize_worktree_root ──────────
+
+    #[test]
+    fn normalize_worktree_root_rejects_path_traversal() {
+        // `..` is a path-traversal hazard; reject it regardless of prefix.
+        assert!(
+            normalize_worktree_root(Some("~/../../etc".into())).is_err(),
+            "tilde-relative traversal must be rejected"
+        );
+        assert!(
+            normalize_worktree_root(Some("/a/../b".into())).is_err(),
+            "absolute traversal must be rejected"
+        );
+        // A segment that merely contains `..` but isn't exactly `..` is fine.
+        assert!(
+            normalize_worktree_root(Some("~/..hidden".into())).is_ok(),
+            "..hidden is not a traversal component"
+        );
+    }
+
+    // ── Fix 3 new test: `\` in normalize_branch ─────────────────────────────
+
+    #[test]
+    fn normalize_branch_rejects_backslash() {
+        // The doc comment lists `\` as rejected; the match must include it.
+        assert!(
+            normalize_branch(Some("feat\\evil".into())).is_err(),
+            "backslash in branch must be rejected"
+        );
+    }
+
+    // ── Fix 5: session worktree_root beats project worktree_root ────────────
+
+    #[test]
+    fn plan_spawn_session_root_wins_over_project_root() {
+        // When both project.worktree_root and spec.worktree_root are set,
+        // the session (spec) root wins: dir = <session_root>/<branch>.
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+
+            [projects.api]
+            host = "devbox"
+            path = "/home/dev/api"
+            workspace = "worktree"
+            agent = "claude"
+            worktree_root = "~/proj"
+
+            [agents.claude]
+            command = ["claude", "--continue"]
+        "#;
+        let cfg = Config::from_toml_str(toml).expect("valid config");
+        let spec = SpawnSpec {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: derive_session_id(Some("feat/login")).expect("derive"),
+            agent: None,
+            base: None,
+            workspace: None,
+            branch: Some("feat/login".into()),
+            worktree_root: Some("~/session".into()), // session root overrides project root
+        };
+        let plan = plan_spawn(&cfg, &spec).expect("plan");
+        // Session-level root wins over project-level root.
+        assert_eq!(plan.dir, "~/session/feat/login");
+        assert_eq!(plan.branch.as_deref(), Some("feat/login")); // raw, no remora/ prefix
     }
 }
