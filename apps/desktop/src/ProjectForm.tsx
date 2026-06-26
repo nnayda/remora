@@ -142,6 +142,13 @@ export function ProjectForm({
         placeholder="origin/main (auto-detected if empty)"
         onChange={(e) => set("base", e.target.value)}
       />
+      <Input
+        label="Worktree root (optional)"
+        mono
+        value={form.worktreeRoot}
+        placeholder="~/.remora/worktrees/<project> (host default if empty)"
+        onChange={(e) => set("worktreeRoot", e.target.value)}
+      />
       {error && (
         <p className="settings-error" role="alert">
           {error}
