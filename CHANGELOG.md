@@ -270,6 +270,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Quieter sidebar chrome**: dropped the per-session "open in a tab" indicator
+  dot and the session-count badges on host and project rows. The counts and the
+  open-tab marker added visual noise without carrying enough signal; the sidebar
+  now reads as host → project → session name plus the activity pulse, with the
+  row actions menu revealed on hover. Removes the now-unused `openKeys` prop
+  threaded from `App` through the sidebar tree and the dead CSS for the count
+  badges and trailing dot. Pure presentation: no transport, store, or protocol
+  changes.
+
 - **Faster session discovery** (#108): listing remote sessions now reads each
   session's `REMORA_*` metadata inline via tmux 3.0's `#{E:VAR}` expansion,
   replacing the old one-`show-environment`-per-session fan-out — the bulk of
