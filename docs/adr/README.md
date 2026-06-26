@@ -23,6 +23,8 @@ the old one rather than editing history (see
 | [0010](0010-in-band-activity-osc-marker.md) | Carry agent-activity signals in-band via a tmux-passthrough OSC marker | Accepted |
 | [0011](0011-ssh-connection-multiplexing-direct-mode.md) | Multiplex direct-mode ssh over one authenticated master (ControlMaster) | Accepted |
 | [0012](0012-client-side-activity-detection.md) | Detect agent activity client-side in the attached terminal, quiescence-primary | Accepted |
+| [0013](0013-core-side-activity-detector.md) | Run the activity detector core-side as the sole output_tx sender | Accepted |
+| [0014](0014-config-file-watcher-and-typed-event-channel.md) | Watch the config file and push changes via a typed Rust→frontend event | Accepted |
 
 ## Statuses
 

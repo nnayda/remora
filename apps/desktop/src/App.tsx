@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { WorkspaceModeDto } from "./bindings";
 import { ConfirmRemoveDialog } from "./ConfirmRemoveDialog";
+import { subscribeConfigChanged } from "./config-watch-listener";
 import { DiffPanel } from "./DiffPanel";
 import { NewSessionDialog } from "./NewSessionDialog";
 import { SettingsDialog } from "./SettingsDialog";
@@ -41,6 +42,27 @@ function App() {
   }, []);
   const { config, sessions, configError, discoveryUnavailable, refresh } =
     useDiscovery();
+
+  // Live-reload the sidebar when the config file changes on disk (backend
+  // watcher emits ConfigChanged). Mirrors the manual refresh button.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    subscribeConfigChanged(() => void refresh())
+      .then((fn) => {
+        // If the effect already cleaned up before listen() resolved, unlisten
+        // immediately; otherwise hand the cleanup the handle.
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      // A failed listen() leaves manual refresh working; never throw an
+      // unhandled rejection that would surface as a console error.
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [refresh]);
   const [dialogOpen, setDialogOpen] = useState(false);
   // Project the New Session dialog is pre-scoped to (per-project sidebar "+"),
   // or null for the global "+ New session" entry point.

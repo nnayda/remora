@@ -171,6 +171,11 @@ async configRemoveAgent(id: string) : Promise<Result<null, BridgeError>> {
 /** user-defined events **/
 
 
+export const events = __makeEvents__<{
+configChanged: ConfigChanged
+}>({
+configChanged: "config-changed"
+})
 
 /** user-defined constants **/
 
@@ -220,6 +225,12 @@ export type BridgeOutput = { event: "bytes"; bytes: number[] } | { event: "close
  * Opaque handle the frontend uses to address one open channel (write/resize/close).
  */
 export type ChannelHandle = number
+/**
+ * Emitted when the per-device config file changes on disk (file watcher).
+ * Carries no payload — the frontend re-reads via `config_get` (its existing
+ * refresh path), so the event is a ping, not a config snapshot.
+ */
+export type ConfigChanged = null
 /**
  * The whole per-device config, projected for the sidebar. `Default` is the
  * empty config a fresh device (no file yet) renders.

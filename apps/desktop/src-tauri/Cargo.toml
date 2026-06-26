@@ -28,6 +28,8 @@ tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
 specta = { version = "=2.0.0-rc.22", features = ["derive", "serde"] }
 specta-typescript = "=0.0.9"
 tokio = { workspace = true, features = ["sync", "macros", "rt", "time"] }
+notify = "8"
+notify-debouncer-full = "0.5"
 
 [dev-dependencies]
 async-trait = { workspace = true }
