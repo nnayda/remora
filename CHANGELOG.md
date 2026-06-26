@@ -20,9 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   byte→status ordering, the `recv()→None` teardown, and no false `idle` under
   backpressure. `awaiting` is marker-only (never inferred); the untrusted marker
   payload is base64-decoded, control- and format-stripped, and length-capped
-  before becoming a preview. Recorded in ADR-0013. Detector events are emitted
-  but not yet consumed by the desktop — that migration (retiring the client-side
-  detector) is the second, stacked PR for #69.
+  before becoming a preview. Recorded in ADR-0013. The desktop consumes these
+  events to drive the per-session activity indicator and the client-side
+  OSC/quiescence detector is retired — detection now lives solely in core, and
+  the UI renders the events it is handed. Shipped as two stacked PRs (core
+  foundation, then the desktop migration). Net visible behavior is unchanged:
+  working/idle is live; `awaiting` (red) and the preview stay dormant until an
+  agent emits the marker (#61).
 
 - **Desktop design system + app redesign**: the desktop frontend now renders
   through a token-driven design system instead of the placeholder stylesheet —

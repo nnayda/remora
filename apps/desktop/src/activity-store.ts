@@ -1,6 +1,7 @@
 /** Rendered activity for a session, sourced from core's status events (ADR-0013).
  * `idle` = output paused (blue, NOT "done"); `awaiting` = needs-you (red),
- * marker-only; `unknown` = attached, no signal yet. */
+ * asserted by core via the marker, never inferred; `unknown` = attached, no
+ * signal yet. */
 export type ActivityState = "working" | "idle" | "awaiting" | "unknown";
 
 /** The write surface a TerminalController uses to record core-emitted events.
