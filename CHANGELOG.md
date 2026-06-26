@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Structured per-session status + event channel** (#69, core foundation): the
+  session channel now carries typed activity events alongside raw PTY bytes.
+  `ChannelOutput` gains `StatusChange(SessionStatus)` (`working` / `idle` /
+  `awaiting` / `unknown`) and `PreviewUpdate(String)` on the same ordered stream
+  (`PROTOCOL_VERSION` 0 → 1). A core-side detector — a clock-free quiescence
+  state machine plus a `vte`-based OSC-7366 marker parser (the Rust port of #55's
+  client units) — runs in the PTY bridge: a single detector thread is the sole
+  sender to the channel and uses `recv_timeout` as its settle clock, preserving
+  byte→status ordering, the `recv()→None` teardown, and no false `idle` under
+  backpressure. `awaiting` is marker-only (never inferred); the untrusted marker
+  payload is base64-decoded, control- and format-stripped, and length-capped
+  before becoming a preview. Recorded in ADR-0013. Detector events are emitted
+  but not yet consumed by the desktop — that migration (retiring the client-side
+  detector) is the second, stacked PR for #69.
+
 - **Desktop design system + app redesign**: the desktop frontend now renders
   through a token-driven design system instead of the placeholder stylesheet —
   dark-first with an OS-following light theme (the terminal stays dark in both),
