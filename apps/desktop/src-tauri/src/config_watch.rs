@@ -1,9 +1,10 @@
 //! Per-device config file watcher.
 //!
-//! Watches the config file's *parent directory* (atomic-rename safe), debounces
-//! bursty editor writes, and invokes a callback when the config file itself
-//! changes. The Tauri-specific emit is injected (see `watch_config`), so the
-//! watch wiring is testable without an `AppHandle`.
+//! Watches the config file's *parent directory* (atomic-rename safe; a symlinked
+//! config path is resolved to its real target first), debounces bursty editor
+//! writes, and invokes a callback when the config file itself changes. The
+//! Tauri-specific emit is injected (see `watch_config`), so the watch wiring is
+//! testable without an `AppHandle`.
 //!
 //! ```text
 //! config.toml saved → debouncer (parent dir) → event_concerns_config filter
@@ -34,6 +35,17 @@ pub fn watch_config(
     on_change: impl Fn() + Send + 'static,
 ) -> notify::Result<()> {
     let config_path = config_path.to_path_buf();
+    // Mirror config save (`ConfigDocument::save`): if the config path is a
+    // symlink (dotfile managers symlink it into a repo), resolve to the real
+    // file so we watch the directory writes actually land in — the symlink's
+    // own parent never sees the atomic rename into the real target's dir.
+    // Non-symlinks (the common case) are untouched; an unresolvable symlink
+    // falls back to the original path.
+    let config_path = if config_path.is_symlink() {
+        std::fs::canonicalize(&config_path).unwrap_or(config_path)
+    } else {
+        config_path
+    };
     let parent = config_path
         .parent()
         .map(Path::to_path_buf)
@@ -50,7 +62,16 @@ pub fn watch_config(
         // Keep the debouncer alive for as long as the thread (app) lives.
         let _debouncer = debouncer;
         for result in rx {
-            let Ok(events) = result else { continue };
+            let events = match result {
+                Ok(events) => events,
+                Err(errors) => {
+                    // Non-fatal: a transient debouncer error (dropped inotify
+                    // event, watch-queue overflow) shouldn't wedge live-reload
+                    // for the rest of the session. Log and keep watching.
+                    eprintln!("config watcher error: {errors:?}");
+                    continue;
+                }
+            };
             if events
                 .iter()
                 .any(|e| event_concerns_config(&e.paths, &config_path))
@@ -124,6 +145,63 @@ mod tests {
         let got = rx.recv_timeout(Duration::from_secs(5));
         std::fs::remove_dir_all(&dir).ok();
         assert!(got.is_ok(), "expected a debounced change event");
+    }
+
+    #[test]
+    fn does_not_fire_on_sibling_write() {
+        // Proves the `event_concerns_config` filter is actually wired into the
+        // watch loop (the predicate's sibling case is unit-tested in isolation;
+        // this confirms a real sibling write does NOT reach the callback).
+        let dir = temp_dir("sibling");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let cfg = dir.join("config.toml");
+        let sibling = dir.join("other.toml");
+
+        let (tx, rx) = mpsc::channel();
+        watch_config(&cfg, Duration::from_millis(20), move || {
+            let _ = tx.send(());
+        })
+        .expect("watcher starts");
+
+        std::thread::sleep(Duration::from_millis(150));
+        std::fs::write(&sibling, "irrelevant\n").expect("write sibling");
+
+        // Give the debouncer ample time to fire if it were going to (debounce
+        // is 20ms); a sibling write must produce nothing.
+        let got = rx.recv_timeout(Duration::from_millis(400));
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(got.is_err(), "a sibling write must not trigger on_change");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fires_on_write_through_a_symlinked_config() {
+        // Dotfile-manager pattern: the config path is a symlink into a repo, so
+        // writes land in the real target's dir, not the symlink's parent. The
+        // watcher must resolve the symlink to see them (mirrors save()).
+        let base = temp_dir("symlink");
+        std::fs::remove_dir_all(&base).ok();
+        let real_dir = base.join("real");
+        let link_dir = base.join("link");
+        std::fs::create_dir_all(&real_dir).expect("mkdir real");
+        std::fs::create_dir_all(&link_dir).expect("mkdir link");
+        let real = real_dir.join("config.toml");
+        std::fs::write(&real, "hosts = {}\n").expect("seed real config");
+        let link = link_dir.join("config.toml");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let (tx, rx) = mpsc::channel();
+        watch_config(&link, Duration::from_millis(20), move || {
+            let _ = tx.send(());
+        })
+        .expect("watcher starts");
+
+        std::thread::sleep(Duration::from_millis(150));
+        std::fs::write(&real, "hosts = {}\n# edit\n").expect("edit real config");
+
+        let got = rx.recv_timeout(Duration::from_secs(5));
+        std::fs::remove_dir_all(&base).ok();
+        assert!(got.is_ok(), "a write through a symlinked config must fire");
     }
 
     #[test]
