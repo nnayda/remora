@@ -42,8 +42,12 @@ export function deriveSessionId(branch: string): string | null {
     }
   }
 
-  // Slugify: lowercase, non-[a-z0-9] → '-', collapse runs, trim, fallback 'x'.
-  const lowered = branch.toLowerCase().replace(/[^a-z0-9]/g, "-");
+  // Slugify: non-ASCII-alphanumeric → '-', then lowercase, collapse runs, trim,
+  // fallback 'x'. The replace MUST precede toLowerCase to mirror Rust's per-char
+  // `is_ascii_alphanumeric() ? to_ascii_lowercase() : '-'`: JS `toLowerCase()`
+  // special-case-folds a few non-ASCII codepoints into ASCII (e.g. `İ` U+0130 →
+  // `i`, KELVIN SIGN U+212A → `k`), so lowercasing first would diverge from Rust.
+  const lowered = branch.replace(/[^A-Za-z0-9]/g, "-").toLowerCase();
   const parts = lowered.split("-").filter((s) => s.length > 0);
   const slug = parts.length > 0 ? parts.join("-") : "x";
 

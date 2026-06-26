@@ -106,7 +106,11 @@ afterEach(() => {
 describe("NewSessionDialog — Branch name field", () => {
   it("renders a 'Branch name' text input", () => {
     renderDialog();
-    expect(screen.getByRole("textbox", { name: /branch name/i })).toBeDefined();
+    // getByRole throws if absent, so the query itself is the assertion; assert
+    // non-null rather than a no-op toBeDefined() on a guaranteed-defined value.
+    expect(
+      screen.queryByRole("textbox", { name: /branch name/i }),
+    ).not.toBeNull();
   });
 
   it("does NOT render a 'Session' text input (old sessionId field is gone)", () => {

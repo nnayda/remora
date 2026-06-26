@@ -2,5 +2,6 @@
   { "branch": "remora/fix-login", "session_id": "fix-login" },
   { "branch": "feat/login", "session_id": "feat-login-a15997df" },
   { "branch": "feat-login", "session_id": "feat-login-fc04d919" },
-  { "branch": "release/1.2", "session_id": "release-1-2-1884638e" }
+  { "branch": "release/1.2", "session_id": "release-1-2-1884638e" },
+  { "branch": "İstanbul", "session_id": "stanbul-93b79d90" }
 ]
