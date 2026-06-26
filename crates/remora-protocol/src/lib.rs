@@ -11,7 +11,7 @@ mod session;
 
 pub use channel::{ChannelInput, ChannelOutput, InvalidTerminalSizeError, TerminalSize};
 pub use id::{AgentId, InvalidIdError, ProjectId, SessionId, MAX_ID_LEN};
-pub use session::{SessionMeta, SessionState, SpawnSpec, WorkspaceMode};
+pub use session::{SessionMeta, SessionState, SessionStatus, SpawnSpec, WorkspaceMode};
 
 /// Version of the wire format defined by this crate.
 ///
@@ -19,4 +19,4 @@ pub use session::{SessionMeta, SessionState, SpawnSpec, WorkspaceMode};
 /// message enum (or changing a representation) is a breaking change: bump
 /// this constant and gate compatibility on it. The tmux naming and worktree
 /// conventions of ADR-0004 version alongside it.
-pub const PROTOCOL_VERSION: u32 = 0;
+pub const PROTOCOL_VERSION: u32 = 1;

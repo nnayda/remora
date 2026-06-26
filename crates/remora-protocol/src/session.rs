@@ -33,6 +33,23 @@ pub enum SessionState {
     Stopped,
 }
 
+/// Per-session agent activity, distinct from lifecycle [`SessionState`].
+///
+/// Produced by the core-side detector (ADR-0013). `Awaiting` is **marker-only,
+/// never inferred** from a quiescent screen. `Unknown` is the initial state of a
+/// freshly-attached channel before any byte arrives; it is never produced by a
+/// parse failure. Closed by construction; adding a variant is a breaking change
+/// (bump [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SessionStatus {
+    Working,
+    Idle,
+    Awaiting,
+    Unknown,
+}
+
 /// One discovered session, as rendered in the sidebar.
 ///
 /// `project_id`/`session_id`/`state` come from the tmux session name and
@@ -254,5 +271,27 @@ mod tests {
                 .workspace,
             None
         );
+    }
+
+    #[test]
+    fn session_status_wire_format_is_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&SessionStatus::Working).expect("ser"),
+            r#""working""#
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionStatus::Idle).expect("ser"),
+            r#""idle""#
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionStatus::Awaiting).expect("ser"),
+            r#""awaiting""#
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionStatus::Unknown).expect("ser"),
+            r#""unknown""#
+        );
+        let back: SessionStatus = serde_json::from_str(r#""awaiting""#).expect("de");
+        assert_eq!(back, SessionStatus::Awaiting);
     }
 }

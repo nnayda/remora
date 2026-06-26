@@ -107,16 +107,23 @@ pub enum ChannelInput {
 
 /// Session → client.
 ///
-/// A single variant today. Adding a variant is a breaking protocol change:
-/// externally tagged serde enums reject unknown variants, so older clients
-/// fail closed rather than skipping unknown messages. Growth therefore
-/// requires a [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION) bump.
+/// Carries raw PTY output and activity events. Adding a variant is a breaking
+/// protocol change: externally tagged serde enums reject unknown variants, so
+/// older clients fail closed rather than skipping unknown messages. Growth
+/// therefore requires a [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION) bump.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ChannelOutput {
     /// Raw PTY output. Feed to a terminal emulator; never parse.
     Bytes(Vec<u8>),
+    /// A change in detected agent activity (ADR-0013). Rides the same stream as
+    /// `Bytes`, ordered after the bytes that triggered it.
+    StatusChange(crate::SessionStatus),
+    /// A short, already-sanitized one-line preview of the latest agent output
+    /// (ADR-0013). The sender (core) control-strips + length-caps the untrusted
+    /// payload before constructing this; consumers render it as text.
+    PreviewUpdate(String),
 }
 
 #[cfg(test)]
@@ -204,5 +211,23 @@ mod tests {
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: ChannelInput = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, ChannelInput::Bytes(invalid_utf8));
+    }
+
+    #[test]
+    fn status_change_wire_format() {
+        let msg = ChannelOutput::StatusChange(crate::SessionStatus::Awaiting);
+        let json = serde_json::to_string(&msg).expect("ser");
+        assert_eq!(json, r#"{"status_change":"awaiting"}"#);
+        let back: ChannelOutput = serde_json::from_str(&json).expect("de");
+        assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn preview_update_wire_format() {
+        let msg = ChannelOutput::PreviewUpdate("run tests? (y/n)".to_string());
+        let json = serde_json::to_string(&msg).expect("ser");
+        assert_eq!(json, r#"{"preview_update":"run tests? (y/n)"}"#);
+        let back: ChannelOutput = serde_json::from_str(&json).expect("de");
+        assert_eq!(msg, back);
     }
 }
