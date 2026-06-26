@@ -47,7 +47,7 @@ describe("SessionStore", () => {
   it("opens a session as a focused tab", async () => {
     const store = new SessionStore(instantOpeners());
     const result = await store.openSession(spec("api", "fix"));
-    expect(result).toEqual({ ok: true, attached: false });
+    expect(result).toEqual({ ok: true, attached: false, opened: true });
     const snap = store.getSnapshot();
     expect(snap.tabs.map((t) => t.key)).toEqual(["api/fix"]);
     expect(snap.activeKey).toBe("api/fix");
@@ -56,7 +56,7 @@ describe("SessionStore", () => {
   it("records attached:true from the opener", async () => {
     const store = new SessionStore(instantOpeners(true));
     const result = await store.openSession(spec("api", "fix"));
-    expect(result).toEqual({ ok: true, attached: true });
+    expect(result).toEqual({ ok: true, attached: true, opened: true });
     expect(store.getSnapshot().tabs[0].attached).toBe(true);
   });
 
@@ -75,10 +75,21 @@ describe("SessionStore", () => {
     await store.openSession(spec("web", "ui"));
     store.focusTab("api/fix"); // move focus away from web/ui
     const result = await store.openSession(spec("web", "ui", "other-agent"));
-    expect(result).toEqual({ ok: true, attached: false });
+    expect(result).toEqual({ ok: true, attached: false, opened: false });
     expect(openers.spawn).toHaveBeenCalledTimes(2); // not 3
     expect(store.getSnapshot().tabs).toHaveLength(2);
     expect(store.getSnapshot().activeKey).toBe("web/ui");
+  });
+
+  it("reports opened:true for a fresh spawn, opened:false for an existing tab (#133)", async () => {
+    const store = new SessionStore(instantOpeners());
+    // First open spawns a fresh tab.
+    const first = await store.openSession(spec("api", "fix"));
+    expect(first).toEqual({ ok: true, attached: false, opened: true });
+    // Re-opening the same key only focuses it — no fresh terminal, so the
+    // dialog/spawn-focus path must not arm focus on a possibly-non-live tab.
+    const second = await store.openSession(spec("api", "fix"));
+    expect(second).toEqual({ ok: true, attached: false, opened: false });
   });
 
   it("closeTab detaches the connection, removes the tab, focuses a neighbour", async () => {
@@ -820,7 +831,7 @@ describe("SessionStore openViaRespawn", () => {
     // spawn must NOT be called — only respawn
     expect(openers.spawn).not.toHaveBeenCalled();
     expect(openers.respawn).toHaveBeenCalledTimes(1);
-    expect(result).toEqual({ ok: true, attached: false });
+    expect(result).toEqual({ ok: true, attached: false, opened: true });
     const snap = store.getSnapshot();
     expect(snap.tabs).toHaveLength(1);
     expect(snap.tabs[0].status).toBe("live");
@@ -844,7 +855,7 @@ describe("SessionStore openViaRespawn", () => {
     expect(store.getSnapshot().activeKey).toBe("p/other");
     // Now call openViaRespawn for the already-open key
     const result = await store.openViaRespawn(spec("p", "s"));
-    expect(result).toEqual({ ok: true, attached: false });
+    expect(result).toEqual({ ok: true, attached: false, opened: false });
     // No second respawn opener call
     expect(openers.respawn).toHaveBeenCalledTimes(1);
     // Focus moved back to the existing tab
@@ -953,7 +964,7 @@ describe("SessionStore openViaRespawn", () => {
 
     // Now call openViaRespawn for the already-open stopped tab
     const result = await store2.openViaRespawn(spec("p", "s"));
-    expect(result).toEqual({ ok: true, attached: false });
+    expect(result).toEqual({ ok: true, attached: false, opened: false });
     // Focus should be on p/s
     expect(store2.getSnapshot().activeKey).toBe("p/s");
     // The respawn opener must have been invoked (via respawnTab)
