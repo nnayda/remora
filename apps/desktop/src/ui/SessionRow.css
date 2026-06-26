@@ -48,6 +48,14 @@
   margin-left: 2px;
   flex: none;
 }
+/* Placeholder for disconnected rows: reserves the status dot's footprint (the
+   StatusIndicator's "sm" 7px core) so session names line up whether or not a
+   row shows a dot. */
+.rmra-srow__pulse-empty {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+}
 .rmra-srow__body {
   min-width: 0;
   flex: 1;
@@ -66,6 +74,11 @@
 }
 .rmra-srow--active .rmra-srow__name {
   color: var(--text-primary);
+}
+/* Disconnected — no live terminal, so we can't report status. Mute the name to
+   read as "not connected" (the active row still wins and stays bright). */
+.rmra-srow--disconnected:not(.rmra-srow--active) .rmra-srow__name {
+  color: var(--text-secondary);
 }
 .rmra-srow__meta {
   display: flex;

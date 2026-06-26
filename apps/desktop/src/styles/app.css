@@ -129,14 +129,6 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.rk-host__count {
-  font-size: 10px;
-  font-family: var(--font-mono);
-  color: var(--text-muted);
-  background: var(--bg-active);
-  border-radius: var(--radius-xs);
-  padding: 1px 6px;
-}
 .rk-host__rows {
   display: flex;
   flex-direction: column;
@@ -190,12 +182,6 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.rk-proj__count {
-  font-size: 10px;
-  font-family: var(--font-mono);
-  color: var(--text-muted);
-  flex: none;
-}
 .rk-proj__actions {
   display: inline-flex;
   padding-right: 4px;
@@ -205,10 +191,6 @@
 .rk-proj__hdr:hover .rk-proj__actions,
 .rk-proj__hdr:focus-within .rk-proj__actions {
   opacity: 1;
-}
-.rk-proj__hdr:hover .rk-proj__count,
-.rk-proj__hdr:focus-within .rk-proj__count {
-  display: none;
 }
 .rk-proj__rows {
   display: flex;
@@ -717,18 +699,6 @@
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
-}
-.rk-srow-trail {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-3);
-}
-.rk-srow__open {
-  width: 5px;
-  height: 5px;
-  border-radius: var(--radius-circle);
-  background: var(--text-muted);
-  flex: none;
 }
 /* Footer identity avatar is decorative — reserve the accent for the four
    sanctioned spots, not a marine disc in the chrome. */

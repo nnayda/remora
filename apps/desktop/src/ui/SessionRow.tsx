@@ -18,6 +18,10 @@ export interface SessionRowProps
   branch?: string | null;
   /** Agent activity state — drives the pulse. @default "idle" */
   state?: IndicatorState;
+  /** Whether we have a live terminal for this session and therefore know its
+   * status. When false the row reads as disconnected: no status dot (we can't
+   * know the state) and muted text. @default true */
+  connected?: boolean;
   /** Selected session. @default false */
   active?: boolean;
   /** Unread / queued count chip. */
@@ -31,13 +35,19 @@ export function SessionRow({
   agent,
   branch = null,
   state = "idle",
+  connected = true,
   active = false,
   count = null,
   actions = null,
   className = "",
   ...props
 }: SessionRowProps) {
-  const cls = ["rmra-srow", active ? "rmra-srow--active" : "", className]
+  const cls = [
+    "rmra-srow",
+    active ? "rmra-srow--active" : "",
+    connected ? "" : "rmra-srow--disconnected",
+    className,
+  ]
     .filter(Boolean)
     .join(" ");
   const hasTrail = count != null || actions;
@@ -48,7 +58,13 @@ export function SessionRow({
     <div className={cls}>
       <button className="rmra-srow__main" {...props}>
         <span className="rmra-srow__pulse">
-          <StatusIndicator state={state} />
+          {connected ? (
+            <StatusIndicator state={state} />
+          ) : (
+            // Not connected — we have no terminal, so no status to show. Reserve
+            // the dot's footprint so names stay aligned with connected rows.
+            <span className="rmra-srow__pulse-empty" aria-hidden="true" />
+          )}
         </span>
         <span className="rmra-srow__body">
           <span className="rmra-srow__name">{name}</span>

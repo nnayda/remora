@@ -1,6 +1,12 @@
-# Remora
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/remora-wordmark-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/remora-wordmark-light.svg">
+    <img alt="Remora" src="docs/assets/remora-wordmark-light.svg" width="320">
+  </picture>
+</p>
 
-**Persistent remote coding-agent sessions, from any device.**
+<p align="center"><strong>Persistent remote coding-agent sessions, from any device.</strong></p>
 
 Remora is a cross-platform client for native coding-agent CLIs — Claude Code
 first, Codex and others by design — running on a remote sandbox. Each coding
@@ -8,8 +14,12 @@ session is a tab; each tab is a git worktree plus a tmux session on your
 sandbox. Close the laptop mid-task, reopen it — or open your phone — and the
 agent is still running, exactly where you left it.
 
-> **Status: pre-alpha.** The scaffold is in place; the app is not yet usable.
-> See [docs/VISION.md](docs/VISION.md) for where this is going.
+> **Status: pre-alpha.** The desktop hero scenario now works in direct mode —
+> spawn a session, drive the agent in an embedded terminal, close the app and
+> reconnect over `ssh` or `kubectl exec`. There are no packaged releases yet,
+> and the panels around the terminal are still landing. Run it from source
+> ([Developing](#developing)); see [docs/ROADMAP.md](docs/ROADMAP.md) for
+> what's left and [docs/VISION.md](docs/VISION.md) for where this is going.
 
 ## Why
 
