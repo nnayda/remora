@@ -317,6 +317,8 @@ impl SessionSource for KubectlSource {
             // The `test -d` preflight in run_respawn maps a gone worktree to
             // SessionNotFound.
             workspace: Some(remora_protocol::WorkspaceMode::Worktree),
+            branch: None,
+            worktree_root: None,
         };
         let plan = plan_spawn(&self.config, &spec)?;
         let host = self.host.clone();
@@ -662,6 +664,8 @@ mod tests {
             agent: Some(remora_protocol::AgentId::new("claude").expect("slug")),
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         };
         source.spawn(spec).await.expect("spawn");
         assert_eq!(*fake.opened.lock().expect("lock"), 1);
@@ -833,6 +837,8 @@ mod tests {
             agent: Some(remora_protocol::AgentId::new("claude").expect("slug")),
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         };
         source.spawn(spec).await.expect("spawn resolves + attaches");
         assert_eq!(*fake.opened.lock().expect("lock"), 1);
@@ -854,6 +860,8 @@ mod tests {
             agent: Some(remora_protocol::AgentId::new("claude").expect("slug")),
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         };
         let err = source.spawn(spec).await.expect_err("resolution fails");
         assert!(matches!(err, SourceError::Transport(_)), "{err}");

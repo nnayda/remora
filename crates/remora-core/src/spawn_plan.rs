@@ -188,6 +188,8 @@ mod tests {
             agent: agent.map(|a| AgentId::new(a).expect("slug")),
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         }
     }
 
@@ -330,6 +332,8 @@ mod tests {
             agent: None,
             base: None,
             workspace: Some(WorkspaceMode::Worktree),
+            branch: None,
+            worktree_root: None,
         };
         let plan = plan_spawn(&config(), &spec).expect("plan");
         assert_eq!(plan.workspace, WorkspaceMode::Worktree);
@@ -345,6 +349,8 @@ mod tests {
             agent: None,
             base: None,
             workspace: Some(WorkspaceMode::Shared),
+            branch: None,
+            worktree_root: None,
         };
         let plan = plan_spawn(&config(), &spec).expect("plan");
         assert_eq!(plan.workspace, WorkspaceMode::Shared);

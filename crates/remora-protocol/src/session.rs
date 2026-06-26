@@ -113,6 +113,16 @@ pub struct SpawnSpec {
     /// Always serialized (mirrors `agent`); an absent key deserializes to
     /// `None`, so older peers stay compatible without a `PROTOCOL_VERSION` bump.
     pub workspace: Option<WorkspaceMode>,
+    /// Per-session branch name (#124). Raw; `spawn_plan::normalize_branch`
+    /// validates it. `None` falls back to the convention (`remora/<session_id>`)
+    /// so an older client keeps working. The session's display identity.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Per-session worktree-root override (#124); the worktree lands at
+    /// `<worktree_root>/<branch>`. `None` falls through the project→host
+    /// default cascade, then the `~/.remora/worktrees/<project>` convention.
+    #[serde(default)]
+    pub worktree_root: Option<String>,
 }
 
 #[cfg(test)]
@@ -220,11 +230,13 @@ mod tests {
             agent: Some(AgentId::new("claude").expect("valid slug")),
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         };
         let json = serde_json::to_string(&spec).expect("serialize");
         assert_eq!(
             json,
-            r#"{"project_id":"api","session_id":"fix-login","agent":"claude","base":null,"workspace":null}"#
+            r#"{"project_id":"api","session_id":"fix-login","agent":"claude","base":null,"workspace":null,"branch":null,"worktree_root":null}"#
         );
         let back: SpawnSpec = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(spec, back);
@@ -238,10 +250,32 @@ mod tests {
             agent: None,
             base: Some("origin/main".to_string()),
             workspace: None,
+            branch: None,
+            worktree_root: None,
         };
         assert_eq!(spec.base.as_deref(), Some("origin/main"));
         let json = serde_json::to_string(&spec).expect("serialize");
         assert!(json.contains(r#""base":"origin/main""#));
+        let back: SpawnSpec = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(spec, back);
+    }
+
+    #[test]
+    fn spawn_spec_carries_branch_and_worktree_root() {
+        let spec = SpawnSpec {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("s1").expect("slug"),
+            agent: None,
+            base: None,
+            workspace: None,
+            branch: Some("feat/login".to_string()),
+            worktree_root: Some("~/work".to_string()),
+        };
+        assert_eq!(spec.branch.as_deref(), Some("feat/login"));
+        assert_eq!(spec.worktree_root.as_deref(), Some("~/work"));
+        let json = serde_json::to_string(&spec).expect("serialize");
+        assert!(json.contains(r#""branch":"feat/login""#));
+        assert!(json.contains(r#""worktree_root":"~/work""#));
         let back: SpawnSpec = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(spec, back);
     }
@@ -267,6 +301,8 @@ mod tests {
             agent: None,
             base: None,
             workspace: Some(WorkspaceMode::Shared),
+            branch: None,
+            worktree_root: None,
         };
         let json = serde_json::to_string(&spec).expect("serialize");
         assert!(json.contains(r#""workspace":"shared""#));

@@ -199,6 +199,8 @@ impl SessionSource for SshSource {
             // The `test -d` preflight in run_respawn maps a gone worktree to
             // SessionNotFound.
             workspace: Some(remora_protocol::WorkspaceMode::Worktree),
+            branch: None,
+            worktree_root: None,
         };
         let plan = plan_spawn(&self.config, &spec)?;
         let exec = Arc::clone(&self.exec);
@@ -274,6 +276,8 @@ mod tests {
             agent: Some(AgentId::new("claude").expect("slug")),
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         }
     }
 
