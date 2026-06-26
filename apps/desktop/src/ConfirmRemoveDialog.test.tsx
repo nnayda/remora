@@ -43,8 +43,8 @@ describe("ConfirmRemoveDialog — shared workspace", () => {
   it("shows 'Close session' title, no destructive copy, and a 'Close' button", () => {
     renderDialog("shared");
 
-    // Title reads "Close session"
-    expect(screen.getByText("Close session")).toBeDefined();
+    // Title reads "Close session" (getByText throws if absent)
+    expect(screen.queryByText("Close session")).not.toBeNull();
 
     // The destructive worktree note must NOT appear
     expect(screen.queryByText(/deletes its worktree and branch/)).toBeNull();
@@ -60,7 +60,7 @@ describe("ConfirmRemoveDialog — worktree workspace (unchanged behaviour)", () 
     renderDialog("worktree");
 
     // Title reads "Remove session"
-    expect(screen.getByText("Remove session")).toBeDefined();
+    expect(screen.queryByText("Remove session")).not.toBeNull();
 
     // The destructive worktree note must be present
     expect(
@@ -69,5 +69,17 @@ describe("ConfirmRemoveDialog — worktree workspace (unchanged behaviour)", () 
 
     // Footer button label is "Remove"
     expect(screen.queryAllByText("Remove").length).toBeGreaterThan(0);
+  });
+});
+
+describe("ConfirmRemoveDialog — null workspace (unknown mode)", () => {
+  it("renders the destructive 'Remove session' copy, never 'Close session'", () => {
+    // A null workspace mode (unconfigured project) must NOT be treated as
+    // shared: the gate is `workspace === "shared"`, so null falls through to
+    // the conservative destructive rendering.
+    renderDialog(null);
+
+    expect(screen.queryByText("Remove session")).not.toBeNull();
+    expect(screen.queryByText("Close session")).toBeNull();
   });
 });
