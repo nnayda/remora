@@ -215,7 +215,7 @@ export type BridgeError = { kind: "sessionExists"; message: string } | { kind: "
  * so the generated TS is a clean discriminated union. A local bridge<->frontend
  * DTO (NOT a wire-protocol type), so it is free to grow.
  */
-export type BridgeOutput = { event: "bytes"; bytes: number[] } | { event: "closed" }
+export type BridgeOutput = { event: "bytes"; bytes: number[] } | { event: "closed" } | { event: "statusChange"; status: SessionStatusDto } | { event: "previewUpdate"; preview: string }
 /**
  * Opaque handle the frontend uses to address one open channel (write/resize/close).
  */
@@ -308,6 +308,13 @@ workspacePath: string | null;
  */
 workspace: WorkspaceModeDto | null }
 export type SessionStateDto = "live" | "stopped"
+/**
+ * Frontend-facing mirror of `remora_protocol::SessionStatus` (which is
+ * specta-agnostic). A local DTO keeps the protocol crate dependency-light while
+ * giving the generated TS a clean string union. snake_case matches the
+ * frontend `ActivityState` tokens ("working" | "idle" | "awaiting" | "unknown").
+ */
+export type SessionStatusDto = "working" | "idle" | "awaiting" | "unknown"
 /**
  * Transport + connection details, shared by the read projection and the write
  * inputs (it round-trips: what the form shows is what it submits). Internally
