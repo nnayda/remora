@@ -306,4 +306,50 @@ describe("DiscoveryStore per-host retention", () => {
     expect(store.getSnapshot().sessions).toEqual([a1]);
     expect(store.getSnapshot().discoveryUnavailable).toBe(true);
   });
+
+  it("[Finding 9] reachable-before-hide host gets a fresh grace window on resume", async () => {
+    // B was reachable when the window was hidden.  After a gap longer than the
+    // grace period, B is now down.  Without lastSeenAt being reset on resume,
+    // the first post-resume poll would compute since=T_pre_hide and immediately
+    // prune B (the exact flicker #159 targets).
+    const list = vi
+      .fn<() => Promise<SessionListDto>>()
+      .mockResolvedValueOnce(listResult([{ hostId: "B", sessions: [b1] }])) // start: B reachable
+      .mockResolvedValueOnce(listResult([{ hostId: "B", available: false }])); // resume poll: B down
+    const { store } = makeStore({ listSessions: list, now });
+    await store.start(); // clock=0: B up, lastSeenAt=0, unavailableSince=null
+    store.setActive(false);
+    clock += RECONNECT_GRACE_MS + 1000; // long hidden gap — would prune without the fix
+    store.setActive(true); // re-stamps lastSeenAt=clock, fires resume poll
+    await Promise.resolve(); // let pollSessions reach await listSessions()
+    await Promise.resolve(); // let mergeHosts + commit run
+    const snap = store.getSnapshot();
+    expect(snap.sessions).toEqual([b1]); // B retained (fresh grace window)
+    expect(snap.reconnectingKeys).toEqual(["b/2"]); // flagged reconnecting
+    store.stop();
+  });
+
+  it("[Finding 9] already-failing-before-hide host also keeps its grace window on resume", async () => {
+    // B was already down (unavailableSince set) when the window was hidden.
+    // The existing guard resets unavailableSince on resume; this test confirms
+    // that behaviour is preserved after the lastSeenAt fix.
+    const list = vi
+      .fn<() => Promise<SessionListDto>>()
+      .mockResolvedValueOnce(listResult([{ hostId: "B", sessions: [b1] }])) // start: B reachable
+      .mockResolvedValueOnce(listResult([{ hostId: "B", available: false }])) // before hide: B down
+      .mockResolvedValueOnce(listResult([{ hostId: "B", available: false }])); // resume poll: B still down
+    const { store } = makeStore({ listSessions: list, now });
+    await store.start(); // clock=0
+    clock += 1000;
+    await store.refreshAfterOpen(); // B goes down; unavailableSince anchored at 0
+    store.setActive(false);
+    clock += RECONNECT_GRACE_MS + 1000; // total gap well past grace
+    store.setActive(true); // resets unavailableSince=clock, fires resume poll
+    await Promise.resolve();
+    await Promise.resolve();
+    const snap = store.getSnapshot();
+    expect(snap.sessions).toEqual([b1]); // B retained
+    expect(snap.reconnectingKeys).toEqual(["b/2"]);
+    store.stop();
+  });
 });

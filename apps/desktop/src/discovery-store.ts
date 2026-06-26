@@ -126,10 +126,15 @@ export class DiscoveryStore {
     if (this.disposed || active === this.active) return;
     this.active = active;
     if (active) {
-      // Resume from hidden: restart the grace window for any still-failing host
-      // so a long hidden gap doesn't prune-then-reappear (the #159 flicker).
+      // Resume from hidden: treat resume as "we just re-contacted everything"
+      // so a long hidden gap never prunes-then-reappears (the #159 flicker).
+      // Reset lastSeenAt for ALL entries (covers hosts that were reachable when
+      // hidden but may have gone down during the gap) and unavailableSince for
+      // already-failing hosts, so the grace window measures from resume, not
+      // from the pre-hide poll.
       const t = this.now();
       for (const entry of this.byHost.values()) {
+        entry.lastSeenAt = t;
         if (entry.unavailableSince !== null) entry.unavailableSince = t;
       }
       void this.pollSessions();
