@@ -2,7 +2,10 @@
 
 Remora — persistent remote coding-agent sessions from any device. Tauri 2
 desktop app (React + TypeScript frontend, Rust shell) over shared Rust crates.
-**Pre-alpha: scaffold only; the app is not yet usable.**
+**Pre-alpha:** the desktop hero scenario works in direct mode (spawn a session,
+drive the agent in an embedded terminal, reconnect over `ssh`/`kubectl exec`);
+there are no packaged releases yet and the panels around the terminal are still
+landing. See docs/ROADMAP.md for what's left.
 
 ## Commands
 
