@@ -290,7 +290,12 @@ pub(crate) fn not_on_remote_tokens(worktree_dir: &str) -> Vec<String> {
 }
 
 /// Tokens for `git -C <project> branch -D <branch>` — force-deletes the
-/// session branch after the worktree is removed.
+/// session branch after the worktree is removed. The branch is shell-quoted
+/// for the same reason every other value is: the ssh/kubectl layers join
+/// tokens into a command string that the remote shell re-parses. Git permits
+/// shell metacharacters in ref names (`;`, `$`, backtick, `&`, `|`, …), so
+/// an unquoted branch from `git worktree list` is a remote code execution
+/// vector. `shell_quote` is the same escaping `worktree_add_tokens` uses.
 pub(crate) fn branch_delete_tokens(project_path: &str, branch: &str) -> Vec<String> {
     vec![
         "git".into(),
@@ -298,7 +303,7 @@ pub(crate) fn branch_delete_tokens(project_path: &str, branch: &str) -> Vec<Stri
         quote_remote_path(project_path),
         "branch".into(),
         "-D".into(),
-        branch.into(),
+        shell_quote(branch),
     ]
 }
 
@@ -2708,7 +2713,67 @@ pub(crate) mod tests {
         assert_eq!(tokens[g + 2], "/home/dev/api");
         assert_eq!(tokens[g + 3], "branch");
         assert_eq!(tokens[g + 4], "-D");
+        // shell_quote leaves clean slug chars unquoted, so the token is unchanged.
         assert_eq!(tokens[g + 5], "remora/fix-login");
+    }
+
+    #[test]
+    fn branch_delete_tokens_shell_quotes_the_branch() {
+        // A branch with shell metacharacters (e.g. from a hand-crafted worktree
+        // surfaced as a Stopped session) must be quoted so the remote shell cannot
+        // execute the metacharacters as code. `a;id` is the canonical injection
+        // probe: unquoted it runs `id` as a separate command.
+        let tokens = branch_delete_tokens("/p", "a;id");
+        let g = tokens.iter().position(|a| a == "git").expect("git");
+        let branch_token = &tokens[g + 5];
+        // Must NOT be the raw unquoted injection string.
+        assert_ne!(
+            branch_token, "a;id",
+            "unquoted branch is a code-injection vector"
+        );
+        // Must equal what shell_quote produces — `'a;id'` — so the remote shell
+        // treats it as a literal argument rather than splitting on the `;`.
+        assert_eq!(branch_token, &shell_quote("a;id"));
+    }
+
+    #[test]
+    fn run_remove_metachar_branch_is_shell_quoted_in_branch_delete() {
+        // If `git worktree list` returns a worktree whose branch contains shell
+        // metacharacters, the `branch -D` call emitted by run_remove must
+        // shell-quote the branch token — no raw `a;id` in the argv. This is the
+        // end-to-end guard for the injection path discovered in the final review.
+        let porcelain = "worktree /home/dev/.remora/worktrees/api/fix-login\n\
+                         HEAD abc\n\
+                         branch refs/heads/a;id\n";
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out(porcelain)),   // git worktree list
+            Ok(FakeExec::out("")),          // status --porcelain (clean)
+            Ok(FakeExec::out("0\n")),       // rev-list (on remote)
+            Ok(FakeExec::ok()),             // kill-session
+            Ok(FakeExec::ok()),             // worktree remove
+            Ok(FakeExec::ok()),             // branch -D
+        ]);
+        // The session_id derives from the raw branch name "a;id".
+        let session_id = derive_session_id(Some("a;id")).expect("slug");
+        assert!(run_remove(&fake, &test_config(), &pid("api"), &session_id, false).is_ok());
+        let calls = fake.calls.lock().expect("lock");
+        let del_call = calls
+            .iter()
+            .find(|c| c.iter().any(|a| a == "-D"))
+            .expect("branch -D call must be present");
+        // The branch token following "-D" must NOT be the raw "a;id" string.
+        let d_pos = del_call.iter().position(|a| a == "-D").expect("-D");
+        let branch_token = &del_call[d_pos + 1];
+        assert_ne!(
+            branch_token, "a;id",
+            "raw unquoted branch would allow remote code execution: {del_call:?}"
+        );
+        assert_eq!(
+            branch_token,
+            &shell_quote("a;id"),
+            "branch token must be shell-quoted: {del_call:?}"
+        );
     }
 
     #[test]

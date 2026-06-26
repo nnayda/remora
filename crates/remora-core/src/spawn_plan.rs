@@ -173,7 +173,10 @@ pub(crate) fn normalize_base(raw: Option<String>) -> Result<Option<String>, Plan
 /// Normalizes a branch override: trims, maps empty/whitespace to `None`,
 /// and enforces git ref-name rules (no `..`, no trailing `/`, no `.lock`
 /// suffix, no interior whitespace) in addition to the shared control-char
-/// and leading-dash guards. Returns the raw branch name (no `remora/` prefix).
+/// and leading-dash guards. Also rejects shell metacharacters (`; $ \`
+/// & | ( ) < >`) — a branch with those is both an atypical name and a
+/// hazard on the teardown path where `branch_delete_tokens` emits it into a
+/// remote shell command. Returns the raw branch name (no `remora/` prefix).
 pub(crate) fn normalize_branch(raw: Option<String>) -> Result<Option<String>, PlanError> {
     let Some(b) = normalize_override(raw, "branch")? else {
         return Ok(None);
@@ -182,6 +185,8 @@ pub(crate) fn normalize_branch(raw: Option<String>) -> Result<Option<String>, Pl
         || b.ends_with('/')
         || b.ends_with(".lock")
         || b.chars().any(char::is_whitespace)
+        || b.chars()
+            .any(|c| matches!(c, ';' | '$' | '`' | '&' | '|' | '(' | ')' | '<' | '>'))
     {
         return Err(PlanError::Invalid("branch", "is not a valid git ref name"));
     }
@@ -454,6 +459,22 @@ mod tests {
         assert!(normalize_branch(Some("a..b".into())).is_err()); // double dot
         assert!(normalize_branch(Some("a b".into())).is_err()); // whitespace
         assert!(normalize_branch(Some("x.lock".into())).is_err()); // .lock suffix
+    }
+
+    #[test]
+    fn normalize_branch_rejects_shell_metacharacters() {
+        // A branch with shell metacharacters is both an atypical ref name and a
+        // remote-injection hazard on the teardown path. All of these must be
+        // rejected at the spawn path (defense in depth; the teardown path is also
+        // hardened independently via shell_quote in branch_delete_tokens).
+        assert!(normalize_branch(Some("x;id".into())).is_err()); // semicolon — injection
+        assert!(normalize_branch(Some("x$HOME".into())).is_err()); // dollar — var expansion
+        assert!(normalize_branch(Some("x`id`".into())).is_err()); // backtick — cmd substitution
+        assert!(normalize_branch(Some("x&id".into())).is_err()); // ampersand — bg job
+        assert!(normalize_branch(Some("x|id".into())).is_err()); // pipe
+        assert!(normalize_branch(Some("x(id)".into())).is_err()); // subshell
+        assert!(normalize_branch(Some("x<y".into())).is_err()); // redirect in
+        assert!(normalize_branch(Some("x>y".into())).is_err()); // redirect out
     }
 
     #[test]
