@@ -228,6 +228,18 @@ pub fn join(
     metas
 }
 
+/// Make a worktree path comparable for the discovery join: expand a single
+/// leading `~/` against the remote `$HOME`, and drop a trailing `/`. Porcelain
+/// paths are already absolute (idempotent here); a live session's
+/// `REMORA_WORKSPACE` is logical (`~/…`) and needs the expansion (A1, #124).
+pub fn canonicalize_remote_path(path: &str, home: &str) -> String {
+    let expanded = match path.strip_prefix("~/") {
+        Some(rest) => format!("{}/{}", home.trim_end_matches('/'), rest),
+        None => path.to_string(),
+    };
+    expanded.trim_end_matches('/').to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use remora_protocol::WorkspaceMode;
@@ -444,5 +456,31 @@ detached
     #[test]
     fn parse_worktree_porcelain_empty_input_is_empty() {
         assert!(parse_worktree_porcelain("").is_empty());
+    }
+
+    #[test]
+    fn canonicalize_expands_leading_tilde() {
+        assert_eq!(
+            canonicalize_remote_path("~/work/feat/login", "/home/dev"),
+            "/home/dev/work/feat/login"
+        );
+    }
+
+    #[test]
+    fn canonicalize_leaves_absolute_untouched_and_trims_trailing_slash() {
+        assert_eq!(
+            canonicalize_remote_path("/home/dev/api/", "/home/dev"),
+            "/home/dev/api"
+        );
+        assert_eq!(
+            canonicalize_remote_path("/mnt/x/wt", "/home/dev"),
+            "/mnt/x/wt"
+        );
+    }
+
+    #[test]
+    fn canonicalize_does_not_expand_bare_tilde_user() {
+        // `~user` is not ours to expand; leave it (it will simply fail to match).
+        assert_eq!(canonicalize_remote_path("~bob/x", "/home/dev"), "~bob/x");
     }
 }
