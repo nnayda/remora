@@ -60,15 +60,3 @@ What becomes harder, and what we are committed to:
 - **Provenance is no longer tracked.** The old convention — branch name encodes the session id — provided implicit auditability: a branch name like `remora/abc123` signals it was managed by Remora. New user-chosen branches have no such marker. Confirmation for destructive operations (e.g., removing a worktree) is deferred to PR B and becomes more important.
 
 - **Discovery cost grows with the number of configured projects.** The scan now queries `git worktree list` for every project on every host, not just tmux sessions. This is a small cost per project (one git command, subsecond), but scales linearly; host state must still degrade gracefully on unreachable transports.
-
-## Update (PR B1)
-
-PR B1 implements the spawn-time override of `branch` and `worktree_root`:
-
-1. **`SpawnSpec` gains `branch` and `worktree_root` fields**. `worktree_root` cascades: per-session overrides (supplied at spawn) flow to per-project defaults to per-host defaults to the convention `~/.remora/worktrees/<project-id>`. `branch` is chosen per-session at spawn, with no project or host default. When `branch` is `None`, the worktree is created at the back-compat path `~/.remora/worktrees/<project>/<session_id>` with branch `remora/<session_id>` (exactly as pre-B1); when `branch` is supplied, the worktree is created at `<worktree_root>/<branch>` with the supplied branch name.
-
-2. **`derive_session_id` moves from `DefaultHasher` to FNV-1a/32**, making the id stable across Rust rebuilds and reproducible in TypeScript (B2's client-side session minting). This closes the hasher item of #153.
-
-3. **Teardown (`run_remove`) and respawn (`run_respawn`) source the real worktree path and branch from authoritative `git worktree list`**, matched by `derive_session_id`. This is the "Sandbox reads for respawn/teardown" carve-out already specified above: the primary checkout (path equals project's `path`) is never `worktree remove`'d or `branch -D`'d — its "remove" only closes the tmux session (A2′ safety).
-
-4. **Backward compatibility:** `branch == None` at spawn reproduces the exact pre-B1 behavior (convention path, `remora/<session_id>` branch naming), so B1 is safe to land before the desktop UI (B2, which brings the "Branch name" + `worktree_root` form fields and client-side session id minting).
