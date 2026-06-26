@@ -2151,7 +2151,8 @@ pub(crate) mod tests {
         //     `main` & `remora__bad` (unparseable). Only api survives.
         //  2) list-sessions inline metadata -> enrichment keyed by trusted name.
         //     workspace_path is set so the path-anchored join can match (#124).
-        //  3) git worktree list for api -> fix-login (live) + add-tests (stopped)
+        //  3) git worktree list for api -> realistic output: primary checkout first
+        //     (as real git always emits), then fix-login (live) + add-tests (stopped).
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out(
                 "remora_api_fix-login\nremora_ghost_x\nmain\nremora__bad\n",
@@ -2160,29 +2161,42 @@ pub(crate) mod tests {
                 "remora_api_fix-login\tclaude\t/home/dev/.remora/worktrees/api/fix-login\t1765500000\n",
             )),
             Ok(FakeExec::out(
-                "worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n\n\
+                "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n\n\
+                 worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n\n\
                  worktree /home/dev/.remora/worktrees/api/add-tests\nbranch refs/heads/remora/add-tests\n",
             )),
         ]);
         let metas = run_list(&fake, &config).expect("list");
 
         // ghost filtered out (R1). api/add-tests is Stopped; api/fix-login is Live.
-        let keys: Vec<(&str, &str, SessionState)> = metas
-            .iter()
-            .map(|m| (m.project_id.as_str(), m.session_id.as_str(), m.state))
-            .collect();
+        // The realistic main-checkout leading entry surfaces as an extra Stopped row
+        // because project_paths is the stubbed-empty map.
+        // INTERIM (Task 6): project_paths is stubbed empty, so the primary checkout is
+        // mis-surfaced as a Worktree row here; Task 6 wires project_paths so A2′
+        // reclassifies it as Shared and this assertion must be updated.
         assert_eq!(
-            keys,
-            vec![
-                ("api", "add-tests", SessionState::Stopped),
-                ("api", "fix-login", SessionState::Live),
-            ]
+            metas.len(),
+            3,
+            "expected 3 rows (add-tests, fix-login, main-checkout interim), got: {metas:?}"
         );
-        let live = &metas[1];
-        assert_eq!(live.agent.as_deref(), Some("claude"));
+        assert!(
+            metas.iter().any(|m| m.branch.as_deref() == Some("main")),
+            "primary-checkout main row missing: {metas:?}"
+        );
+        let add_tests = metas
+            .iter()
+            .find(|m| m.session_id.as_str() == "add-tests")
+            .expect("add-tests row");
+        let fix_login = metas
+            .iter()
+            .find(|m| m.session_id.as_str() == "fix-login")
+            .expect("fix-login row");
+        assert_eq!(add_tests.state, SessionState::Stopped);
+        assert_eq!(fix_login.state, SessionState::Live);
+        assert_eq!(fix_login.agent.as_deref(), Some("claude"));
         // Stopped carries the real discovered worktree path (R6).
         assert_eq!(
-            metas[0].workspace_path.as_deref(),
+            add_tests.workspace_path.as_deref(),
             Some("/home/dev/.remora/worktrees/api/add-tests")
         );
     }
