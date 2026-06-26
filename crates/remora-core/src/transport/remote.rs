@@ -2436,11 +2436,13 @@ pub(crate) mod tests {
         // The session is in the trusted names listing, but the inline-metadata
         // read flakes (transient, or tmux < 3.0). It must stay Live with empty
         // metadata, not be downgraded — metadata is best-effort enrichment (#108).
+        // Call order: 1) names, 2) metadata (flakes), 3) printf $HOME, 4) worktree list.
         let config = test_config();
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names: live set
             Ok(FakeExec::fail("connection reset")),      // 2) metadata read flakes
-            Ok(FakeExec::out("")),                       // 3) worktree list: empty
+            Ok(FakeExec::out("/home/dev")),              // 3) printf $HOME (#124)
+            Ok(FakeExec::out("")),                       // 4) worktree list: empty
         ]);
         let metas = run_list(&fake, &config).expect("list");
         assert_eq!(metas.len(), 1);
@@ -2455,6 +2457,7 @@ pub(crate) mod tests {
         // metadata row (`remora_api_evil...`). Because the live set comes from the
         // trusted names-only listing, the phantom name — absent there — must be
         // dropped, never surfaced as a Live session (#108 regression guard).
+        // Call order: 1) names, 2) metadata (with injected phantom), 3) printf $HOME, 4) worktree list.
         let config = test_config();
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names: ONLY the real session
@@ -2462,7 +2465,8 @@ pub(crate) mod tests {
                 "remora_api_fix-login\tx\t\t\n\
                  remora_api_evil\t/ws\t9999999999\t\n", // 2) metadata: real + injected phantom
             )),
-            Ok(FakeExec::out("")), // 3) worktree list: empty
+            Ok(FakeExec::out("/home/dev")), // 3) printf $HOME (#124)
+            Ok(FakeExec::out("")),          // 4) worktree list: empty
         ]);
         let metas = run_list(&fake, &config).expect("list");
         assert_eq!(metas.len(), 1, "phantom must not appear: {metas:?}");
@@ -2474,11 +2478,15 @@ pub(crate) mod tests {
         // A failed `git worktree list` for one project yields empty for that
         // project, never a failed discovery (decision 8): the live session
         // still lists, just with no Stopped twin.
+        // Call order: 1) names, 2) metadata, 3) printf $HOME, 4) worktree list (FAILS).
+        // The FakeExec::fail at position 4 must land on the WORKTREE LIST call —
+        // not on $HOME — so decision 8 is actually exercised.
         let config = test_config();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names: live set
+            Ok(FakeExec::out("remora_api_fix-login\n")),          // 1) names: live set
             Ok(FakeExec::out("remora_api_fix-login\tclaude\t\t\n")), // 2) inline metadata
-            Ok(FakeExec::fail("fatal: not a git repository")), // 3) worktree list fails
+            Ok(FakeExec::out("/home/dev")),                        // 3) printf $HOME (#124)
+            Ok(FakeExec::fail("fatal: not a git repository")),     // 4) worktree list FAILS → decision 8
         ]);
         let metas = run_list(&fake, &config).expect("list must not fail");
         assert_eq!(metas.len(), 1);

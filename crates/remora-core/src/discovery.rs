@@ -154,16 +154,20 @@ pub fn join(
     // O(worktrees) rather than O(live × worktrees). Sessions with no
     // REMORA_WORKSPACE go into a separate bucket; they can never match a
     // worktree path so they always surface as unmatched-live rows.
+    // Multiple live sessions can share the same canonical workspace path: shared-
+    // mode sessions all set REMORA_WORKSPACE to the project root, so two+ shared
+    // sessions on one project map to the same key. Using Vec avoids silently
+    // overwriting all but one (the old single-value HashMap behaviour).
     let mut live_by_path: std::collections::HashMap<
         (ProjectId, String),
-        (SessionId, DiscoveredEnv),
+        Vec<(SessionId, DiscoveredEnv)>,
     > = std::collections::HashMap::new();
     let mut live_unmatched: Vec<(ProjectId, SessionId, DiscoveredEnv)> = Vec::new();
     for (p, s, env) in live {
         match env.workspace_path.as_deref() {
             Some(wp) => {
                 let key = (p.clone(), canonicalize_remote_path(wp, home));
-                live_by_path.insert(key, (s, env));
+                live_by_path.entry(key).or_default().push((s, env));
             }
             None => live_unmatched.push((p, s, env)),
         }
@@ -178,9 +182,10 @@ pub fn join(
             .map(|pp| pp == &cpath)
             .unwrap_or(false);
         let key = (project.clone(), cpath.clone());
-        // Remove the matching live entry: using `remove` both consumes the match
-        // (preventing a second worktree from claiming the same live session) and
-        // leaves only unmatched entries in `live_by_path` for the next phase.
+        // Pop ONE live entry for this key: a worktree can be claimed by at most
+        // one live session (the physical checkout is exclusive). Using `get_mut`
+        // + `pop` rather than `remove` leaves remaining sessions in the vec for
+        // the drain phase below, so none are silently dropped.
         //
         // LIVE match → use the real tmux slug as `session_id` so that reconnect
         // resolves correctly even after a branch rename (the tmux name never
@@ -188,7 +193,7 @@ pub fn join(
         // caller can still reconnect via the real slug).
         // STOPPED (no live match) → derive from the branch as before; skip
         // detached / nameless worktrees since they have no identity to respawn.
-        let (session_id, state, agent, created_at) = match live_by_path.remove(&key) {
+        let (session_id, state, agent, created_at) = match live_by_path.get_mut(&key).and_then(|v| v.pop()) {
             Some((sid, env)) => (sid, SessionState::Live, env.agent, env.created_at),
             None => {
                 let Some(sid) = naming::derive_session_id(wt.branch.as_deref()) else {
@@ -209,7 +214,7 @@ pub fn join(
             } else {
                 WorkspaceMode::Worktree
             }),
-            branch: wt.branch,
+            branch: wt.branch.as_deref().and_then(clean_metadata),
         });
     }
 
@@ -218,22 +223,26 @@ pub fn join(
     // a failed scan leaves the mode `None` so the client falls back to the
     // project default rather than mislabeling a live session on a transient
     // scan error (which would wrongly hide Stop/Respawn).
-    for ((project, _cpath), (sid, env)) in live_by_path {
-        let workspace = if scanned.contains(&project) {
-            Some(WorkspaceMode::Shared)
-        } else {
-            None
-        };
-        metas.push(SessionMeta {
-            project_id: project,
-            session_id: sid,
-            state: SessionState::Live,
-            agent: env.agent,
-            created_at: env.created_at,
-            workspace_path: env.workspace_path.as_deref().and_then(clean_metadata),
-            workspace,
-            branch: None,
-        });
+    // Flatten: each vec entry is a session that was not claimed by a worktree,
+    // so every one becomes its own Shared row (none are silently dropped).
+    for ((project, _cpath), sessions) in live_by_path {
+        for (sid, env) in sessions {
+            let workspace = if scanned.contains(&project) {
+                Some(WorkspaceMode::Shared)
+            } else {
+                None
+            };
+            metas.push(SessionMeta {
+                project_id: project.clone(),
+                session_id: sid,
+                state: SessionState::Live,
+                agent: env.agent,
+                created_at: env.created_at,
+                workspace_path: env.workspace_path.as_deref().and_then(clean_metadata),
+                workspace,
+                branch: None,
+            });
+        }
     }
     for (project, sid, env) in live_unmatched {
         let workspace = if scanned.contains(&project) {
@@ -585,6 +594,65 @@ mod tests {
             &std::collections::HashSet::new(), // project not scanned
         );
         assert_eq!(metas[0].workspace, None);
+    }
+
+    /// REGRESSION GUARD: shared-mode sessions all set `REMORA_WORKSPACE` to the
+    /// project root, so two+ shared sessions on one project resolve to the same
+    /// `(project, canonical_path)` key. The old single-value HashMap silently
+    /// dropped all but one; this test verifies that BOTH appear in the output.
+    #[test]
+    fn join_surfaces_all_live_sessions_sharing_a_path() {
+        let proj = ProjectId::new("api").expect("slug");
+        let s1 = SessionId::new("s1").expect("slug");
+        let s2 = SessionId::new("s2").expect("slug");
+        // Both sessions share the same workspace_path (the project root — the
+        // shared-mode pattern: spawn_plan.rs WorkspaceMode::Shared => project.path).
+        let live = vec![
+            (
+                proj.clone(),
+                s1.clone(),
+                DiscoveredEnv {
+                    agent: Some("claude".into()),
+                    created_at: Some(1),
+                    workspace_path: Some("/home/dev/api".into()),
+                },
+            ),
+            (
+                proj.clone(),
+                s2.clone(),
+                DiscoveredEnv {
+                    agent: Some("codex".into()),
+                    created_at: Some(2),
+                    workspace_path: Some("/home/dev/api".into()),
+                },
+            ),
+        ];
+        // Primary checkout at the project path; one worktree row claims one of them.
+        let wts = vec![(
+            proj.clone(),
+            WorktreeInfo {
+                path: "/home/dev/api".into(),
+                branch: Some("main".into()),
+            },
+        )];
+        let scanned: HashSet<ProjectId> = [proj.clone()].into_iter().collect();
+        let metas = join(
+            live,
+            wts,
+            &paths(&[("api", "/home/dev/api")]),
+            "/home/dev",
+            &scanned,
+        );
+        // Both sessions must appear — none silently dropped.
+        assert_eq!(metas.len(), 2, "both sessions must surface: {metas:?}");
+        let ids: HashSet<&str> = metas.iter().map(|m| m.session_id.as_str()).collect();
+        assert!(ids.contains("s1"), "s1 missing from: {metas:?}");
+        assert!(ids.contains("s2"), "s2 missing from: {metas:?}");
+        // All rows are Live.
+        assert!(
+            metas.iter().all(|m| m.state == SessionState::Live),
+            "all rows must be Live: {metas:?}"
+        );
     }
 
     #[test]

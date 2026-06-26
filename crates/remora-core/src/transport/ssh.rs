@@ -768,11 +768,13 @@ mod tests {
         // The session is in the trusted names listing, but the inline-metadata
         // read flakes (transient, or tmux < 3.0). It must still list as Live with
         // empty metadata — metadata is best-effort enrichment (#108).
+        // Call order: 1) names, 2) metadata (flakes), 3) printf $HOME, 4) worktree list.
         let config = test_config();
         let fake = Arc::new(FakeExec::new(vec![
             Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names
             Ok(FakeExec::fail("connection reset")),      // 2) metadata flakes
-            Ok(FakeExec::out("")),                       // 3) worktree empty
+            Ok(FakeExec::out("/home/dev")),              // 3) printf $HOME (#124)
+            Ok(FakeExec::out("")),                       // 4) worktree empty
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let metas = source.list().await.expect("list");
@@ -784,11 +786,15 @@ mod tests {
 
     #[tokio::test]
     async fn list_survives_worktree_list_failure_per_decision_8() {
+        // Call order: 1) names, 2) metadata, 3) printf $HOME, 4) worktree list (FAILS).
+        // The FakeExec::fail at position 4 must land on the WORKTREE LIST call —
+        // not on $HOME — so decision 8 is actually exercised.
         let config = test_config();
         let fake = Arc::new(FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names
+            Ok(FakeExec::out("remora_api_fix-login\n")),          // 1) names
             Ok(FakeExec::out("remora_api_fix-login\tclaude\t\t\n")), // 2) metadata
-            Ok(FakeExec::fail("fatal: not a git repository")), // 3) worktree fails
+            Ok(FakeExec::out("/home/dev")),                        // 3) printf $HOME (#124)
+            Ok(FakeExec::fail("fatal: not a git repository")),     // 4) worktree list FAILS → decision 8
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let metas = source.list().await.expect("list must not fail");
