@@ -109,6 +109,8 @@ pub struct Host {
     /// Optional display name; renames touch only this, never the id.
     pub name: Option<String>,
     pub transport: Transport,
+    /// Host-wide default worktree-root (#124); a project or session value wins.
+    pub worktree_root: Option<String>,
 }
 
 /// How to reach a host. Adding a transport (e.g. `docker`, planned) should
@@ -169,6 +171,11 @@ pub struct Project {
     /// `origin/develop`. Omitted = detect the remote default branch.
     #[serde(default)]
     pub base: Option<String>,
+    /// Optional default worktree-root for new sessions (#124); a per-session
+    /// `SpawnSpec::worktree_root` overrides it. Omitted = host default, then
+    /// the `~/.remora/worktrees/<project>` convention.
+    #[serde(default)]
+    pub worktree_root: Option<String>,
 }
 
 /// Per-agent adapter data (ADR-0003): data, never code paths.
@@ -405,6 +412,8 @@ struct RawHost {
     namespace: Option<RawKubectlField>,
     context: Option<RawKubectlField>,
     container: Option<RawKubectlField>,
+    #[serde(default)]
+    worktree_root: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -682,6 +691,7 @@ impl RawHost {
         transport.map(|transport| Host {
             name: self.name,
             transport,
+            worktree_root: self.worktree_root,
         })
     }
 }
@@ -1713,5 +1723,49 @@ mod tests {
         let err = Config::from_toml_str("[hosts.k]\ntransport = \"kubectl\"\npod = \"-bad\"\n")
             .expect_err("leading dash literal rejected");
         assert!(format!("{err}").contains("pod"), "{err}");
+    }
+
+    #[test]
+    fn project_worktree_root_parses_and_is_optional() {
+        let cfg = Config::from_toml_str(
+            "[hosts.devbox]\ntransport = \"ssh\"\nhost = \"devbox\"\n\
+             [projects.api]\nhost = \"devbox\"\npath = \"/api\"\nworkspace = \"worktree\"\n\
+             agent = \"claude\"\nworktree_root = \"~/work\"\n\
+             [agents.claude]\ncommand = [\"claude\"]\n",
+        )
+        .expect("valid");
+        let api = &cfg.projects[&ProjectId::new("api").expect("slug")];
+        assert_eq!(api.worktree_root.as_deref(), Some("~/work"));
+    }
+
+    #[test]
+    fn project_worktree_root_defaults_to_none() {
+        let cfg = Config::from_toml_str(
+            "[hosts.devbox]\ntransport = \"ssh\"\nhost = \"devbox\"\n\
+             [projects.api]\nhost = \"devbox\"\npath = \"/api\"\nworkspace = \"worktree\"\n\
+             agent = \"claude\"\n\
+             [agents.claude]\ncommand = [\"claude\"]\n",
+        )
+        .expect("valid");
+        let api = &cfg.projects[&ProjectId::new("api").expect("slug")];
+        assert_eq!(api.worktree_root, None);
+    }
+
+    #[test]
+    fn host_worktree_root_parses_and_is_optional() {
+        let cfg = Config::from_toml_str(
+            "[hosts.devbox]\ntransport = \"ssh\"\nhost = \"devbox\"\nworktree_root = \"~/work\"\n",
+        )
+        .expect("valid");
+        let devbox = &cfg.hosts[&host_id("devbox")];
+        assert_eq!(devbox.worktree_root.as_deref(), Some("~/work"));
+    }
+
+    #[test]
+    fn host_worktree_root_defaults_to_none() {
+        let cfg = Config::from_toml_str("[hosts.devbox]\ntransport = \"ssh\"\nhost = \"devbox\"\n")
+            .expect("valid");
+        let devbox = &cfg.hosts[&host_id("devbox")];
+        assert_eq!(devbox.worktree_root, None);
     }
 }

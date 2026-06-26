@@ -245,6 +245,7 @@ impl HostInputDto {
         Host {
             name: self.name,
             transport,
+            worktree_root: None,
         }
     }
 }
@@ -278,6 +279,7 @@ impl ProjectInputDto {
             workspace: self.workspace.into(),
             agent: AgentId::new(self.agent).map_err(invalid)?,
             base: self.base,
+            worktree_root: None,
         })
     }
 }
@@ -346,6 +348,7 @@ mod tests {
                 user: Some("rootuser".into()),
                 port: Some(2222),
             }),
+            worktree_root: None,
         }
     }
 
@@ -358,6 +361,7 @@ mod tests {
                 context: Some(KubectlField::Literal("secret-context".into())),
                 container: Some(KubectlField::Literal("secret-container".into())),
             }),
+            worktree_root: None,
         }
     }
 
@@ -378,6 +382,7 @@ mod tests {
                 workspace: WorkspaceMode::Worktree,
                 agent: AgentId::new("claude").expect("id"),
                 base: None,
+                worktree_root: None,
             },
         );
         config.agents.insert(
@@ -501,6 +506,7 @@ mod tests {
             workspace: WorkspaceMode::Worktree,
             agent: AgentId::new("claude").expect("id"),
             base: Some("origin/develop".into()),
+            worktree_root: None,
         };
         // out to the form…
         let out = editor_project_dto("api", project);
@@ -536,6 +542,7 @@ mod tests {
                 context: None,
                 container: None,
             }),
+            worktree_root: None,
         };
         let dto = TransportDto::from(host.transport.clone());
         let TransportDto::Kubectl {
