@@ -106,12 +106,13 @@ export function useRailWidth(opts: RailWidthOptions) {
     [opts.min, opts.max],
   );
 
-  const commitWidth = useCallback(() => {
-    writeState(opts.key, {
-      width: widthRef.current,
-      collapsed: collapsedRef.current,
-    });
-  }, [opts.key]);
+  const commitWidth = useCallback(
+    (next?: number) => {
+      const w = next ?? widthRef.current;
+      writeState(opts.key, { width: w, collapsed: collapsedRef.current });
+    },
+    [opts.key],
+  );
 
   const toggleCollapsed = useCallback(() => {
     const next = !collapsedRef.current;

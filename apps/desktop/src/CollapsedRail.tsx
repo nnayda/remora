@@ -1,6 +1,7 @@
 import type { ActivityState } from "./activity-store";
 import { hostIndicatorState } from "./host-activity";
 import type { ProjectNode } from "./session-tree";
+import type { IndicatorState } from "./status-state";
 import { Avatar, IconButton, StatusIndicator, Tooltip, useTheme } from "./ui";
 import { ChevronRight, Moon, Settings, Sun } from "./ui/icons";
 
@@ -18,6 +19,22 @@ interface HostEntry {
   label: string;
   sessions: ProjectNode["sessions"];
   hasActive: boolean;
+}
+
+/** Map an IndicatorState to a human-readable phrase for aria-labels. */
+function activityPhrase(state: IndicatorState): string {
+  switch (state) {
+    case "needs":
+      return "needs attention";
+    case "working":
+      return "working";
+    case "error":
+      return "error";
+    case "done":
+      return "done";
+    case "idle":
+      return "idle";
+  }
 }
 
 /** Group projects by host label (deduped, tree order) for the narrow rail. */
@@ -81,7 +98,7 @@ export function CollapsedRail({
                     : "rk-railmini__host"
                 }
                 aria-current={host.hasActive ? "true" : undefined}
-                aria-label={`${host.label}, ${count} session${count === 1 ? "" : "s"}, ${state}`}
+                aria-label={`${host.label}, ${count} session${count === 1 ? "" : "s"}, ${activityPhrase(state)}`}
                 onClick={onExpand}
               >
                 <Avatar shape="circle" size="sm" name={host.label} />

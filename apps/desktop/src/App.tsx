@@ -103,7 +103,6 @@ function App() {
 
   // Sidebar resize + collapse state, persisted per-device in localStorage.
   const sidebarRef = useRef<HTMLDivElement>(null);
-  const sidebarFocusDidMountRef = useRef(false);
   const isMobile = useIsMobile();
   const { width, collapsed, setWidth, commitWidth, toggleCollapsed, reset } =
     useRailWidth({
@@ -112,6 +111,7 @@ function App() {
       min: 180,
       max: 480,
     });
+  const prevCollapsedRef = useRef(collapsed);
   const [resizing, setResizing] = useState(false);
   // On mobile the layout owns full-width; collapsed rail only renders off-mobile.
   const showCollapsed = shouldRenderCollapsed(collapsed, isMobile);
@@ -165,19 +165,18 @@ function App() {
 
   // After the collapsed/expanded swap, move focus to the counterpart toggle so
   // keyboard users aren't dropped to <body>. :focus-visible keeps mouse users
-  // ring-free. Keyed on showCollapsed so it runs only when the view changes.
+  // ring-free. Keyed on both collapsed and showCollapsed so it runs when the
+  // view changes, but skips mount and isMobile-only changes (viewport resize).
   useEffect(() => {
-    if (!sidebarFocusDidMountRef.current) {
-      sidebarFocusDidMountRef.current = true;
-      return;
-    }
+    if (prevCollapsedRef.current === collapsed) return; // isMobile-only change or mount → skip
+    prevCollapsedRef.current = collapsed;
     const root = sidebarRef.current;
     if (!root) return;
     const selector = showCollapsed
       ? 'button[aria-label="Expand sidebar"]'
       : 'button[aria-label="Collapse sidebar"]';
     root.querySelector<HTMLButtonElement>(selector)?.focus();
-  }, [showCollapsed]);
+  }, [collapsed, showCollapsed]);
 
   /** Open a session clicked in the sidebar, routing by its discovered state:
    * live → attach/focus, stopped → respawn. Reuses the dialog's deduping path

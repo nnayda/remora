@@ -64,7 +64,7 @@ export interface ResizeHandleProps {
   /** Live, during drag/keyboard — state only. */
   onResize: (width: number) => void;
   /** Persist — called on pointerup / after a keyboard nudge. */
-  onCommit: () => void;
+  onCommit: (width?: number) => void;
   /** Double-click — reset to default. */
   onReset: () => void;
   /** Notifies the parent so it can toggle the no-transition class during drag. */
@@ -133,13 +133,13 @@ export function ResizeHandle({
       if (next === value) return;
       e.preventDefault();
       onResize(next);
-      onCommit();
+      onCommit(next);
     },
     [value, step, min, max, edge, onResize, onCommit],
   );
 
   return (
-    // biome-ignore lint/a11y/useSemanticElements: <hr> is a void element and cannot hold pointer/keyboard event handlers; <div> with role="separator" is required here
+    // biome-ignore lint/a11y/useSemanticElements: <hr> maps to the non-interactive separator role; an interactive (focusable, tabIndex) separator/splitter must be a <div role="separator"> per the ARIA APG
     <div
       className="rk-resize-handle"
       role="separator"

@@ -66,4 +66,29 @@ describe("nextWidthFromKey", () => {
       ),
     ).toBe(180);
   });
+  it("edge:left — clamps at the bounds", () => {
+    // ArrowRight on edge:left shrinks (delta is negative), so near-min clamps to min
+    expect(
+      nextWidthFromKey(
+        { key: "ArrowRight", shiftKey: true },
+        190,
+        8,
+        180,
+        480,
+        "left",
+      ),
+    ).toBe(180);
+  });
+  it("edge:left — Shift quadruples the step", () => {
+    expect(
+      nextWidthFromKey(
+        { key: "ArrowLeft", shiftKey: true },
+        300,
+        8,
+        180,
+        480,
+        "left",
+      ),
+    ).toBe(332);
+  });
 });
