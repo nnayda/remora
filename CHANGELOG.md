@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Resizable, collapsible left sidebar** (#156): drag the sidebar's right edge
+  to resize it (clamped 180-480px, and never more than ~40% of the window so the
+  terminal stays usable), double-click the divider to reset to 240px, or nudge
+  it with the keyboard (arrows ±8px, Shift ±32px, Home/End to the bounds). A
+  collapse toggle shrinks it to a 56px rail showing one avatar per host with an
+  aggregate activity dot (needs > working > idle) and a tooltip, keeping
+  quick session access while reclaiming space for the terminal. The chosen width
+  and collapsed state persist across launches in `localStorage`. The ≤680px
+  mobile single-pane layout is unchanged (the rail never renders there). The
+  resize hook and pointer-math handle are written to be reused by the
+  right-panel resize (#157).
 - **Desktop UI for spawn-time branch and worktree overrides** (#124): the New
   Session dialog replaces the generated "Session id" field with a **Branch
   name** field and an optional **Worktree root** field — the user-chosen branch
