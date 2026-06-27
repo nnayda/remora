@@ -18,4 +18,5 @@ export * from "./Switch";
 export * from "./Tag";
 export * from "./Toast";
 export * from "./Tooltip";
+export * from "./use-is-mobile";
 export * from "./use-theme";
