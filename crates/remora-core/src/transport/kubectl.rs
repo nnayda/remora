@@ -317,6 +317,8 @@ impl SessionSource for KubectlSource {
             // The `test -d` preflight in run_respawn maps a gone worktree to
             // SessionNotFound.
             workspace: Some(remora_protocol::WorkspaceMode::Worktree),
+            branch: None,
+            worktree_root: None,
         };
         let plan = plan_spawn(&self.config, &spec)?;
         let host = self.host.clone();
@@ -662,6 +664,8 @@ mod tests {
             agent: Some(remora_protocol::AgentId::new("claude").expect("slug")),
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         };
         source.spawn(spec).await.expect("spawn");
         assert_eq!(*fake.opened.lock().expect("lock"), 1);
@@ -787,14 +791,21 @@ mod tests {
 
     #[tokio::test]
     async fn remove_delegates_to_run_remove_via_spawn_blocking() {
-        // For a worktree project: test -d probe → dirty-check (clean) → kill → worktree remove → branch -D.
+        // For a worktree project, run_remove now discovers the real worktree via
+        // `git worktree list`. Call order: printf $HOME, git worktree list
+        // (found at conventional path), dirty-check (clean), kill-session,
+        // worktree remove, branch -D.
+        let porcelain = "worktree /home/dev/.remora/worktrees/api/fix-login\n\
+                         HEAD abc\n\
+                         branch refs/heads/remora/fix-login\n";
         let fake = Arc::new(FakeExec::new(vec![
-            Ok(FakeExec::ok()),       // test -d worktree probe: dir exists
-            Ok(FakeExec::out("")),    // status --porcelain (clean)
-            Ok(FakeExec::out("0\n")), // rev-list (on remote)
-            Ok(FakeExec::ok()),       // kill-session
-            Ok(FakeExec::ok()),       // worktree remove
-            Ok(FakeExec::ok()),       // branch -D
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out(porcelain)),   // git worktree list: found
+            Ok(FakeExec::out("")),          // status --porcelain (clean)
+            Ok(FakeExec::out("0\n")),       // rev-list (on remote)
+            Ok(FakeExec::ok()),             // kill-session
+            Ok(FakeExec::ok()),             // worktree remove
+            Ok(FakeExec::ok()),             // branch -D
         ]));
         let source = KubectlSource::with_exec(kubectl_host(), test_config(), fake.clone());
         source
@@ -833,6 +844,8 @@ mod tests {
             agent: Some(remora_protocol::AgentId::new("claude").expect("slug")),
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         };
         source.spawn(spec).await.expect("spawn resolves + attaches");
         assert_eq!(*fake.opened.lock().expect("lock"), 1);
@@ -854,6 +867,8 @@ mod tests {
             agent: Some(remora_protocol::AgentId::new("claude").expect("slug")),
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         };
         let err = source.spawn(spec).await.expect_err("resolution fails");
         assert!(matches!(err, SourceError::Transport(_)), "{err}");

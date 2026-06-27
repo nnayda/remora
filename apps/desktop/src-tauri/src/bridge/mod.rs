@@ -104,6 +104,7 @@ impl Bridge {
         handle
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         &self,
         project_id: String,
@@ -111,6 +112,8 @@ impl Bridge {
         agent: Option<String>,
         base: Option<String>,
         workspace: Option<remora_protocol::WorkspaceMode>,
+        branch: Option<String>,
+        worktree_root: Option<String>,
         sink: Arc<dyn OutputSink>,
     ) -> Result<ChannelHandle, BridgeError> {
         let spec = SpawnSpec {
@@ -122,10 +125,12 @@ impl Bridge {
                 .map_err(|e| BridgeError::InvalidId {
                     message: e.to_string(),
                 })?,
-            // Raw; core's `normalize_base` (plan_spawn) is the authoritative
-            // validator — every transport and the future relay cross it.
+            // Raw; core's `normalize_base` / `plan_spawn` are the authoritative
+            // validators — every transport and the future relay cross them.
             base,
             workspace,
+            branch,
+            worktree_root,
         };
         let source = self.resolve_for(&spec.project_id)?;
         let channel = source.spawn(spec).await?;
@@ -734,6 +739,8 @@ mod tests {
                 Some("claude".into()),
                 None,
                 None,
+                None,
+                None,
                 s,
             )
             .await
@@ -747,7 +754,7 @@ mod tests {
         let src = Arc::new(FakeSessionSource::new());
         let (s0, _r0) = sink();
         bridge(src.clone())
-            .spawn("api".into(), "x".into(), None, None, None, s0)
+            .spawn("api".into(), "x".into(), None, None, None, None, None, s0)
             .await
             .expect("spawn");
         let b = bridge(src);
@@ -763,7 +770,7 @@ mod tests {
         let b = bridge(Arc::new(FakeSessionSource::new()));
         let (s, mut rx) = sink();
         let h = b
-            .spawn("api".into(), "x".into(), None, None, None, s)
+            .spawn("api".into(), "x".into(), None, None, None, None, None, s)
             .await
             .expect("spawn");
         b.close(h);
@@ -789,7 +796,7 @@ mod tests {
         let b = bridge(Arc::new(FakeSessionSource::new()));
         let (s, rx) = sink();
         let h = b
-            .spawn("api".into(), "x".into(), None, None, None, s)
+            .spawn("api".into(), "x".into(), None, None, None, None, None, s)
             .await
             .expect("spawn");
         drop(rx); // frontend gone
@@ -804,7 +811,7 @@ mod tests {
         let b = bridge(Arc::new(FakeSessionSource::new()));
         let (s, _rx) = sink();
         let h = b
-            .spawn("api".into(), "x".into(), None, None, None, s)
+            .spawn("api".into(), "x".into(), None, None, None, None, None, s)
             .await
             .expect("spawn");
         assert!(matches!(
@@ -831,7 +838,8 @@ mod tests {
         let b = bridge(Arc::new(FakeSessionSource::new()));
         let (s, _rx) = sink();
         assert!(matches!(
-            b.spawn("API".into(), "x".into(), None, None, None, s).await,
+            b.spawn("API".into(), "x".into(), None, None, None, None, None, s)
+                .await,
             Err(BridgeError::InvalidId { .. })
         ));
     }
@@ -841,13 +849,13 @@ mod tests {
         let src = Arc::new(FakeSessionSource::new());
         let (s1, _r1) = sink();
         bridge(src.clone())
-            .spawn("api".into(), "x".into(), None, None, None, s1)
+            .spawn("api".into(), "x".into(), None, None, None, None, None, s1)
             .await
             .expect("spawn");
         let (s2, _r2) = sink();
         assert!(matches!(
             bridge(src)
-                .spawn("api".into(), "x".into(), None, None, None, s2)
+                .spawn("api".into(), "x".into(), None, None, None, None, None, s2)
                 .await,
             Err(BridgeError::SessionExists { .. })
         ));
@@ -862,6 +870,8 @@ mod tests {
             agent: None,
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         })
         .await
         .expect("spawn");
@@ -979,7 +989,7 @@ mod tests {
         let (s, mut rx) = sink();
         let b = bridge(src.clone());
         let h = b
-            .spawn("api".into(), "x".into(), None, None, None, s)
+            .spawn("api".into(), "x".into(), None, None, None, None, None, s)
             .await
             .expect("spawn");
         src.stop_session(&pid("api"), &sid("x")); // kills the channel
@@ -1030,7 +1040,7 @@ mod tests {
             }),
         );
         let (s, _rx) = sink();
-        b.spawn("api".into(), "x".into(), None, None, None, s)
+        b.spawn("api".into(), "x".into(), None, None, None, None, None, s)
             .await
             .expect("spawn");
         assert_eq!(
@@ -1103,6 +1113,8 @@ mod tests {
                 None,
                 Some("origin/dev".into()),
                 None,
+                None,
+                None,
                 s,
             )
             .await;
@@ -1115,6 +1127,29 @@ mod tests {
                 .as_deref(),
             Some("origin/dev")
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_threads_branch_and_worktree_root_into_spec() {
+        let (src, recorded) = SpecRecordingSource::new();
+        let b = bridge(Arc::new(src));
+        let (s, _rx) = sink();
+        let _ = b
+            .spawn(
+                "api".into(),
+                "x".into(),
+                None,
+                None,
+                None,
+                Some("feat/login".into()),
+                Some("~/work".into()),
+                s,
+            )
+            .await;
+        let guard = recorded.lock().expect("lock");
+        let spec = guard.as_ref().expect("spec recorded");
+        assert_eq!(spec.branch.as_deref(), Some("feat/login"));
+        assert_eq!(spec.worktree_root.as_deref(), Some("~/work"));
     }
 
     /// A resolver whose `all()` returns two sources: one live with a session,
@@ -1258,6 +1293,8 @@ mod tests {
             agent: None,
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         })
         .await
         .expect("spawn");
@@ -1293,6 +1330,7 @@ mod tests {
                 user: Some("rootuser".into()),
                 port: Some(2222),
             },
+            worktree_root: None,
         }
     }
     fn project_input() -> ProjectInputDto {
@@ -1303,6 +1341,7 @@ mod tests {
             workspace: WorkspaceModeDto::Worktree,
             agent: "claude".into(),
             base: None,
+            worktree_root: None,
         }
     }
     fn agent_input() -> AgentInputDto {
@@ -1637,6 +1676,8 @@ mod tests {
             agent: None,
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         })
         .await
         .expect("spawn");
@@ -1657,6 +1698,8 @@ mod tests {
             agent: None,
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         })
         .await
         .expect("spawn");
@@ -1676,6 +1719,8 @@ mod tests {
             agent: None,
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         })
         .await
         .expect("spawn");
@@ -1724,7 +1769,7 @@ mod tests {
         );
         let (s, _rx) = sink();
         let result = b
-            .spawn("ghost".into(), "x".into(), None, None, None, s)
+            .spawn("ghost".into(), "x".into(), None, None, None, None, None, s)
             .await;
         std::fs::remove_file(&path).ok();
         assert!(matches!(result, Err(BridgeError::Config { .. })));

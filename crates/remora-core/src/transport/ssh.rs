@@ -199,6 +199,8 @@ impl SessionSource for SshSource {
             // The `test -d` preflight in run_respawn maps a gone worktree to
             // SessionNotFound.
             workspace: Some(remora_protocol::WorkspaceMode::Worktree),
+            branch: None,
+            worktree_root: None,
         };
         let plan = plan_spawn(&self.config, &spec)?;
         let exec = Arc::clone(&self.exec);
@@ -274,6 +276,8 @@ mod tests {
             agent: Some(AgentId::new("claude").expect("slug")),
             base: None,
             workspace: None,
+            branch: None,
+            worktree_root: None,
         }
     }
 
@@ -848,6 +852,8 @@ mod tests {
     async fn respawn_creates_without_worktree_add_and_attaches() {
         let config = test_config(); // api is worktree-mode
         let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::ok()), // printf $HOME → home = "~" (fallback)
+            Ok(FakeExec::ok()), // git worktree list → empty → None → convention
             Ok(FakeExec::ok()), // test -d preflight: dir exists
             Ok(FakeExec::ok()), // new-session ok
         ]));
@@ -858,10 +864,11 @@ mod tests {
             .await
             .expect("respawn");
         let calls = fake.calls.lock().expect("lock");
-        // First call is the `test -d` preflight; then new-session; never a
-        // `git worktree add` (the worktree survives).
-        assert!(calls[0].iter().any(|a| a == "test") && calls[0].iter().any(|a| a == "-d"));
-        assert!(calls[1].iter().any(|a| a == "new-session"));
+        // calls[0] = printf $HOME; calls[1] = git worktree list;
+        // calls[2] = test -d preflight; calls[3] = new-session.
+        // Never a `git worktree add` (the worktree survives).
+        assert!(calls[2].iter().any(|a| a == "test") && calls[2].iter().any(|a| a == "-d"));
+        assert!(calls[3].iter().any(|a| a == "new-session"));
         assert!(!calls.iter().any(|c| c.iter().any(|a| a == "add")));
         assert_eq!(fake.opened.lock().expect("lock").len(), 1);
     }
@@ -870,6 +877,8 @@ mod tests {
     async fn respawn_duplicate_attaches_to_live_session() {
         let config = test_config();
         let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::ok()), // printf $HOME → home = "~" (fallback)
+            Ok(FakeExec::ok()), // git worktree list → empty → None → convention
             Ok(FakeExec::ok()), // test -d preflight: dir exists
             Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
         ]));
@@ -885,7 +894,11 @@ mod tests {
     #[tokio::test]
     async fn respawn_of_vanished_worktree_is_not_found() {
         let config = test_config();
-        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::fail(""))]));
+        let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::ok()),     // printf $HOME → home = "~" (fallback)
+            Ok(FakeExec::ok()),     // git worktree list → empty → None → convention
+            Ok(FakeExec::fail("")), // test -d: empty stderr → SessionNotFound
+        ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let (project, session) = (pid("api"), sid("fix-login"));
         let err = source
@@ -894,7 +907,9 @@ mod tests {
             .expect_err("vanished");
         assert!(matches!(err, SourceError::SessionNotFound { .. }), "{err}");
         let calls = fake.calls.lock().expect("lock");
-        assert_eq!(calls.len(), 1, "only the preflight runs");
+        // calls[0] = printf $HOME; calls[1] = git worktree list;
+        // calls[2] = test -d preflight → fails → SessionNotFound (no new-session).
+        assert_eq!(calls.len(), 3, "home + worktree-list + preflight only");
         assert!(!calls.iter().any(|c| c.iter().any(|a| a == "new-session")));
         assert_eq!(fake.opened.lock().expect("lock").len(), 0);
     }
@@ -902,9 +917,15 @@ mod tests {
     #[tokio::test]
     async fn respawn_preflight_probe_failure_is_transport() {
         let config = test_config();
-        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::fail(
-            "ssh: connect to host devbox port 22: Connection refused",
-        ))]));
+        // printf $HOME: success=true, empty stdout → not absolute → home = "~" (fallback);
+        // worktree list: empty → None → convention; test -d: fails with stderr → Transport.
+        let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::ok()), // printf $HOME → home = "~" (fallback)
+            Ok(FakeExec::ok()), // git worktree list → empty → None → convention
+            Ok(FakeExec::fail(
+                "ssh: connect to host devbox port 22: Connection refused",
+            )), // test -d: non-empty stderr → Transport
+        ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let (project, session) = (pid("api"), sid("fix-login"));
         let err = source
@@ -919,6 +940,8 @@ mod tests {
     async fn respawn_generic_new_session_failure_is_transport_and_opens_no_channel() {
         let config = test_config();
         let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::ok()),                      // printf $HOME → home = "~"
+            Ok(FakeExec::ok()),                      // git worktree list → None → convention
             Ok(FakeExec::ok()),                      // test -d preflight: dir exists
             Ok(FakeExec::fail("no server running")), // new-session: generic failure
         ]));
@@ -953,6 +976,8 @@ mod tests {
         "#;
         let config = Arc::new(Config::from_toml_str(toml).expect("config"));
         let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::ok()),     // printf $HOME → home = "~" (fallback)
+            Ok(FakeExec::ok()),     // git worktree list → empty → None → convention
             Ok(FakeExec::fail("")), // test -d: worktree dir gone → SessionNotFound
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
@@ -965,11 +990,12 @@ mod tests {
             matches!(err, SourceError::SessionNotFound { .. }),
             "expected SessionNotFound (worktree gone), got: {err}"
         );
-        // The preflight `test -d` must have run.
+        // calls[0] = printf $HOME; calls[1] = git worktree list;
+        // calls[2] = test -d preflight → fails → SessionNotFound.
         let calls = fake.calls.lock().expect("lock");
-        assert_eq!(calls.len(), 1, "only the preflight probe runs");
+        assert_eq!(calls.len(), 3, "home + worktree-list + preflight probe");
         assert!(
-            calls[0].iter().any(|a| a == "test") && calls[0].iter().any(|a| a == "-d"),
+            calls[2].iter().any(|a| a == "test") && calls[2].iter().any(|a| a == "-d"),
             "preflight must be a `test -d` probe"
         );
     }
@@ -992,6 +1018,8 @@ mod tests {
         "#;
         let config = Arc::new(Config::from_toml_str(toml).expect("config"));
         let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::ok()), // printf $HOME → home = "~" (fallback)
+            Ok(FakeExec::ok()), // git worktree list → empty → None → convention
             Ok(FakeExec::ok()), // test -d: worktree dir exists
             Ok(FakeExec::ok()), // new-session ok
         ]));
@@ -1012,6 +1040,8 @@ mod tests {
     async fn respawn_uses_the_supplied_agent_not_the_project_default() {
         // Project default is "claude"; respawn with "codex" must launch codex.
         let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::ok()), // printf $HOME → home = "~" (fallback)
+            Ok(FakeExec::ok()), // git worktree list → empty → None → convention
             Ok(FakeExec::ok()), // test -d preflight: dir exists
             Ok(FakeExec::ok()), // new-session ok
         ]));

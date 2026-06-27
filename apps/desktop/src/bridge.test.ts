@@ -40,6 +40,8 @@ describe("bridge.ts", () => {
         _a: unknown,
         _b: unknown,
         _w: unknown,
+        _branch: unknown,
+        _worktreeRoot: unknown,
         ch: { onmessage: ((m: unknown) => void) | null },
       ) => {
         ch.onmessage?.({ event: "bytes", bytes: [104] });
@@ -54,6 +56,8 @@ describe("bridge.ts", () => {
       null,
       null,
       "worktree",
+      null,
+      null,
       (m) => seen.push(m),
     );
     expect(h).toBe(1);
@@ -74,6 +78,8 @@ describe("bridge.ts", () => {
       null,
       "origin/dev",
       "worktree",
+      null,
+      null,
       () => {},
     );
     expect(spy).toHaveBeenCalledWith(
@@ -82,6 +88,8 @@ describe("bridge.ts", () => {
       null,
       "origin/dev",
       "worktree",
+      null,
+      null,
       expect.anything(),
     );
   });

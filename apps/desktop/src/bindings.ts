@@ -22,9 +22,9 @@ async configGet() : Promise<Result<ConfigDto, BridgeError>> {
     else return { status: "error", error: e  as any };
 }
 },
-async sessionSpawn(projectId: string, sessionId: string, agent: string | null, base: string | null, workspace: WorkspaceModeDto | null, onOutput: TAURI_CHANNEL<BridgeOutput>) : Promise<Result<ChannelHandle, BridgeError>> {
+async sessionSpawn(projectId: string, sessionId: string, agent: string | null, base: string | null, workspace: WorkspaceModeDto | null, branch: string | null, worktreeRoot: string | null, onOutput: TAURI_CHANNEL<BridgeOutput>) : Promise<Result<ChannelHandle, BridgeError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("session_spawn", { projectId, sessionId, agent, base, workspace, onOutput }) };
+    return { status: "ok", data: await TAURI_INVOKE("session_spawn", { projectId, sessionId, agent, base, workspace, branch, worktreeRoot, onOutput }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -260,12 +260,12 @@ export type EditorConfigDto = { hosts: EditorHostDto[]; projects: EditorProjectD
 /**
  * A host with its full connection details (the editable form state).
  */
-export type EditorHostDto = { id: string; name: string | null; transport: TransportDto }
+export type EditorHostDto = { id: string; name: string | null; transport: TransportDto; worktreeRoot: string | null }
 /**
  * A project with every editable field, including the on-host `path` and
  * `workspace` mode that the display `ProjectDto` omits.
  */
-export type EditorProjectDto = { id: string; name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string; base: string | null }
+export type EditorProjectDto = { id: string; name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string; base: string | null; worktreeRoot: string | null }
 /**
  * A configured host, label-only. The `transport` discriminant is all the UI
  * needs (an icon/badge); the connection details never cross.
@@ -275,7 +275,14 @@ export type HostDto = { id: string; name: string | null; transport: TransportKin
  * Form payload for create/edit of a host. The entry id is a separate command
  * argument, so it is not carried here.
  */
-export type HostInputDto = { name: string | null; transport: TransportDto }
+export type HostInputDto = { name: string | null; transport: TransportDto; 
+/**
+ * Preserved across the editor round-trip so that a TOML-set `worktree_root`
+ * is not silently cleared when the user edits an unrelated field. B2 will
+ * add the form input; here we just thread the value through so the save
+ * path does not destroy it.
+ */
+worktreeRoot?: string | null }
 /**
  * One host's discovery outcome for a single `Bridge::list` poll. `available`
  * is false when the host's `source.list()` errored (then `sessions` is empty);
@@ -306,7 +313,14 @@ export type ProjectDto = { id: string; name: string | null; hostId: string; work
  * Form payload for create/edit of a project. `host_id` and `agent` are
  * references to existing entries; converting parses them into ids.
  */
-export type ProjectInputDto = { name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string; base?: string | null }
+export type ProjectInputDto = { name: string | null; hostId: string; path: string; workspace: WorkspaceModeDto; agent: string; base?: string | null; 
+/**
+ * Preserved across the editor round-trip so that a TOML-set `worktree_root`
+ * is not silently cleared when the user edits an unrelated field. B2 will
+ * add the form input; here we just thread the value through so the save
+ * path does not destroy it.
+ */
+worktreeRoot?: string | null }
 /**
  * Result of a discovery poll: one bucket per host attempted this poll, in
  * config order. Sessions are sorted by (project_id, session_id) within each
@@ -329,7 +343,12 @@ workspacePath: string | null;
  * Effective workspace mode discovered for this session (real state), or
  * null from an older sender. Drives sidebar/tab gating.
  */
-workspace: WorkspaceModeDto | null }
+workspace: WorkspaceModeDto | null; 
+/**
+ * Git branch the sandbox advertises for this session. Untrusted,
+ * display-only (same rule as `agent`/`workspace_path`).
+ */
+branch: string | null }
 export type SessionStateDto = "live" | "stopped"
 /**
  * Frontend-facing mirror of `remora_protocol::SessionStatus` (which is

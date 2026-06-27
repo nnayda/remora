@@ -30,6 +30,7 @@ const session = (
   sessionId: string,
   state: "live" | "stopped" = "live",
   agent: string | null = null,
+  branch: string | null = null,
 ): SessionMetaDto => ({
   projectId,
   sessionId,
@@ -38,6 +39,7 @@ const session = (
   createdAt: null,
   workspacePath: null,
   workspace: null,
+  branch,
 });
 
 const cfg = (
@@ -260,6 +262,7 @@ describe("buildTree", () => {
           createdAt: null,
           workspacePath: null,
           workspace: "worktree",
+          branch: null,
         },
       ],
     );
@@ -280,6 +283,22 @@ describe("buildTree", () => {
     expect(rows.find((s) => s.sessionId === "other")?.reconnecting).toBe(false);
   });
 
+  it("carries branch from SessionMetaDto onto SessionNode", () => {
+    const tree = buildTree(
+      cfg([host("devbox", "ssh")], [project("api", "devbox")]),
+      [session("api", "feat-login", "live", null, "feat/login")],
+    );
+    expect(tree[0].sessions[0].branch).toBe("feat/login");
+  });
+
+  it("sets SessionNode.branch to null when the DTO has no branch", () => {
+    const tree = buildTree(
+      cfg([host("devbox", "ssh")], [project("api", "devbox")]),
+      [session("api", "s1")],
+    );
+    expect(tree[0].sessions[0].branch).toBeNull();
+  });
+
   it("falls back to the project default when discovered workspace is null", () => {
     const tree = buildTree(
       cfg(
@@ -295,6 +314,7 @@ describe("buildTree", () => {
           createdAt: null,
           workspacePath: null,
           workspace: null,
+          branch: null,
         },
       ],
     );

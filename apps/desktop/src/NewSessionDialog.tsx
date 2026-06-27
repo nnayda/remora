@@ -1,10 +1,10 @@
 import { type KeyboardEvent, useEffect, useMemo, useState } from "react";
 import type { ConfigDto } from "./bindings";
+import { deriveSessionId } from "./derive-session-id";
 import { NAME_INPUT_ID, shouldFocusNameField } from "./new-session-focus";
 import { buildNewSessionModel, resolveSelection } from "./new-session-model";
 import type { OpenResult, SpawnInput } from "./session-store";
 import { OPEN_CANCELLED } from "./session-store";
-import { isValidSlug, normalizeSlugInput } from "./spawn-input";
 import { Button, Dialog, Input, Select } from "./ui";
 import { Terminal } from "./ui/icons";
 
@@ -46,7 +46,8 @@ export function NewSessionDialog({
   const model = useMemo(() => buildNewSessionModel(config), [config]);
   const initial = resolveSelection(model, initialProjectId);
   const [projectId, setProjectId] = useState(initial.projectId);
-  const [sessionId, setSessionId] = useState("");
+  const [branch, setBranch] = useState("");
+  const [worktreeRoot, setWorktreeRoot] = useState("");
   // Agent defaults to the selected project's default; project changes reset it.
   const [agent, setAgent] = useState(initial.agent);
   const [base, setBase] = useState("");
@@ -56,12 +57,20 @@ export function NewSessionDialog({
 
   const selectedProject =
     model.projects.find((p) => p.id === projectId) ?? null;
+
+  /** Derived session id from the typed branch name (null = invalid/too long). */
+  const sessionId = useMemo(
+    () => (branch.trim() !== "" ? deriveSessionId(branch.trim()) : null),
+    [branch],
+  );
+
   // Membership guards (not mere non-empty) so a stale selection that matches no
   // option can't submit a project/agent the config no longer has.
   const valid =
     selectedProject !== null &&
     model.agents.includes(agent) &&
-    isValidSlug(sessionId);
+    branch.trim() !== "" &&
+    sessionId !== null;
 
   // Focus a field on open; restore focus to the opener on close. Opened from a
   // project "+" the project is already implied, so focus the session-name input
@@ -98,6 +107,10 @@ export function NewSessionDialog({
       // silently submitted against its replacement (empty → that project's
       // configured/detected default).
       setBase("");
+      // Clear branch and worktree root when project is gone — a branch entered
+      // for the old project shouldn't silently land on its replacement.
+      setBranch("");
+      setWorktreeRoot("");
     }
   }, [model, projectId]);
 
@@ -115,19 +128,24 @@ export function NewSessionDialog({
   /** Validate, open the session, and reflect the outcome (success closes the
    * dialog; a real error shows inline; the button never sticks on "Connecting…"). */
   async function submit() {
-    if (!valid || submitting) return;
+    // sessionId is non-null when `valid` (both check branch + derive); the
+    // explicit guard here lets TypeScript narrow without a non-null assertion.
+    if (!valid || submitting || sessionId === null) return;
     setSubmitting(true);
     setError(null);
     try {
       // Send null when the agent is the project default so spawn resolves the
       // live default (preserving SpawnInput's "null = project default" path);
       // an explicit override sends its id.
+      // sessionId is non-null here (narrowed by the guard above).
       const result = await openSession({
         projectId,
         sessionId,
         agent: agent === selectedProject?.defaultAgent ? null : agent,
         base: base.trim() === "" ? null : base.trim(),
         workspace,
+        branch: branch.trim(),
+        worktreeRoot: worktreeRoot.trim() === "" ? null : worktreeRoot.trim(),
       });
       if (result.ok) {
         onOpened({ attached: result.attached, opened: result.opened });
@@ -244,10 +262,25 @@ export function NewSessionDialog({
           </div>
           <Input
             id={NAME_INPUT_ID}
-            label="Session"
-            value={sessionId}
+            label="Branch name"
+            value={branch}
             mono
-            onChange={(e) => setSessionId(normalizeSlugInput(e.target.value))}
+            placeholder="feat/login"
+            hint="The branch to create — also the session's name."
+            error={
+              branch.trim() !== "" && sessionId === null
+                ? "Branch name is too long or not a valid git ref."
+                : undefined
+            }
+            onChange={(e) => setBranch(e.target.value)}
+          />
+          <Input
+            label="Worktree root (optional)"
+            value={worktreeRoot}
+            mono
+            placeholder="project/host default"
+            hint="Override the directory where the worktree is created. Empty = project default."
+            onChange={(e) => setWorktreeRoot(e.target.value)}
           />
           <div className="rmra-field">
             <Select

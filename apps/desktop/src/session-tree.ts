@@ -43,6 +43,12 @@ export interface SessionNode {
   /** Host of this session is currently unavailable; its row is retained and
    * shown dimmed/"reconnecting" rather than removed (#159). */
   reconnecting: boolean;
+  /**
+   * Git branch the session advertises (ADR-0015). This is the user-facing
+   * identity shown in the sidebar; falls back to sessionId when null
+   * (e.g. detached HEAD).
+   */
+  branch: string | null;
 }
 
 export interface ProjectNode {
@@ -87,6 +93,7 @@ function sessionNode(
     key: tabKey(s.projectId, s.sessionId),
     workspace,
     reconnecting,
+    branch: s.branch,
   };
 }
 

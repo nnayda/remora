@@ -75,6 +75,7 @@ pub struct EditorHostDto {
     pub id: String,
     pub name: Option<String>,
     pub transport: TransportDto,
+    pub worktree_root: Option<String>,
 }
 
 /// A kubectl connection field for the editor: `command = false` is a literal
@@ -143,6 +144,7 @@ pub struct EditorProjectDto {
     pub workspace: WorkspaceModeDto,
     pub agent: String,
     pub base: Option<String>,
+    pub worktree_root: Option<String>,
 }
 
 /// Workspace mode, shared by the read projection and the write inputs.
@@ -221,6 +223,12 @@ impl From<Transport> for TransportDto {
 pub struct HostInputDto {
     pub name: Option<String>,
     pub transport: TransportDto,
+    /// Preserved across the editor round-trip so that a TOML-set `worktree_root`
+    /// is not silently cleared when the user edits an unrelated field. B2 will
+    /// add the form input; here we just thread the value through so the save
+    /// path does not destroy it.
+    #[serde(default)]
+    pub worktree_root: Option<String>,
 }
 
 impl HostInputDto {
@@ -245,6 +253,7 @@ impl HostInputDto {
         Host {
             name: self.name,
             transport,
+            worktree_root: self.worktree_root,
         }
     }
 }
@@ -261,6 +270,12 @@ pub struct ProjectInputDto {
     pub agent: String,
     #[serde(default)]
     pub base: Option<String>,
+    /// Preserved across the editor round-trip so that a TOML-set `worktree_root`
+    /// is not silently cleared when the user edits an unrelated field. B2 will
+    /// add the form input; here we just thread the value through so the save
+    /// path does not destroy it.
+    #[serde(default)]
+    pub worktree_root: Option<String>,
 }
 
 impl ProjectInputDto {
@@ -278,6 +293,7 @@ impl ProjectInputDto {
             workspace: self.workspace.into(),
             agent: AgentId::new(self.agent).map_err(invalid)?,
             base: self.base,
+            worktree_root: self.worktree_root,
         })
     }
 }
@@ -314,6 +330,7 @@ fn editor_host_dto(id: &str, host: Host) -> EditorHostDto {
         id: id.to_owned(),
         name: host.name,
         transport: host.transport.into(),
+        worktree_root: host.worktree_root,
     }
 }
 
@@ -326,6 +343,7 @@ fn editor_project_dto(id: &str, project: Project) -> EditorProjectDto {
         workspace: project.workspace.into(),
         agent: project.agent.as_str().to_owned(),
         base: project.base,
+        worktree_root: project.worktree_root,
     }
 }
 
@@ -346,6 +364,7 @@ mod tests {
                 user: Some("rootuser".into()),
                 port: Some(2222),
             }),
+            worktree_root: None,
         }
     }
 
@@ -358,6 +377,7 @@ mod tests {
                 context: Some(KubectlField::Literal("secret-context".into())),
                 container: Some(KubectlField::Literal("secret-container".into())),
             }),
+            worktree_root: None,
         }
     }
 
@@ -378,6 +398,7 @@ mod tests {
                 workspace: WorkspaceMode::Worktree,
                 agent: AgentId::new("claude").expect("id"),
                 base: None,
+                worktree_root: None,
             },
         );
         config.agents.insert(
@@ -501,6 +522,7 @@ mod tests {
             workspace: WorkspaceMode::Worktree,
             agent: AgentId::new("claude").expect("id"),
             base: Some("origin/develop".into()),
+            worktree_root: None,
         };
         // out to the form…
         let out = editor_project_dto("api", project);
@@ -513,10 +535,70 @@ mod tests {
             workspace: out.workspace,
             agent: out.agent,
             base: out.base,
+            worktree_root: out.worktree_root,
         }
         .into_project()
         .expect("into_project");
         assert_eq!(back.base.as_deref(), Some("origin/develop"));
+    }
+
+    #[test]
+    fn project_worktree_root_survives_dto_round_trip() {
+        // A TOML-set `worktree_root` must not be silently cleared when the user
+        // edits and saves a project through the config editor. The editor reads
+        // `worktree_root` from the Project into `EditorProjectDto`, and the form
+        // submission carries it back through `ProjectInputDto::into_project`.
+        let project = Project {
+            name: Some("API".into()),
+            host: HostId::new("ssh-box").expect("id"),
+            path: "/srv/api".into(),
+            workspace: WorkspaceMode::Worktree,
+            agent: AgentId::new("claude").expect("id"),
+            base: None,
+            worktree_root: Some("~/work".into()),
+        };
+        // out to the form…
+        let out = editor_project_dto("api", project);
+        assert_eq!(out.worktree_root.as_deref(), Some("~/work"));
+        // …and back from the form must NOT drop worktree_root.
+        let back = ProjectInputDto {
+            name: out.name,
+            host_id: out.host_id,
+            path: out.path,
+            workspace: out.workspace,
+            agent: out.agent,
+            base: out.base,
+            worktree_root: out.worktree_root,
+        }
+        .into_project()
+        .expect("into_project");
+        assert_eq!(back.worktree_root.as_deref(), Some("~/work"));
+    }
+
+    #[test]
+    fn host_worktree_root_survives_dto_round_trip() {
+        // A TOML-set host-level `worktree_root` must not be silently cleared when
+        // the user edits and saves a host through the config editor.
+        let host = Host {
+            name: Some("Dev box".into()),
+            transport: Transport::Ssh(SshHost {
+                host: "devbox".into(),
+                user: None,
+                port: None,
+            }),
+            worktree_root: Some("~/host-work".into()),
+        };
+        // out to the form…
+        let out = editor_host_dto("devbox", host);
+        assert_eq!(out.worktree_root.as_deref(), Some("~/host-work"));
+        // …and back from the form must NOT drop worktree_root.
+        let back = HostInputDto {
+            name: out.name,
+            transport: out.transport,
+            worktree_root: out.worktree_root,
+        }
+        .into_host();
+        assert_eq!(back.worktree_root.as_deref(), Some("~/host-work"));
     }
 
     #[test]
@@ -536,6 +618,7 @@ mod tests {
                 context: None,
                 container: None,
             }),
+            worktree_root: None,
         };
         let dto = TransportDto::from(host.transport.clone());
         let TransportDto::Kubectl {
@@ -554,6 +637,7 @@ mod tests {
         let back = HostInputDto {
             name: None,
             transport: dto,
+            worktree_root: None,
         }
         .into_host();
         assert_eq!(back, host);

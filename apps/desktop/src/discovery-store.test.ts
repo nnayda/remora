@@ -16,6 +16,7 @@ const session = (projectId: string, sessionId: string): SessionMetaDto => ({
   createdAt: null,
   workspacePath: null,
   workspace: null,
+  branch: null,
 });
 
 /** Build a host-grouped poll result. */

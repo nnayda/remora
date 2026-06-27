@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Desktop UI for spawn-time branch and worktree overrides** (#124): the New
+  Session dialog replaces the generated "Session id" field with a **Branch
+  name** field and an optional **Worktree root** field — the user-chosen branch
+  is the session's identity, and the internal `session_id` is minted on the
+  client from that branch via a TypeScript port of the core FNV-1a/32
+  `derive_session_id`, kept byte-identical to Rust by a shared test-vector
+  fixture (core rejects any spawn whose `session_id` doesn't match
+  `derive(branch)`, so a hash mismatch surfaces immediately). The sidebar now
+  renders that branch as the session's name instead of the internal slug; the
+  config editor gains a `worktree_root` field on both hosts and projects
+  (feeding the host → project → session cascade); and a primary-checkout
+  (Shared) session's removal is relabelled **"Close session"** with
+  non-destructive copy, since tearing it down only ends the tmux session and
+  never deletes a worktree or branch. This **completes #124** — the discovery
+  foundation landed in #155 and the core spawn engine in #160; follow-ups #153
+  (`$HOME`-fallback hardening), #154 (edge-case tests), and #145 (user docs)
+  remain open.
+- **New-project "+" on the sidebar section header** (#161): a `+` button next to
+  the sidebar "Projects" header opens Settings deep-linked to the new-project
+  create form (first field focused), instead of landing on the entity list and
+  making you hunt for the projects section. The footer gear still opens Settings
+  on the list as before. `SettingsDialog` gains an optional `initialView` prop
+  (default `{ kind: "list" }`) that seeds its view state, and `App` routes the
+  gear to the list and the new `+` to the project-create form. The button stays
+  visible in the empty "No projects yet" state so a first-time user can reach
+  the form in one click.
+- **Spawn-time worktree path and branch overrides** (#124): when spawning a
+  session, you can now specify a custom worktree root path and branch name. The
+  `worktree_root` overrides the project and host defaults (which cascade to the
+  convention `~/.remora/worktrees/<project-id>`); the `branch` is chosen
+  per-session at spawn with no project or host default. The branch can be any
+  valid git ref — feature branch, device label, personal naming scheme —
+  without the fixed `remora/<session-id>` prefix; when not specified, the
+  worktree is created at the back-compat path `~/.remora/worktrees/<project>/<session_id>`
+  with branch `remora/<session_id>`, so existing workflows are unchanged. The `session_id` derivation moved from `DefaultHasher` to FNV-1a/32,
+  making ids stable across Rust rebuilds and reproducible in TypeScript (closes
+  #153's hasher item); client-side session id minting and the "Branch name" +
+  `worktree_root` form fields land in a follow-up desktop PR.
 - **Branch-identified session discovery** (#124, ADR-0015): the discovery
   foundation that will let a future release place worktrees at custom paths and
   name their branches freely. Discovery no longer parses the
@@ -378,6 +416,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Open-vs-teardown race that orphaned a session.** Clicking Remove on a session
+  and then clicking its row (which respawns) could interleave: the remove killed
+  tmux and deleted the worktree + branch while the respawn re-created tmux in that
+  same worktree, leaving a live tmux with no worktree or branch behind it. The
+  orphan then showed no Stop affordance (discovery classifies a backing-less live
+  session as Shared) and was awkward to clear. `SessionStore` had two independent
+  in-flight guards — `pending` (open-vs-open) and `teardownPending`
+  (teardown-vs-teardown) — with nothing serializing an open against a teardown,
+  and `respawnTab` checked neither. Added a per-key `busy()` cross-lock (opens use
+  `pending`, respawns a new `respawning` count, teardowns `teardownPending`):
+  `openTab`/`stop`/`remove` refuse while busy, and `respawnTab` bails if an open
+  or teardown is in flight while still allowing a concurrent respawn (newest-wins
+  via the reconnect token). The `respawning` map is a count, not a set, so two
+  overlapping respawns keep the key locked until both settle.
+- **Remove dialog showed a generic error instead of the real reason.** A failed
+  remove surfaced "Could not remove the session." even when the backend returned
+  a specific cause, because the dialog only rendered `Error` instances and
+  strings — a tauri-specta `BridgeError` is a typed plain object, so its message
+  was dropped. A new `removeErrorMessage` helper surfaces the `BridgeError`
+  message (falling back to the friendly copy only for a bare `{ok:false}`).
 - A kubectl `{ command }` field accidentally wrapped in command substitution —
   `pod = { command = "$(kubectl … | head -n1)" }` — is now rejected at config
   time with a targeted message ("must be the command itself, not wrapped in

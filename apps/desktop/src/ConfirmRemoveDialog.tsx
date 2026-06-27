@@ -1,6 +1,6 @@
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import type { WorkspaceModeDto } from "./bindings";
-import type { RemoveResult } from "./session-store";
+import { type RemoveResult, removeErrorMessage } from "./session-store";
 import { Button, Dialog } from "./ui";
 import { AlertTriangle } from "./ui/icons";
 
@@ -85,14 +85,9 @@ export function ConfirmRemoveDialog({
       });
       return;
     }
-    // Error from a force attempt (or unexpected non-dirty error on first attempt).
-    const msg =
-      result.error instanceof Error
-        ? result.error.message
-        : typeof result.error === "string"
-          ? result.error
-          : "Could not remove the session.";
-    setError(msg);
+    // Error from a force attempt (or unexpected non-dirty error on first
+    // attempt). Surfaces a BridgeError's message instead of a generic string.
+    setError(removeErrorMessage(result));
   }
 
   /** Modal keyboard handling: Esc closes, Tab is trapped within the dialog. */
@@ -122,6 +117,7 @@ export function ConfirmRemoveDialog({
     workspace === "worktree" ? " and deletes its worktree and branch." : ".";
 
   const isForce = stage.kind === "force";
+  const isShared = workspace === "shared";
 
   const footer = (
     <>
@@ -130,12 +126,12 @@ export function ConfirmRemoveDialog({
       </Button>
       <Button
         ref={firstButtonRef}
-        variant="danger"
+        variant={isShared && !isForce ? "primary" : "danger"}
         onClick={() => void handleConfirm(isForce)}
         disabled={busy}
         loading={busy}
       >
-        {isForce ? "Remove anyway" : "Remove"}
+        {isForce ? "Remove anyway" : isShared ? "Close" : "Remove"}
       </Button>
     </>
   );
@@ -143,11 +139,19 @@ export function ConfirmRemoveDialog({
   return (
     <Dialog
       open
-      title={isForce ? "Remove anyway?" : "Remove session"}
+      title={
+        isForce
+          ? "Remove anyway?"
+          : isShared
+            ? "Close session"
+            : "Remove session"
+      }
       description={
         isForce
           ? undefined
-          : "This kills the tmux session and cannot be undone."
+          : isShared
+            ? "This closes the tmux session."
+            : "This kills the tmux session and cannot be undone."
       }
       icon={<AlertTriangle size={18} />}
       onClose={requestClose}
@@ -156,6 +160,14 @@ export function ConfirmRemoveDialog({
     >
       {isForce ? (
         <p>This session has {stage.dirtyReason}. Remove anyway?</p>
+      ) : isShared ? (
+        <p>
+          Close session{" "}
+          <strong style={{ fontFamily: "var(--font-mono)" }}>
+            {projectId}/{sessionId}
+          </strong>
+          ? This closes the tmux session.
+        </p>
       ) : (
         <p>
           Remove session{" "}
