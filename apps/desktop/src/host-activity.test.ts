@@ -11,6 +11,8 @@ function session(key: string, state: "live" | "stopped" = "live"): SessionNode {
     agent: null,
     key,
     workspace: "worktree",
+    reconnecting: false,
+    branch: null,
   };
 }
 

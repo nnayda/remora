@@ -46,6 +46,8 @@ interface SidebarProps {
   onNewSession: (projectId: string) => void;
   /** Open the config-management (Settings) modal. */
   onOpenSettings: () => void;
+  /** Open Settings deep-linked to the new-project form (section-header "+"). */
+  onAddProject: () => void;
   activity: ReadonlyMap<string, ActivityState>;
   /** Collapse the sidebar to the narrow icon rail. */
   onCollapse?: () => void;
@@ -85,6 +87,7 @@ export function Sidebar({
   onRemove,
   onNewSession,
   onOpenSettings,
+  onAddProject,
   activity,
   onCollapse,
 }: SidebarProps) {
@@ -172,7 +175,12 @@ export function Sidebar({
       )}
 
       <div className="rk-sidebar__scroll">
-        <div className="rk-sidebar__label">Projects</div>
+        <div className="rk-sidebar__label">
+          <span className="rk-sidebar__label-text">Projects</span>
+          <IconButton label="New project" size="sm" onClick={onAddProject}>
+            <Plus size={14} />
+          </IconButton>
+        </div>
         {filtered.length === 0 ? (
           <p className="rk-sidebar__empty">No projects yet.</p>
         ) : (
@@ -293,7 +301,7 @@ function ProjectGroup({
             return (
               <SessionRow
                 key={session.key}
-                name={session.sessionId}
+                name={session.branch ?? session.sessionId}
                 agent={session.agent ?? undefined}
                 branch={null}
                 state={sessionIndicatorState(
@@ -305,6 +313,7 @@ function ProjectGroup({
                 aria-current={session.key === activeKey ? "true" : undefined}
                 title={stopped ? "Stopped — click to respawn" : undefined}
                 onClick={() => onOpenSession(session)}
+                reconnecting={session.reconnecting}
                 actions={
                   <SessionMenu
                     session={session}

@@ -26,6 +26,7 @@ the old one rather than editing history (see
 | [0013](0013-core-side-activity-detector.md) | Run the activity detector core-side as the sole output_tx sender | Accepted |
 | [0014](0014-config-file-watcher-and-typed-event-channel.md) | Watch the config file and push changes via a typed Rust→frontend event | Accepted |
 | [0015](0015-branch-identified-worktree-discovery.md) | Identify worktree sessions by branch, discover by path | Accepted |
+| [0016](0016-host-grouped-discovery-list.md) | Report discovery as per-host buckets, retain a transiently-down host's rows | Accepted |
 
 ## Statuses
 

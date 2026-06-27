@@ -1,4 +1,5 @@
-import type { ConfigDto, SessionMetaDto } from "./bindings";
+import type { ConfigDto, SessionListDto, SessionMetaDto } from "./bindings";
+import { tabKey } from "./session-store";
 
 /**
  * App-scoped owner of the sidebar's live discovery state: the per-device config
@@ -14,11 +15,18 @@ import type { ConfigDto, SessionMetaDto } from "./bindings";
  *   stop ─▶ dispose: clear interval + ignore any in-flight result
  */
 
+/** How long a host's last-good rows are retained while it is continuously
+ * unavailable, before they are pruned. Partial-failure only — all-hosts-down is
+ * the discoveryUnavailable banner's job. */
+export const RECONNECT_GRACE_MS = 15_000;
+
 export interface DiscoveryDeps {
   loadConfig: () => Promise<ConfigDto>;
-  listSessions: () => Promise<SessionMetaDto[]>;
+  listSessions: () => Promise<SessionListDto>;
   /** Poll period while active. Defaults to 4s. */
   intervalMs?: number;
+  /** Wall clock for the grace window. Defaults to Date.now (injectable for tests). */
+  now?: () => number;
 }
 
 export interface DiscoverySnapshot {
@@ -28,6 +36,9 @@ export interface DiscoverySnapshot {
   configError: string | null;
   /** True when the last session poll failed (last good list is retained). */
   discoveryUnavailable: boolean;
+  /** tabKey(projectId, sessionId) of every session on a host currently
+   * unavailable (retained, shown dimmed/reconnecting). */
+  reconnectingKeys: string[];
 }
 
 const EMPTY_CONFIG: ConfigDto = { hosts: [], projects: [], agents: [] };
@@ -42,6 +53,7 @@ function errorMessage(e: unknown): string {
 
 export class DiscoveryStore {
   private readonly intervalMs: number;
+  private readonly now: () => number;
   private timer: ReturnType<typeof setInterval> | null = null;
   private fetching = false;
   private active = true;
@@ -53,7 +65,21 @@ export class DiscoveryStore {
     sessions: [],
     configError: null,
     discoveryUnavailable: false,
+    reconnectingKeys: [],
   };
+
+  // host id → its last-good rows + when it started failing (null ⇒ reachable)
+  // `unavailableSince` is the timestamp of the FIRST poll that found the host
+  // down (null while reachable); the 15s grace window measures from that
+  // detection, so a host gets a full reconnecting window however slow its
+  // transport is to surface the error.
+  private byHost = new Map<
+    string,
+    {
+      sessions: SessionMetaDto[];
+      unavailableSince: number | null;
+    }
+  >();
 
   /** Resolve the poll interval, clamping a 0/negative override to the default. */
   constructor(private readonly deps: DiscoveryDeps) {
@@ -61,6 +87,7 @@ export class DiscoveryStore {
     // that hammers listSessions(); fall back to the 4s default.
     const intervalMs = deps.intervalMs ?? 4000;
     this.intervalMs = intervalMs > 0 ? intervalMs : 4000;
+    this.now = deps.now ?? Date.now;
   }
 
   /** `useSyncExternalStore` subscribe: register a listener, returns unsubscribe. */
@@ -99,6 +126,14 @@ export class DiscoveryStore {
     if (this.disposed || active === this.active) return;
     this.active = active;
     if (active) {
+      // Resume from hidden: restart the grace window for any already-failing
+      // host so a long hidden gap never prunes-then-reappears (the #159
+      // flicker). A host that was reachable when hidden needs no reset — its
+      // window only starts when the first post-resume poll detects it down.
+      const t = this.now();
+      for (const entry of this.byHost.values()) {
+        if (entry.unavailableSince !== null) entry.unavailableSince = t;
+      }
       void this.pollSessions();
       this.startTimer();
     } else {
@@ -167,15 +202,85 @@ export class DiscoveryStore {
     if (this.fetching) return;
     this.fetching = true;
     try {
-      const sessions = await this.deps.listSessions();
+      const result = await this.deps.listSessions();
       if (this.disposed) return;
-      this.commit({ sessions, discoveryUnavailable: false });
+      this.mergeHosts(result);
+      this.commit({
+        sessions: this.flattenSessions(),
+        reconnectingKeys: this.computeReconnectingKeys(),
+        discoveryUnavailable: false,
+      });
     } catch {
       if (this.disposed) return;
-      // Keep the last good list; just flag that discovery is currently down.
+      // All hosts down (or transport error): keep last good, flag the banner.
+      // Per-host timers are intentionally left running.
       this.commit({ discoveryUnavailable: true });
     } finally {
       this.fetching = false;
     }
+  }
+
+  /** Fold a host-grouped poll into the retention map. */
+  private mergeHosts(result: SessionListDto): void {
+    const seen = new Set<string>();
+    for (const host of result.hosts) {
+      seen.add(host.hostId);
+      if (host.available) {
+        // Authoritative — including an empty list (reachable-but-empty clears).
+        this.byHost.set(host.hostId, {
+          sessions: host.sessions,
+          unavailableSince: null,
+        });
+        continue;
+      }
+      const prior = this.byHost.get(host.hostId);
+      // Nothing worth retaining ⇒ don't arm a timer or mark reconnecting.
+      if (!prior || prior.sessions.length === 0) {
+        this.byHost.delete(host.hostId);
+        continue;
+      }
+      // Anchor the grace window at the FIRST down poll (detection time); keep
+      // that anchor on subsequent down polls so total reconnecting time is 15s.
+      const since = prior.unavailableSince ?? this.now();
+      if (this.now() - since > RECONNECT_GRACE_MS) {
+        this.byHost.delete(host.hostId); // prune after grace
+      } else {
+        this.byHost.set(host.hostId, {
+          sessions: prior.sessions,
+          unavailableSince: since,
+        });
+      }
+    }
+    // Reconcile: a host absent from this poll (removed from config) must not
+    // linger as ghost rows on the app-scoped singleton.
+    for (const hostId of [...this.byHost.keys()]) {
+      if (!seen.has(hostId)) this.byHost.delete(hostId);
+    }
+  }
+
+  /** All retained sessions, sorted by (projectId, sessionId) for a stable tree.
+   * Uses code-unit `<`/`>` (not localeCompare) to match the bridge's byte-order
+   * `(project_id, session_id)` sort, so the cross-host merge preserves the
+   * transport-stable order buildTree relies on. */
+  private flattenSessions(): SessionMetaDto[] {
+    const all: SessionMetaDto[] = [];
+    for (const { sessions } of this.byHost.values()) all.push(...sessions);
+    const byCodeUnit = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+    all.sort((a, b) =>
+      a.projectId === b.projectId
+        ? byCodeUnit(a.sessionId, b.sessionId)
+        : byCodeUnit(a.projectId, b.projectId),
+    );
+    return all;
+  }
+
+  /** tabKeys of sessions on a currently-unavailable (retained) host. */
+  private computeReconnectingKeys(): string[] {
+    const keys: string[] = [];
+    for (const { sessions, unavailableSince } of this.byHost.values()) {
+      if (unavailableSince === null) continue;
+      for (const s of sessions) keys.push(tabKey(s.projectId, s.sessionId));
+    }
+    return keys;
   }
 }

@@ -123,6 +123,9 @@ pub struct SessionMetaDto {
     /// Effective workspace mode discovered for this session (real state), or
     /// null from an older sender. Drives sidebar/tab gating.
     pub workspace: Option<WorkspaceModeDto>,
+    /// Git branch the sandbox advertises for this session. Untrusted,
+    /// display-only (same rule as `agent`/`workspace_path`).
+    pub branch: Option<String>,
 }
 
 impl From<SessionMeta> for SessionMetaDto {
@@ -135,8 +138,29 @@ impl From<SessionMeta> for SessionMetaDto {
             created_at: m.created_at,
             workspace_path: m.workspace_path,
             workspace: m.workspace.map(Into::into),
+            branch: m.branch,
         }
     }
+}
+
+/// One host's discovery outcome for a single `Bridge::list` poll. `available`
+/// is false when the host's `source.list()` errored (then `sessions` is empty);
+/// retention of last-good rows for a transiently-down host is the frontend's job.
+#[derive(Clone, Debug, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct HostSessionsDto {
+    pub host_id: String,
+    pub available: bool,
+    pub sessions: Vec<SessionMetaDto>,
+}
+
+/// Result of a discovery poll: one bucket per host attempted this poll, in
+/// config order. Sessions are sorted by (project_id, session_id) within each
+/// bucket (the frontend re-sorts after flattening across hosts).
+#[derive(Clone, Debug, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionListDto {
+    pub hosts: Vec<HostSessionsDto>,
 }
 
 #[cfg(test)]
@@ -190,6 +214,19 @@ mod tests {
     }
 
     #[test]
+    fn host_sessions_dto_serializes_camelcase() {
+        let dto = HostSessionsDto {
+            host_id: "hermes".into(),
+            available: false,
+            sessions: vec![],
+        };
+        let json = serde_json::to_string(&dto).expect("serialize");
+        assert!(json.contains(r#""hostId":"hermes""#));
+        assert!(json.contains(r#""available":false"#));
+        assert!(json.contains(r#""sessions":[]"#));
+    }
+
+    #[test]
     fn dto_round_trips_camelcase() {
         let meta = SessionMeta {
             project_id: ProjectId::new("api").expect("slug"),
@@ -206,5 +243,23 @@ mod tests {
         assert!(json.contains(r#""projectId":"api""#));
         assert!(json.contains(r#""state":"stopped""#));
         assert!(json.contains(r#""workspace":"worktree""#));
+    }
+
+    #[test]
+    fn session_meta_branch_is_copied_to_dto() {
+        let meta = SessionMeta {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("fix-login").expect("slug"),
+            state: SessionState::Live,
+            agent: None,
+            created_at: None,
+            workspace_path: None,
+            workspace: None,
+            branch: Some("feat/login".into()),
+        };
+        let dto = SessionMetaDto::from(meta);
+        assert_eq!(dto.branch, Some("feat/login".to_string()));
+        let json = serde_json::to_string(&dto).expect("serialize");
+        assert!(json.contains(r#""branch":"feat/login""#));
     }
 }

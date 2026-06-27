@@ -25,7 +25,7 @@ use dto::ConfigDto;
 use editor_dto::{
     AgentInputDto, EditableConfigDto, EditorConfigDto, HostInputDto, ProjectInputDto,
 };
-use error::{BridgeError, SessionMetaDto};
+use error::{BridgeError, HostSessionsDto, SessionListDto, SessionMetaDto};
 use output::{BridgeOutput, ChannelHandle, OutputSink};
 
 type Registry = Arc<Mutex<HashMap<u64, OpenChannel>>>;
@@ -104,6 +104,7 @@ impl Bridge {
         handle
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         &self,
         project_id: String,
@@ -111,6 +112,8 @@ impl Bridge {
         agent: Option<String>,
         base: Option<String>,
         workspace: Option<remora_protocol::WorkspaceMode>,
+        branch: Option<String>,
+        worktree_root: Option<String>,
         sink: Arc<dyn OutputSink>,
     ) -> Result<ChannelHandle, BridgeError> {
         let spec = SpawnSpec {
@@ -122,12 +125,12 @@ impl Bridge {
                 .map_err(|e| BridgeError::InvalidId {
                     message: e.to_string(),
                 })?,
-            // Raw; core's `normalize_base` (plan_spawn) is the authoritative
-            // validator — every transport and the future relay cross it.
+            // Raw; core's `normalize_base` / `plan_spawn` are the authoritative
+            // validators — every transport and the future relay cross them.
             base,
             workspace,
-            branch: None,
-            worktree_root: None,
+            branch,
+            worktree_root,
         };
         let source = self.resolve_for(&spec.project_id)?;
         let channel = source.spawn(spec).await?;
@@ -221,23 +224,40 @@ impl Bridge {
         }
     }
 
-    /// Sorted by (project_id, session_id) for a transport-stable UI contract.
-    pub async fn list(&self) -> Result<Vec<SessionMetaDto>, BridgeError> {
+    /// One bucket per configured host. A host whose `source.list()` errors is
+    /// reported `available: false` with no sessions (the frontend retains its
+    /// last-good rows); only when *every* host fails do we return `Err` so the
+    /// sidebar shows the global "discovery unavailable" banner.
+    pub async fn list(&self) -> Result<SessionListDto, BridgeError> {
         let config = Arc::new(self.load_config()?);
         let sources = self.resolver.all(&config);
         let total = sources.len();
-        let mut metas: Vec<SessionMetaDto> = Vec::new();
+        let mut hosts: Vec<HostSessionsDto> = Vec::with_capacity(total);
         let mut failed = 0usize;
         let mut last_err: Option<SourceError> = None;
-        for source in sources {
+        for (host_id, source) in sources {
             match source.list().await {
-                Ok(ms) => metas.extend(ms.into_iter().map(Into::into)),
-                // One host down must not blank the whole sidebar — skip it and
-                // carry the partial result. TODO(stage 11+): surface per-host
-                // availability instead of silently dropping a down host.
+                Ok(ms) => {
+                    let mut sessions: Vec<SessionMetaDto> =
+                        ms.into_iter().map(Into::into).collect();
+                    sessions.sort_by(|a, b| {
+                        (a.project_id.as_str(), a.session_id.as_str())
+                            .cmp(&(b.project_id.as_str(), b.session_id.as_str()))
+                    });
+                    hosts.push(HostSessionsDto {
+                        host_id: host_id.as_str().to_owned(),
+                        available: true,
+                        sessions,
+                    });
+                }
                 Err(e) => {
                     failed += 1;
                     last_err = Some(e);
+                    hosts.push(HostSessionsDto {
+                        host_id: host_id.as_str().to_owned(),
+                        available: false,
+                        sessions: Vec::new(),
+                    });
                 }
             }
         }
@@ -249,11 +269,7 @@ impl Bridge {
                 },
             });
         }
-        metas.sort_by(|a, b| {
-            (a.project_id.as_str(), a.session_id.as_str())
-                .cmp(&(b.project_id.as_str(), b.session_id.as_str()))
-        });
-        Ok(metas)
+        Ok(SessionListDto { hosts })
     }
 
     /// Resolve the transport for a project: load config fresh, then pick the
@@ -563,11 +579,18 @@ fn deregister(registry: &Registry, handle: u64) {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use remora_core::config::HostId;
     use remora_core::{FakeSessionSource, SessionSource, SourceError};
     use remora_protocol::{SessionMeta, SessionState};
 
     use super::resolve::SourceResolver;
-    use error::SessionStateDto;
+    use error::{SessionListDto, SessionStateDto};
+
+    /// Flatten a host-grouped list result to the sessions across all hosts,
+    /// preserving per-host order (tests that only care about sessions).
+    fn flat_sessions(list: SessionListDto) -> Vec<SessionMetaDto> {
+        list.hosts.into_iter().flat_map(|h| h.sessions).collect()
+    }
 
     /// Test resolver: returns one fixed source for every project, and as the
     /// sole element of `all()`. Lets the existing single-source tests run
@@ -581,8 +604,8 @@ mod tests {
         ) -> Result<Arc<dyn SessionSource>, BridgeError> {
             Ok(Arc::clone(&self.0))
         }
-        fn all(&self, _config: &Arc<Config>) -> Vec<Arc<dyn SessionSource>> {
-            vec![Arc::clone(&self.0)]
+        fn all(&self, _config: &Arc<Config>) -> Vec<(HostId, Arc<dyn SessionSource>)> {
+            vec![(HostId::new("h").expect("id"), Arc::clone(&self.0))]
         }
     }
 
@@ -716,6 +739,8 @@ mod tests {
                 Some("claude".into()),
                 None,
                 None,
+                None,
+                None,
                 s,
             )
             .await
@@ -729,7 +754,7 @@ mod tests {
         let src = Arc::new(FakeSessionSource::new());
         let (s0, _r0) = sink();
         bridge(src.clone())
-            .spawn("api".into(), "x".into(), None, None, None, s0)
+            .spawn("api".into(), "x".into(), None, None, None, None, None, s0)
             .await
             .expect("spawn");
         let b = bridge(src);
@@ -745,7 +770,7 @@ mod tests {
         let b = bridge(Arc::new(FakeSessionSource::new()));
         let (s, mut rx) = sink();
         let h = b
-            .spawn("api".into(), "x".into(), None, None, None, s)
+            .spawn("api".into(), "x".into(), None, None, None, None, None, s)
             .await
             .expect("spawn");
         b.close(h);
@@ -771,7 +796,7 @@ mod tests {
         let b = bridge(Arc::new(FakeSessionSource::new()));
         let (s, rx) = sink();
         let h = b
-            .spawn("api".into(), "x".into(), None, None, None, s)
+            .spawn("api".into(), "x".into(), None, None, None, None, None, s)
             .await
             .expect("spawn");
         drop(rx); // frontend gone
@@ -786,7 +811,7 @@ mod tests {
         let b = bridge(Arc::new(FakeSessionSource::new()));
         let (s, _rx) = sink();
         let h = b
-            .spawn("api".into(), "x".into(), None, None, None, s)
+            .spawn("api".into(), "x".into(), None, None, None, None, None, s)
             .await
             .expect("spawn");
         assert!(matches!(
@@ -813,7 +838,8 @@ mod tests {
         let b = bridge(Arc::new(FakeSessionSource::new()));
         let (s, _rx) = sink();
         assert!(matches!(
-            b.spawn("API".into(), "x".into(), None, None, None, s).await,
+            b.spawn("API".into(), "x".into(), None, None, None, None, None, s)
+                .await,
             Err(BridgeError::InvalidId { .. })
         ));
     }
@@ -823,13 +849,13 @@ mod tests {
         let src = Arc::new(FakeSessionSource::new());
         let (s1, _r1) = sink();
         bridge(src.clone())
-            .spawn("api".into(), "x".into(), None, None, None, s1)
+            .spawn("api".into(), "x".into(), None, None, None, None, None, s1)
             .await
             .expect("spawn");
         let (s2, _r2) = sink();
         assert!(matches!(
             bridge(src)
-                .spawn("api".into(), "x".into(), None, None, None, s2)
+                .spawn("api".into(), "x".into(), None, None, None, None, None, s2)
                 .await,
             Err(BridgeError::SessionExists { .. })
         ));
@@ -916,7 +942,7 @@ mod tests {
     #[tokio::test]
     async fn list_is_sorted_by_bridge() {
         let b = bridge(Arc::new(ReverseSource));
-        let listed = b.list().await.expect("list");
+        let listed = flat_sessions(b.list().await.expect("list"));
         assert_eq!(
             (listed[0].project_id.as_str(), listed[1].project_id.as_str()),
             ("api", "zeta")
@@ -963,7 +989,7 @@ mod tests {
         let (s, mut rx) = sink();
         let b = bridge(src.clone());
         let h = b
-            .spawn("api".into(), "x".into(), None, None, None, s)
+            .spawn("api".into(), "x".into(), None, None, None, None, None, s)
             .await
             .expect("spawn");
         src.stop_session(&pid("api"), &sid("x")); // kills the channel
@@ -995,8 +1021,8 @@ mod tests {
                 .push(project_id.as_str().to_string());
             Ok(Arc::clone(&self.source))
         }
-        fn all(&self, _c: &Arc<Config>) -> Vec<Arc<dyn SessionSource>> {
-            vec![Arc::clone(&self.source)]
+        fn all(&self, _c: &Arc<Config>) -> Vec<(HostId, Arc<dyn SessionSource>)> {
+            vec![(HostId::new("h").expect("id"), Arc::clone(&self.source))]
         }
     }
 
@@ -1014,7 +1040,7 @@ mod tests {
             }),
         );
         let (s, _rx) = sink();
-        b.spawn("api".into(), "x".into(), None, None, None, s)
+        b.spawn("api".into(), "x".into(), None, None, None, None, None, s)
             .await
             .expect("spawn");
         assert_eq!(
@@ -1087,6 +1113,8 @@ mod tests {
                 None,
                 Some("origin/dev".into()),
                 None,
+                None,
+                None,
                 s,
             )
             .await;
@@ -1099,6 +1127,29 @@ mod tests {
                 .as_deref(),
             Some("origin/dev")
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_threads_branch_and_worktree_root_into_spec() {
+        let (src, recorded) = SpecRecordingSource::new();
+        let b = bridge(Arc::new(src));
+        let (s, _rx) = sink();
+        let _ = b
+            .spawn(
+                "api".into(),
+                "x".into(),
+                None,
+                None,
+                None,
+                Some("feat/login".into()),
+                Some("~/work".into()),
+                s,
+            )
+            .await;
+        let guard = recorded.lock().expect("lock");
+        let spec = guard.as_ref().expect("spec recorded");
+        assert_eq!(spec.branch.as_deref(), Some("feat/login"));
+        assert_eq!(spec.worktree_root.as_deref(), Some("~/work"));
     }
 
     /// A resolver whose `all()` returns two sources: one live with a session,
@@ -1144,8 +1195,17 @@ mod tests {
         ) -> Result<Arc<dyn SessionSource>, BridgeError> {
             unreachable!()
         }
-        fn all(&self, _c: &Arc<Config>) -> Vec<Arc<dyn SessionSource>> {
-            vec![Arc::new(ReverseSource), Arc::new(ErroringSource)]
+        fn all(&self, _c: &Arc<Config>) -> Vec<(HostId, Arc<dyn SessionSource>)> {
+            vec![
+                (
+                    HostId::new("up").expect("id"),
+                    Arc::new(ReverseSource) as Arc<dyn SessionSource>,
+                ),
+                (
+                    HostId::new("down").expect("id"),
+                    Arc::new(ErroringSource) as Arc<dyn SessionSource>,
+                ),
+            ]
         }
     }
 
@@ -1158,9 +1218,23 @@ mod tests {
                 tokio::spawn(fut);
             }),
         );
-        let listed = b.list().await.expect("partial result, not an error");
-        // ReverseSource contributes 2 sessions; ErroringSource contributes none.
-        assert_eq!(listed.len(), 2);
+        let result = b.list().await.expect("partial result, not an error");
+        // Both hosts get a bucket; the down host is available:false with no rows,
+        // the up host carries its session.
+        let down = result
+            .hosts
+            .iter()
+            .find(|h| h.host_id == "down")
+            .expect("down bucket");
+        assert!(!down.available);
+        assert!(down.sessions.is_empty());
+        let up = result
+            .hosts
+            .iter()
+            .find(|h| h.host_id == "up")
+            .expect("up bucket");
+        assert!(up.available);
+        assert_eq!(up.sessions.len(), 2); // ReverseSource returns 2 sessions
     }
 
     /// All hosts down → the sidebar should see discovery-unavailable, so the
@@ -1174,8 +1248,17 @@ mod tests {
         ) -> Result<Arc<dyn SessionSource>, BridgeError> {
             unreachable!()
         }
-        fn all(&self, _c: &Arc<Config>) -> Vec<Arc<dyn SessionSource>> {
-            vec![Arc::new(ErroringSource)]
+        fn all(&self, _c: &Arc<Config>) -> Vec<(HostId, Arc<dyn SessionSource>)> {
+            vec![
+                (
+                    HostId::new("a").expect("id"),
+                    Arc::new(ErroringSource) as Arc<dyn SessionSource>,
+                ),
+                (
+                    HostId::new("b").expect("id"),
+                    Arc::new(ErroringSource) as Arc<dyn SessionSource>,
+                ),
+            ]
         }
     }
 
@@ -1601,7 +1684,7 @@ mod tests {
         let b = bridge(src);
         b.stop("api".into(), "x".into()).await.expect("stop");
         assert!(matches!(
-            b.list().await.expect("list")[0].state,
+            flat_sessions(b.list().await.expect("list"))[0].state,
             SessionStateDto::Stopped
         ));
     }
@@ -1624,7 +1707,7 @@ mod tests {
         b.remove("api".into(), "x".into(), true)
             .await
             .expect("remove");
-        assert!(b.list().await.expect("list").is_empty());
+        assert!(flat_sessions(b.list().await.expect("list")).is_empty());
     }
 
     #[tokio::test]
@@ -1686,7 +1769,7 @@ mod tests {
         );
         let (s, _rx) = sink();
         let result = b
-            .spawn("ghost".into(), "x".into(), None, None, None, s)
+            .spawn("ghost".into(), "x".into(), None, None, None, None, None, s)
             .await;
         std::fs::remove_file(&path).ok();
         assert!(matches!(result, Err(BridgeError::Config { .. })));

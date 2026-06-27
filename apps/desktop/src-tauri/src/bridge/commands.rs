@@ -7,7 +7,7 @@ use crate::bridge::dto::ConfigDto;
 use crate::bridge::editor_dto::{
     AgentInputDto, EditableConfigDto, HostInputDto, ProjectInputDto, WorkspaceModeDto,
 };
-use crate::bridge::error::{BridgeError, SessionMetaDto};
+use crate::bridge::error::{BridgeError, SessionListDto};
 use crate::bridge::output::{BridgeOutput, ChannelHandle, ChannelSink};
 use crate::bridge::Bridge;
 
@@ -19,9 +19,7 @@ pub struct ConfigChanged;
 
 #[tauri::command]
 #[specta::specta]
-async fn session_list(
-    bridge: tauri::State<'_, Bridge>,
-) -> Result<Vec<SessionMetaDto>, BridgeError> {
+async fn session_list(bridge: tauri::State<'_, Bridge>) -> Result<SessionListDto, BridgeError> {
     bridge.list().await
 }
 
@@ -33,6 +31,7 @@ async fn config_get(bridge: tauri::State<'_, Bridge>) -> Result<ConfigDto, Bridg
 
 #[tauri::command]
 #[specta::specta]
+#[allow(clippy::too_many_arguments)]
 async fn session_spawn(
     bridge: tauri::State<'_, Bridge>,
     project_id: String,
@@ -40,6 +39,8 @@ async fn session_spawn(
     agent: Option<String>,
     base: Option<String>,
     workspace: Option<WorkspaceModeDto>,
+    branch: Option<String>,
+    worktree_root: Option<String>,
     on_output: Channel<BridgeOutput>,
 ) -> Result<ChannelHandle, BridgeError> {
     bridge
@@ -49,6 +50,8 @@ async fn session_spawn(
             agent,
             base,
             workspace.map(Into::into),
+            branch,
+            worktree_root,
             Arc::new(ChannelSink(on_output)),
         )
         .await

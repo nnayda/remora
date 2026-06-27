@@ -6,7 +6,7 @@
 
 
 export const commands = {
-async sessionList() : Promise<Result<SessionMetaDto[], BridgeError>> {
+async sessionList() : Promise<Result<SessionListDto, BridgeError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("session_list") };
 } catch (e) {
@@ -22,9 +22,9 @@ async configGet() : Promise<Result<ConfigDto, BridgeError>> {
     else return { status: "error", error: e  as any };
 }
 },
-async sessionSpawn(projectId: string, sessionId: string, agent: string | null, base: string | null, workspace: WorkspaceModeDto | null, onOutput: TAURI_CHANNEL<BridgeOutput>) : Promise<Result<ChannelHandle, BridgeError>> {
+async sessionSpawn(projectId: string, sessionId: string, agent: string | null, base: string | null, workspace: WorkspaceModeDto | null, branch: string | null, worktreeRoot: string | null, onOutput: TAURI_CHANNEL<BridgeOutput>) : Promise<Result<ChannelHandle, BridgeError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("session_spawn", { projectId, sessionId, agent, base, workspace, onOutput }) };
+    return { status: "ok", data: await TAURI_INVOKE("session_spawn", { projectId, sessionId, agent, base, workspace, branch, worktreeRoot, onOutput }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -284,6 +284,12 @@ export type HostInputDto = { name: string | null; transport: TransportDto;
  */
 worktreeRoot?: string | null }
 /**
+ * One host's discovery outcome for a single `Bridge::list` poll. `available`
+ * is false when the host's `source.list()` errored (then `sessions` is empty);
+ * retention of last-good rows for a transiently-down host is the frontend's job.
+ */
+export type HostSessionsDto = { hostId: string; available: boolean; sessions: SessionMetaDto[] }
+/**
  * A kubectl connection field for the editor: `command = false` is a literal
  * value, `command = true` means `value` is a shell command line resolved at
  * connect time. Flat + form-friendly for the TS toggle.
@@ -315,6 +321,12 @@ export type ProjectInputDto = { name: string | null; hostId: string; path: strin
  * path does not destroy it.
  */
 worktreeRoot?: string | null }
+/**
+ * Result of a discovery poll: one bucket per host attempted this poll, in
+ * config order. Sessions are sorted by (project_id, session_id) within each
+ * bucket (the frontend re-sorts after flattening across hosts).
+ */
+export type SessionListDto = { hosts: HostSessionsDto[] }
 export type SessionMetaDto = { projectId: string; sessionId: string; state: SessionStateDto; 
 /**
  * Agent id the sandbox advertises for this session. Untrusted,
@@ -331,7 +343,12 @@ workspacePath: string | null;
  * Effective workspace mode discovered for this session (real state), or
  * null from an older sender. Drives sidebar/tab gating.
  */
-workspace: WorkspaceModeDto | null }
+workspace: WorkspaceModeDto | null; 
+/**
+ * Git branch the sandbox advertises for this session. Untrusted,
+ * display-only (same rule as `agent`/`workspace_path`).
+ */
+branch: string | null }
 export type SessionStateDto = "live" | "stopped"
 /**
  * Frontend-facing mirror of `remora_protocol::SessionStatus` (which is

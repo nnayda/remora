@@ -9,6 +9,8 @@ const sess = (sessionId: string): SessionNode => ({
   agent: null,
   key: `p/${sessionId}`,
   workspace: null,
+  reconnecting: false,
+  branch: null,
 });
 
 const proj = (

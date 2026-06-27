@@ -5,7 +5,7 @@ import { ConfirmRemoveDialog } from "./ConfirmRemoveDialog";
 import { subscribeConfigChanged } from "./config-watch-listener";
 import { DiffPanel } from "./DiffPanel";
 import { NewSessionDialog } from "./NewSessionDialog";
-import { SettingsDialog } from "./SettingsDialog";
+import { SettingsDialog, type View as SettingsView } from "./SettingsDialog";
 import { Sidebar } from "./Sidebar";
 import { canRespawn, OPEN_CANCELLED, tabKey } from "./session-store";
 import { buildTree, type SessionNode } from "./session-tree";
@@ -58,8 +58,14 @@ function App() {
   } = useSessions();
   useReconnect(sessionStore);
   const activity = useActivity();
-  const { config, sessions, configError, discoveryUnavailable, refresh } =
-    useDiscovery();
+  const {
+    config,
+    sessions,
+    configError,
+    discoveryUnavailable,
+    reconnectingKeys,
+    refresh,
+  } = useDiscovery();
 
   // Live-reload the sidebar when the config file changes on disk (backend
   // watcher emits ConfigChanged). Mirrors the manual refresh button.
@@ -86,6 +92,11 @@ function App() {
   // or null for the global "+ New session" entry point.
   const [dialogProjectId, setDialogProjectId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Body the Settings dialog opens on: the list (footer gear) or a deep-linked
+  // form (the sidebar's new-project "+").
+  const [settingsView, setSettingsView] = useState<SettingsView>({
+    kind: "list",
+  });
   const [notice, setNotice] = useState<string | null>(null);
   // Files & diff peek panel (⌘\). Closed by default — the terminal is the hero;
   // the panel is an intentional reveal (and its data surface is empty for now).
@@ -124,7 +135,14 @@ function App() {
   const showCollapsed = shouldRenderCollapsed(collapsed, isMobile);
 
   // Recompute the tree only when config or the polled session list changes.
-  const tree = useMemo(() => buildTree(config, sessions), [config, sessions]);
+  const reconnectingSet = useMemo(
+    () => new Set(reconnectingKeys),
+    [reconnectingKeys],
+  );
+  const tree = useMemo(
+    () => buildTree(config, sessions, reconnectingSet),
+    [config, sessions, reconnectingSet],
+  );
   // Which sessions are open as tabs — the only ones we have a live terminal for
   // and can therefore report an activity status. Drives the sidebar's "show the
   // status dot only when connected" rule.
@@ -338,9 +356,19 @@ function App() {
     void discoveryStore.refreshAfterOpen();
   }
 
-  /** Open the Settings dialog — shared by the full sidebar and the collapsed rail. */
+  /** Open the Settings dialog on its list view — shared by the full sidebar and
+   * the collapsed rail. Resets the deep-linked view so the footer gear always
+   * lands on the list, not a stale new-project form. */
   function openSettings() {
     setNotice(null);
+    setSettingsView({ kind: "list" });
+    setSettingsOpen(true);
+  }
+
+  /** Open Settings deep-linked to the new-project form (the Projects header "+", #161). */
+  function openAddProject() {
+    setNotice(null);
+    setSettingsView({ kind: "project", mode: "create" });
     setSettingsOpen(true);
   }
 
@@ -392,6 +420,7 @@ function App() {
             onRemove={onRemove}
             onNewSession={openNewSession}
             onOpenSettings={openSettings}
+            onAddProject={openAddProject}
             activity={activity}
             onCollapse={toggleCollapsed}
           />
@@ -585,6 +614,7 @@ function App() {
           // A config edit changes the sidebar's (redacted) view; re-read it.
           onConfigChanged={() => void refresh()}
           onClose={() => setSettingsOpen(false)}
+          initialView={settingsView}
         />
       )}
     </main>

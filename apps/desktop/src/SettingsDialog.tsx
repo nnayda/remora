@@ -32,10 +32,13 @@ interface SettingsDialogProps {
   /** Re-read the sidebar's (redacted) config after a mutation. */
   onConfigChanged: () => void;
   onClose: () => void;
+  /** Body to show on open. Defaults to the entity list; deep-link to a form
+   * (e.g. the new-project "+" in the sidebar) by passing that view. */
+  initialView?: View;
 }
 
 /** Which body the dialog shows: the entity list, or one open entity form. */
-type View =
+export type View =
   | { kind: "list" }
   | { kind: "host"; mode: "create" | "edit"; initial?: EditorHostDto }
   | { kind: "project"; mode: "create" | "edit"; initial?: EditorProjectDto }
@@ -52,11 +55,12 @@ type View =
 export function SettingsDialog({
   onConfigChanged,
   onClose,
+  initialView = { kind: "list" },
 }: SettingsDialogProps) {
   const [model, setModel] = useState<SettingsModel | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [listError, setListError] = useState<string | null>(null);
-  const [view, setView] = useState<View>({ kind: "list" });
+  const [view, setView] = useState<View>(initialView);
   // Anchored inside the presentational Dialog body; the focus trap operates on
   // the enclosing `.rmra-dialog` element resolved via `dialogRoot()`.
   const anchorRef = useRef<HTMLDivElement>(null);

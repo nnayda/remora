@@ -73,12 +73,19 @@
   padding: 10px 8px;
 }
 .rk-sidebar__label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: 0 4px 6px 8px;
+  min-height: 24px;
+}
+.rk-sidebar__label-text {
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--text-muted);
-  padding: 4px 8px 8px;
 }
 
 /* sidebar search (Input-styled filter field) */

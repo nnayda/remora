@@ -154,6 +154,21 @@ describe("host form", () => {
     });
   });
 
+  it("round-trips worktreeRoot through the form, blank -> null", () => {
+    const dto: EditorHostDto = {
+      id: "devbox",
+      name: null,
+      transport: { kind: "ssh", host: "h", user: null, port: null },
+      worktreeRoot: "~/work",
+    };
+    const form = hostFormFromDto(dto);
+    expect(form.worktreeRoot).toBe("~/work");
+    expect(toHostInput(form).worktreeRoot).toBe("~/work");
+
+    const blank = { ...form, worktreeRoot: "" };
+    expect(toHostInput(blank).worktreeRoot).toBeNull();
+  });
+
   it("builds a kubectl input dropping empty optionals", () => {
     const form = {
       ...emptyHostForm(),
@@ -231,7 +246,27 @@ describe("project form", () => {
       workspace: "worktree",
       agent: "claude",
       base: null,
+      worktreeRoot: null,
     });
+  });
+
+  it("round-trips worktreeRoot through the form, blank -> null", () => {
+    const dto = {
+      id: "api",
+      name: null,
+      hostId: "h",
+      path: "/p",
+      workspace: "worktree",
+      agent: "claude",
+      base: null,
+      worktreeRoot: "~/work",
+    } as import("./bindings").EditorProjectDto;
+    const form = projectFormFromDto(dto);
+    expect(form.worktreeRoot).toBe("~/work");
+    expect(toProjectInput(form).worktreeRoot).toBe("~/work");
+
+    const blank = { ...form, worktreeRoot: "" };
+    expect(toProjectInput(blank).worktreeRoot).toBeNull();
   });
 
   it("round-trips project base through the form, blank -> null", () => {
