@@ -3,6 +3,7 @@ import type { ActivityState } from "./activity-store";
 import wordmark from "./assets/remora-wordmark.svg";
 import { filterTree } from "./filter-tree";
 import type { HostTransport, ProjectNode, SessionNode } from "./session-tree";
+import { SIDEBAR_COLLAPSE_LABEL } from "./sidebar-labels";
 import { sessionIndicatorState } from "./status-state";
 import { Avatar, IconButton, SessionRow, useTheme } from "./ui";
 import {
@@ -127,7 +128,11 @@ export function Sidebar({
             <RotateCw size={15} />
           </IconButton>
           {onCollapse && (
-            <IconButton label="Collapse sidebar" size="sm" onClick={onCollapse}>
+            <IconButton
+              label={SIDEBAR_COLLAPSE_LABEL}
+              size="sm"
+              onClick={onCollapse}
+            >
               <SidebarIcon size={15} />
             </IconButton>
           )}

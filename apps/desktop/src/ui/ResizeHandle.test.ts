@@ -91,4 +91,28 @@ describe("nextWidthFromKey", () => {
       ),
     ).toBe(332);
   });
+  it("clamps at the MAX bound on both edges", () => {
+    // edge:right — ArrowRight grows; near-max + Shift clamps to max
+    expect(
+      nextWidthFromKey(
+        { key: "ArrowRight", shiftKey: true },
+        470,
+        8,
+        180,
+        480,
+        "right",
+      ),
+    ).toBe(480);
+    // edge:left — ArrowLeft grows; near-max + Shift clamps to max
+    expect(
+      nextWidthFromKey(
+        { key: "ArrowLeft", shiftKey: true },
+        470,
+        8,
+        180,
+        480,
+        "left",
+      ),
+    ).toBe(480);
+  });
 });

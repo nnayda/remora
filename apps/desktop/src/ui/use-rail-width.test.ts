@@ -23,6 +23,7 @@ describe("clampWidth", () => {
   it("returns min for non-finite input", () => {
     expect(clampWidth(Number.NaN, 180, 480)).toBe(180);
     expect(clampWidth(Number.POSITIVE_INFINITY, 180, 480)).toBe(180);
+    expect(clampWidth(Number.NEGATIVE_INFINITY, 180, 480)).toBe(180);
   });
 });
 
@@ -45,6 +46,12 @@ describe("parseRailState", () => {
     expect(parseRailState('{"width":5000,"collapsed":true}', OPTS)).toEqual({
       width: 480,
       collapsed: true,
+    });
+  });
+  it("treats a truthy non-boolean collapsed as false (strict ===)", () => {
+    expect(parseRailState('{"width":300,"collapsed":1}', OPTS)).toEqual({
+      width: 300,
+      collapsed: false,
     });
   });
   it("falls back to default width when width is missing or non-numeric", () => {

@@ -13,7 +13,7 @@
 .rk-resize-handle::after {
   content: "";
   position: absolute;
-  inset: 0 -5px; /* ~11px hit area straddling the 1px line */
+  inset: 0 calc(-1 * var(--space-3)); /* ~13px hit area straddling the 1px line (6px/side, on grid) */
 }
 .rk-resize-handle:hover,
 .rk-resize-handle:focus-visible {

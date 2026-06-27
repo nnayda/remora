@@ -47,4 +47,13 @@ describe("hostIndicatorState", () => {
       hostIndicatorState([session("a", "stopped")], new Set(["a"]), activity),
     ).toBe("idle");
   });
+  it("returns idle for an empty session list", () => {
+    expect(hostIndicatorState([], new Set(), activity)).toBe("idle");
+  });
+  it("returns idle for an open live session with no activity entry", () => {
+    // key "z" is open but absent from the activity map → no signal → idle
+    expect(hostIndicatorState([session("z")], new Set(["z"]), activity)).toBe(
+      "idle",
+    );
+  });
 });

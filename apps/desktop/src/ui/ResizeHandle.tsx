@@ -92,9 +92,6 @@ export function ResizeHandle({
 }: ResizeHandleProps) {
   const draggingRef = useRef(false);
 
-  // Safety net: if the handle unmounts mid-drag, never leave body styles stuck.
-  useEffect(() => releaseBody, []);
-
   const endDrag = useCallback(() => {
     if (!draggingRef.current) return;
     draggingRef.current = false;
@@ -102,6 +99,15 @@ export function ResizeHandle({
     onResizingChange?.(false);
     onCommit();
   }, [onCommit, onResizingChange]);
+
+  // Safety net: if the handle unmounts mid-drag (e.g. the parent stops
+  // rendering it because the window crossed the mobile breakpoint), run the
+  // full endDrag — not just releaseBody — so the parent's resizing flag is
+  // cleared and the in-progress width is committed. Idempotent via the
+  // draggingRef guard, so a no-op when not dragging.
+  const endDragRef = useRef(endDrag);
+  endDragRef.current = endDrag;
+  useEffect(() => () => endDragRef.current(), []);
 
   const onPointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {

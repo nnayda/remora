@@ -75,8 +75,12 @@ function writeState(key: string, state: RailState): void {
   }
 }
 
-/** Configured max capped so the rail never eats more than ~40% of the window. */
-function effectiveMax(max: number): number {
+/**
+ * Configured max capped so the rail never eats more than ~40% of the window.
+ * Exported so the single rail-bounds source (App's SIDEBAR_RAIL + the
+ * ResizeHandle `max` prop) and the hook agree — see App.tsx.
+ */
+export function effectiveMax(max: number): number {
   if (typeof window === "undefined") return max;
   return Math.min(max, Math.floor(window.innerWidth * 0.4));
 }
@@ -88,12 +92,18 @@ function effectiveMax(max: number): number {
  * commitWidth persists once on pointerup.
  */
 export function useRailWidth(opts: RailWidthOptions) {
-  const [width, setWidthState] = useState(
-    () => parseRailState(readRaw(opts.key), opts).width,
-  );
-  const [collapsed, setCollapsed] = useState(
-    () => parseRailState(readRaw(opts.key), opts).collapsed,
-  );
+  // One localStorage read on mount; clamp the restored width through
+  // effectiveMax so a wide width saved on a large screen can't paint
+  // oversized when restored on a narrow window.
+  const [initial] = useState((): RailState => {
+    const parsed = parseRailState(readRaw(opts.key), opts);
+    return {
+      width: clampWidth(parsed.width, opts.min, effectiveMax(opts.max)),
+      collapsed: parsed.collapsed,
+    };
+  });
+  const [width, setWidthState] = useState(initial.width);
+  const [collapsed, setCollapsed] = useState(initial.collapsed);
 
   const widthRef = useRef(width);
   widthRef.current = width;

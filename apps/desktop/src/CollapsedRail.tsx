@@ -1,6 +1,7 @@
 import type { ActivityState } from "./activity-store";
 import { hostIndicatorState } from "./host-activity";
 import type { ProjectNode } from "./session-tree";
+import { SIDEBAR_EXPAND_LABEL } from "./sidebar-labels";
 import type { IndicatorState } from "./status-state";
 import { Avatar, IconButton, StatusIndicator, Tooltip, useTheme } from "./ui";
 import { ChevronRight, Moon, Settings, Sun } from "./ui/icons";
@@ -79,7 +80,7 @@ export function CollapsedRail({
   return (
     <nav className="rk-railmini" aria-label="Sessions (collapsed)">
       <div className="rk-railmini__top">
-        <IconButton label="Expand sidebar" size="sm" onClick={onExpand}>
+        <IconButton label={SIDEBAR_EXPAND_LABEL} size="sm" onClick={onExpand}>
           <ChevronRight size={15} />
         </IconButton>
       </div>
@@ -97,7 +98,7 @@ export function CollapsedRail({
                     ? "rk-railmini__host is-active"
                     : "rk-railmini__host"
                 }
-                aria-current={host.hasActive ? "true" : undefined}
+                aria-current={host.hasActive ? "page" : undefined}
                 aria-label={`${host.label}, ${count} session${count === 1 ? "" : "s"}, ${activityPhrase(state)}`}
                 onClick={onExpand}
               >

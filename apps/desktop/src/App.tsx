@@ -10,10 +10,12 @@ import { Sidebar } from "./Sidebar";
 import { canRespawn, OPEN_CANCELLED, tabKey } from "./session-store";
 import { buildTree, type SessionNode } from "./session-tree";
 import { shouldDisarmAfterSidebarOpen } from "./sidebar-focus";
+import { SIDEBAR_COLLAPSE_LABEL, SIDEBAR_EXPAND_LABEL } from "./sidebar-labels";
 import { TabBar } from "./TabBar";
 import { Terminal, type TerminalHandle } from "./Terminal";
 import {
   Button,
+  effectiveMax,
   IconButton,
   ResizeHandle,
   shouldRenderCollapsed,
@@ -28,6 +30,16 @@ import { useReconnect } from "./useReconnect";
 import { sessionStore, useSessions } from "./useSessions";
 
 export const APP_NAME = "Remora";
+
+/** Single source of truth for the left sidebar's persisted width bounds. The
+ * hook clamps to [min, effectiveMax(max)] and the ResizeHandle advertises the
+ * same bounds — keep both reading from here so they can't drift. */
+const SIDEBAR_RAIL = {
+  key: "remora.rail.sidebar",
+  defaultWidth: 240,
+  min: 180,
+  max: 480,
+} as const;
 
 /** Root component: wires the discovery and session stores to the sidebar, tab
  * bar, terminal panes, the diff peek panel, and the new-session dialog. */
@@ -105,12 +117,7 @@ function App() {
   const sidebarRef = useRef<HTMLDivElement>(null);
   const isMobile = useIsMobile();
   const { width, collapsed, setWidth, commitWidth, toggleCollapsed, reset } =
-    useRailWidth({
-      key: "remora.rail.sidebar",
-      defaultWidth: 240,
-      min: 180,
-      max: 480,
-    });
+    useRailWidth(SIDEBAR_RAIL);
   const prevCollapsedRef = useRef(collapsed);
   const [resizing, setResizing] = useState(false);
   // On mobile the layout owns full-width; collapsed rail only renders off-mobile.
@@ -172,10 +179,10 @@ function App() {
     prevCollapsedRef.current = collapsed;
     const root = sidebarRef.current;
     if (!root) return;
-    const selector = showCollapsed
-      ? 'button[aria-label="Expand sidebar"]'
-      : 'button[aria-label="Collapse sidebar"]';
-    root.querySelector<HTMLButtonElement>(selector)?.focus();
+    const label = showCollapsed ? SIDEBAR_EXPAND_LABEL : SIDEBAR_COLLAPSE_LABEL;
+    root
+      .querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`)
+      ?.focus();
   }, [collapsed, showCollapsed]);
 
   /** Open a session clicked in the sidebar, routing by its discovered state:
@@ -394,8 +401,8 @@ function App() {
         <ResizeHandle
           edge="right"
           railRef={sidebarRef}
-          min={180}
-          max={Math.min(480, Math.floor(window.innerWidth * 0.4))}
+          min={SIDEBAR_RAIL.min}
+          max={effectiveMax(SIDEBAR_RAIL.max)}
           ariaLabel="Resize sidebar"
           value={width}
           onResize={setWidth}
