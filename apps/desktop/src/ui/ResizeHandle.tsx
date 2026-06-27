@@ -1,4 +1,6 @@
+import { useCallback, useEffect, useRef } from "react";
 import { clampWidth } from "./use-rail-width";
+import "./ResizeHandle.css";
 
 export type RailEdge = "left" | "right";
 
@@ -44,4 +46,116 @@ export function nextWidthFromKey(
     default:
       return current;
   }
+}
+
+export interface ResizeHandleProps {
+  /** Which edge of the rail the handle occupies. */
+  edge: RailEdge;
+  /** The rail element, measured for its bounding rect during drag. */
+  railRef: React.RefObject<HTMLElement>;
+  min: number;
+  /** Effective (already viewport-capped) max. */
+  max: number;
+  ariaLabel: string;
+  /** Current width, for aria-valuenow + keyboard math. */
+  value: number;
+  /** Keyboard nudge step in px (default 8). */
+  step?: number;
+  /** Live, during drag/keyboard — state only. */
+  onResize: (width: number) => void;
+  /** Persist — called on pointerup / after a keyboard nudge. */
+  onCommit: () => void;
+  /** Double-click — reset to default. */
+  onReset: () => void;
+  /** Notifies the parent so it can toggle the no-transition class during drag. */
+  onResizingChange?: (active: boolean) => void;
+}
+
+/** Restore body styles set during a drag. Idempotent. */
+function releaseBody(): void {
+  document.body.style.removeProperty("user-select");
+  document.body.style.removeProperty("cursor");
+}
+
+export function ResizeHandle({
+  edge,
+  railRef,
+  min,
+  max,
+  ariaLabel,
+  value,
+  step = 8,
+  onResize,
+  onCommit,
+  onReset,
+  onResizingChange,
+}: ResizeHandleProps) {
+  const draggingRef = useRef(false);
+
+  // Safety net: if the handle unmounts mid-drag, never leave body styles stuck.
+  useEffect(() => releaseBody, []);
+
+  const endDrag = useCallback(() => {
+    if (!draggingRef.current) return;
+    draggingRef.current = false;
+    releaseBody();
+    onResizingChange?.(false);
+    onCommit();
+  }, [onCommit, onResizingChange]);
+
+  const onPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.currentTarget.setPointerCapture(e.pointerId);
+      draggingRef.current = true;
+      document.body.style.userSelect = "none";
+      document.body.style.cursor = "col-resize";
+      onResizingChange?.(true);
+    },
+    [onResizingChange],
+  );
+
+  const onPointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!draggingRef.current) return;
+      const rail = railRef.current;
+      if (!rail) return;
+      const rect = rail.getBoundingClientRect();
+      onResize(nextWidthFromPointer(e.clientX, rect, edge, min, max));
+    },
+    [railRef, edge, min, max, onResize],
+  );
+
+  const onKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      const next = nextWidthFromKey(e, value, step, min, max, edge);
+      if (next === value) return;
+      e.preventDefault();
+      onResize(next);
+      onCommit();
+    },
+    [value, step, min, max, edge, onResize, onCommit],
+  );
+
+  return (
+    // biome-ignore lint/a11y/useSemanticElements: <hr> is a void element and cannot hold pointer/keyboard event handlers; <div> with role="separator" is required here
+    <div
+      className="rk-resize-handle"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={ariaLabel}
+      aria-valuenow={Math.round(value)}
+      aria-valuemin={min}
+      aria-valuemax={max}
+      tabIndex={0}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+      onLostPointerCapture={endDrag}
+      onDoubleClick={onReset}
+      onKeyDown={onKeyDown}
+    />
+  );
 }

@@ -8,6 +8,8 @@ export * from "./IconButton";
 export * from "./Input";
 export type { IconProps } from "./icons";
 export * as Icons from "./icons";
+export type { ResizeHandleProps } from "./ResizeHandle";
+export { ResizeHandle } from "./ResizeHandle";
 export * from "./Select";
 export * from "./SessionRow";
 export * from "./SessionTab";
