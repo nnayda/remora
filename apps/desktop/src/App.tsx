@@ -4,7 +4,7 @@ import { ConfirmRemoveDialog } from "./ConfirmRemoveDialog";
 import { subscribeConfigChanged } from "./config-watch-listener";
 import { DiffPanel } from "./DiffPanel";
 import { NewSessionDialog } from "./NewSessionDialog";
-import { SettingsDialog } from "./SettingsDialog";
+import { SettingsDialog, type View as SettingsView } from "./SettingsDialog";
 import { Sidebar } from "./Sidebar";
 import { canRespawn, OPEN_CANCELLED, tabKey } from "./session-store";
 import { buildTree, type SessionNode } from "./session-tree";
@@ -65,6 +65,11 @@ function App() {
   // or null for the global "+ New session" entry point.
   const [dialogProjectId, setDialogProjectId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Body the Settings dialog opens on: the list (footer gear) or a deep-linked
+  // form (the sidebar's new-project "+").
+  const [settingsView, setSettingsView] = useState<SettingsView>({
+    kind: "list",
+  });
   const [notice, setNotice] = useState<string | null>(null);
   // Files & diff peek panel (⌘\). Closed by default — the terminal is the hero;
   // the panel is an intentional reveal (and its data surface is empty for now).
@@ -319,6 +324,12 @@ function App() {
           onNewSession={openNewSession}
           onOpenSettings={() => {
             setNotice(null);
+            setSettingsView({ kind: "list" });
+            setSettingsOpen(true);
+          }}
+          onAddProject={() => {
+            setNotice(null);
+            setSettingsView({ kind: "project", mode: "create" });
             setSettingsOpen(true);
           }}
           activity={activity}
@@ -498,6 +509,7 @@ function App() {
           // A config edit changes the sidebar's (redacted) view; re-read it.
           onConfigChanged={() => void refresh()}
           onClose={() => setSettingsOpen(false)}
+          initialView={settingsView}
         />
       )}
     </main>
