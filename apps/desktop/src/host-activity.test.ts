@@ -22,19 +22,29 @@ describe("hostIndicatorState", () => {
   ]);
 
   it("returns idle for a host with no open sessions", () => {
-    expect(hostIndicatorState([session("a")], new Set(), activity)).toBe("idle");
+    expect(hostIndicatorState([session("a")], new Set(), activity)).toBe(
+      "idle",
+    );
   });
   it("returns needs when any open session is awaiting (wins over working)", () => {
     const sessions = [session("a"), session("b")];
-    expect(hostIndicatorState(sessions, new Set(["a", "b"]), activity)).toBe("needs");
+    expect(hostIndicatorState(sessions, new Set(["a", "b"]), activity)).toBe(
+      "needs",
+    );
   });
   it("returns working when an open session is working and none need", () => {
-    expect(hostIndicatorState([session("a")], new Set(["a"]), activity)).toBe("working");
+    expect(hostIndicatorState([session("a")], new Set(["a"]), activity)).toBe(
+      "working",
+    );
   });
   it("ignores activity for sessions that are not open", () => {
-    expect(hostIndicatorState([session("b")], new Set(), activity)).toBe("idle");
+    expect(hostIndicatorState([session("b")], new Set(), activity)).toBe(
+      "idle",
+    );
   });
   it("treats stopped open sessions as idle", () => {
-    expect(hostIndicatorState([session("a", "stopped")], new Set(["a"]), activity)).toBe("idle");
+    expect(
+      hostIndicatorState([session("a", "stopped")], new Set(["a"]), activity),
+    ).toBe("idle");
   });
 });

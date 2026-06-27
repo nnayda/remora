@@ -19,6 +19,15 @@
 .rk-app__sidebar {
   width: var(--rail-sidebar);
   flex: none;
+  transition: width var(--dur-base) var(--ease-standard);
+}
+.rk-app__sidebar--collapsed {
+  width: var(--rail-sidebar-collapsed);
+  overflow: hidden;
+}
+/* Drag must feel instant — suppress the collapse transition while resizing. */
+.rk-app__sidebar--resizing {
+  transition: none;
 }
 .rk-app__main {
   flex: 1;
@@ -739,6 +748,62 @@
   white-space: nowrap;
 }
 
+/* ---------- COLLAPSED RAIL ---------- */
+.rk-railmini {
+  height: 100%;
+  background: var(--bg-sidebar);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-3) 0;
+}
+.rk-railmini__top {
+  display: flex;
+  justify-content: center;
+}
+.rk-railmini__hosts {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+}
+/* Tooltip wraps each host button in a <span class="rmra-tip">; target the
+   direct children of __hosts so centering applies regardless of wrapper. */
+.rk-railmini__hosts > * {
+  display: flex;
+  justify-content: center;
+}
+.rk-railmini__host {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  padding: var(--space-1);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+.rk-railmini__host.is-active {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.rk-railmini__host > :last-child {
+  /* StatusIndicator dot anchored to the avatar corner */
+  position: absolute;
+  right: 0;
+  bottom: 0;
+}
+.rk-railmini__foot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+}
+
 /* ---------- RESPONSIVE: fold to single pane ---------- */
 @media (max-width: 860px) {
   .rk-app__panel {
@@ -774,5 +839,8 @@
   }
   .rk-mobilebar {
     display: flex;
+  }
+  .rk-resize-handle {
+    display: none;
   }
 }

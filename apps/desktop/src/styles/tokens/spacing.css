@@ -30,6 +30,9 @@
   /* --- LAYOUT RAILS --- */
   --rail-sidebar: 240px;
   --rail-sidebar-md: 264px;
+  --rail-sidebar-min: 180px;
+  --rail-sidebar-max: 480px;
+  --rail-sidebar-collapsed: 56px;
   --rail-panel: 300px; /* files / diff / PR peek panel */
   --h-titlebar: 40px;
   --h-tabbar: 38px;

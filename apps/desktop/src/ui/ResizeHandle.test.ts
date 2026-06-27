@@ -18,22 +18,52 @@ describe("nextWidthFromPointer", () => {
 
 describe("nextWidthFromKey", () => {
   it("edge:right — ArrowRight grows, ArrowLeft shrinks", () => {
-    expect(nextWidthFromKey({ key: "ArrowRight" }, 300, 8, 180, 480, "right")).toBe(308);
-    expect(nextWidthFromKey({ key: "ArrowLeft" }, 300, 8, 180, 480, "right")).toBe(292);
+    expect(
+      nextWidthFromKey({ key: "ArrowRight" }, 300, 8, 180, 480, "right"),
+    ).toBe(308);
+    expect(
+      nextWidthFromKey({ key: "ArrowLeft" }, 300, 8, 180, 480, "right"),
+    ).toBe(292);
   });
   it("edge:left — directions invert spatially", () => {
-    expect(nextWidthFromKey({ key: "ArrowRight" }, 300, 8, 180, 480, "left")).toBe(292);
-    expect(nextWidthFromKey({ key: "ArrowLeft" }, 300, 8, 180, 480, "left")).toBe(308);
+    expect(
+      nextWidthFromKey({ key: "ArrowRight" }, 300, 8, 180, 480, "left"),
+    ).toBe(292);
+    expect(
+      nextWidthFromKey({ key: "ArrowLeft" }, 300, 8, 180, 480, "left"),
+    ).toBe(308);
   });
   it("Shift quadruples the step", () => {
-    expect(nextWidthFromKey({ key: "ArrowRight", shiftKey: true }, 300, 8, 180, 480, "right")).toBe(332);
+    expect(
+      nextWidthFromKey(
+        { key: "ArrowRight", shiftKey: true },
+        300,
+        8,
+        180,
+        480,
+        "right",
+      ),
+    ).toBe(332);
   });
   it("Home/End jump to bounds, other keys are ignored", () => {
-    expect(nextWidthFromKey({ key: "Home" }, 300, 8, 180, 480, "right")).toBe(180);
-    expect(nextWidthFromKey({ key: "End" }, 300, 8, 180, 480, "right")).toBe(480);
+    expect(nextWidthFromKey({ key: "Home" }, 300, 8, 180, 480, "right")).toBe(
+      180,
+    );
+    expect(nextWidthFromKey({ key: "End" }, 300, 8, 180, 480, "right")).toBe(
+      480,
+    );
     expect(nextWidthFromKey({ key: "a" }, 300, 8, 180, 480, "right")).toBe(300);
   });
   it("clamps at the bounds", () => {
-    expect(nextWidthFromKey({ key: "ArrowLeft", shiftKey: true }, 190, 8, 180, 480, "right")).toBe(180);
+    expect(
+      nextWidthFromKey(
+        { key: "ArrowLeft", shiftKey: true },
+        190,
+        8,
+        180,
+        480,
+        "right",
+      ),
+    ).toBe(180);
   });
 });

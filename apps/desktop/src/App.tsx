@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { WorkspaceModeDto } from "./bindings";
+import { CollapsedRail } from "./CollapsedRail";
 import { ConfirmRemoveDialog } from "./ConfirmRemoveDialog";
 import { subscribeConfigChanged } from "./config-watch-listener";
 import { DiffPanel } from "./DiffPanel";
@@ -11,7 +12,15 @@ import { buildTree, type SessionNode } from "./session-tree";
 import { shouldDisarmAfterSidebarOpen } from "./sidebar-focus";
 import { TabBar } from "./TabBar";
 import { Terminal, type TerminalHandle } from "./Terminal";
-import { Button, IconButton, Tag } from "./ui";
+import {
+  Button,
+  IconButton,
+  ResizeHandle,
+  shouldRenderCollapsed,
+  Tag,
+  useIsMobile,
+  useRailWidth,
+} from "./ui";
 import { ChevronRight } from "./ui/icons";
 import { useActivity } from "./useActivity";
 import { discoveryStore, useDiscovery } from "./useDiscovery";
@@ -92,6 +101,20 @@ function App() {
   // the flag, and a new session's terminal would never take focus (#126).
   const [focusRequest, setFocusRequest] = useState(0);
 
+  // Sidebar resize + collapse state, persisted per-device in localStorage.
+  const sidebarRef = useRef<HTMLDivElement>(null);
+  const isMobile = useIsMobile();
+  const { width, collapsed, setWidth, commitWidth, toggleCollapsed, reset } =
+    useRailWidth({
+      key: "remora.rail.sidebar",
+      defaultWidth: 240,
+      min: 180,
+      max: 480,
+    });
+  const [resizing, setResizing] = useState(false);
+  // On mobile the layout owns full-width; collapsed rail only renders off-mobile.
+  const showCollapsed = shouldRenderCollapsed(collapsed, isMobile);
+
   // Recompute the tree only when config or the polled session list changes.
   const tree = useMemo(() => buildTree(config, sessions), [config, sessions]);
   // Which sessions are open as tabs — the only ones we have a live terminal for
@@ -138,6 +161,18 @@ function App() {
     const raf = requestAnimationFrame(() => handle.focus());
     return () => cancelAnimationFrame(raf);
   }, [activeKey, activeStatus, focusRequest]);
+
+  // After the collapsed/expanded swap, move focus to the counterpart toggle so
+  // keyboard users aren't dropped to <body>. :focus-visible keeps mouse users
+  // ring-free. Keyed on showCollapsed so it runs only when the view changes.
+  useEffect(() => {
+    const root = sidebarRef.current;
+    if (!root) return;
+    const selector = showCollapsed
+      ? 'button[aria-label="Expand sidebar"]'
+      : 'button[aria-label="Collapse sidebar"]';
+    root.querySelector<HTMLButtonElement>(selector)?.focus();
+  }, [showCollapsed]);
 
   /** Open a session clicked in the sidebar, routing by its discovered state:
    * live → attach/focus, stopped → respawn. Reuses the dialog's deduping path
@@ -292,6 +327,12 @@ function App() {
     void discoveryStore.refreshAfterOpen();
   }
 
+  /** Open the Settings dialog — shared by the full sidebar and the collapsed rail. */
+  function openSettings() {
+    setNotice(null);
+    setSettingsOpen(true);
+  }
+
   /** Open the New Session dialog. `projectId` pre-scopes it to a project (the
    * sidebar per-project "+"); null is the global, no-context entry point. */
   function openNewSession(projectId: string | null) {
@@ -305,25 +346,60 @@ function App() {
 
   return (
     <main className={`rk-app rk-app--${mobilePane}`}>
-      <div className="rk-app__sidebar">
-        <Sidebar
-          tree={tree}
-          activeKey={activeKey}
-          openKeys={openKeys}
-          onOpenSession={openFromSidebar}
-          configError={configError}
-          discoveryUnavailable={discoveryUnavailable}
-          onRefresh={() => void refresh()}
-          onStop={onStop}
-          onRemove={onRemove}
-          onNewSession={openNewSession}
-          onOpenSettings={() => {
-            setNotice(null);
-            setSettingsOpen(true);
-          }}
-          activity={activity}
-        />
+      <div
+        ref={sidebarRef}
+        className={[
+          "rk-app__sidebar",
+          showCollapsed ? "rk-app__sidebar--collapsed" : "",
+          resizing ? "rk-app__sidebar--resizing" : "",
+        ]
+          .filter(Boolean)
+          .join(" ")}
+        style={
+          isMobile ? undefined : { width: showCollapsed ? undefined : width }
+        }
+      >
+        {showCollapsed ? (
+          <CollapsedRail
+            tree={tree}
+            activeKey={activeKey}
+            openKeys={openKeys}
+            activity={activity}
+            onExpand={toggleCollapsed}
+            onOpenSettings={openSettings}
+          />
+        ) : (
+          <Sidebar
+            tree={tree}
+            activeKey={activeKey}
+            openKeys={openKeys}
+            onOpenSession={openFromSidebar}
+            configError={configError}
+            discoveryUnavailable={discoveryUnavailable}
+            onRefresh={() => void refresh()}
+            onStop={onStop}
+            onRemove={onRemove}
+            onNewSession={openNewSession}
+            onOpenSettings={openSettings}
+            activity={activity}
+            onCollapse={toggleCollapsed}
+          />
+        )}
       </div>
+      {!showCollapsed && !isMobile && (
+        <ResizeHandle
+          edge="right"
+          railRef={sidebarRef}
+          min={180}
+          max={Math.min(480, Math.floor(window.innerWidth * 0.4))}
+          ariaLabel="Resize sidebar"
+          value={width}
+          onResize={setWidth}
+          onCommit={commitWidth}
+          onReset={reset}
+          onResizingChange={setResizing}
+        />
+      )}
       <div className="rk-app__main">
         <div className="rk-mobilebar">
           <IconButton

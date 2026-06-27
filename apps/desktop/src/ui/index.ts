@@ -19,4 +19,5 @@ export * from "./Tag";
 export * from "./Toast";
 export * from "./Tooltip";
 export * from "./use-is-mobile";
+export * from "./use-rail-width";
 export * from "./use-theme";

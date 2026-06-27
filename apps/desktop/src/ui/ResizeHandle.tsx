@@ -52,7 +52,7 @@ export interface ResizeHandleProps {
   /** Which edge of the rail the handle occupies. */
   edge: RailEdge;
   /** The rail element, measured for its bounding rect during drag. */
-  railRef: React.RefObject<HTMLElement>;
+  railRef: React.RefObject<HTMLElement | null>;
   min: number;
   /** Effective (already viewport-capped) max. */
   max: number;

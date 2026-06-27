@@ -16,6 +16,7 @@ import {
   RotateCw,
   Search,
   Settings,
+  Sidebar as SidebarIcon,
   Ssh,
   Sun,
   Trash,
@@ -45,6 +46,8 @@ interface SidebarProps {
   /** Open the config-management (Settings) modal. */
   onOpenSettings: () => void;
   activity: ReadonlyMap<string, ActivityState>;
+  /** Collapse the sidebar to the narrow icon rail. */
+  onCollapse?: () => void;
 }
 
 /** The transport glyph folded into the host label. null/unknown → no glyph. */
@@ -82,6 +85,7 @@ export function Sidebar({
   onNewSession,
   onOpenSettings,
   activity,
+  onCollapse,
 }: SidebarProps) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const toggle = (id: string) =>
@@ -122,6 +126,11 @@ export function Sidebar({
           <IconButton label="Refresh" size="sm" onClick={onRefresh}>
             <RotateCw size={15} />
           </IconButton>
+          {onCollapse && (
+            <IconButton label="Collapse sidebar" size="sm" onClick={onCollapse}>
+              <SidebarIcon size={15} />
+            </IconButton>
+          )}
         </div>
       </div>
 
