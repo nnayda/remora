@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Desktop UI for spawn-time branch and worktree overrides** (#124): the New
+  Session dialog replaces the generated "Session id" field with a **Branch
+  name** field and an optional **Worktree root** field — the user-chosen branch
+  is the session's identity, and the internal `session_id` is minted on the
+  client from that branch via a TypeScript port of the core FNV-1a/32
+  `derive_session_id`, kept byte-identical to Rust by a shared test-vector
+  fixture (core rejects any spawn whose `session_id` doesn't match
+  `derive(branch)`, so a hash mismatch surfaces immediately). The sidebar now
+  renders that branch as the session's name instead of the internal slug; the
+  config editor gains a `worktree_root` field on both hosts and projects
+  (feeding the host → project → session cascade); and a primary-checkout
+  (Shared) session's removal is relabelled **"Close session"** with
+  non-destructive copy, since tearing it down only ends the tmux session and
+  never deletes a worktree or branch. This **completes #124** — the discovery
+  foundation landed in #155 and the core spawn engine in #160; follow-ups #153
+  (`$HOME`-fallback hardening), #154 (edge-case tests), and #145 (user docs)
+  remain open.
 - **New-project "+" on the sidebar section header** (#161): a `+` button next to
   the sidebar "Projects" header opens Settings deep-linked to the new-project
   create form (first field focused), instead of landing on the entity list and

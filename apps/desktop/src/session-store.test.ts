@@ -392,6 +392,44 @@ describe("removeErrorMessage", () => {
 });
 
 describe("SessionStore workspace threading", () => {
+  it("openSession forwards branch and worktreeRoot to the spawn opener", async () => {
+    let capturedBranch: string | null | undefined;
+    let capturedWorktreeRoot: string | null | undefined;
+    const store = new SessionStore({
+      spawn: vi.fn(
+        async (
+          _p: string,
+          _s: string,
+          _a: string | null,
+          _b: string | null,
+          _w: string,
+          branch: string | null,
+          worktreeRoot: string | null,
+        ) => {
+          capturedBranch = branch;
+          capturedWorktreeRoot = worktreeRoot;
+          return { connection: fakeConn().conn, attached: false };
+        },
+      ),
+      attach: vi.fn(async () => fakeConn().conn),
+      respawn: vi.fn(async () => fakeConn().conn),
+      schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
+    } as any);
+    await store.openSession({
+      projectId: "api",
+      sessionId: "s1",
+      agent: null,
+      base: null,
+      workspace: "worktree",
+      branch: "feat/my-branch",
+      worktreeRoot: "/path/to/worktree",
+    });
+    expect(capturedBranch).toBe("feat/my-branch");
+    expect(capturedWorktreeRoot).toBe("/path/to/worktree");
+  });
+
   it("spawn opener receives the chosen workspace and stores it on the tab", async () => {
     const calls: string[] = [];
     const store = new SessionStore({

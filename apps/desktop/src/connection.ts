@@ -191,10 +191,21 @@ export async function openSession(
   agent: string | null,
   base: string | null,
   workspace: WorkspaceModeDto,
+  branch: string | null,
+  worktreeRoot: string | null,
 ): Promise<{ connection: SessionConnection; attached: boolean }> {
   try {
     const connection = await openConnection((o) =>
-      spawnSession(projectId, sessionId, agent, base, workspace, o),
+      spawnSession(
+        projectId,
+        sessionId,
+        agent,
+        base,
+        workspace,
+        branch,
+        worktreeRoot,
+        o,
+      ),
     );
     return { connection, attached: false };
   } catch (e) {

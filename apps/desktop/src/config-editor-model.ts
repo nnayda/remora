@@ -65,6 +65,7 @@ export interface HostFormState {
   namespaceIsCommand: boolean;
   contextIsCommand: boolean;
   containerIsCommand: boolean;
+  worktreeRoot: string;
 }
 
 export function emptyHostForm(): HostFormState {
@@ -83,11 +84,17 @@ export function emptyHostForm(): HostFormState {
     namespaceIsCommand: false,
     contextIsCommand: false,
     containerIsCommand: false,
+    worktreeRoot: "",
   };
 }
 
 export function hostFormFromDto(dto: EditorHostDto): HostFormState {
-  const form = { ...emptyHostForm(), id: dto.id, name: dto.name ?? "" };
+  const form = {
+    ...emptyHostForm(),
+    id: dto.id,
+    name: dto.name ?? "",
+    worktreeRoot: dto.worktreeRoot ?? "",
+  };
   const t = dto.transport;
   if (t.kind === "ssh") {
     form.kind = "ssh";
@@ -158,7 +165,11 @@ export function toHostInput(form: HostFormState): HostInputDto {
           context: optionalFieldDto(form.context, form.contextIsCommand),
           container: optionalFieldDto(form.container, form.containerIsCommand),
         };
-  return { name: blankToNull(form.name), transport };
+  return {
+    name: blankToNull(form.name),
+    transport,
+    worktreeRoot: blankToNull(form.worktreeRoot),
+  };
 }
 
 // ---- Project form ----
@@ -171,6 +182,7 @@ export interface ProjectFormState {
   workspace: WorkspaceModeDto;
   agent: string;
   base: string;
+  worktreeRoot: string;
 }
 
 /** A blank project form, preselecting the first existing host and agent so the
@@ -187,6 +199,7 @@ export function emptyProjectForm(
     workspace: "worktree",
     agent: agentIds[0] ?? "",
     base: "",
+    worktreeRoot: "",
   };
 }
 
@@ -199,6 +212,7 @@ export function projectFormFromDto(dto: EditorProjectDto): ProjectFormState {
     workspace: dto.workspace,
     agent: dto.agent,
     base: dto.base ?? "",
+    worktreeRoot: dto.worktreeRoot ?? "",
   };
 }
 
@@ -226,6 +240,7 @@ export function toProjectInput(form: ProjectFormState): ProjectInputDto {
     workspace: form.workspace,
     agent: form.agent,
     base: blankToNull(form.base),
+    worktreeRoot: blankToNull(form.worktreeRoot),
   };
 }
 

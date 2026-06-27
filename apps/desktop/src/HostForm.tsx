@@ -78,6 +78,13 @@ export function HostForm({ mode, initial, onSubmit, onCancel }: HostFormProps) {
         onChange={(e) => set("name", e.target.value)}
         placeholder="optional display name"
       />
+      <Input
+        label="Worktree root (optional)"
+        mono
+        value={form.worktreeRoot}
+        onChange={(e) => set("worktreeRoot", e.target.value)}
+        placeholder="~/.remora/worktrees (used by this host's projects)"
+      />
       <Select
         label="Transport"
         mono
