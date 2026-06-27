@@ -88,9 +88,12 @@ function effectiveMax(max: number): number {
  * commitWidth persists once on pointerup.
  */
 export function useRailWidth(opts: RailWidthOptions) {
-  const initial = parseRailState(readRaw(opts.key), opts);
-  const [width, setWidthState] = useState(initial.width);
-  const [collapsed, setCollapsed] = useState(initial.collapsed);
+  const [width, setWidthState] = useState(
+    () => parseRailState(readRaw(opts.key), opts).width,
+  );
+  const [collapsed, setCollapsed] = useState(
+    () => parseRailState(readRaw(opts.key), opts).collapsed,
+  );
 
   const widthRef = useRef(width);
   widthRef.current = width;
@@ -98,12 +101,16 @@ export function useRailWidth(opts: RailWidthOptions) {
   collapsedRef.current = collapsed;
 
   const setWidth = useCallback(
-    (w: number) => setWidthState(clampWidth(w, opts.min, effectiveMax(opts.max))),
+    (w: number) =>
+      setWidthState(clampWidth(w, opts.min, effectiveMax(opts.max))),
     [opts.min, opts.max],
   );
 
   const commitWidth = useCallback(() => {
-    writeState(opts.key, { width: widthRef.current, collapsed: collapsedRef.current });
+    writeState(opts.key, {
+      width: widthRef.current,
+      collapsed: collapsedRef.current,
+    });
   }, [opts.key]);
 
   const toggleCollapsed = useCallback(() => {
@@ -113,9 +120,17 @@ export function useRailWidth(opts: RailWidthOptions) {
   }, [opts.key]);
 
   const reset = useCallback(() => {
-    setWidthState(opts.defaultWidth);
-    writeState(opts.key, { width: opts.defaultWidth, collapsed: collapsedRef.current });
-  }, [opts.key, opts.defaultWidth]);
+    const clampedDefault = clampWidth(
+      opts.defaultWidth,
+      opts.min,
+      effectiveMax(opts.max),
+    );
+    setWidthState(clampedDefault);
+    writeState(opts.key, {
+      width: clampedDefault,
+      collapsed: collapsedRef.current,
+    });
+  }, [opts.key, opts.defaultWidth, opts.min, opts.max]);
 
   return { width, collapsed, setWidth, commitWidth, toggleCollapsed, reset };
 }
