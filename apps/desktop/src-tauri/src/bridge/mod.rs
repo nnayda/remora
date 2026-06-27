@@ -583,7 +583,7 @@ mod tests {
 
     /// Flatten a host-grouped list result to the sessions across all hosts,
     /// preserving per-host order (tests that only care about sessions).
-    fn flat_sessions(list: SessionListDto) -> Vec<error::SessionMetaDto> {
+    fn flat_sessions(list: SessionListDto) -> Vec<SessionMetaDto> {
         list.hosts.into_iter().flat_map(|h| h.sessions).collect()
     }
 

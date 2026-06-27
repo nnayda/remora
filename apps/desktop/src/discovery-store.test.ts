@@ -244,17 +244,53 @@ describe("DiscoveryStore per-host retention", () => {
     expect(snap.discoveryUnavailable).toBe(false);
   });
 
-  it("prunes a host that stays down past the grace window", async () => {
+  it("prunes a host only after the grace window since first detection (anchor preserved across down polls)", async () => {
     const list = vi
       .fn<() => Promise<SessionListDto>>()
-      .mockResolvedValue(listResult([{ hostId: "B", available: false }]))
-      .mockResolvedValueOnce(listResult([{ hostId: "B", sessions: [b1] }]));
+      .mockResolvedValueOnce(listResult([{ hostId: "B", sessions: [b1] }])) // up
+      .mockResolvedValue(listResult([{ hostId: "B", available: false }])); // down thereafter
     const { store } = makeStore({ listSessions: list, now });
-    await store.start(); // B has b1
-    clock += RECONNECT_GRACE_MS + 1;
-    await store.refreshAfterOpen(); // B down past grace
-    expect(store.getSnapshot().sessions).toEqual([]);
+    await store.start(); // clock 0: B up
+    clock += 5000;
+    await store.refreshAfterOpen(); // first down poll: detection anchored at 5000
+    expect(store.getSnapshot().sessions).toEqual([b1]); // retained (within grace)
+    expect(store.getSnapshot().reconnectingKeys).toEqual(["b/2"]);
+    clock += 5000; // clock=10000: 5s since detection — still within grace
+    await store.refreshAfterOpen();
+    expect(store.getSnapshot().sessions).toEqual([b1]); // anchor not reset by the 2nd down poll
+    clock += RECONNECT_GRACE_MS; // clock=25000: 20s since the 5000 detection (> grace)
+    await store.refreshAfterOpen();
+    expect(store.getSnapshot().sessions).toEqual([]); // pruned
     expect(store.getSnapshot().reconnectingKeys).toEqual([]);
+  });
+
+  it("retains a host that has been down for exactly the grace window (boundary)", async () => {
+    const list = vi
+      .fn<() => Promise<SessionListDto>>()
+      .mockResolvedValueOnce(listResult([{ hostId: "B", sessions: [b1] }]))
+      .mockResolvedValue(listResult([{ hostId: "B", available: false }]));
+    const { store } = makeStore({ listSessions: list, now });
+    await store.start(); // up at clock 0
+    await store.refreshAfterOpen(); // down: detection anchored at 0
+    clock += RECONNECT_GRACE_MS; // exactly the window — prune is strictly `>`
+    await store.refreshAfterOpen();
+    expect(store.getSnapshot().sessions).toEqual([b1]); // still retained at the boundary
+    expect(store.getSnapshot().reconnectingKeys).toEqual(["b/2"]);
+  });
+
+  it("clears the reconnecting flag when a down host recovers", async () => {
+    const list = vi
+      .fn<() => Promise<SessionListDto>>()
+      .mockResolvedValueOnce(listResult([{ hostId: "B", sessions: [b1] }])) // up
+      .mockResolvedValueOnce(listResult([{ hostId: "B", available: false }])) // down
+      .mockResolvedValueOnce(listResult([{ hostId: "B", sessions: [b1] }])); // recovered
+    const { store } = makeStore({ listSessions: list, now });
+    await store.start();
+    await store.refreshAfterOpen(); // down → reconnecting
+    expect(store.getSnapshot().reconnectingKeys).toEqual(["b/2"]);
+    await store.refreshAfterOpen(); // recovered → authoritative, flag cleared
+    expect(store.getSnapshot().reconnectingKeys).toEqual([]);
+    expect(store.getSnapshot().sessions).toEqual([b1]);
   });
 
   it("[CRITICAL] clears rows when a reachable host returns zero sessions", async () => {
@@ -308,19 +344,19 @@ describe("DiscoveryStore per-host retention", () => {
   });
 
   it("[Finding 9] reachable-before-hide host gets a fresh grace window on resume", async () => {
-    // B was reachable when the window was hidden.  After a gap longer than the
-    // grace period, B is now down.  Without lastSeenAt being reset on resume,
-    // the first post-resume poll would compute since=T_pre_hide and immediately
-    // prune B (the exact flicker #159 targets).
+    // B was reachable when the window was hidden, so its window never started.
+    // After a gap longer than the grace period, B is now down. Detection-time
+    // anchoring means the first post-resume poll anchors `since` at resume time,
+    // so B is retained (no prune-then-reappear flicker).
     const list = vi
       .fn<() => Promise<SessionListDto>>()
       .mockResolvedValueOnce(listResult([{ hostId: "B", sessions: [b1] }])) // start: B reachable
       .mockResolvedValueOnce(listResult([{ hostId: "B", available: false }])); // resume poll: B down
     const { store } = makeStore({ listSessions: list, now });
-    await store.start(); // clock=0: B up, lastSeenAt=0, unavailableSince=null
+    await store.start(); // clock=0: B up, unavailableSince=null
     store.setActive(false);
-    clock += RECONNECT_GRACE_MS + 1000; // long hidden gap — would prune without the fix
-    store.setActive(true); // re-stamps lastSeenAt=clock, fires resume poll
+    clock += RECONNECT_GRACE_MS + 1000; // long hidden gap
+    store.setActive(true); // fires resume poll; B's window starts now
     await Promise.resolve(); // let pollSessions reach await listSessions()
     await Promise.resolve(); // let mergeHosts + commit run
     const snap = store.getSnapshot();
@@ -331,8 +367,8 @@ describe("DiscoveryStore per-host retention", () => {
 
   it("[Finding 9] already-failing-before-hide host also keeps its grace window on resume", async () => {
     // B was already down (unavailableSince set) when the window was hidden.
-    // The existing guard resets unavailableSince on resume; this test confirms
-    // that behaviour is preserved after the lastSeenAt fix.
+    // The resume guard resets unavailableSince on resume so a long hidden gap
+    // restarts the grace window rather than pruning B on the first resume poll.
     const list = vi
       .fn<() => Promise<SessionListDto>>()
       .mockResolvedValueOnce(listResult([{ hostId: "B", sessions: [b1] }])) // start: B reachable
@@ -341,7 +377,7 @@ describe("DiscoveryStore per-host retention", () => {
     const { store } = makeStore({ listSessions: list, now });
     await store.start(); // clock=0
     clock += 1000;
-    await store.refreshAfterOpen(); // B goes down; unavailableSince anchored at 0
+    await store.refreshAfterOpen(); // B goes down; unavailableSince anchored at 1000
     store.setActive(false);
     clock += RECONNECT_GRACE_MS + 1000; // total gap well past grace
     store.setActive(true); // resets unavailableSince=clock, fires resume poll

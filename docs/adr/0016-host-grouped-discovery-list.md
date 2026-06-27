@@ -35,14 +35,16 @@ enclosing bucket at the desktop aggregation boundary, so core/protocol stay
 host-agnostic (the one rule, ADR-0003/0004).
 
 The desktop `DiscoveryStore` owns retention and timing. It keeps a per-host map
-of last-good rows plus the timestamp each host was last reached. A reachable
-host is authoritative (including a reachable-but-empty host, which clears its
-rows — ended sessions still prune immediately). An unavailable host's last-good
-rows are retained and its sessions marked "reconnecting" (the sidebar dims
-them) until it has been continuously unreachable for longer than a 15s grace
-window, after which they are pruned; a host removed from config is reconciled
-out at once. Resuming from a hidden window restarts every host's grace timer so
-a long hidden gap never prunes-then-reappears. This resolves the
+of last-good rows plus the timestamp of the first poll that found the host down.
+A reachable host is authoritative (including a reachable-but-empty host, which
+clears its rows — ended sessions still prune immediately). An unavailable host's
+last-good rows are retained and its sessions marked "reconnecting" (the sidebar
+dims them) until it has been continuously unreachable for longer than a 15s
+grace window measured **from that first-down detection** (so a host gets a full
+reconnecting window however slow its transport is to surface the error), after
+which they are pruned; a host removed from config is reconciled out at once.
+Resuming from a hidden window restarts the grace timer for any already-failing
+host so a long hidden gap never prunes-then-reappears. This resolves the
 `TODO(stage 11+)`.
 
 ## Alternatives considered

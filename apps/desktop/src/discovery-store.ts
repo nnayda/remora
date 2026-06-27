@@ -69,15 +69,15 @@ export class DiscoveryStore {
   };
 
   // host id → its last-good rows + when it started failing (null ⇒ reachable)
-  // + when it was last seen available (used to seed the grace window on first
-  // unavailable poll, so the window measures from the last good contact, not
-  // from the moment the down-poll arrived).
+  // `unavailableSince` is the timestamp of the FIRST poll that found the host
+  // down (null while reachable); the 15s grace window measures from that
+  // detection, so a host gets a full reconnecting window however slow its
+  // transport is to surface the error.
   private byHost = new Map<
     string,
     {
       sessions: SessionMetaDto[];
       unavailableSince: number | null;
-      lastSeenAt: number;
     }
   >();
 
@@ -126,15 +126,12 @@ export class DiscoveryStore {
     if (this.disposed || active === this.active) return;
     this.active = active;
     if (active) {
-      // Resume from hidden: treat resume as "we just re-contacted everything"
-      // so a long hidden gap never prunes-then-reappears (the #159 flicker).
-      // Reset lastSeenAt for ALL entries (covers hosts that were reachable when
-      // hidden but may have gone down during the gap) and unavailableSince for
-      // already-failing hosts, so the grace window measures from resume, not
-      // from the pre-hide poll.
+      // Resume from hidden: restart the grace window for any already-failing
+      // host so a long hidden gap never prunes-then-reappears (the #159
+      // flicker). A host that was reachable when hidden needs no reset — its
+      // window only starts when the first post-resume poll detects it down.
       const t = this.now();
       for (const entry of this.byHost.values()) {
-        entry.lastSeenAt = t;
         if (entry.unavailableSince !== null) entry.unavailableSince = t;
       }
       void this.pollSessions();
@@ -233,7 +230,6 @@ export class DiscoveryStore {
         this.byHost.set(host.hostId, {
           sessions: host.sessions,
           unavailableSince: null,
-          lastSeenAt: this.now(),
         });
         continue;
       }
@@ -243,17 +239,15 @@ export class DiscoveryStore {
         this.byHost.delete(host.hostId);
         continue;
       }
-      // Use when we first noted this host going down; if this is the first
-      // unavailable poll, anchor from the last successful contact so the window
-      // measures total downtime (including the time the app was polling).
-      const since = prior.unavailableSince ?? prior.lastSeenAt;
+      // Anchor the grace window at the FIRST down poll (detection time); keep
+      // that anchor on subsequent down polls so total reconnecting time is 15s.
+      const since = prior.unavailableSince ?? this.now();
       if (this.now() - since > RECONNECT_GRACE_MS) {
         this.byHost.delete(host.hostId); // prune after grace
       } else {
         this.byHost.set(host.hostId, {
           sessions: prior.sessions,
           unavailableSince: since,
-          lastSeenAt: prior.lastSeenAt,
         });
       }
     }
@@ -264,14 +258,18 @@ export class DiscoveryStore {
     }
   }
 
-  /** All retained sessions, sorted by (projectId, sessionId) for a stable tree. */
+  /** All retained sessions, sorted by (projectId, sessionId) for a stable tree.
+   * Uses code-unit `<`/`>` (not localeCompare) to match the bridge's byte-order
+   * `(project_id, session_id)` sort, so the cross-host merge preserves the
+   * transport-stable order buildTree relies on. */
   private flattenSessions(): SessionMetaDto[] {
     const all: SessionMetaDto[] = [];
     for (const { sessions } of this.byHost.values()) all.push(...sessions);
+    const byCodeUnit = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
     all.sort((a, b) =>
       a.projectId === b.projectId
-        ? a.sessionId.localeCompare(b.sessionId)
-        : a.projectId.localeCompare(b.projectId),
+        ? byCodeUnit(a.sessionId, b.sessionId)
+        : byCodeUnit(a.projectId, b.projectId),
     );
     return all;
   }

@@ -140,7 +140,7 @@ export function buildTree(
         sessionNode(
           s,
           s.workspace ?? projectWorkspace.get(s.projectId) ?? null,
-          reconnectingKeys.has(tabKey(s.projectId, s.sessionId)),
+          reconnectingKeys.has(key),
         ),
       );
       continue;
@@ -160,11 +160,7 @@ export function buildTree(
       syntheticOrder.push(syn);
     }
     syn.sessions.push(
-      sessionNode(
-        s,
-        s.workspace ?? null,
-        reconnectingKeys.has(tabKey(s.projectId, s.sessionId)),
-      ),
+      sessionNode(s, s.workspace ?? null, reconnectingKeys.has(key)),
     );
   }
 
