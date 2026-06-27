@@ -103,6 +103,7 @@ function App() {
 
   // Sidebar resize + collapse state, persisted per-device in localStorage.
   const sidebarRef = useRef<HTMLDivElement>(null);
+  const sidebarFocusDidMountRef = useRef(false);
   const isMobile = useIsMobile();
   const { width, collapsed, setWidth, commitWidth, toggleCollapsed, reset } =
     useRailWidth({
@@ -166,6 +167,10 @@ function App() {
   // keyboard users aren't dropped to <body>. :focus-visible keeps mouse users
   // ring-free. Keyed on showCollapsed so it runs only when the view changes.
   useEffect(() => {
+    if (!sidebarFocusDidMountRef.current) {
+      sidebarFocusDidMountRef.current = true;
+      return;
+    }
     const root = sidebarRef.current;
     if (!root) return;
     const selector = showCollapsed
