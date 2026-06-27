@@ -4,6 +4,7 @@ import type { StoreOpeners } from "./session-store";
 import {
   canRespawn,
   OPEN_CANCELLED,
+  removeErrorMessage,
   SessionStore,
   tabKey,
 } from "./session-store";
@@ -360,6 +361,33 @@ describe("canRespawn", () => {
   it("canRespawn is false for shared, true for worktree", () => {
     expect(canRespawn("shared")).toBe(false);
     expect(canRespawn("worktree")).toBe(true);
+  });
+});
+
+describe("removeErrorMessage", () => {
+  it("surfaces a BridgeError's message (a plain object, not an Error)", () => {
+    // The bridge throws typed plain objects; the dialog used to fall through to
+    // a generic string because they fail `instanceof Error`, masking the cause.
+    const err = { kind: "transport", message: "kill tmux: permission denied" };
+    expect(removeErrorMessage({ ok: false, error: err })).toBe(
+      "kill tmux: permission denied",
+    );
+  });
+
+  it("uses a real Error instance's message", () => {
+    expect(removeErrorMessage({ ok: false, error: new Error("boom") })).toBe(
+      "boom",
+    );
+  });
+
+  it("passes a string error through", () => {
+    expect(removeErrorMessage({ ok: false, error: "nope" })).toBe("nope");
+  });
+
+  it("falls back to the friendly copy for a bare {ok:false}", () => {
+    expect(removeErrorMessage({ ok: false })).toBe(
+      "Could not remove the session.",
+    );
   });
 });
 
@@ -1465,6 +1493,218 @@ describe("SessionStore Fix D coverage", () => {
     expect(second).toEqual({ ok: false });
     resolve();
     await first;
+    expect(remove).toHaveBeenCalledTimes(1);
+  });
+
+  // CROSS-RACE: open (respawn) vs teardown (remove). The bug: `pending`
+  // guards opens against opens and `teardownPending` guards teardowns against
+  // teardowns, but nothing serialized an open against a teardown. A remove that
+  // killed tmux + deleted the worktree could interleave with a respawn that
+  // re-created tmux in that worktree, leaving a live tmux with no worktree or
+  // branch — an orphan that shows no Stop affordance and is hard to remove.
+  it("RACE: respawnTab is refused while a remove is in-flight (no orphan respawn)", async () => {
+    let resolveRemove!: () => void;
+    const respawn = vi.fn(() => Promise.resolve(fakeConn().conn));
+    const remove = vi.fn(
+      () =>
+        new Promise<void>((r) => {
+          resolveRemove = r;
+        }),
+    );
+    const { store } = makeStore({ respawn, remove });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      base: null,
+      workspace: "worktree" as const,
+    });
+    // Start a remove whose backend hangs → teardown is in flight for this key.
+    const removeP = store.remove("p", "s", true);
+    // While the remove runs, a stray respawn fires (the user clicks the row).
+    await store.respawnTab("p/s");
+    // It must NOT spawn a new session underneath the in-flight teardown.
+    expect(respawn).not.toHaveBeenCalled();
+    resolveRemove();
+    await removeP;
+  });
+
+  it("RACE: remove is refused while a respawn is in-flight (won't tear down a session being created)", async () => {
+    let resolveRespawn!: (c: SessionConnection) => void;
+    const respawn = vi.fn(
+      () =>
+        new Promise<SessionConnection>((r) => {
+          resolveRespawn = r;
+        }),
+    );
+    const remove = vi.fn(() => Promise.resolve());
+    const { store, spawned } = makeStore({ respawn, remove });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      base: null,
+      workspace: "worktree" as const,
+    });
+    spawned.die(); // → reconnecting
+    await Promise.resolve();
+    // Drive a respawn whose backend hangs → open is in flight for this key.
+    const respawnP = store.respawnTab("p/s");
+    // A remove fires concurrently — it must back off, not kill the new session.
+    const r = await store.remove("p", "s", true);
+    expect(r).toEqual({ ok: false });
+    expect(remove).not.toHaveBeenCalled();
+    resolveRespawn(fakeConn().conn);
+    await respawnP;
+  });
+
+  it("RACE: stop is refused while a respawn is in-flight", async () => {
+    let resolveRespawn!: (c: SessionConnection) => void;
+    const respawn = vi.fn(
+      () =>
+        new Promise<SessionConnection>((r) => {
+          resolveRespawn = r;
+        }),
+    );
+    const stop = vi.fn(() => Promise.resolve());
+    const { store, spawned } = makeStore({ respawn, stop });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      base: null,
+      workspace: "worktree" as const,
+    });
+    spawned.die();
+    await Promise.resolve();
+    const respawnP = store.respawnTab("p/s");
+    const r = await store.stop("p", "s");
+    expect(r).toEqual({ ok: false });
+    expect(stop).not.toHaveBeenCalled();
+    resolveRespawn(fakeConn().conn);
+    await respawnP;
+  });
+
+  it("RACE: respawnTab is refused while a stop is in-flight", async () => {
+    let resolveStop!: () => void;
+    const respawn = vi.fn(() => Promise.resolve(fakeConn().conn));
+    const stop = vi.fn(
+      () =>
+        new Promise<void>((r) => {
+          resolveStop = r;
+        }),
+    );
+    const { store } = makeStore({ respawn, stop });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      base: null,
+      workspace: "worktree" as const,
+    });
+    const stopP = store.stop("p", "s");
+    await store.respawnTab("p/s");
+    expect(respawn).not.toHaveBeenCalled();
+    resolveStop();
+    await stopP;
+  });
+
+  // The spawn-open path (openSession → pending) is guarded by the same busy()
+  // lock as respawn; these two cover the open(spawn)-vs-teardown directions.
+  it("RACE: remove is refused while an openSession (spawn) is in-flight", async () => {
+    let resolveSpawn!: (v: {
+      connection: SessionConnection;
+      attached: boolean;
+    }) => void;
+    const spawn = vi.fn(
+      () =>
+        new Promise<{ connection: SessionConnection; attached: boolean }>(
+          (r) => {
+            resolveSpawn = r;
+          },
+        ),
+    );
+    const remove = vi.fn(() => Promise.resolve());
+    const { store } = makeStore({ spawn, remove });
+    // First open spawns a tab; second concurrent open holds `pending`.
+    const openP = store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      base: null,
+      workspace: "worktree" as const,
+    });
+    const r = await store.remove("p", "s", true);
+    expect(r).toEqual({ ok: false });
+    expect(remove).not.toHaveBeenCalled();
+    resolveSpawn({ connection: fakeConn().conn, attached: false });
+    await openP;
+  });
+
+  it("RACE: openSession is refused while a teardown is in-flight", async () => {
+    let resolveRemove!: () => void;
+    const spawn = vi.fn(async () => ({
+      connection: fakeConn().conn,
+      attached: false,
+    }));
+    const remove = vi.fn(
+      () =>
+        new Promise<void>((r) => {
+          resolveRemove = r;
+        }),
+    );
+    const { store } = makeStore({ spawn, remove });
+    // Tear down a key with no open tab (backend hangs → teardownPending held).
+    // With no existing tab, openSession can't dedupe, so it reaches openTab's
+    // busy() check — the spawn-open path's cross-guard against orphaning.
+    const removeP = store.remove("p", "s", true);
+    const r = await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      base: null,
+      workspace: "worktree" as const,
+    });
+    expect(r).toEqual({ ok: false, error: OPEN_CANCELLED });
+    expect(spawn).not.toHaveBeenCalled();
+    resolveRemove();
+    await removeP;
+  });
+
+  it("RACE: two overlapping respawns keep the key busy until BOTH settle", async () => {
+    let r1!: (c: SessionConnection) => void;
+    let r2!: (c: SessionConnection) => void;
+    let call = 0;
+    const respawn = vi.fn(
+      () =>
+        new Promise<SessionConnection>((res) => {
+          call += 1;
+          if (call === 1) r1 = res;
+          else r2 = res;
+        }),
+    );
+    const remove = vi.fn(() => Promise.resolve());
+    const { store, spawned } = makeStore({ respawn, remove });
+    await store.openSession({
+      projectId: "p",
+      sessionId: "s",
+      agent: null,
+      base: null,
+      workspace: "worktree" as const,
+    });
+    spawned.die();
+    await Promise.resolve();
+    const p1 = store.respawnTab("p/s"); // respawning count = 1
+    const p2 = store.respawnTab("p/s"); // count = 2 (newest-wins cancels p1)
+    // Settle the first: count drops to 1, key still busy.
+    r1(fakeConn().conn);
+    await p1;
+    expect(await store.remove("p", "s", true)).toEqual({ ok: false });
+    expect(remove).not.toHaveBeenCalled();
+    // Settle the second: count drains to 0, key free → remove now proceeds.
+    r2(fakeConn().conn);
+    await p2;
+    expect(await store.remove("p", "s", true)).toEqual({ ok: true });
     expect(remove).toHaveBeenCalledTimes(1);
   });
 

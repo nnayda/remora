@@ -56,6 +56,11 @@ direction. See docs/ARCHITECTURE.md.
   clippy warnings fail CI.
 - TypeScript: Biome is the style arbiter — no manual formatting debates.
 - Architectural decisions get a new ADR in `docs/adr/`; never rewrite old ones.
+- Follow-up work goes in a GitHub issue, not a code comment or a PR note. When a
+  change defers something — a known limitation, a deferred edge case, a "do this
+  next" — open an issue and reference it (`see #NNN`) rather than leaving a bare
+  `TODO`/`FIXME` or burying it in PR prose, where it gets lost. Code comments
+  explain the code as it is; the issue tracker owns the work that's still to do.
 - Working artifacts — design specs, implementation plans, session notes,
   throwaway spikes (`docs/superpowers/`, `notes/`, `spikes/`) — stay local
   and are never committed (gitignored). Durable outcomes belong in ADRs,
