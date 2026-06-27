@@ -416,6 +416,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A transient host connection drop no longer blanks that host's sessions in
+  the sidebar** (#159, ADR-0016). A momentary blip to one host (network hiccup,
+  ssh stall) made its session rows vanish for a few seconds, then reappear — the
+  whole sidebar reshuffled on a one-off drop. The discovery `list` swallowed a
+  per-host error and returned a *successful* shorter list, so the frontend's
+  retain-last-good safety net (which only fired when *every* host was down) never
+  ran. `Bridge::list` now returns one bucket per attempted host
+  (`{ hostId, available, sessions }`) instead of a flat list, resolving the
+  long-standing silent-drop `TODO`. The desktop `DiscoveryStore` retains a
+  transiently-down host's last-good rows, marks them "reconnecting" (dimmed in
+  the sidebar), and prunes only after 15s of continuous unavailability measured
+  from the first failed poll — so even a slow-timeout transport keeps a full
+  reconnecting window. A reachable host (including one that returns zero
+  sessions) stays authoritative, a host removed from config is dropped at once,
+  and all-hosts-down still surfaces the existing "discovery unavailable" banner.
 - **Open-vs-teardown race that orphaned a session.** Clicking Remove on a session
   and then clicking its row (which respawns) could interleave: the remove killed
   tmux and deleted the worktree + branch while the respawn re-created tmux in that
