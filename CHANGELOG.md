@@ -26,6 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   foundation landed in #155 and the core spawn engine in #160; follow-ups #153
   (`$HOME`-fallback hardening), #154 (edge-case tests), and #145 (user docs)
   remain open.
+- **New-project "+" on the sidebar section header** (#161): a `+` button next to
+  the sidebar "Projects" header opens Settings deep-linked to the new-project
+  create form (first field focused), instead of landing on the entity list and
+  making you hunt for the projects section. The footer gear still opens Settings
+  on the list as before. `SettingsDialog` gains an optional `initialView` prop
+  (default `{ kind: "list" }`) that seeds its view state, and `App` routes the
+  gear to the list and the new `+` to the project-create form. The button stays
+  visible in the empty "No projects yet" state so a first-time user can reach
+  the form in one click.
 - **Spawn-time worktree path and branch overrides** (#124): when spawning a
   session, you can now specify a custom worktree root path and branch name. The
   `worktree_root` overrides the project and host defaults (which cascade to the
