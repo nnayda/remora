@@ -299,6 +299,7 @@ function ProjectGroup({
                 aria-current={session.key === activeKey ? "true" : undefined}
                 title={stopped ? "Stopped — click to respawn" : undefined}
                 onClick={() => onOpenSession(session)}
+                reconnecting={session.reconnecting}
                 actions={
                   <SessionMenu
                     session={session}

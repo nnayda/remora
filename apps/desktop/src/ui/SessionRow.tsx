@@ -28,6 +28,8 @@ export interface SessionRowProps
   count?: number | null;
   /** Trailing controls revealed on hover/focus — typically a row menu trigger. */
   actions?: React.ReactNode;
+  /** Host is unavailable; render dimmed with a reconnecting cue. @default false */
+  reconnecting?: boolean;
 }
 
 export function SessionRow({
@@ -39,6 +41,7 @@ export function SessionRow({
   active = false,
   count = null,
   actions = null,
+  reconnecting = false,
   className = "",
   ...props
 }: SessionRowProps) {
@@ -46,6 +49,7 @@ export function SessionRow({
     "rmra-srow",
     active ? "rmra-srow--active" : "",
     connected ? "" : "rmra-srow--disconnected",
+    reconnecting ? "rmra-srow--reconnecting" : "",
     className,
   ]
     .filter(Boolean)
@@ -68,6 +72,9 @@ export function SessionRow({
         </span>
         <span className="rmra-srow__body">
           <span className="rmra-srow__name">{name}</span>
+          {reconnecting && (
+            <span className="rmra-srow__reconnecting">reconnecting…</span>
+          )}
           {hasMeta && (
             <span className="rmra-srow__meta">
               {agent && <span className="rmra-srow__agent">{agent}</span>}

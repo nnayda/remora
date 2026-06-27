@@ -125,3 +125,14 @@
 .rmra-srow:focus-within .rmra-srow__actions {
   opacity: 1;
 }
+
+/* Host transiently unavailable: dim the row but keep it in place (#159). */
+.rmra-srow--reconnecting {
+  opacity: 0.55;
+}
+.rmra-srow__reconnecting {
+  margin-left: 0.5ch;
+  font-size: 0.85em;
+  font-style: italic;
+  opacity: 0.8;
+}

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use remora_core::config::{Config, Transport};
+use remora_core::config::{Config, HostId, Transport};
 use remora_core::{KubectlSource, SessionSource, SshSource};
 use remora_protocol::ProjectId;
 
@@ -19,8 +19,9 @@ pub trait SourceResolver: Send + Sync {
         project_id: &ProjectId,
     ) -> Result<Arc<dyn SessionSource>, BridgeError>;
 
-    /// One transport per host (ssh and kubectl), for discovery aggregation.
-    fn all(&self, config: &Arc<Config>) -> Vec<Arc<dyn SessionSource>>;
+    /// One transport per host (ssh and kubectl), paired with its config id,
+    /// for discovery aggregation.
+    fn all(&self, config: &Arc<Config>) -> Vec<(HostId, Arc<dyn SessionSource>)>;
 }
 
 /// Production resolver: config is the source of truth.
@@ -56,17 +57,20 @@ impl SourceResolver for ConfigResolver {
         }
     }
 
-    fn all(&self, config: &Arc<Config>) -> Vec<Arc<dyn SessionSource>> {
+    fn all(&self, config: &Arc<Config>) -> Vec<(HostId, Arc<dyn SessionSource>)> {
         config
             .hosts
-            .values()
-            .map(|host| match &host.transport {
-                Transport::Ssh(ssh) => Arc::new(SshSource::new(ssh.clone(), Arc::clone(config)))
-                    as Arc<dyn SessionSource>,
-                Transport::Kubectl(k) => {
-                    Arc::new(KubectlSource::new(k.clone(), Arc::clone(config)))
-                        as Arc<dyn SessionSource>
-                }
+            .iter()
+            .map(|(id, host)| {
+                let source: Arc<dyn SessionSource> = match &host.transport {
+                    Transport::Ssh(ssh) => {
+                        Arc::new(SshSource::new(ssh.clone(), Arc::clone(config)))
+                    }
+                    Transport::Kubectl(k) => {
+                        Arc::new(KubectlSource::new(k.clone(), Arc::clone(config)))
+                    }
+                };
+                (id.clone(), source)
             })
             .collect()
     }
@@ -124,5 +128,19 @@ mod tests {
     fn all_empty_config_is_empty() {
         let r = ConfigResolver;
         assert!(r.all(&config("")).is_empty());
+    }
+
+    #[test]
+    fn all_pairs_each_source_with_its_host_id() {
+        let toml = "[hosts.a]\ntransport = \"ssh\"\nhost = \"a\"\n\
+            [hosts.k]\ntransport = \"kubectl\"\npod = \"p\"\n";
+        let r = ConfigResolver;
+        let ids: Vec<String> = r
+            .all(&config(toml))
+            .iter()
+            .map(|(id, _)| id.as_str().to_owned())
+            .collect();
+        // config.hosts is a BTreeMap, so ids come back sorted.
+        assert_eq!(ids, vec!["a".to_string(), "k".to_string()]);
     }
 }
