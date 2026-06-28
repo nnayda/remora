@@ -30,6 +30,11 @@
   /* --- LAYOUT RAILS --- */
   --rail-sidebar: 240px;
   --rail-sidebar-md: 264px;
+  /* min/max document the JS drag-clamp bounds (enforced in ui/use-rail-width.ts,
+     not as CSS min/max-width — the collapsed rail is intentionally below min). */
+  --rail-sidebar-min: 180px;
+  --rail-sidebar-max: 480px;
+  --rail-sidebar-collapsed: 56px;
   --rail-panel: 300px; /* files / diff / PR peek panel */
   --h-titlebar: 40px;
   --h-tabbar: 38px;

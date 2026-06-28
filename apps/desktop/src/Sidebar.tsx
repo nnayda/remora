@@ -3,6 +3,7 @@ import type { ActivityState } from "./activity-store";
 import wordmark from "./assets/remora-wordmark.svg";
 import { filterTree } from "./filter-tree";
 import type { HostTransport, ProjectNode, SessionNode } from "./session-tree";
+import { SIDEBAR_COLLAPSE_LABEL } from "./sidebar-labels";
 import { sessionIndicatorState } from "./status-state";
 import { Avatar, IconButton, SessionRow, useTheme } from "./ui";
 import {
@@ -16,6 +17,7 @@ import {
   RotateCw,
   Search,
   Settings,
+  Sidebar as SidebarIcon,
   Ssh,
   Sun,
   Trash,
@@ -47,6 +49,8 @@ interface SidebarProps {
   /** Open Settings deep-linked to the new-project form (section-header "+"). */
   onAddProject: () => void;
   activity: ReadonlyMap<string, ActivityState>;
+  /** Collapse the sidebar to the narrow icon rail. */
+  onCollapse?: () => void;
 }
 
 /** The transport glyph folded into the host label. null/unknown → no glyph. */
@@ -85,6 +89,7 @@ export function Sidebar({
   onOpenSettings,
   onAddProject,
   activity,
+  onCollapse,
 }: SidebarProps) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const toggle = (id: string) =>
@@ -125,6 +130,15 @@ export function Sidebar({
           <IconButton label="Refresh" size="sm" onClick={onRefresh}>
             <RotateCw size={15} />
           </IconButton>
+          {onCollapse && (
+            <IconButton
+              label={SIDEBAR_COLLAPSE_LABEL}
+              size="sm"
+              onClick={onCollapse}
+            >
+              <SidebarIcon size={15} />
+            </IconButton>
+          )}
         </div>
       </div>
 

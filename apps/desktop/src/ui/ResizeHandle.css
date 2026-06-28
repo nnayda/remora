@@ -1,0 +1,25 @@
+/* A 1px hairline sitting on the rail's edge, with a wider transparent hit area.
+   The rail owns its width; the handle owns the drag affordance. */
+.rk-resize-handle {
+  flex: none;
+  width: 1px;
+  align-self: stretch;
+  background: var(--border-hairline);
+  cursor: col-resize;
+  position: relative;
+  transition: background var(--dur-fast) var(--ease-standard);
+}
+/* Widen the clickable area without widening the visual hairline. */
+.rk-resize-handle::after {
+  content: "";
+  position: absolute;
+  inset: 0 calc(-1 * var(--space-3)); /* ~13px hit area straddling the 1px line (6px/side, on grid) */
+}
+.rk-resize-handle:hover,
+.rk-resize-handle:focus-visible {
+  background: var(--border-strong);
+  outline: none;
+}
+.rk-resize-handle:focus-visible {
+  box-shadow: 0 0 0 2px var(--focus-ring, var(--border-strong));
+}
