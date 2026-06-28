@@ -23,7 +23,9 @@
 }
 .rk-app__sidebar--collapsed {
   width: var(--rail-sidebar-collapsed);
-  overflow: hidden;
+  /* No clipping overflow here: the collapsed rail's side="right" host tooltips
+     must escape the 56px rail. Collapsed content is already narrow, so there is
+     nothing to clip during the width transition anyway. */
 }
 /* Drag must feel instant — suppress the collapse transition while resizing. */
 .rk-app__sidebar--resizing {
@@ -772,7 +774,10 @@
 .rk-railmini__hosts {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
+  /* overflow stays visible: a scroll container would force overflow-x to auto
+     and clip the side="right" host tooltips (the rail's whole point). Typical
+     host counts fit; scroll-with-many-hosts needs portal tooltips (follow-up). */
+  overflow: visible;
   display: flex;
   flex-direction: column;
   align-items: center;

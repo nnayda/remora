@@ -422,7 +422,7 @@ function App() {
             onOpenSettings={openSettings}
             onAddProject={openAddProject}
             activity={activity}
-            onCollapse={toggleCollapsed}
+            onCollapse={isMobile ? undefined : toggleCollapsed}
           />
         )}
       </div>

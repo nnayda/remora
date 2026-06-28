@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 export interface RailWidthOptions {
   /** localStorage key, e.g. "remora.rail.sidebar". */
@@ -111,10 +111,31 @@ export function useRailWidth(opts: RailWidthOptions) {
   collapsedRef.current = collapsed;
 
   const setWidth = useCallback(
-    (w: number) =>
-      setWidthState(clampWidth(w, opts.min, effectiveMax(opts.max))),
+    (w: number) => {
+      const clamped = clampWidth(w, opts.min, effectiveMax(opts.max));
+      // Sync the ref synchronously so a commit fired in the same tick (before a
+      // re-render) persists the value just set, not the previous render's.
+      widthRef.current = clamped;
+      setWidthState(clamped);
+    },
     [opts.min, opts.max],
   );
+
+  // Re-clamp the live width when the window shrinks: effectiveMax is viewport-
+  // relative, so a width set on a wide window must shrink with the window or it
+  // would exceed the ~40% cap until the next drag. clampWidth returns the same
+  // value when already in bounds, so React bails on the no-op (no churn).
+  useEffect(() => {
+    function onResize() {
+      setWidthState((w) => {
+        const clamped = clampWidth(w, opts.min, effectiveMax(opts.max));
+        widthRef.current = clamped;
+        return clamped;
+      });
+    }
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [opts.min, opts.max]);
 
   const commitWidth = useCallback(
     (next?: number) => {
