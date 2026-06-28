@@ -746,14 +746,18 @@ detached
     #[test]
     fn parse_worktree_porcelain_captures_branch_on_locked_record() {
         // A `locked` line within a worktree record must not interfere with
-        // capturing the branch: `locked` is ignored and the `branch refs/heads/…`
-        // line still sets it. (Locked worktrees are real — e.g. a worktree on
-        // removable media — and must still be discoverable by branch identity.)
+        // capturing the branch — even when the branch line appears AFTER `locked`.
+        // `locked` is ignored without terminating the record, so the later
+        // `branch refs/heads/…` line still sets the branch. Ordering `locked`
+        // before `branch` is what makes this a real guard: it would catch a
+        // regression that finalized the record early on `locked`. (Locked
+        // worktrees are real — e.g. a worktree on removable media — and must
+        // still be discoverable by branch identity.)
         let out = "\
 worktree /home/dev/.remora/worktrees/api/held
 HEAD abc123
-branch refs/heads/remora/held
 locked
+branch refs/heads/remora/held
 ";
         let got = parse_worktree_porcelain(out);
         assert_eq!(got.len(), 1);
