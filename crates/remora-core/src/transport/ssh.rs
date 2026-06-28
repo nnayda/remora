@@ -758,6 +758,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_home_fetch_non_absolute_degrades_tilde_session_to_shared() {
+        // When the `printf $HOME` probe returns a NON-ABSOLUTE value, `run_list`
+        // rejects it (ADR-0004 never-trust) and falls back to home = "~". A live
+        // session whose REMORA_WORKSPACE is a logical `~/…` path then canonicalizes
+        // to `~/…` (unexpanded) and so fails to match the absolute worktree paths —
+        // it surfaces as Live + Shared instead of Live + Worktree. This is the
+        // documented "acceptable degradation" (#124); the test pins it so a
+        // regression in the $HOME-validation policy is caught.
+        //
+        // Discovery call order: 1) names, 2) metadata, 3) printf $HOME, 4) worktree
+        // list. Here (3) returns a non-absolute string so the fallback engages.
+        let config = test_config();
+        let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names
+            Ok(FakeExec::out(
+                "remora_api_fix-login\tclaude\t~/.remora/worktrees/api/fix-login\t1765500000\n",
+            )), // 2) metadata: logical ~/… workspace
+            Ok(FakeExec::out("not-an-absolute-path")), // 3) printf $HOME → not absolute → home = "~"
+            Ok(FakeExec::out(
+                "worktree /home/dev/api\nbranch refs/heads/main\n\n\
+                 worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n",
+            )), // 4) worktree list (absolute paths)
+        ]));
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        let metas = source.list().await.expect("list");
+        // The live `fix-login` session could not be path-matched to its worktree
+        // (home="~" left the `~/…` path unexpanded), so it surfaces as Live +
+        // Shared — the degradation. (The worktree itself still surfaces, but as a
+        // separate Stopped + Worktree row derived from its branch, since the join
+        // failed to pair them.)
+        let live_row = metas
+            .iter()
+            .find(|m| m.state == SessionState::Live)
+            .expect("the live session must still surface");
+        assert_eq!(live_row.session_id.as_str(), "fix-login");
+        assert_eq!(
+            live_row.workspace,
+            Some(WorkspaceMode::Shared),
+            "a ~/… live session degrades to Shared when $HOME is unavailable: {metas:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn list_treats_no_server_as_empty() {
         let config = test_config();
         let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::fail(

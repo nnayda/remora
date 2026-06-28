@@ -581,6 +581,56 @@ mod tests {
     }
 
     #[test]
+    fn join_drains_live_session_with_unmatched_workspace_path_as_shared() {
+        // A live session whose REMORA_WORKSPACE is SET (`Some`) but canonicalizes
+        // to a path that matches no worktree. This exercises the `live_by_path`
+        // drain loop — distinct from
+        // `join_stamps_shared_mode_for_live_session_without_a_worktree`, which
+        // uses `workspace_path: None` and so exercises the *other* (`live_unmatched`)
+        // loop. The session must surface as Live + Shared (its project was scanned)
+        // with its `workspace_path` preserved verbatim.
+        let proj = ProjectId::new("api").expect("slug");
+        let live = vec![(
+            proj.clone(),
+            SessionId::new("s1").expect("slug"),
+            DiscoveredEnv {
+                agent: Some("claude".into()),
+                created_at: Some(7),
+                workspace_path: Some("/home/dev/elsewhere".into()), // matches no worktree
+            },
+        )];
+        // A worktree that does NOT match the live session's path (it's the primary
+        // checkout), so the live session is never popped and falls to the drain.
+        let wts = vec![(
+            proj.clone(),
+            WorktreeInfo {
+                path: "/home/dev/api".into(),
+                branch: Some("main".into()),
+            },
+        )];
+        let scanned: HashSet<ProjectId> = [proj.clone()].into_iter().collect();
+        let metas = join(
+            live,
+            wts,
+            &paths(&[("api", "/home/dev/api")]),
+            "/home/dev",
+            &scanned,
+        );
+        let live_row = metas
+            .iter()
+            .find(|m| m.session_id.as_str() == "s1")
+            .expect("the unmatched live session must surface");
+        assert_eq!(live_row.state, SessionState::Live);
+        assert_eq!(live_row.workspace, Some(WorkspaceMode::Shared));
+        assert_eq!(
+            live_row.workspace_path.as_deref(),
+            Some("/home/dev/elsewhere"),
+            "the drained live session keeps its original workspace_path"
+        );
+        assert_eq!(live_row.branch, None);
+    }
+
+    #[test]
     fn join_leaves_mode_unknown_when_project_scan_failed() {
         // A live session whose project's worktree scan did NOT complete must not
         // be mislabeled Shared: its mode is unknown (None), so the client falls
@@ -691,6 +741,36 @@ detached
     #[test]
     fn parse_worktree_porcelain_empty_input_is_empty() {
         assert!(parse_worktree_porcelain("").is_empty());
+    }
+
+    #[test]
+    fn parse_worktree_porcelain_captures_branch_on_locked_record() {
+        // A `locked` line within a worktree record must not interfere with
+        // capturing the branch: `locked` is ignored and the `branch refs/heads/…`
+        // line still sets it. (Locked worktrees are real — e.g. a worktree on
+        // removable media — and must still be discoverable by branch identity.)
+        let out = "\
+worktree /home/dev/.remora/worktrees/api/held
+HEAD abc123
+branch refs/heads/remora/held
+locked
+";
+        let got = parse_worktree_porcelain(out);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, "/home/dev/.remora/worktrees/api/held");
+        assert_eq!(got[0].branch.as_deref(), Some("remora/held"));
+    }
+
+    #[test]
+    fn parse_worktree_porcelain_ignores_orphan_branch_line() {
+        // A `branch refs/heads/…` line with no preceding `worktree` line has no
+        // record to attach to; it must be silently ignored — no panic, no phantom
+        // worktree — and a following well-formed record still parses normally.
+        let out = "branch refs/heads/orphan\n\nworktree /home/dev/api\nbranch refs/heads/main\n";
+        let got = parse_worktree_porcelain(out);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, "/home/dev/api");
+        assert_eq!(got[0].branch.as_deref(), Some("main"));
     }
 
     #[test]

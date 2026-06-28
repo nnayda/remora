@@ -35,8 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-destructive copy, since tearing it down only ends the tmux session and
   never deletes a worktree or branch. This **completes #124** — the discovery
   foundation landed in #155 and the core spawn engine in #160; follow-ups #153
-  (`$HOME`-fallback hardening), #154 (edge-case tests), and #145 (user docs)
-  remain open.
+  (`$HOME`-fallback hardening) and #145 (user docs) remain open.
 - **New-project "+" on the sidebar section header** (#161): a `+` button next to
   the sidebar "Projects" header opens Settings deep-linked to the new-project
   create form (first field focused), instead of landing on the entity list and
