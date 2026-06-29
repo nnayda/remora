@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Design system documented in `DESIGN.md`** (#150): the shipped token system
+  (`apps/desktop/src/styles/tokens/*.css`) now has a written home in the
+  [Google design.md](https://github.com/google-labs-code/design.md) format —
+  machine-readable token front matter mirroring the CSS, plus prose for the
+  decisions that the tokens alone don't capture (host as a bare muted label vs a
+  chip, `Tag` for machine values vs `Badge` for status, the single marine
+  accent, the activity pulse as the one signature motion, soft depth over heavy
+  cards). CI lints it (`pnpm design:lint`, pinned `@google/design.md@0.3.0`) so
+  the doc can't silently drift from the CSS. The pulse's canonical color is
+  recorded as marine; the stray lavender glow is flagged for retirement (#180).
 - **Resizable, collapsible left sidebar** (#156): drag the sidebar's right edge
   to resize it (clamped 180-480px, and never more than ~40% of the window so the
   terminal stays usable), double-click the divider to reset to 240px, or nudge
