@@ -426,6 +426,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Re-clicking the already-active live session in the sidebar now focuses its
+  terminal** (#141). Clicking a sidebar session whose local tab was already the
+  active, live tab did nothing: `openSession`'s dedupe set `activeKey` to its
+  current value, so the `activeKey`-gated focus effect never re-fired — the
+  terminal wasn't focused and the `focusOnSelect` intent flag stayed armed,
+  later stealing focus into the terminal on the next unrelated status change
+  (the same focus-steal class as #133/#136). `openFromSidebar` now mirrors the
+  tab bar's path: when the clicked session is already the active tab, it focuses
+  the terminal directly and disarms the flag. (The symmetric leak on the respawn
+  path is tracked separately in #178.)
 - **Attach fingerprints the session instead of trusting the tmux name alone**
   (#105). Attach was name-only: `tmux has-session -t remora_<project>_<session>`
   then attach. If something else held a session with that name — a tmux server
