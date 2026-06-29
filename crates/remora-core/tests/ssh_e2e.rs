@@ -2,8 +2,11 @@
 //! need external infrastructure. Run by hand (or in a future docker CI):
 //!
 //! ```sh
-//! # For the attach test, create the session first:
-//! #   tmux new-session -d -s remora_demo_one
+//! # For the attach test, create the session first. Attach fingerprints the
+//! # session by its REMORA_* env (#105), so a bare `tmux new-session` is
+//! # refused as a same-named impostor — stamp one var to mark it as ours:
+//! #   tmux new-session -d -s remora_demo_one \; \
+//! #     set-environment -t remora_demo_one REMORA_CREATED_AT 0
 //! REMORA_E2E_SSH_HOST=devbox \
 //! REMORA_E2E_PROJECT=demo REMORA_E2E_SESSION=one \
 //!   cargo test -p remora-core --test ssh_e2e -- --ignored --nocapture

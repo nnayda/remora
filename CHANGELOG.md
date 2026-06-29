@@ -426,6 +426,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Attach fingerprints the session instead of trusting the tmux name alone**
+  (#105). Attach was name-only: `tmux has-session -t remora_<project>_<session>`
+  then attach. If something else held a session with that name — a tmux server
+  restart with a foreign recreation, or a manually reused name — Remora would
+  pipe the client's keystrokes (and the agent-control bytes) straight into an
+  unknown process. The name is a hint, not proof (ADR-0004). Attach now uses a
+  single `tmux show-environment` round-trip as both the liveness preflight and an
+  identity fingerprint: a live session that carries no `REMORA_*` env is a
+  same-named impostor and is refused as `SessionNotFound` rather than attached.
+  The preflight, fingerprint gate, and error mapping moved into one transport-
+  neutral `run_attach` shared by the ssh and kubectl transports (replacing the
+  duplicated has-session preflight each carried). Spawn was hardened so the
+  fingerprint is reliable: the metadata write now reports success and re-stamps
+  once if every write failed, so a transient blip can't leave a live-but-
+  permanently-unreconnectable session (the happy path pays no extra round-trip).
+  Attach also maps tmux's torn-down-server stderr (`error connecting to <sock>`)
+  to `SessionNotFound` via an attach-only classifier, without loosening the
+  conservative shared classifier the spawn cleanup gate relies on.
 - **A transient host connection drop no longer blanks that host's sessions in
   the sidebar** (#159, ADR-0016). A momentary blip to one host (network hiccup,
   ssh stall) made its session rows vanish for a few seconds, then reappear — the
