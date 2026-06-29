@@ -16,7 +16,7 @@ use crate::config::Config;
 use crate::discovery::{self, DiscoveredEnv};
 use crate::naming::{
     derive_session_id, parse_tmux_session_name, tmux_session_name, ENV_AGENT, ENV_CREATED_AT,
-    ENV_WORKSPACE,
+    ENV_PREFIX, ENV_WORKSPACE,
 };
 use crate::spawn_plan::{PlanError, SpawnPlan};
 use crate::{DirtyReason, SessionChannel, SourceError};
@@ -497,8 +497,10 @@ pub(crate) fn dir_exists_tokens(dir: &str) -> Vec<String> {
     vec!["test".into(), "-d".into(), quote_remote_path(dir)]
 }
 
-/// Tokens for `tmux has-session -t <name>` — the liveness preflight for
-/// `attach`.
+/// Tokens for `tmux has-session -t <name>` — the liveness probe used by the
+/// spawn cleanup gate (`run_spawn`). Attach uses `show_environment_tokens`
+/// instead: one round-trip that is both a liveness preflight and the identity
+/// fingerprint (#105).
 pub(crate) fn has_session_tokens(tmux_name: &str) -> Vec<String> {
     vec![
         "tmux".into(),
@@ -506,6 +508,39 @@ pub(crate) fn has_session_tokens(tmux_name: &str) -> Vec<String> {
         "-t".into(),
         tmux_name.into(),
     ]
+}
+
+/// Tokens for `tmux show-environment -t <name>` — the attach preflight. One
+/// round-trip does double duty: a non-zero exit is the liveness check (a
+/// missing/stopped session prints a known tmux "no such session" stderr), and
+/// the printed session environment carries the `REMORA_*` fingerprint that
+/// proves the session is one Remora spawned (#105). Same round-trip count as
+/// the old `has-session` preflight, so the fingerprint is free on the hot path.
+pub(crate) fn show_environment_tokens(tmux_name: &str) -> Vec<String> {
+    vec![
+        "tmux".into(),
+        "show-environment".into(),
+        "-t".into(),
+        tmux_name.into(),
+    ]
+}
+
+/// Whether `tmux show-environment` output proves the session is one Remora
+/// spawned: it carries at least one *set* `REMORA_*` variable (#105). tmux
+/// prints each session variable as `KEY=value` and a variable marked for
+/// removal as `-KEY`, so the leading-`-` form is not a match. A session that
+/// only reuses the `remora_<project>_<session>` name — a tmux server restart
+/// with foreign recreation, or a manually reused name — carries none; the name
+/// is a hint, not proof (ADR-0004). Tolerant of a partial metadata write
+/// (`write_metadata` is best-effort): any single `REMORA_*` variable suffices.
+pub(crate) fn has_remora_fingerprint(show_environment_stdout: &str) -> bool {
+    show_environment_stdout.lines().any(|line| {
+        line.strip_prefix(ENV_PREFIX)
+            .and_then(|rest| rest.split_once('='))
+            .is_some_and(|(name, _value)| {
+                !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -569,17 +604,42 @@ pub(crate) fn classify_worktree_add_failure(
     }
 }
 
-/// Whether a failed `has-session`/`new-session` stderr positively means the
-/// session does not exist (server up but name unknown, or no server at all),
-/// as opposed to an ambiguous transport failure (ssh/auth/network) that also
-/// exits non-zero. Matched case-insensitively to survive a non-English
-/// `LC_MESSAGES`. Mirrors the cold-state phrases in `classify_list_sessions`,
-/// plus has-session's own `can't find session`.
+/// Whether a failed `has-session`/`new-session`/`show-environment` stderr
+/// positively means the session does not exist (server up but name unknown, or
+/// no server at all), as opposed to an ambiguous transport failure
+/// (ssh/auth/network) that also exits non-zero. Matched case-insensitively to
+/// survive a non-English `LC_MESSAGES`. Mirrors the cold-state phrases in
+/// `classify_list_sessions`, plus the two distinct "name unknown" phrasings
+/// tmux uses for the same condition: `has-session` says `can't find session`
+/// while `show-environment` (the attach preflight, #105) says `no such session`
+/// — both mean "server up, this session is gone", which is genuinely absent for
+/// every caller (attach → `SessionNotFound`; the spawn cleanup gate → safe to
+/// reclaim the orphaned worktree).
 pub(crate) fn stderr_signals_session_absent(stderr: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
     lower.contains("can't find session")
+        || lower.contains("no such session")
         || lower.contains("no server running")
         || lower.contains("no sessions")
+}
+
+/// Attach-only "session absent" classifier: the shared
+/// [`stderr_signals_session_absent`] plus the fully-torn-down-server case.
+///
+/// When the tmux server itself is gone (socket missing), tmux prints
+/// `error connecting to <sock> (No such file or directory)` rather than a
+/// per-session "not found" — verified on tmux 3.4 for both `has-session` and
+/// `show-environment`. No server means no session, so for *attach* that is
+/// genuinely absent → `SessionNotFound`. The phrase is tmux-specific: ssh prints
+/// `connect to host …` and kubectl `unable to connect to the server`, so a real
+/// connection failure still surfaces as `Transport`, not a misleading "not
+/// found". This is deliberately NOT folded into the shared classifier: the spawn
+/// cleanup gate must stay conservative, since a connection error there could
+/// mean the session was created just before the link dropped, and reclaiming its
+/// worktree would yank a live session's cwd (#105 review).
+fn attach_stderr_signals_absent(stderr: &str) -> bool {
+    stderr_signals_session_absent(stderr)
+        || stderr.to_ascii_lowercase().contains("error connecting to")
 }
 
 // ---------------------------------------------------------------------------
@@ -603,25 +663,112 @@ pub(crate) fn create_session(exec: &dyn RemoteExec, plan: &SpawnPlan) -> Result<
 }
 
 /// Writes the `REMORA_*` env metadata. Every call is tolerated: a metadata
-/// failure must never fail an already-live session (env is untrusted/display-
-/// only — ADR-0004). `remain-on-exit` is no longer written here — it is applied
+/// failure must never fail an already-live session (values are untrusted /
+/// display-only — ADR-0004). Returns whether *all* writes succeeded so the
+/// caller can confirm-and-re-stamp on failure: the *presence* of this env is
+/// load-bearing for attach's identity fingerprint (#105), even though the values
+/// stay untrusted. `remain-on-exit` is no longer written here — it is applied
 /// atomically inside `new_session_tokens` so a pane whose process exits at startup
 /// (a bad start dir, a missing agent binary) is retained before it can
 /// self-destruct the session, instead of racing these env-var round-trips and
 /// turning the follow-up attach into a spurious `SessionNotFound` (#28).
-pub(crate) fn write_metadata(exec: &dyn RemoteExec, plan: &SpawnPlan) {
+pub(crate) fn write_metadata(exec: &dyn RemoteExec, plan: &SpawnPlan) -> bool {
+    let mut all_ok = true;
     for (key, value) in &plan.env {
-        let _ = exec.run(&set_environment_tokens(&plan.tmux_name, key, value));
+        let ok = exec
+            .run(&set_environment_tokens(&plan.tmux_name, key, value))
+            .map(|out| out.success)
+            .unwrap_or(false);
+        all_ok &= ok;
     }
+    all_ok
+}
+
+/// Best-effort check that the session carries the `REMORA_*` fingerprint (#105).
+/// Any transport error or non-zero exit reads as "not confirmed" so the caller
+/// re-stamps rather than leaving a live-but-unreconnectable session.
+fn fingerprint_present(exec: &dyn RemoteExec, tmux_name: &str) -> bool {
+    exec.run(&show_environment_tokens(tmux_name))
+        .map(|out| out.success && has_remora_fingerprint(&out.stdout))
+        .unwrap_or(false)
+}
+
+/// The shared spawn/respawn tail: enable passthrough, write the `REMORA_*`
+/// metadata, ensure the fingerprint actually landed, then open the channel.
+///
+/// allow-passthrough is best-effort (absent on tmux < 3.3, degrades to
+/// quiescence-only activity detection). The metadata write is best-effort too,
+/// but its `REMORA_*` env is load-bearing: attach/reconnect fingerprints the
+/// session by it (#105). So when a write reports failure, confirm at least one
+/// var stuck and re-stamp once on a total miss — otherwise a transient blip at
+/// spawn would leave a live but permanently unreconnectable session. The verify
+/// round-trip is paid only on a write failure; the happy path costs nothing
+/// extra. Still never fails an already-live session on a metadata hiccup: a
+/// fingerprint that refuses to stick degrades to pre-#105 behavior, not a failed
+/// spawn.
+fn stamp_and_attach(
+    exec: &dyn RemoteExec,
+    plan: &SpawnPlan,
+) -> Result<SessionChannel, SourceError> {
+    let _ = exec.run(&set_passthrough_tokens(&plan.tmux_name));
+    if !write_metadata(exec, plan) && !fingerprint_present(exec, &plan.tmux_name) {
+        let _ = write_metadata(exec, plan);
+    }
+    attach_channel(exec, &plan.tmux_name)
 }
 
 /// Opens the PTY attach channel to an existing session (no liveness
-/// preflight — callers that need one do it first; see `SshSource::attach`).
+/// preflight — callers that need one do it first; see `run_attach`).
 pub(crate) fn attach_channel(
     exec: &dyn RemoteExec,
     tmux_name: &str,
 ) -> Result<SessionChannel, SourceError> {
     exec.open_channel(&attach_tokens(tmux_name))
+}
+
+/// Opens a channel to a live session after proving it is one Remora spawned —
+/// the attach orchestration shared by every transport.
+///
+/// A single `tmux show-environment` round-trip is both the liveness preflight
+/// AND the identity fingerprint (#105). A missing or stopped session exits
+/// non-zero with a known tmux absent-stderr (`no such session`, or
+/// `error connecting …` when the whole server is gone — see
+/// [`attach_stderr_signals_absent`]) → `SessionNotFound` (honoring the trait
+/// contract); an ssh/kubectl/network failure also exits non-zero, so only those
+/// known phrasings map to `SessionNotFound` while anything ambiguous surfaces as
+/// `Transport` rather than a misleading "not found". A
+/// session that is live but carries no `REMORA_*` env is a same-named impostor
+/// (a tmux server restart with foreign recreation, or a manually reused name):
+/// the name is a hint, not proof (ADR-0004), so attach refuses it as
+/// `SessionNotFound` rather than piping the client's input into an unknown
+/// process. The TOCTOU window (the session dies between preflight and attach)
+/// degrades to channel death. A dead-pane session still exists and attaches.
+pub(crate) fn run_attach(
+    exec: &dyn RemoteExec,
+    project_id: &ProjectId,
+    session_id: &SessionId,
+) -> Result<SessionChannel, SourceError> {
+    let tmux_name = tmux_session_name(project_id, session_id);
+    let out = exec.run(&show_environment_tokens(&tmux_name))?;
+    if !out.success {
+        return if attach_stderr_signals_absent(&out.stderr) {
+            Err(SourceError::SessionNotFound {
+                project_id: project_id.clone(),
+                session_id: session_id.clone(),
+            })
+        } else {
+            Err(SourceError::Transport(out.stderr))
+        };
+    }
+    if !has_remora_fingerprint(&out.stdout) {
+        // Live and name-matched, but unfingerprinted: not a session we spawned.
+        // Treat as unknown rather than attach (#105).
+        return Err(SourceError::SessionNotFound {
+            project_id: project_id.clone(),
+            session_id: session_id.clone(),
+        });
+    }
+    attach_channel(exec, &tmux_name)
 }
 
 /// Resolves the git start-point for a new worktree (#54): fetch origin
@@ -728,11 +875,7 @@ pub(crate) fn run_spawn(
         return Err(err);
     }
 
-    // Best-effort: allow-passthrough is absent on tmux < 3.3 and degrades to
-    // quiescence-only activity detection. Must never fail the spawn.
-    let _ = exec.run(&set_passthrough_tokens(&plan.tmux_name));
-    write_metadata(exec, plan);
-    attach_channel(exec, &plan.tmux_name)
+    stamp_and_attach(exec, plan)
 }
 
 /// Re-creates a stopped session's tmux session and attaches. Unlike spawn:
@@ -814,13 +957,7 @@ pub(crate) fn run_respawn(
         };
     }
     match create_session(exec, effective) {
-        Ok(()) => {
-            // Best-effort: allow-passthrough is absent on tmux < 3.3 and
-            // degrades to quiescence-only activity detection. Must never fail.
-            let _ = exec.run(&set_passthrough_tokens(&effective.tmux_name));
-            write_metadata(exec, effective);
-            attach_channel(exec, &effective.tmux_name)
-        }
+        Ok(()) => stamp_and_attach(exec, effective),
         // Concurrent respawner already created it: attach to the live session.
         Err(SourceError::SessionExists { .. }) => attach_channel(exec, &effective.tmux_name),
         Err(err) => Err(err),
@@ -1880,6 +2017,178 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn show_environment_tokens_targets_the_name() {
+        let tokens = show_environment_tokens("remora_api_fix-login");
+        let s = tokens
+            .iter()
+            .position(|a| a == "show-environment")
+            .expect("show-environment");
+        assert_eq!(tokens[s + 1], "-t");
+        assert_eq!(tokens[s + 2], "remora_api_fix-login");
+    }
+
+    #[test]
+    fn fingerprint_accepts_a_session_carrying_remora_env() {
+        // A realistic `show-environment` dump: the login env plus the REMORA_*
+        // metadata spawn wrote.
+        let env = "PATH=/usr/bin\nHOME=/home/dev\nREMORA_AGENT=claude\n\
+                   REMORA_WORKSPACE=/home/dev/wt\nREMORA_CREATED_AT=1700000000\n";
+        assert!(has_remora_fingerprint(env));
+    }
+
+    #[test]
+    fn fingerprint_tolerates_a_partial_metadata_write() {
+        // write_metadata is best-effort (ADR-0004): a single surviving REMORA_*
+        // variable still proves the session is ours.
+        assert!(has_remora_fingerprint(
+            "PATH=/usr/bin\nREMORA_CREATED_AT=1700000000\n"
+        ));
+    }
+
+    #[test]
+    fn fingerprint_rejects_a_same_named_impostor() {
+        // A session reusing the `remora_*` name but carrying no REMORA_* env is
+        // not one we spawned.
+        let env = "PATH=/usr/bin\nHOME=/home/dev\nTERM=xterm-256color\n";
+        assert!(!has_remora_fingerprint(env));
+    }
+
+    #[test]
+    fn fingerprint_ignores_the_removal_form() {
+        // tmux prints a variable marked for removal as `-KEY`; that is not a set
+        // variable, so it must not satisfy the fingerprint.
+        assert!(!has_remora_fingerprint("-REMORA_AGENT\nPATH=/usr/bin\n"));
+    }
+
+    #[test]
+    fn fingerprint_rejects_a_bare_prefix_with_empty_name() {
+        // A line `REMORA_=...` has an empty key after the prefix — not a real
+        // metadata var. The empty-name guard must reject it (else a stray value
+        // beginning with the prefix could forge a fingerprint).
+        assert!(!has_remora_fingerprint("REMORA_=value\n"));
+    }
+
+    #[test]
+    fn fingerprint_rejects_a_non_identifier_key() {
+        // The key between the prefix and `=` must be a valid identifier. A line
+        // whose "name" carries a space or punctuation is not a tmux variable.
+        assert!(!has_remora_fingerprint("REMORA_ FOO=1\n"));
+        assert!(!has_remora_fingerprint("REMORA_A-B=1\n"));
+    }
+
+    #[test]
+    fn fingerprint_accepts_a_value_containing_equals() {
+        // `split_once('=')` keeps the first `=`, so a value that itself contains
+        // `=` (e.g. a base64 token) still leaves a valid key and matches.
+        assert!(has_remora_fingerprint("REMORA_CREATED_AT=a=b\n"));
+    }
+
+    #[test]
+    fn run_attach_opens_a_channel_for_a_fingerprinted_session() {
+        let fake = FakeExec::new(vec![Ok(FakeExec::out(
+            "PATH=/usr/bin\nREMORA_AGENT=claude\nREMORA_WORKSPACE=/w\nREMORA_CREATED_AT=1\n",
+        ))]);
+        let project = ProjectId::new("api").expect("slug");
+        let session = SessionId::new("fix-login").expect("slug");
+        let result = run_attach(&fake, &project, &session);
+        assert!(result.is_ok(), "{result:?}");
+        // Exactly one channel opened, and it is the attach.
+        let opened = fake.opened.lock().expect("lock");
+        assert_eq!(opened.len(), 1);
+        assert!(opened[0].iter().any(|a| a == "attach-session"));
+        // One round-trip preflight (show-environment), no separate has-session.
+        assert_eq!(fake.count_calls_with("show-environment"), 1);
+        assert_eq!(fake.count_calls_with("has-session"), 0);
+    }
+
+    #[test]
+    fn run_attach_refuses_a_same_named_impostor_before_opening_a_channel() {
+        // Session exists (show-environment succeeds) but carries no REMORA_* env.
+        let fake = FakeExec::new(vec![Ok(FakeExec::out("PATH=/usr/bin\nTERM=xterm\n"))]);
+        let project = ProjectId::new("api").expect("slug");
+        let session = SessionId::new("fix-login").expect("slug");
+        let result = run_attach(&fake, &project, &session);
+        assert!(
+            matches!(result, Err(SourceError::SessionNotFound { .. })),
+            "{result:?}"
+        );
+        // No channel opened: the client's input never reaches the impostor.
+        assert!(fake.opened.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn run_attach_maps_a_missing_session_to_not_found() {
+        // The real wording `tmux show-environment` (the attach preflight) emits
+        // for a missing session — verified against tmux 3.4. It differs from
+        // has-session's `can't find session`, so the classifier must match both.
+        let fake = FakeExec::new(vec![Ok(FakeExec::fail(
+            "no such session: remora_api_fix-login",
+        ))]);
+        let project = ProjectId::new("api").expect("slug");
+        let session = SessionId::new("fix-login").expect("slug");
+        let result = run_attach(&fake, &project, &session);
+        assert!(
+            matches!(result, Err(SourceError::SessionNotFound { .. })),
+            "{result:?}"
+        );
+        assert!(fake.opened.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn run_attach_surfaces_a_transport_failure_not_not_found() {
+        // An ssh/kubectl/network failure also exits non-zero; it must not
+        // masquerade as SessionNotFound.
+        let fake = FakeExec::new(vec![Ok(FakeExec::fail(
+            "kex_exchange_identification: connection closed by remote host",
+        ))]);
+        let project = ProjectId::new("api").expect("slug");
+        let session = SessionId::new("fix-login").expect("slug");
+        let result = run_attach(&fake, &project, &session);
+        assert!(
+            matches!(result, Err(SourceError::Transport(_))),
+            "{result:?}"
+        );
+        assert!(fake.opened.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn run_attach_maps_a_torn_down_server_to_not_found() {
+        // When the whole tmux server is gone, show-environment prints
+        // `error connecting to <sock> (No such file or directory)` (verified on
+        // tmux 3.4) — no server means no session, so attach treats it as absent.
+        let fake = FakeExec::new(vec![Ok(FakeExec::fail(
+            "error connecting to /tmp/tmux-1000/default (No such file or directory)",
+        ))]);
+        let project = ProjectId::new("api").expect("slug");
+        let session = SessionId::new("fix-login").expect("slug");
+        let result = run_attach(&fake, &project, &session);
+        assert!(
+            matches!(result, Err(SourceError::SessionNotFound { .. })),
+            "{result:?}"
+        );
+        assert!(fake.opened.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn attach_absent_classifier_separates_tmux_server_gone_from_ssh_down() {
+        // tmux's "error connecting" (server socket gone) is absent for attach...
+        assert!(attach_stderr_signals_absent(
+            "error connecting to /tmp/tmux-1000/default (No such file or directory)"
+        ));
+        assert!(attach_stderr_signals_absent(
+            "no such session: remora_api_x"
+        ));
+        // ...but a real ssh/kubectl connection failure is NOT absent — it must
+        // stay a transport error, never a misleading "not found".
+        assert!(!attach_stderr_signals_absent(
+            "ssh: connect to host devbox port 22: Connection refused"
+        ));
+        assert!(!attach_stderr_signals_absent(
+            "Unable to connect to the server: dial tcp: lookup api timed out"
+        ));
+    }
+
+    #[test]
     fn agent_command_survives_the_double_shell() {
         let plan = SpawnPlan {
             agent_argv: vec![
@@ -1986,9 +2295,15 @@ pub(crate) mod tests {
 
     #[test]
     fn stderr_signals_session_absent_only_for_known_tmux_phrases() {
-        // Positive: tmux's "no such session" phrasings (case-insensitive).
+        // Positive: tmux's "session absent" phrasings (case-insensitive). The
+        // two callers emit DIFFERENT wording for the same condition —
+        // has-session says "can't find session", show-environment (the attach
+        // preflight, #105) says "no such session" — both must read as absent.
         assert!(stderr_signals_session_absent(
             "can't find session: remora_api_x"
+        ));
+        assert!(stderr_signals_session_absent(
+            "no such session: remora_api_x"
         ));
         assert!(stderr_signals_session_absent(
             "no server running on /tmp/tmux-1000/default"
@@ -2171,6 +2486,73 @@ pub(crate) mod tests {
                 .any(|c| c.iter().any(|a| a == "set-option")),
             "remain-on-exit is not a standalone follow-up call after metadata"
         );
+        // Happy path pays no verify round-trip: when every set-environment
+        // succeeds, the fingerprint confirm/re-stamp (#105) is skipped entirely.
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.iter().any(|a| a == "show-environment")),
+            "no fingerprint verify when metadata writes all succeed"
+        );
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
+    #[test]
+    fn spawn_restamps_metadata_when_every_write_fails_so_session_stays_reconnectable() {
+        // All three set-environment writes fail at spawn (transient blip), but
+        // the session is live. The REMORA_* env is load-bearing for reconnect
+        // (#105), so the tail confirms the fingerprint, finds it absent, and
+        // re-stamps once — otherwise every later attach would reject this live
+        // session as SessionNotFound forever.
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                   // fetch
+            Ok(FakeExec::out("origin/main\n")),   // symbolic-ref
+            Ok(FakeExec::ok()),                   // verify
+            Ok(FakeExec::ok()),                   // worktree add
+            Ok(FakeExec::ok()),                   // new-session
+            Ok(FakeExec::ok()),                   // allow-passthrough
+            Ok(FakeExec::fail("blip")),           // set-environment REMORA_AGENT (FAIL)
+            Ok(FakeExec::fail("blip")),           // set-environment REMORA_WORKSPACE (FAIL)
+            Ok(FakeExec::fail("blip")),           // set-environment REMORA_CREATED_AT (FAIL)
+            Ok(FakeExec::out("PATH=/usr/bin\n")), // show-environment: no fingerprint
+            Ok(FakeExec::ok()),                   // re-stamp REMORA_AGENT
+            Ok(FakeExec::ok()),                   // re-stamp REMORA_WORKSPACE
+            Ok(FakeExec::ok()),                   // re-stamp REMORA_CREATED_AT
+        ]);
+        let result = run_spawn(&fake, &plan);
+        assert!(
+            result.is_ok(),
+            "a metadata blip must not fail spawn: {result:?}"
+        );
+        // One verify round-trip, and the three writes were retried (3 + 3 = 6).
+        assert_eq!(fake.count_calls_with("show-environment"), 1);
+        assert_eq!(fake.count_calls_with("set-environment"), 6);
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
+    #[test]
+    fn spawn_does_not_restamp_when_one_metadata_write_survives() {
+        // A partial write still leaves a usable fingerprint (any single REMORA_*
+        // var suffices), so the tail confirms it and skips the re-stamp.
+        let plan = worktree_plan();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::ok()),                         // fetch
+            Ok(FakeExec::out("origin/main\n")),         // symbolic-ref
+            Ok(FakeExec::ok()),                         // verify
+            Ok(FakeExec::ok()),                         // worktree add
+            Ok(FakeExec::ok()),                         // new-session
+            Ok(FakeExec::ok()),                         // allow-passthrough
+            Ok(FakeExec::ok()),                         // set-environment REMORA_AGENT (ok)
+            Ok(FakeExec::fail("blip")),                 // set-environment REMORA_WORKSPACE (FAIL)
+            Ok(FakeExec::fail("blip")),                 // set-environment REMORA_CREATED_AT (FAIL)
+            Ok(FakeExec::out("REMORA_AGENT=claude\n")), // show-environment: fingerprint present
+        ]);
+        let result = run_spawn(&fake, &plan);
+        assert!(result.is_ok(), "{result:?}");
+        // Verified once, NOT re-stamped: only the original 3 writes happened.
+        assert_eq!(fake.count_calls_with("show-environment"), 1);
+        assert_eq!(fake.count_calls_with("set-environment"), 3);
         assert_eq!(fake.opened.lock().expect("lock").len(), 1);
     }
 

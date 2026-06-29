@@ -12,12 +12,10 @@ use async_trait::async_trait;
 use remora_protocol::{ProjectId, SessionId, SessionMeta, SpawnSpec};
 
 use super::remote::{
-    attach_channel, capture, has_session_tokens, open_pty, resolve_local_command, run_list,
-    run_remove, run_respawn, run_spawn, run_stop, stderr_signals_session_absent, LocalRunner,
-    RemoteExec, RemoteOutput, ShellRunner,
+    capture, open_pty, resolve_local_command, run_attach, run_list, run_remove, run_respawn,
+    run_spawn, run_stop, LocalRunner, RemoteExec, RemoteOutput, ShellRunner,
 };
 use crate::config::{Config, KubectlField, KubectlHost};
-use crate::naming::tmux_session_name;
 use crate::spawn_plan::plan_spawn;
 use crate::{SessionChannel, SessionSource, SourceError};
 
@@ -254,12 +252,15 @@ impl SessionSource for KubectlSource {
         .map_err(|e| SourceError::Transport(format!("spawn task: {e}")))?
     }
 
+    /// Opens a channel to an existing *live* session over `kubectl exec`,
+    /// fingerprinting it first so a same-named impostor isn't attached (#105).
+    /// The preflight, fingerprint gate, and error mapping live in the
+    /// transport-neutral [`run_attach`].
     async fn attach(
         &self,
         project_id: &ProjectId,
         session_id: &SessionId,
     ) -> Result<SessionChannel, SourceError> {
-        let tmux_name = tmux_session_name(project_id, session_id);
         let host = self.host.clone();
         let runner = Arc::clone(&self.runner);
         let factory = self.exec_factory.clone();
@@ -267,22 +268,7 @@ impl SessionSource for KubectlSource {
         let session_id = session_id.clone();
         tokio::task::spawn_blocking(move || {
             let exec = build_exec(&host, runner.as_ref(), &factory)?;
-            let out = exec.run(&has_session_tokens(&tmux_name))?;
-            if !out.success {
-                // A non-zero `has-session` only means "absent" for a known tmux
-                // no-such-session stderr; a kubectl/auth/network failure also
-                // exits non-zero and must surface as Transport, not as a
-                // misleading SessionNotFound (mirrors the run_spawn cleanup gate).
-                return if stderr_signals_session_absent(&out.stderr) {
-                    Err(SourceError::SessionNotFound {
-                        project_id,
-                        session_id,
-                    })
-                } else {
-                    Err(SourceError::Transport(out.stderr))
-                };
-            }
-            attach_channel(exec.as_ref(), &tmux_name)
+            run_attach(exec.as_ref(), &project_id, &session_id)
         })
         .await
         .map_err(|e| SourceError::Transport(format!("attach task: {e}")))?
@@ -722,8 +708,8 @@ mod tests {
 
     #[tokio::test]
     async fn attach_kubectl_failure_is_transport_not_not_found() {
-        // A kubectl/auth/API failure on has-session must surface as Transport,
-        // never be misclassified as a missing session.
+        // A kubectl/auth/API failure on the show-environment preflight must
+        // surface as Transport, never be misclassified as a missing session.
         let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::fail(
             "Unable to connect to the server: dial tcp: lookup api timed out",
         ))]));
@@ -733,6 +719,39 @@ mod tests {
             .await
             .expect_err("transport failure");
         assert!(matches!(err, SourceError::Transport(_)), "{err}");
+        assert_eq!(*fake.opened.lock().expect("lock"), 0);
+    }
+
+    #[tokio::test]
+    async fn attach_opens_channel_when_session_is_fingerprinted() {
+        // The show-environment preflight returns a session env carrying REMORA_*,
+        // so attach proceeds to open the channel over kubectl exec.
+        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::out(
+            "REMORA_AGENT=claude\nREMORA_WORKSPACE=/home/dev/wt\nREMORA_CREATED_AT=1700000000\n",
+        ))]));
+        let source = KubectlSource::with_exec(kubectl_host(), test_config(), fake.clone());
+        source
+            .attach(&pid("api"), &sid("fix-login"))
+            .await
+            .expect("attach");
+        assert_eq!(*fake.opened.lock().expect("lock"), 1);
+    }
+
+    #[tokio::test]
+    async fn attach_unfingerprinted_session_is_not_found() {
+        // The preflight succeeds (a session with this name is live), but it
+        // carries no REMORA_* env — a same-named impostor (#105). Attach must
+        // refuse it as SessionNotFound and open no channel, so the client's
+        // input never reaches the unknown process.
+        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::out(
+            "PATH=/usr/bin\nTERM=xterm-256color\n",
+        ))]));
+        let source = KubectlSource::with_exec(kubectl_host(), test_config(), fake.clone());
+        let err = source
+            .attach(&pid("api"), &sid("fix-login"))
+            .await
+            .expect_err("impostor");
+        assert!(matches!(err, SourceError::SessionNotFound { .. }), "{err}");
         assert_eq!(*fake.opened.lock().expect("lock"), 0);
     }
 

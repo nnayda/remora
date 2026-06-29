@@ -88,6 +88,13 @@ pub fn derive_session_id(branch: Option<&str>) -> Option<SessionId> {
     SessionId::new(format!("{base}-{suffix}")).ok()
 }
 
+/// The shared namespace every session-metadata key lives under. Attach
+/// fingerprints a session by the *presence* of any set `REMORA_*` variable to
+/// prove it is one Remora spawned rather than a same-named impostor (#105), so
+/// the namespace is defined once, here. Every `ENV_*` key below must start with
+/// it (locked by a test).
+pub const ENV_PREFIX: &str = "REMORA_";
+
 /// Session-environment metadata keys (ADR-0004, versioned wire format).
 /// Stage-5 spawn writes them; discovery reads them back inline via tmux's
 /// `#{E:VAR}` expansion in `list-sessions` (#108).
@@ -117,9 +124,24 @@ mod tests {
 
     #[test]
     fn env_var_names_are_stable_wire_format() {
+        assert_eq!(ENV_PREFIX, "REMORA_");
         assert_eq!(ENV_AGENT, "REMORA_AGENT");
         assert_eq!(ENV_WORKSPACE, "REMORA_WORKSPACE");
         assert_eq!(ENV_CREATED_AT, "REMORA_CREATED_AT");
+    }
+
+    #[test]
+    fn every_metadata_key_lives_under_env_prefix() {
+        // The attach fingerprint (#105) detects a Remora session by the
+        // ENV_PREFIX namespace via `strip_prefix(ENV_PREFIX)`. If a key ever
+        // drifted out of the namespace, the fingerprint would silently stop
+        // recognizing it — pin the invariant here.
+        for key in [ENV_AGENT, ENV_WORKSPACE, ENV_CREATED_AT] {
+            assert!(
+                key.starts_with(ENV_PREFIX),
+                "{key} must live under {ENV_PREFIX}"
+            );
+        }
     }
 
     #[test]

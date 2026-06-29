@@ -7,11 +7,10 @@ use async_trait::async_trait;
 use remora_protocol::{ProjectId, SessionId, SessionMeta, SpawnSpec};
 
 use super::remote::{
-    attach_channel, capture, has_session_tokens, open_pty, run_list, run_remove, run_respawn,
-    run_spawn, run_stop, stderr_signals_session_absent, RemoteExec, RemoteOutput,
+    capture, open_pty, run_attach, run_list, run_remove, run_respawn, run_spawn, run_stop,
+    RemoteExec, RemoteOutput,
 };
 use crate::config::{Config, SshHost};
-use crate::naming::tmux_session_name;
 use crate::spawn_plan::plan_spawn;
 use crate::{SessionChannel, SessionSource, SourceError};
 
@@ -135,40 +134,21 @@ impl SessionSource for SshSource {
             .map_err(|e| SourceError::Transport(format!("spawn task: {e}")))?
     }
 
-    /// Opens a channel to an existing *live* session over ssh.
-    ///
-    /// A `tmux has-session` preflight returns `SessionNotFound` for a missing
-    /// or stopped session (honoring the trait contract stage 4 deferred); a
-    /// dead-pane session still exists and is attachable. A failed preflight is
-    /// only treated as absent for a known tmux no-such-session stderr — an
-    /// ssh/auth/network failure also exits non-zero and surfaces as `Transport`
-    /// rather than a misleading `SessionNotFound`. The TOCTOU window (session
-    /// dies between preflight and attach) degrades to channel death.
+    /// Opens a channel to an existing *live* session over ssh, fingerprinting it
+    /// first so a same-named impostor isn't attached (#105). The preflight,
+    /// fingerprint gate, and error mapping live in the transport-neutral
+    /// [`run_attach`].
     async fn attach(
         &self,
         project_id: &ProjectId,
         session_id: &SessionId,
     ) -> Result<SessionChannel, SourceError> {
-        let tmux_name = tmux_session_name(project_id, session_id);
         let exec = Arc::clone(&self.exec);
         let project_id = project_id.clone();
         let session_id = session_id.clone();
-        tokio::task::spawn_blocking(move || {
-            let out = exec.run(&has_session_tokens(&tmux_name))?;
-            if !out.success {
-                return if stderr_signals_session_absent(&out.stderr) {
-                    Err(SourceError::SessionNotFound {
-                        project_id,
-                        session_id,
-                    })
-                } else {
-                    Err(SourceError::Transport(out.stderr))
-                };
-            }
-            attach_channel(exec.as_ref(), &tmux_name)
-        })
-        .await
-        .map_err(|e| SourceError::Transport(format!("attach task: {e}")))?
+        tokio::task::spawn_blocking(move || run_attach(exec.as_ref(), &project_id, &session_id))
+            .await
+            .map_err(|e| SourceError::Transport(format!("attach task: {e}")))?
     }
 
     /// Discovers sessions on the host and joins them to local config.
@@ -823,8 +803,8 @@ mod tests {
 
     #[tokio::test]
     async fn attach_ssh_failure_is_transport_not_not_found() {
-        // An ssh/auth/network failure on has-session must surface as Transport,
-        // never be misclassified as a missing session.
+        // An ssh/auth/network failure on the show-environment preflight must
+        // surface as Transport, never be misclassified as a missing session.
         let config = test_config();
         let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::fail(
             "ssh: connect to host devbox port 22: Connection refused",
@@ -839,9 +819,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attach_unfingerprinted_session_is_not_found() {
+        // The preflight succeeds (a session with this name is live) but carries
+        // no REMORA_* env — a same-named impostor (#105). Attach refuses it as
+        // SessionNotFound and opens no channel.
+        let config = test_config();
+        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::out(
+            "PATH=/usr/bin\nTERM=xterm-256color\n",
+        ))]));
+        let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
+        let err = source
+            .attach(&pid("api"), &sid("fix-login"))
+            .await
+            .expect_err("impostor");
+        assert!(matches!(err, SourceError::SessionNotFound { .. }), "{err}");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
+    }
+
+    #[tokio::test]
     async fn attach_opens_channel_when_session_is_live() {
         let config = test_config();
-        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::ok())]));
+        // The show-environment preflight returns the session env carrying the
+        // REMORA_* fingerprint, so attach proceeds to open the channel.
+        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::out(
+            "REMORA_AGENT=claude\nREMORA_WORKSPACE=/home/dev/wt\nREMORA_CREATED_AT=1700000000\n",
+        ))]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let (project, session) = (pid("api"), sid("fix-login"));
         source.attach(&project, &session).await.expect("attach");
