@@ -55,6 +55,14 @@ direction. See docs/ARCHITECTURE.md.
 - Rust: `unsafe_code` denied workspace-wide; `clippy::unwrap_used` warns;
   clippy warnings fail CI.
 - TypeScript: Biome is the style arbiter — no manual formatting debates.
+- Visual/UI work follows `DESIGN.md` (repo root) — the design system's written
+  home. Token *values* live in `apps/desktop/src/styles/tokens/*.css`; DESIGN.md
+  mirrors them as machine-readable front matter and explains the *decisions*
+  (when a chip vs a bare label, host/transport conventions, the marine accent,
+  the activity pulse). Read it before changing colors, type, spacing, or
+  components, and keep the front matter in sync with the token CSS. CI lints it
+  (`pnpm design:lint`, [Google design.md](https://github.com/google-labs-code/design.md)
+  format, pinned alpha schema).
 - Architectural decisions get a new ADR in `docs/adr/`; never rewrite old ones.
 - Follow-up work goes in a GitHub issue, not a code comment or a PR note. When a
   change defers something — a known limitation, a deferred edge case, a "do this

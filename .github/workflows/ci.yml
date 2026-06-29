@@ -89,3 +89,21 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
         with:
           command: check
+
+  design:
+    name: Design system (design.md lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 24
+
+      # Pinned to the alpha schema version DESIGN.md targets. Bump deliberately
+      # (the format is pre-1.0); keep in sync with the `design:lint` package
+      # script. Gate is errors-only — lint exits non-zero on errors, not warnings.
+      - name: Lint DESIGN.md
+        run: npx -y @google/design.md@0.3.0 lint DESIGN.md

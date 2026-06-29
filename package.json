@@ -10,7 +10,8 @@
     "typecheck": "pnpm -r typecheck",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
-    "format": "biome format --write ."
+    "format": "biome format --write .",
+    "design:lint": "npx -y @google/design.md@0.3.0 lint DESIGN.md"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.0"
