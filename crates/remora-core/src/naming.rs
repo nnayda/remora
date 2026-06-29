@@ -236,6 +236,25 @@ mod tests {
     }
 
     #[test]
+    fn derive_session_id_overlong_branch_base_silently_returns_none() {
+        // A slugified base plus the `-` separator plus the 8-hex FNV suffix that
+        // exceeds SessionId's 64-char cap (MAX_ID_LEN) makes `SessionId::new`
+        // reject the result, so `derive_session_id` returns `None` and the
+        // worktree is silently dropped from discovery. DECISION (#154): this
+        // silent-drop is the accepted UX for the rare case of a branch whose name
+        // slugifies to >55 chars — truncating the base to fit would change the
+        // derive output, which is a versioned cross-language contract (the TS
+        // port and the shared `derive-session-id-vectors.json` fixture), so it is
+        // intentionally NOT done here. This test pins the boundary so the silent
+        // drop can't regress unnoticed.
+        // base = 9 chars of overhead (`-` + 8 hex). 55 + 9 == 64 (the cap) → Some;
+        // 56 + 9 == 65 (over the cap) → None.
+        assert!(derive_session_id(Some(&"a".repeat(55))).is_some());
+        assert!(derive_session_id(Some(&"a".repeat(56))).is_none());
+        assert!(derive_session_id(Some(&"a".repeat(57))).is_none());
+    }
+
+    #[test]
     fn derive_session_id_remora_prefix_with_invalid_slug_falls_through() {
         // `remora/` followed by a non-slug is NOT treated as a round-trip.
         let s = derive_session_id(Some("remora/Bad_Slug")).expect("slug");
