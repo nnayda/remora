@@ -920,12 +920,16 @@ mod tests {
 
     #[tokio::test]
     async fn respawn_duplicate_attaches_to_live_session() {
+        // A concurrent respawner won the new-session lock; this loser attaches to
+        // the live session — but through the fingerprint gate (#105), so the
+        // show-environment preflight must report the REMORA_* fingerprint.
         let config = test_config();
         let fake = Arc::new(FakeExec::new(vec![
             Ok(FakeExec::ok()), // printf $HOME → home = "~" (fallback)
             Ok(FakeExec::ok()), // git worktree list → empty → None → convention
             Ok(FakeExec::ok()), // test -d preflight: dir exists
             Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
+            Ok(FakeExec::out("REMORA_AGENT=claude\n")), // show-environment: fingerprint present
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let (project, session) = (pid("api"), sid("fix-login"));

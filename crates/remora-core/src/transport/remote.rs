@@ -771,6 +771,31 @@ pub(crate) fn run_attach(
     attach_channel(exec, &tmux_name)
 }
 
+/// Fingerprinted attach for the respawn duplicate-session race. When
+/// `run_respawn`'s `new-session` lock loses to a concurrent respawner, the
+/// winner created the session but may not have stamped its `REMORA_*` metadata
+/// yet (it stamps just after the lock — see `stamp_and_attach`), so a straight
+/// [`run_attach`] could momentarily see an unfingerprinted session and reject
+/// it. Retry the fingerprinted attach a few times to absorb that stamp window.
+/// Only `SessionNotFound` is retried; a real impostor never gains a fingerprint,
+/// so it still fails after the bound rather than being attached by name (#105).
+fn run_attach_awaiting_fingerprint(
+    exec: &dyn RemoteExec,
+    project_id: &ProjectId,
+    session_id: &SessionId,
+) -> Result<SessionChannel, SourceError> {
+    const ATTEMPTS: usize = 5;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+    let mut result = run_attach(exec, project_id, session_id);
+    let mut tries = 1;
+    while tries < ATTEMPTS && matches!(result, Err(SourceError::SessionNotFound { .. })) {
+        std::thread::sleep(BACKOFF);
+        result = run_attach(exec, project_id, session_id);
+        tries += 1;
+    }
+    result
+}
+
 /// Resolves the git start-point for a new worktree (#54): fetch origin
 /// (best-effort), then the cascade — explicit `plan.base` → detected
 /// `origin/HEAD` (verified) → `origin/main` → `origin/master` → `None` (omit
@@ -958,8 +983,14 @@ pub(crate) fn run_respawn(
     }
     match create_session(exec, effective) {
         Ok(()) => stamp_and_attach(exec, effective),
-        // Concurrent respawner already created it: attach to the live session.
-        Err(SourceError::SessionExists { .. }) => attach_channel(exec, &effective.tmux_name),
+        // A concurrent respawner already created it (ADR-0004). Attach to the
+        // live session — but still through the fingerprint gate (#105), so a
+        // same-named impostor holding the name can't receive the PTY by winning
+        // this branch. The bounded retry absorbs the window where the concurrent
+        // respawner has taken the new-session lock but not yet stamped metadata.
+        Err(SourceError::SessionExists { .. }) => {
+            run_attach_awaiting_fingerprint(exec, &effective.project_id, &effective.session_id)
+        }
         Err(err) => Err(err),
     }
 }
@@ -3974,5 +4005,79 @@ pub(crate) mod tests {
             1,
             "must open exactly one channel"
         );
+    }
+
+    #[test]
+    fn run_respawn_duplicate_session_attaches_through_the_fingerprint_gate() {
+        // A concurrent respawner won the new-session lock and stamped the
+        // session. The loser must attach through the fingerprint gate (#105),
+        // not by tmux name alone.
+        let plan = worktree_plan();
+        let porcelain = "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n";
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out(porcelain)),   // git worktree list → convention
+            Ok(FakeExec::ok()),             // test -d
+            Ok(FakeExec::fail("duplicate session: remora_api_fix-login")), // lost the lock
+            Ok(FakeExec::out("REMORA_AGENT=claude\n")), // show-environment: fingerprint present
+        ]);
+        assert!(
+            run_respawn(&fake, &plan).is_ok(),
+            "fingerprinted attach to the concurrent session must succeed"
+        );
+        assert_eq!(
+            fake.count_calls_with("show-environment"),
+            1,
+            "the duplicate branch must fingerprint, not attach by name"
+        );
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
+    #[test]
+    fn run_respawn_duplicate_session_refuses_an_unfingerprinted_impostor() {
+        // The name is held by a session carrying no REMORA_* env — an impostor.
+        // The duplicate branch must refuse it (after the bounded retry) and open
+        // no channel, never attach by name (#105).
+        let plan = worktree_plan();
+        let porcelain = "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n";
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("/home/dev")),
+            Ok(FakeExec::out(porcelain)),
+            Ok(FakeExec::ok()),
+            Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
+            // Every show-environment retry returns no fingerprint: the default
+            // FakeExec result is a successful empty-stdout reply once the queue
+            // drains, so the fingerprint stays absent across all attempts.
+        ]);
+        let err = run_respawn(&fake, &plan).expect_err("impostor must be refused");
+        assert!(matches!(err, SourceError::SessionNotFound { .. }), "{err}");
+        assert!(fake.opened.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn run_respawn_duplicate_session_retries_until_the_concurrent_stamp_lands() {
+        // The concurrent winner took the lock but hasn't stamped yet: the first
+        // fingerprint read misses, a retry sees it. The bounded retry absorbs the
+        // stamp window instead of spuriously failing a legit concurrent respawn.
+        let plan = worktree_plan();
+        let porcelain = "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n";
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("/home/dev")),
+            Ok(FakeExec::out(porcelain)),
+            Ok(FakeExec::ok()),
+            Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
+            Ok(FakeExec::out("PATH=/usr/bin\n")), // 1st read: not stamped yet
+            Ok(FakeExec::out("REMORA_AGENT=claude\n")), // 2nd read: stamp landed
+        ]);
+        assert!(
+            run_respawn(&fake, &plan).is_ok(),
+            "the retry must absorb the concurrent stamp window"
+        );
+        assert_eq!(
+            fake.count_calls_with("show-environment"),
+            2,
+            "must retry the fingerprint read until the stamp lands"
+        );
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
     }
 }
