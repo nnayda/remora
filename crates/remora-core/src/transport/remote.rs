@@ -4141,4 +4141,248 @@ pub(crate) mod tests {
             ]
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Real-sh cascade integration tests (Task 6 — #182)
+    //
+    // Each test builds a real local bare+work repo (no network), runs the FULL
+    // worktree_add_cmd(plan) through `sh -c`, then asserts the new worktree's
+    // HEAD commit matches the expected source ref. These are the safety net
+    // proving the shell cascade picks the right base across every branch
+    // topology — the behavior the deleted Rust resolve_base used to own.
+    // -----------------------------------------------------------------------
+
+    /// Runs `sh -c <script>` and returns the process output.
+    fn sh(script: &str) -> std::process::Output {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("sh")
+    }
+
+    /// Returns the trimmed commit hash for `rev` in `repo_dir`.
+    fn git_rev(repo_dir: &str, rev: &str) -> String {
+        let out = sh(&format!("git -C {repo_dir} rev-parse {rev}"));
+        assert!(
+            out.status.success(),
+            "git rev-parse {rev} in {repo_dir} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Creates a temp dir with a work repo whose `origin` is a local bare repo.
+    /// Each branch in `branches` gets a DISTINCT empty commit (so tests can tell
+    /// which base was chosen by comparing commit hashes). After all pushes the
+    /// work repo's HEAD is the "local-init" commit. If `head` is Some("main"),
+    /// sets `origin/HEAD` to point there via `git remote set-head`.
+    /// Returns (work_path, TempDir) — the guard keeps the directory alive.
+    fn cascade_repo(branches: &[&str], head: Option<&str>) -> (String, tempfile::TempDir) {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().to_str().expect("utf8").to_string();
+
+        // For each branch: make a distinct commit, point the branch there, push,
+        // then reset back to local-init (HEAD~1) so local HEAD stays constant.
+        let branch_cmds: String = branches
+            .iter()
+            .map(|b| {
+                format!(
+                    "git commit -q --allow-empty -m for-{b}; \
+                     git branch -f {b}; \
+                     git push -q origin {b}; \
+                     git reset -q --hard HEAD~1; ",
+                    b = b
+                )
+            })
+            .collect();
+
+        let set_head = head
+            .map(|h| format!("git remote set-head origin {h};"))
+            .unwrap_or_default();
+
+        let script = format!(
+            "set -e; \
+             cd {root}; \
+             git init -q bare.git --bare; \
+             git init -q work; \
+             cd work; \
+             git config user.email a@b.c; \
+             git config user.name a; \
+             git remote add origin ../bare.git; \
+             git commit -q --allow-empty -m local-init; \
+             git branch -m _local-init; \
+             {branch_cmds}\
+             git fetch -q origin; \
+             {set_head}",
+            root = root,
+            branch_cmds = branch_cmds,
+            set_head = set_head,
+        );
+        let out = sh(&script);
+        assert!(
+            out.status.success(),
+            "cascade_repo setup failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (format!("{root}/work"), td)
+    }
+
+    /// Builds a minimal SpawnPlan for cascade tests: branch = Some("test-branch"),
+    /// base = None (so the cascade runs), no agent, no env.
+    fn cascade_plan(project_path: &str, wt_dir: &str) -> SpawnPlan {
+        SpawnPlan {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("test-branch").expect("slug"),
+            tmux_name: "remora_api_test-branch".into(),
+            workspace: WorkspaceMode::Worktree,
+            project_path: project_path.to_string(),
+            dir: wt_dir.to_string(),
+            branch: Some("test-branch".into()),
+            base: None,
+            env: vec![],
+            agent_argv: vec![],
+        }
+    }
+
+    #[test]
+    fn cascade_prefers_verified_origin_head() {
+        // origin/HEAD → main; both main and master exist.
+        // Cascade must pick origin/main (via the symbolic-ref arm).
+        let (repo, _guard) = cascade_repo(&["main", "master"], Some("main"));
+        let wt = format!("{repo}/../wt-head");
+        let plan = cascade_plan(&repo, &wt);
+        let cmd = worktree_add_cmd(&plan);
+        let out = sh(&cmd);
+        assert!(
+            out.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let wt_commit = git_rev(&wt, "HEAD");
+        let expected = git_rev(&repo, "refs/remotes/origin/main");
+        assert_eq!(
+            wt_commit, expected,
+            "cascade must pick origin/main (via origin/HEAD → main)"
+        );
+    }
+
+    #[test]
+    fn cascade_falls_back_to_origin_main() {
+        // No origin/HEAD; both main and master exist → origin/main wins (first
+        // fallback arm).
+        let (repo, _guard) = cascade_repo(&["main", "master"], None);
+        let wt = format!("{repo}/../wt-main");
+        let plan = cascade_plan(&repo, &wt);
+        let cmd = worktree_add_cmd(&plan);
+        let out = sh(&cmd);
+        assert!(
+            out.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let wt_commit = git_rev(&wt, "HEAD");
+        let expected = git_rev(&repo, "refs/remotes/origin/main");
+        assert_ne!(
+            git_rev(&repo, "refs/remotes/origin/main"),
+            git_rev(&repo, "refs/remotes/origin/master"),
+            "test setup must give main and master distinct commits"
+        );
+        assert_eq!(wt_commit, expected, "cascade must fall back to origin/main");
+    }
+
+    #[test]
+    fn cascade_falls_back_to_origin_master() {
+        // Only master pushed; no main, no origin/HEAD → origin/master wins
+        // (second fallback arm).
+        let (repo, _guard) = cascade_repo(&["master"], None);
+        let wt = format!("{repo}/../wt-master");
+        let plan = cascade_plan(&repo, &wt);
+        let cmd = worktree_add_cmd(&plan);
+        let out = sh(&cmd);
+        assert!(
+            out.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let wt_commit = git_rev(&wt, "HEAD");
+        let expected = git_rev(&repo, "refs/remotes/origin/master");
+        assert_eq!(
+            wt_commit, expected,
+            "cascade must fall back to origin/master"
+        );
+    }
+
+    #[test]
+    fn cascade_none_uses_local_head() {
+        // Origin has neither main nor master (only a dev branch), no origin/HEAD.
+        // Cascade outputs nothing → git worktree add runs without a start-point
+        // → new branch based on local HEAD. Command must still SUCCEED.
+        let (repo, _guard) = cascade_repo(&["dev"], None);
+        let local_head = git_rev(&repo, "HEAD");
+        let wt = format!("{repo}/../wt-none");
+        let plan = cascade_plan(&repo, &wt);
+        let cmd = worktree_add_cmd(&plan);
+        let out = sh(&cmd);
+        assert!(
+            out.status.success(),
+            "worktree add must succeed even with no cascade match: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let wt_commit = git_rev(&wt, "HEAD");
+        assert_eq!(
+            wt_commit, local_head,
+            "empty cascade → worktree based on local HEAD"
+        );
+    }
+
+    #[test]
+    fn cascade_rejects_tag_named_like_branch() {
+        // A TAG `refs/tags/origin/main` exists at a DISTINCT commit, but there is
+        // NO remote-tracking branch `refs/remotes/origin/main`. The cascade uses
+        // `rev-parse --verify "refs/remotes/origin/main^{commit}"` which must NOT
+        // match the tag (wrong ref namespace). Falls through to local HEAD.
+        let (repo, _guard) = cascade_repo(&[], None); // no branches pushed
+        let local_head = git_rev(&repo, "HEAD");
+
+        // Create a distinct commit and tag it as "origin/main" (tag name, not ref).
+        let tag_setup = format!(
+            "set -e; \
+             cd {repo}; \
+             git commit -q --allow-empty -m for-tag; \
+             git tag origin/main HEAD; \
+             git reset -q --hard HEAD~1;",
+            repo = repo
+        );
+        let out = sh(&tag_setup);
+        assert!(
+            out.status.success(),
+            "tag setup failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let tag_commit = git_rev(&repo, "refs/tags/origin/main");
+        assert_ne!(
+            tag_commit, local_head,
+            "tag must point at a distinct commit from local HEAD (test setup invariant)"
+        );
+
+        let wt = format!("{repo}/../wt-tag");
+        let plan = cascade_plan(&repo, &wt);
+        let cmd = worktree_add_cmd(&plan);
+        let out = sh(&cmd);
+        assert!(
+            out.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let wt_commit = git_rev(&wt, "HEAD");
+        assert_eq!(
+            wt_commit, local_head,
+            "cascade must NOT pick the same-named tag — must fall through to local HEAD"
+        );
+        assert_ne!(
+            wt_commit, tag_commit,
+            "cascade must reject the refs/tags/origin/main tag (wrong namespace)"
+        );
+    }
 }
