@@ -34,6 +34,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-process `kube-rs` reused client (~47%, and 3× slower in absolute terms),
   with no new dependency. The ADR records the decision to pursue the no-dep
   round-trip reduction and reject `kube-rs`; implementation is tracked in #182.
+- **Batched `spawn`/`respawn` exec chains** (#182): the spawn-side
+  implementation of ADR-0017. The dependent `spawn` chain (fetch →
+  base-resolution → worktree-add → new-session → passthrough → metadata) and the
+  `respawn` stamp tail now run as a single in-pod `sh` script behind the
+  existing `RemoteExec` seam — steps framed by ASCII control bytes and parsed
+  back in Rust, with per-step failure classification, the worktree-cleanup gate,
+  and the #105 fingerprint all preserved. This cuts kubectl worktree-spawn from
+  ~11 round-trips to 3 (the kubectl-only binary probe + one script + the
+  interactive attach) and ssh to 2, with no new dependency and no change to the
+  pod contract (`sh` + `tmux` + `git`). The git base cascade (`origin/HEAD` →
+  `origin/main` → `origin/master`, each peeled with `^{commit}`) moves into the
+  shell script as the single source of truth — the Rust `resolve_base` is
+  removed — and is covered by real-`sh` tests against a live local git repo.
+  Discovery (`list()`) batching is the follow-up half of #182.
 - **Design system documented in `DESIGN.md`** (#150): the shipped token system
   (`apps/desktop/src/styles/tokens/*.css`) now has a written home in the
   [Google design.md](https://github.com/google-labs-code/design.md) format —
