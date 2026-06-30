@@ -84,10 +84,11 @@ pub(crate) enum BatchMode {
 /// subshell with `2>&1`, captures `$?` IMMEDIATELY (nothing between the
 /// subshell and the capture), then emits `<US><rc><RS>`. In `StopOnError`, a
 /// fatal step appends a halt guard. No `set -e` is ever emitted. `$__rc` is
-/// left unquoted in the tail printf because it is always a decimal 0–255
-/// integer. The whole assembled script is shell-quoted once by `build()`, so
-/// the per-step printf args here are written as bare single-quoted literals
-/// — do NOT quote the printf command name itself.
+/// double-quoted in the tail printf for consistency (behavior is identical
+/// since it is always a decimal 0–255 integer). The whole assembled script is
+/// shell-quoted once by `build()`, so the per-step printf args here are
+/// written as bare single-quoted literals — do NOT quote the printf command
+/// name itself.
 fn frame_step(step: &Step, mode: BatchMode) -> String {
     let id = step.id.token();
     let mut s = String::new();
@@ -101,7 +102,7 @@ fn frame_step(step: &Step, mode: BatchMode) -> String {
     // Capture $? IMMEDIATELY — nothing between the group and the capture.
     s.push_str("__rc=$?;");
     // Record tail: US (\037) + rc + RS (\036 = 0x1e).
-    s.push_str("printf '\\037%s\\036' $__rc");
+    s.push_str("printf '\\037%s\\036' \"$__rc\"");
     if matches!(mode, BatchMode::StopOnError) && step.fatal {
         // Halt: exit(0) after recording so the record stream stays parseable.
         s.push_str(";[ $__rc -ne 0 ]&&exit 0");
@@ -111,10 +112,14 @@ fn frame_step(step: &Step, mode: BatchMode) -> String {
 }
 
 /// POSIX single-quotes a shell script for use as the `-c` argument to an
-/// enclosing shell. Unlike the per-token `shell_quote` (which uses
-/// `shlex::try_quote` and may produce double-quoted output for strings
-/// containing `$`), this wraps the ENTIRE script in `'…'` and escapes
-/// embedded single quotes via the `'"'"'` idiom. Starts with `'` by
+/// enclosing shell. Unlike the per-token `shell_quote` (which delegates to
+/// `shlex::try_quote` and may emit a mixed-quoting result — a concatenation
+/// of bare, single-, and double-quoted chunks depending on character class —
+/// making the whole-script token hard to audit), this always wraps the ENTIRE
+/// script in a single outer `'…'` pair, which is trivially auditable and
+/// provably correct for passing a whole script verbatim to the inner `sh`.
+/// Embedded single quotes are escaped via the `'\''` idiom (close-quote,
+/// backslash-escaped literal quote, reopen-quote). Starts with `'` by
 /// construction, satisfying the argv-shape invariant. `$__rc` inside the
 /// script is NOT expanded by the outer shell (single-quoting prevents it),
 /// so the inner `sh -c` receives the script verbatim and expands `$__rc` in
