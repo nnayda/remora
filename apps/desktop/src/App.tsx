@@ -24,7 +24,7 @@ import {
   useRailWidth,
 } from "./ui";
 import { ChevronRight } from "./ui/icons";
-import { useActivity } from "./useActivity";
+import { useActivity, usePreviews } from "./useActivity";
 import { discoveryStore, useDiscovery } from "./useDiscovery";
 import { useReconnect } from "./useReconnect";
 import { sessionStore, useSessions } from "./useSessions";
@@ -59,6 +59,7 @@ function App() {
   } = useSessions();
   useReconnect(sessionStore);
   const activity = useActivity();
+  const previews = usePreviews();
   const {
     config,
     sessions,
@@ -439,6 +440,7 @@ function App() {
             onOpenSettings={openSettings}
             onAddProject={openAddProject}
             activity={activity}
+            previews={previews}
             onCollapse={isMobile ? undefined : toggleCollapsed}
           />
         )}
