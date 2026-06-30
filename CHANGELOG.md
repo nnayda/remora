@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Agent prompt preview** (#61): when an agent is waiting on you, the sidebar
+  session row now shows what it asked ("the session says: …") on hover. A
+  Claude Code Notification hook (`contrib/agent-hooks/claude-code/`) emits the
+  text over the existing in-band activity marker; Remora core sanitizes and
+  length-caps the untrusted payload and the UI renders it as sandbox-claimed.
+  See `docs/agent-hooks.md` and ADR-0018. The richer Activity panel and a phone
+  push (with the relay) are follow-ups.
 - **Connecting spinner in the sidebar session row** (#170): clicking a session
   to open or attach it now spins a small marine indicator in the row's status
   slot within a frame of the click, instead of reading as a dead click while a
