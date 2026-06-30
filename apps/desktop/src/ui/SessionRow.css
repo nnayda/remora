@@ -56,6 +56,19 @@
   width: 7px;
   height: 7px;
 }
+/* Connecting spinner: fills the 7px dot footprint while an open is in flight.
+   Marine arc on a faint accent track, reusing the shared `rmra-spin` keyframe
+   (Button.css). It replaces the status dot rather than sitting beside it, so it
+   never competes with the activity pulse (DESIGN.md). */
+.rmra-srow__spinner {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: 1.5px solid var(--accent-border);
+  border-top-color: var(--accent);
+  animation: rmra-spin 0.6s linear infinite;
+}
 .rmra-srow__body {
   min-width: 0;
   flex: 1;

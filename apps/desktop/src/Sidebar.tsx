@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { ActivityState } from "./activity-store";
+import { previewWhenAwaiting, rowTitle } from "./agent-claimed";
 import wordmark from "./assets/remora-wordmark.svg";
 import { filterTree } from "./filter-tree";
 import type { HostTransport, ProjectNode, SessionNode } from "./session-tree";
@@ -31,6 +32,9 @@ interface SidebarProps {
   /** Tab keys currently open — the sessions we have a live terminal for. Only
    * these show an activity dot; the rest read as disconnected (muted, no dot). */
   openKeys: Set<string>;
+  /** Session keys whose open is in flight — their row shows a connecting
+   * spinner until the open resolves, fails, or is cancelled (#170). */
+  connectingKeys: ReadonlySet<string>;
   /** Open (attach/focus) a session. App routes by node.state: live→attach, stopped→respawn. */
   onOpenSession: (node: SessionNode) => void;
   /** Non-fatal config read error; shown as a banner above the tree. */
@@ -49,6 +53,7 @@ interface SidebarProps {
   /** Open Settings deep-linked to the new-project form (section-header "+"). */
   onAddProject: () => void;
   activity: ReadonlyMap<string, ActivityState>;
+  previews: ReadonlyMap<string, string>;
   /** Collapse the sidebar to the narrow icon rail. */
   onCollapse?: () => void;
 }
@@ -79,6 +84,7 @@ export function Sidebar({
   tree,
   activeKey,
   openKeys,
+  connectingKeys,
   onOpenSession,
   configError,
   discoveryUnavailable,
@@ -89,6 +95,7 @@ export function Sidebar({
   onOpenSettings,
   onAddProject,
   activity,
+  previews,
   onCollapse,
 }: SidebarProps) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
@@ -192,11 +199,13 @@ export function Sidebar({
               toggle={toggle}
               activeKey={activeKey}
               openKeys={openKeys}
+              connectingKeys={connectingKeys}
               onOpenSession={onOpenSession}
               onStop={onStop}
               onRemove={onRemove}
               onNewSession={onNewSession}
               activity={activity}
+              previews={previews}
             />
           ))
         )}
@@ -229,22 +238,26 @@ function ProjectGroup({
   toggle,
   activeKey,
   openKeys,
+  connectingKeys,
   onOpenSession,
   onStop,
   onRemove,
   onNewSession,
   activity,
+  previews,
 }: {
   project: ProjectNode;
   collapsed: Set<string>;
   toggle: (id: string) => void;
   activeKey: string | null;
   openKeys: Set<string>;
+  connectingKeys: ReadonlySet<string>;
   onOpenSession: (node: SessionNode) => void;
   onStop: (node: SessionNode) => void;
   onRemove: (node: SessionNode) => void;
   onNewSession: (projectId: string) => void;
   activity: ReadonlyMap<string, ActivityState>;
+  previews: ReadonlyMap<string, string>;
 }) {
   const open = !collapsed.has(project.id);
   // Only fully configured projects can be pre-scoped: synthetic projects have
@@ -309,9 +322,16 @@ function ProjectGroup({
                   activity.get(session.key),
                 )}
                 connected={openKeys.has(session.key)}
+                connecting={connectingKeys.has(session.key)}
                 active={session.key === activeKey}
                 aria-current={session.key === activeKey ? "true" : undefined}
-                title={stopped ? "Stopped — click to respawn" : undefined}
+                title={rowTitle({
+                  preview: previewWhenAwaiting(
+                    activity.get(session.key),
+                    previews.get(session.key),
+                  ),
+                  fallback: stopped ? "Stopped — click to respawn" : undefined,
+                })}
                 onClick={() => onOpenSession(session)}
                 reconnecting={session.reconnecting}
                 actions={

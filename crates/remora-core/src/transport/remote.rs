@@ -520,17 +520,43 @@ pub(crate) fn has_remora_fingerprint(show_environment_stdout: &str) -> bool {
 // Error classifiers
 // ---------------------------------------------------------------------------
 
+/// Whether a failed `tmux list-sessions` stderr positively means "no tmux
+/// server is reachable, so there are zero live sessions" — the benign cold
+/// state for a *list*, as opposed to an ambiguous transport failure. Matched
+/// case-insensitively so an odd-case variant still trips (the phrases aren't
+/// localized by tmux/ssh/kubectl, so this is case-folding, not locale-proofing).
+/// Covers the two cold-state phrasings tmux emits (`no server running` when the
+/// server is gone, `no sessions` when it's up but empty) plus the stale-socket
+/// case a pod/host restart on a persistent volume leaves behind: the server
+/// process dies with the pod but its socket file survives on the volume, so
+/// `list-sessions` prints `error connecting to <sock> (No such file or
+/// directory)` instead (#190). The stale-socket arm requires BOTH `error
+/// connecting to` AND `no such file`: pairing the connect failure with the
+/// ENOENT detail proves the socket is actually gone, so a live-but-unreachable
+/// socket (`error connecting to <sock> (Permission denied)` — server still up,
+/// wrong uid/mode) stays `Transport` rather than wrongly clearing a host that
+/// still has live sessions. The `error connecting to` phrase is tmux-specific —
+/// ssh prints `connect to host …` and kubectl `unable to connect to the
+/// server`, so a genuine transport failure still falls through to `Transport`
+/// rather than being mistaken for an empty host. Shared with the attach
+/// preflight via [`attach_stderr_signals_absent`].
+fn stderr_signals_server_absent(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("no server running")
+        || lower.contains("no sessions")
+        || (lower.contains("error connecting to") && lower.contains("no such file"))
+}
+
 /// Classifies `tmux list-sessions`: success → the stdout rows (each a
 /// `name<SEP>agent<SEP>workspace<SEP>created_at` line, parsed by
-/// `discovery::parse_session_line`); a no-server / no-sessions stderr → empty
-/// (the normal cold state, decision 9, matched case-insensitively); any other
+/// `discovery::parse_session_line`); a server-absent stderr → empty (the normal
+/// cold state, decision 9; see [`stderr_signals_server_absent`]); any other
 /// failure → `Transport`.
 pub(crate) fn classify_list_sessions(out: &RemoteOutput) -> Result<Vec<String>, SourceError> {
     if out.success {
         return Ok(out.stdout.lines().map(str::to_string).collect());
     }
-    let lower = out.stderr.to_ascii_lowercase();
-    if lower.contains("no server running") || lower.contains("no sessions") {
+    if stderr_signals_server_absent(&out.stderr) {
         Ok(Vec::new())
     } else {
         Err(SourceError::Transport(out.stderr.clone()))
@@ -597,7 +623,9 @@ pub(crate) fn stderr_signals_session_absent(stderr: &str) -> bool {
 }
 
 /// Attach-only "session absent" classifier: the shared
-/// [`stderr_signals_session_absent`] plus the fully-torn-down-server case.
+/// [`stderr_signals_session_absent`] plus the fully-torn-down-server case
+/// ([`stderr_signals_server_absent`], which adds the stale-socket
+/// `error connecting to … (No such file or directory)`).
 ///
 /// When the tmux server itself is gone (socket missing), tmux prints
 /// `error connecting to <sock> (No such file or directory)` rather than a
@@ -606,13 +634,13 @@ pub(crate) fn stderr_signals_session_absent(stderr: &str) -> bool {
 /// genuinely absent → `SessionNotFound`. The phrase is tmux-specific: ssh prints
 /// `connect to host …` and kubectl `unable to connect to the server`, so a real
 /// connection failure still surfaces as `Transport`, not a misleading "not
-/// found". This is deliberately NOT folded into the shared classifier: the spawn
-/// cleanup gate must stay conservative, since a connection error there could
-/// mean the session was created just before the link dropped, and reclaiming its
-/// worktree would yank a live session's cwd (#105 review).
+/// found". This is deliberately NOT folded into the shared
+/// `stderr_signals_session_absent`: the spawn cleanup gate must stay
+/// conservative, since a connection error there could mean the session was
+/// created just before the link dropped, and reclaiming its worktree would yank
+/// a live session's cwd (#105 review).
 fn attach_stderr_signals_absent(stderr: &str) -> bool {
-    stderr_signals_session_absent(stderr)
-        || stderr.to_ascii_lowercase().contains("error connecting to")
+    stderr_signals_session_absent(stderr) || stderr_signals_server_absent(stderr)
 }
 
 // ---------------------------------------------------------------------------
@@ -2410,6 +2438,71 @@ pub(crate) mod tests {
         ));
     }
 
+    #[test]
+    fn classify_list_sessions_treats_stale_socket_as_empty() {
+        // After a pod/host restart the tmux server is dead but its socket file
+        // survives on the persistent volume, so `list-sessions` prints
+        // `error connecting to <sock>` rather than `no server running` (#190).
+        // The list path must treat this as the cold state (empty) — not a
+        // transport error — or discovery aborts before scanning worktrees and
+        // drops the host's stopped sessions until a new spawn restarts tmux.
+        let stale = RemoteOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "error connecting to /tmp/tmux-1000/default (No such file or directory)".into(),
+        };
+        assert_eq!(
+            classify_list_sessions(&stale).expect("stale socket is the cold state"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn classify_list_sessions_keeps_real_connection_failures_as_transport() {
+        // A genuine transport failure (ssh/kubectl can't reach the host) is NOT
+        // the cold state: surfacing it as empty would wrongly clear a host whose
+        // sessions are merely unreachable. ssh prints `connect to host …` and
+        // kubectl `unable to connect to the server` — neither is tmux's
+        // stale-socket `error connecting to`, so both must stay `Transport`.
+        for stderr in [
+            "ssh: connect to host hermes port 22: Connection refused",
+            "Unable to connect to the server: dial tcp: i/o timeout",
+        ] {
+            let out = RemoteOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: stderr.into(),
+            };
+            assert!(
+                matches!(classify_list_sessions(&out), Err(SourceError::Transport(_))),
+                "{stderr:?} should stay Transport"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_list_sessions_keeps_unreachable_live_socket_as_transport() {
+        // The stale-socket arm is pinned to the ENOENT detail, not the bare
+        // `error connecting to` phrase: `(Permission denied)` means the socket
+        // is still THERE and the server may be ALIVE (wrong uid/mode), so it is
+        // NOT the cold state. Classifying it as empty would clear a host whose
+        // sessions are live but momentarily unreachable — the same visibility
+        // loss #190 set out to prevent, from a different cause. Must stay
+        // `Transport` (#190 review: care not to over-broaden the phrase).
+        let perm = RemoteOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "error connecting to /tmp/tmux-1000/default (Permission denied)".into(),
+        };
+        assert!(
+            matches!(
+                classify_list_sessions(&perm),
+                Err(SourceError::Transport(_))
+            ),
+            "live-but-unreachable socket must stay Transport"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // run_spawn orchestration tests (batched — #182)
     // -----------------------------------------------------------------------
@@ -2889,6 +2982,52 @@ pub(crate) mod tests {
             "no server running on /tmp/tmux-1000/default",
         ))]);
         assert!(run_list(&fake, &config).expect("list").is_empty());
+    }
+
+    #[test]
+    fn list_recovers_worktrees_after_stale_socket_list_sessions() {
+        // #190: after a k8s pod restart the tmux server is dead but its socket
+        // survives on the persistent volume, so `list-sessions` fails with
+        // `error connecting to <sock>`. The whole-host discovery must treat that
+        // as the cold state and STILL scan worktrees — otherwise the stopped
+        // (respawnable) sessions vanish from the sidebar until a new spawn
+        // restarts tmux. Before the fix `run_list` returned Err here.
+        //
+        // FakeExec call order (one shared-default project with a surviving
+        // worktree at ~/.remora/worktrees/scratch/s1):
+        //   1) list-sessions -> stale-socket failure (server gone)
+        //   2) printf $HOME  -> "/home/dev" for path canonicalization
+        //   3) git worktree list for scratch -> s1 worktree entry
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.scratch]
+            host = "devbox"
+            path = "/home/dev/scratch"
+            workspace = "shared"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+        "#;
+        let config = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::fail(
+                "error connecting to /tmp/tmux-1000/default (No such file or directory)",
+            )), // list-sessions: stale socket, server gone
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out(
+                "worktree /home/dev/.remora/worktrees/scratch/s1\nbranch refs/heads/remora/s1\n",
+            )), // worktree list for scratch
+        ]);
+        let metas = run_list(&fake, &config).expect("stale socket must not fail discovery");
+        assert_eq!(
+            metas.len(),
+            1,
+            "expected the surviving worktree session, got: {metas:?}"
+        );
+        assert_eq!(metas[0].project_id.as_str(), "scratch");
+        assert_eq!(metas[0].session_id.as_str(), "s1");
     }
 
     #[test]
