@@ -5,9 +5,6 @@
 //! `RemoteExec::run` (as `["sh","-c", <quoted script>]`), so no transport knows
 //! it exists. Reused by spawn/respawn (this PR) and list() (follow-up).
 
-// Task 2 wires in the callers; suppress dead_code until then.
-#![allow(dead_code)]
-
 use crate::SourceError;
 
 /// Unit separator between a record's fields; record separator between records.
@@ -75,7 +72,8 @@ pub(crate) struct Step {
 pub(crate) enum BatchMode {
     /// Spawn/respawn: a fatal step's non-zero exit halts the chain.
     StopOnError,
-    /// list(): every step runs regardless of any individual exit.
+    /// list(): every step runs regardless of any individual exit (follow-up PR).
+    #[allow(dead_code)]
     RunAll,
 }
 
