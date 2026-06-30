@@ -34,7 +34,8 @@ a preview segment and nothing displayed it. #61 makes it live.
 ## Threat model
 
 The marker payload is untrusted and forgeable by anything in the sandbox. Core
-sanitizes (control/bidi strip) and length-caps (80) before the text leaves
+sanitizes (control/bidi strip, incl. the U+2028/U+2029 line/paragraph
+separators that `char::is_control()` misses) and length-caps (80) before the text leaves
 `remora-core`; the UI renders it as sandbox-claimed and never wires an action to
 it. Trusted facts (host/session identity) come from client state, never the
 payload. This is the threat model ADR-0010 reserved for #61.

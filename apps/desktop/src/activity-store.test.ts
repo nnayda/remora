@@ -92,4 +92,19 @@ describe("ActivityStore (passive recorder)", () => {
     store.setPreview("k", "x");
     expect(listener).toHaveBeenCalledTimes(1);
   });
+
+  it("expires a stale preview when the status changes", () => {
+    // A preview belongs to its status episode: when the agent leaves (or
+    // re-enters) a state, a prior preview must not linger and re-show as the
+    // current prompt. A fresh marker that carries a preview re-sets it on the
+    // following setPreview call.
+    const store = new ActivityStore();
+    store.setStatus("k", "awaiting");
+    store.setPreview("k", "Approve running tests?");
+    expect(store.getPreviewSnapshot().get("k")).toBe("Approve running tests?");
+
+    store.setStatus("k", "working"); // agent resumed — prior prompt is stale
+    expect(store.getPreviewSnapshot().has("k")).toBe(false);
+    expect(store.getPreview("k")).toBeUndefined();
+  });
 });
