@@ -2974,12 +2974,20 @@ pub(crate) mod tests {
     #[test]
     fn run_list_batches_into_one_call_and_joins() {
         // test_config has one project `api` (worktree, /home/dev/api).
-        // One batched call returns: names, metadata, home, wt_scan(api).
+        // One batched call returns: names (including an unconfigured ghost),
+        // metadata, home, wt_scan(api) with primary checkout + worktree.
         let cfg = test_config();
         let stdout = list_stdout(&[
-            (batch::StepId::Names, "remora_api_fix-login\n", 0),
+            // remora_ghost_x is live but "ghost" is not in config → R1 drops it.
+            (
+                batch::StepId::Names,
+                "remora_api_fix-login\nremora_ghost_x\n",
+                0,
+            ),
             (batch::StepId::Metadata, "remora_api_fix-login\tclaude\t/home/dev/.remora/worktrees/api/fix-login\t1765500000\n", 0),
             (batch::StepId::Home, "/home/dev", 0),
+            // WorktreeScan includes both the primary checkout (/home/dev/api,
+            // A2': surfaces as Shared) and the fix-login worktree.
             (batch::StepId::WorktreeScan, "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n\nworktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n", 0),
         ]);
         let fake = FakeExec::new(vec![Ok(RemoteOutput {
@@ -2993,12 +3001,101 @@ pub(crate) mod tests {
             1,
             "exactly ONE batched run (was 3+M)"
         );
+        // R1: the unconfigured ghost session must be filtered out.
+        assert!(
+            !metas.iter().any(|m| m.session_id.as_str() == "x"),
+            "R1: ghost session must not appear in list: {metas:?}"
+        );
+        // A2': the primary checkout (/home/dev/api) surfaces as Shared.
+        let primary = metas
+            .iter()
+            .find(|m| m.workspace == Some(WorkspaceMode::Shared))
+            .expect("primary checkout must carry WorkspaceMode::Shared");
+        assert_eq!(primary.workspace, Some(WorkspaceMode::Shared));
+        // The live worktree session is present with the expected metadata.
         let live = metas
             .iter()
             .find(|m| m.session_id.as_str() == "fix-login")
             .expect("live row");
         assert_eq!(live.state, SessionState::Live);
         assert_eq!(live.agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn run_list_maps_each_worktree_scan_to_its_own_project() {
+        // Two worktree projects: api (alphabetically first) and zeta.
+        // build_list_steps iterates config.projects (BTreeMap order = alphabetical),
+        // so the WorktreeScan records come out api-then-zeta. Assert that each
+        // resulting session is attributed to the correct project (not cross-mapped).
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.api]
+            host = "devbox"
+            path = "/home/dev/api"
+            workspace = "worktree"
+            agent = "claude"
+            [projects.zeta]
+            host = "devbox"
+            path = "/home/dev/zeta"
+            workspace = "worktree"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+        "#;
+        let cfg = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let stdout = list_stdout(&[
+            (
+                batch::StepId::Names,
+                "remora_api_fix-login\nremora_zeta_work\n",
+                0,
+            ),
+            (
+                batch::StepId::Metadata,
+                "remora_api_fix-login\tclaude\t/home/dev/.remora/worktrees/api/fix-login\t1765500000\n\
+                 remora_zeta_work\tclaude\t/home/dev/.remora/worktrees/zeta/work\t1765500001\n",
+                0,
+            ),
+            (batch::StepId::Home, "/home/dev", 0),
+            // api WorktreeScan first (BTreeMap: api < zeta alphabetically)
+            (
+                batch::StepId::WorktreeScan,
+                "worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n",
+                0,
+            ),
+            // zeta WorktreeScan second
+            (
+                batch::StepId::WorktreeScan,
+                "worktree /home/dev/.remora/worktrees/zeta/work\nbranch refs/heads/remora/work\n",
+                0,
+            ),
+        ]);
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        let metas = run_list(&fake, &cfg).expect("list");
+        // Each session must be attributed to its own project, not cross-mapped.
+        let api_row = metas
+            .iter()
+            .find(|m| m.session_id.as_str() == "fix-login")
+            .expect("api session must be present");
+        assert_eq!(
+            api_row.project_id.as_str(),
+            "api",
+            "fix-login session must belong to api, not zeta"
+        );
+        let zeta_row = metas
+            .iter()
+            .find(|m| m.session_id.as_str() == "work")
+            .expect("zeta session must be present");
+        assert_eq!(
+            zeta_row.project_id.as_str(),
+            "zeta",
+            "work session must belong to zeta, not api"
+        );
     }
 
     #[test]
@@ -3041,6 +3138,7 @@ pub(crate) mod tests {
         assert_eq!(metas.len(), 1, "surviving worktree session: {metas:?}");
         assert_eq!(metas[0].session_id.as_str(), "s1");
         assert_eq!(metas[0].project_id.as_str(), "scratch");
+        assert_eq!(metas[0].state, SessionState::Stopped);
     }
 
     #[test]
@@ -3145,6 +3243,8 @@ pub(crate) mod tests {
             stderr: String::new(),
         })]);
         let metas = run_list(&fake, &test_config()).expect("list must not fail");
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].session_id.as_str(), "fix-login");
         assert!(metas.iter().all(|m| m.state == SessionState::Live));
     }
 

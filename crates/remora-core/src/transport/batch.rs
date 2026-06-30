@@ -154,7 +154,11 @@ fn quote_script(s: &str) -> String {
 /// (unquoted) script would be word-split by that enclosing shell and `sh -c`
 /// would only see the first word.
 pub(crate) fn build(steps: &[Step], mode: BatchMode) -> Vec<String> {
-    let mut script = String::new();
+    // `frame_step` relies on `tr` (a POSIX baseline) to strip the framing
+    // delimiter bytes from step output. If it is somehow absent, fail the whole
+    // batch LOUDLY (no records emitted ⇒ the caller surfaces Transport) rather
+    // than silently emitting unstripped/empty output and dropping discovery rows.
+    let mut script = String::from("command -v tr >/dev/null 2>&1 || exit 126\n");
     for step in steps {
         script.push_str(&frame_step(step, mode));
     }
@@ -233,6 +237,24 @@ mod tests {
         assert!(
             argv[2].starts_with('\''),
             "script arg must be single-quoted: {:?}",
+            argv[2]
+        );
+    }
+
+    #[test]
+    fn build_script_guards_against_missing_tr() {
+        // The quoted script (argv[2]) must include the `command -v tr` guard so
+        // a host lacking `tr` fails loudly (no records) rather than silently
+        // emitting unstripped/empty output and dropping discovery rows.
+        let steps = [Step {
+            id: StepId::Fetch,
+            cmd: "true".into(),
+            fatal: false,
+        }];
+        let argv = build(&steps, BatchMode::RunAll);
+        assert!(
+            argv[2].contains("command -v tr"),
+            "script must guard against missing tr: {:?}",
             argv[2]
         );
     }
