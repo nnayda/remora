@@ -31,6 +31,9 @@ interface SidebarProps {
   /** Tab keys currently open — the sessions we have a live terminal for. Only
    * these show an activity dot; the rest read as disconnected (muted, no dot). */
   openKeys: Set<string>;
+  /** Session keys whose open is in flight — their row shows a connecting
+   * spinner until the open resolves, fails, or is cancelled (#170). */
+  connectingKeys: ReadonlySet<string>;
   /** Open (attach/focus) a session. App routes by node.state: live→attach, stopped→respawn. */
   onOpenSession: (node: SessionNode) => void;
   /** Non-fatal config read error; shown as a banner above the tree. */
@@ -79,6 +82,7 @@ export function Sidebar({
   tree,
   activeKey,
   openKeys,
+  connectingKeys,
   onOpenSession,
   configError,
   discoveryUnavailable,
@@ -192,6 +196,7 @@ export function Sidebar({
               toggle={toggle}
               activeKey={activeKey}
               openKeys={openKeys}
+              connectingKeys={connectingKeys}
               onOpenSession={onOpenSession}
               onStop={onStop}
               onRemove={onRemove}
@@ -229,6 +234,7 @@ function ProjectGroup({
   toggle,
   activeKey,
   openKeys,
+  connectingKeys,
   onOpenSession,
   onStop,
   onRemove,
@@ -240,6 +246,7 @@ function ProjectGroup({
   toggle: (id: string) => void;
   activeKey: string | null;
   openKeys: Set<string>;
+  connectingKeys: ReadonlySet<string>;
   onOpenSession: (node: SessionNode) => void;
   onStop: (node: SessionNode) => void;
   onRemove: (node: SessionNode) => void;
@@ -309,6 +316,7 @@ function ProjectGroup({
                   activity.get(session.key),
                 )}
                 connected={openKeys.has(session.key)}
+                connecting={connectingKeys.has(session.key)}
                 active={session.key === activeKey}
                 aria-current={session.key === activeKey ? "true" : undefined}
                 title={stopped ? "Stopped — click to respawn" : undefined}

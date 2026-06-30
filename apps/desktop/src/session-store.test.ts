@@ -156,6 +156,111 @@ describe("SessionStore", () => {
     expect(store.getSnapshot().tabs).toHaveLength(0);
   });
 
+  it("exposes the connecting key synchronously while an open is in flight, then clears it when live (#170)", async () => {
+    let resolve!: (r: {
+      connection: SessionConnection;
+      attached: boolean;
+    }) => void;
+    const openers: StoreOpeners = {
+      spawn: vi.fn(
+        () =>
+          new Promise<{ connection: SessionConnection; attached: boolean }>(
+            (res) => {
+              resolve = res;
+            },
+          ),
+      ),
+      attach: vi.fn(async () => makeConn()),
+      respawn: vi.fn(async () => makeConn()),
+      schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
+    };
+    const store = new SessionStore(openers);
+    const listener = vi.fn();
+    store.subscribe(listener);
+    // The open's commit must land synchronously (before the first await
+    // suspends), so the sidebar row spins within a frame of the click.
+    const pending = store.openSession(spec("api", "fix"));
+    expect(listener).toHaveBeenCalled();
+    expect(store.getSnapshot().connecting).toEqual(["api/fix"]);
+    expect(store.getSnapshot().tabs).toHaveLength(0); // not committed yet
+    resolve({ connection: makeConn(), attached: false });
+    await pending;
+    expect(store.getSnapshot().connecting).toEqual([]);
+    expect(store.getSnapshot().tabs.map((t) => t.key)).toEqual(["api/fix"]);
+  });
+
+  it("clears the connecting key when the open fails (#170)", async () => {
+    const openers: StoreOpeners = {
+      spawn: vi.fn(async () => {
+        throw { kind: "transport", message: "net" };
+      }),
+      attach: vi.fn(async () => makeConn()),
+      respawn: vi.fn(async () => makeConn()),
+      schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
+    };
+    const store = new SessionStore(openers);
+    const result = await store.openSession(spec("api", "fix"));
+    expect(result.ok).toBe(false);
+    expect(store.getSnapshot().connecting).toEqual([]);
+  });
+
+  it("clears the connecting key when the open is cancelled before it resolves (#170)", async () => {
+    let resolve!: (r: {
+      connection: SessionConnection;
+      attached: boolean;
+    }) => void;
+    const openers: StoreOpeners = {
+      spawn: vi.fn(
+        () =>
+          new Promise<{ connection: SessionConnection; attached: boolean }>(
+            (res) => {
+              resolve = res;
+            },
+          ),
+      ),
+      attach: vi.fn(async () => makeConn()),
+      respawn: vi.fn(async () => makeConn()),
+      schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
+    };
+    const store = new SessionStore(openers);
+    const pending = store.openSession(spec("api", "fix"));
+    expect(store.getSnapshot().connecting).toEqual(["api/fix"]);
+    store.dispose(); // cancel the in-flight open
+    resolve({ connection: makeConn(), attached: false });
+    await pending;
+    expect(store.getSnapshot().connecting).toEqual([]);
+  });
+
+  it("tracks connecting through the respawn-from-stopped open path (#170)", async () => {
+    let resolve!: (c: SessionConnection) => void;
+    const openers: StoreOpeners = {
+      spawn: vi.fn(async () => ({ connection: makeConn(), attached: false })),
+      attach: vi.fn(async () => makeConn()),
+      respawn: vi.fn(
+        () =>
+          new Promise<SessionConnection>((res) => {
+            resolve = res;
+          }),
+      ),
+      schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
+    };
+    const store = new SessionStore(openers);
+    const pending = store.openViaRespawn(spec("api", "fix"));
+    expect(store.getSnapshot().connecting).toEqual(["api/fix"]);
+    resolve(makeConn());
+    await pending;
+    expect(store.getSnapshot().connecting).toEqual([]);
+    expect(store.getSnapshot().tabs.map((t) => t.key)).toEqual(["api/fix"]);
+  });
+
   it("dispose closes all open connections and cancels pending opens", async () => {
     let resolve!: (r: {
       connection: SessionConnection;
