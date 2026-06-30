@@ -983,6 +983,21 @@ pub(crate) fn run_respawn(
             other => Err(other),
         };
     }
+    // The session-creating lock must have a PRESENT, successful record before we
+    // attach. `NewSession` is respawn's first batched step, so a truncated stream
+    // is normally caught earlier (parse error / `records.is_empty()`); this
+    // fail-closed guard mirrors `run_spawn` so a non-empty stream that somehow
+    // lacks a successful `NewSession` (a future step reorder, a partial frame)
+    // can never fall through to attaching a never-created session. No worktree
+    // cleanup here: respawn reuses the surviving worktree, it never creates one.
+    let new_session_ok = records
+        .iter()
+        .any(|r| matches!(r.id, StepId::NewSession) && r.rc == 0);
+    if !new_session_ok {
+        return Err(SourceError::Transport(
+            "batch incomplete: new-session step did not complete".into(),
+        ));
+    }
     // new-session ok; best-effort metadata re-stamp on a set-env miss.
     let metadata_missed = records
         .iter()
@@ -4283,6 +4298,45 @@ pub(crate) mod tests {
         assert!(
             !calls.iter().any(|c| c.iter().any(|a| a == "add")),
             "no worktree add on respawn"
+        );
+    }
+
+    #[test]
+    fn run_respawn_non_empty_stream_without_new_session_is_transport_no_attach() {
+        // Fail-closed guard (mirrors run_spawn): a non-empty batched-tail stream
+        // that lacks a *successful* NewSession record must NOT fall through to
+        // attaching a never-created session. Here the tail carries only a
+        // Passthrough record (no NewSession) — run_respawn must return Transport
+        // and open no channel.
+        let tail = rec(batch::StepId::Passthrough, "", 0);
+        let fake = FakeExec::new(vec![
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // $HOME
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // worktree list empty
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // test -d ok
+            Ok(RemoteOutput {
+                success: true,
+                stdout: tail,
+                stderr: String::new(),
+            }), // batched tail: no NewSession record
+        ]);
+        let err = run_respawn(&fake, &respawn_plan()).expect_err("missing new-session");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
+        assert_eq!(
+            fake.opened.lock().expect("lock").len(),
+            0,
+            "must not attach a never-created session"
         );
     }
 
