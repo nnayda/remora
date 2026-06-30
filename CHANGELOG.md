@@ -454,6 +454,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Discovery no longer drops a host's worktrees after a Kubernetes pod
+  restart** (#190). After a pod restart on a persistent volume the tmux server
+  dies but its socket file survives, so `tmux list-sessions` fails with `error
+  connecting to <sock> (No such file or directory)`. The discovery (`list`)
+  classifier only treated `no server running` / `no sessions` as the benign cold
+  state, so it mapped the stale socket to a transport error and aborted
+  `run_list` before the worktree scan — the host went `available:false` and its
+  rows were pruned after the reconnect grace (ADR-0016), reappearing only once a
+  new spawn restarted tmux. The list path now shares the attach path's "server
+  gone" tolerance through a single `stderr_signals_server_absent` helper: a
+  stale-socket failure is the cold state (empty live set), so discovery proceeds
+  to surface the surviving stopped/respawnable sessions. The stale-socket arm
+  requires both `error connecting to` and the `No such file or directory` detail,
+  so a live-but-unreachable socket (`Permission denied`) and genuine ssh/kubectl
+  connection failures still surface as transport errors rather than wrongly
+  clearing a host that is merely unreachable.
 - **Re-clicking the already-active live session in the sidebar now focuses its
   terminal** (#141). Clicking a sidebar session whose local tab was already the
   active, live tab did nothing: `openSession`'s dedupe set `activeKey` to its
