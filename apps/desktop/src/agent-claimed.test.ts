@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { rowTitle, previewWhenAwaiting } from "./agent-claimed";
+import { previewWhenAwaiting, rowTitle } from "./agent-claimed";
 
 describe("rowTitle", () => {
   it("frames a preview as sandbox-claimed", () => {
