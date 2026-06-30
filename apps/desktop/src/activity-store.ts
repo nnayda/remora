@@ -20,7 +20,7 @@ export interface ActivitySink {
  *
  *   setStatus(key, s)  ─▶ status map ─▶ snapshot (status only) ─▶ UI
  *   setPreview(key, t) ─▶ preview map ─▶ preview snapshot ─▶ UI (own commit; never churns the status snapshot)
- *   clear(key)         ─▶ drop both   (each commits its own snapshot independently)
+ *   clear(key)         ─▶ drop both   (snapshots updated independently; at most one notification)
  */
 export class ActivityStore implements ActivitySink {
   private readonly status = new Map<string, ActivityState>();
@@ -57,17 +57,22 @@ export class ActivityStore implements ActivitySink {
   clear(key: string): void {
     const hadStatus = this.status.delete(key);
     const hadPreview = this.previews.delete(key);
-    if (hadStatus) this.commit();
-    if (hadPreview) this.commitPreviews();
+    if (hadStatus) this.snapshot = new Map(this.status);
+    if (hadPreview) this.previewSnapshot = new Map(this.previews);
+    if (hadStatus || hadPreview) this.notify();
+  }
+
+  private notify(): void {
+    for (const listener of this.listeners) listener();
   }
 
   private commit(): void {
     this.snapshot = new Map(this.status);
-    for (const listener of this.listeners) listener();
+    this.notify();
   }
 
   private commitPreviews(): void {
     this.previewSnapshot = new Map(this.previews);
-    for (const listener of this.listeners) listener();
+    this.notify();
   }
 }

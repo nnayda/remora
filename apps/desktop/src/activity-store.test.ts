@@ -83,4 +83,13 @@ describe("ActivityStore (passive recorder)", () => {
     s.setStatus("p/a", "idle");
     expect(s.getSnapshot()).not.toBe(snap);
   });
+
+  it("setPreview does not notify on unchanged text", () => {
+    const store = new ActivityStore();
+    const listener = vi.fn();
+    store.subscribe(listener);
+    store.setPreview("k", "x");
+    store.setPreview("k", "x");
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
 });

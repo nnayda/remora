@@ -55,6 +55,7 @@ fn is_stripped(c: char) -> bool {
         || matches!(c,
             '\u{200B}'..='\u{200F}'   // zero-width space/joiner, LRM/RLM
             | '\u{202A}'..='\u{202E}' // bidi embeddings + LRO/RLO overrides
+            | '\u{2028}' | '\u{2029}' // line/para separators — is_control() misses these
             | '\u{2066}'..='\u{2069}' // bidi isolates
             | '\u{FEFF}'              // BOM / zero-width no-break space
             | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation marks
@@ -96,5 +97,12 @@ mod tests {
         assert_eq!(sanitize("a\u{200b}b\u{200d}c", 80).into_string(), "abc"); // ZWSP/ZWJ
         assert_eq!(sanitize("\u{feff}done", 80).into_string(), "done"); // BOM
         assert_eq!(sanitize("a\u{2066}b\u{2069}c", 80).into_string(), "abc"); // isolates
+    }
+
+    #[test]
+    fn strips_unicode_line_para_separators() {
+        // U+2028 and U+2029 are not caught by is_control() but can inject hard
+        // line breaks into tooltip text, faking a trusted second line.
+        assert_eq!(sanitize("a\u{2028}b\u{2029}c", 80).into_string(), "abc");
     }
 }

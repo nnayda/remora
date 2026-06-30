@@ -130,6 +130,21 @@ mod tests {
         format!("\x1b]7366;remora;1;state;{state_b64}\x07").into_bytes()
     }
 
+    const AWAITING_INPUT_B64: &str = "YXdhaXRpbmdfaW5wdXQ="; // base64("awaiting_input")
+
+    fn make_wrapped(state_b64: &str, msg_b64: &str) -> String {
+        // tmux passthrough envelope (inner ESC doubled), ADR-0010 on-wire form.
+        format!("\x1bPtmux;\x1b\x1b]7366;remora;1;state;{state_b64};{msg_b64}\x07\x1b\\")
+    }
+
+    fn strip_tmux_passthrough(wrapped: &str) -> String {
+        wrapped
+            .strip_prefix("\x1bPtmux;")
+            .and_then(|s| s.strip_suffix("\x1b\\"))
+            .expect("tmux passthrough envelope")
+            .replace("\x1b\x1b", "\x1b")
+    }
+
     #[test]
     fn parses_a_whole_state_marker() {
         let mut s = MarkerScanner::new();
@@ -212,17 +227,12 @@ mod tests {
         // The literal message a Notification hook would carry.
         let msg = "Approve running tests?";
         let enc = base64::engine::general_purpose::STANDARD.encode(msg);
-        let state = "YXdhaXRpbmdfaW5wdXQ="; // base64("awaiting_input")
 
         // The exact WRAPPED bytes remora-notify.sh emits (keep in sync with the script).
-        let wrapped = format!("\x1bPtmux;\x1b\x1b]7366;remora;1;state;{state};{enc}\x07\x1b\\");
+        let wrapped = make_wrapped(AWAITING_INPUT_B64, &enc);
 
         // Reverse what tmux does on the way out: drop the envelope, un-double ESC.
-        let inner = wrapped
-            .strip_prefix("\x1bPtmux;")
-            .and_then(|s| s.strip_suffix("\x1b\\"))
-            .expect("wrapped form has the tmux passthrough envelope")
-            .replace("\x1b\x1b", "\x1b");
+        let inner = strip_tmux_passthrough(&wrapped);
 
         // Core only ever sees the inner form; assert the scanner accepts it.
         let mut s = MarkerScanner::new();
@@ -238,7 +248,8 @@ mod tests {
     #[test]
     fn wrapped_envelope_shape_is_tmux_passthrough() {
         // Guards against regressing the recipe back to a bare OSC (which tmux eats).
-        let wrapped = "\x1bPtmux;\x1b\x1b]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=;QQ==\x07\x1b\\";
+        // Built via make_wrapped so the shape test is tied to the real construction helper.
+        let wrapped = make_wrapped(AWAITING_INPUT_B64, "QQ==");
         assert!(
             wrapped.starts_with("\x1bPtmux;"),
             "missing passthrough prefix"
@@ -297,11 +308,13 @@ mod tests {
             .expect("bash should spawn");
 
         let msg = "Approve running tests?";
+        // Use serde_json to build the JSON so quotes/backslashes in msg can't malform it.
+        let stdin_json = serde_json::json!({ "message": msg }).to_string();
         child
             .stdin
             .take()
             .expect("stdin piped")
-            .write_all(format!("{{\"message\":\"{msg}\"}}\n").as_bytes())
+            .write_all(format!("{stdin_json}\n").as_bytes())
             .expect("write stdin");
 
         let output = child.wait_with_output().expect("script should exit");
@@ -311,9 +324,8 @@ mod tests {
             output.status
         );
 
-        let state = "YXdhaXRpbmdfaW5wdXQ="; // base64("awaiting_input")
         let enc = base64::engine::general_purpose::STANDARD.encode(msg);
-        let expected = format!("\x1bPtmux;\x1b\x1b]7366;remora;1;state;{state};{enc}\x07\x1b\\");
+        let expected = make_wrapped(AWAITING_INPUT_B64, &enc);
 
         let stdout = String::from_utf8(output.stdout).expect("script output is utf-8");
         // The script's printf emits no trailing newline; trim at most one in
@@ -325,14 +337,9 @@ mod tests {
             "script output does not match wire contract"
         );
 
-        // Feed through the tmux-strip used by remora_notify_recipe_round_trip
-        // and assert the scanner produces the expected hit, tying the script
-        // output to the full scanner pipeline.
-        let inner = expected
-            .strip_prefix("\x1bPtmux;")
-            .and_then(|s| s.strip_suffix("\x1b\\"))
-            .expect("wrapped form has the tmux passthrough envelope")
-            .replace("\x1b\x1b", "\x1b");
+        // Feed through strip_tmux_passthrough and assert the scanner produces
+        // the expected hit, tying the script output to the full scanner pipeline.
+        let inner = strip_tmux_passthrough(&expected);
 
         let mut s = MarkerScanner::new();
         let hits = s.feed(inner.as_bytes());
