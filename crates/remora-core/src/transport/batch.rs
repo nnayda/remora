@@ -23,6 +23,11 @@ pub(crate) enum StepId {
     NewSession,
     Passthrough,
     SetEnv,
+    // list() sections (PR B)
+    Names,
+    Metadata,
+    Home,
+    WorktreeScan,
 }
 
 impl StepId {
@@ -35,6 +40,10 @@ impl StepId {
             StepId::NewSession => "new_session",
             StepId::Passthrough => "passthrough",
             StepId::SetEnv => "set_env",
+            StepId::Names => "names",
+            StepId::Metadata => "metadata",
+            StepId::Home => "home",
+            StepId::WorktreeScan => "wt_scan",
         }
     }
 
@@ -45,6 +54,10 @@ impl StepId {
             "new_session" => Some(StepId::NewSession),
             "passthrough" => Some(StepId::Passthrough),
             "set_env" => Some(StepId::SetEnv),
+            "names" => Some(StepId::Names),
+            "metadata" => Some(StepId::Metadata),
+            "home" => Some(StepId::Home),
+            "wt_scan" => Some(StepId::WorktreeScan),
             _ => None,
         }
     }
@@ -417,5 +430,29 @@ mod tests {
             parse_records(&stream),
             Err(SourceError::Transport(_))
         ));
+    }
+
+    #[test]
+    fn list_step_ids_round_trip_through_tokens() {
+        for id in [
+            StepId::Names,
+            StepId::Metadata,
+            StepId::Home,
+            StepId::WorktreeScan,
+        ] {
+            assert_eq!(
+                StepId::from_token(id.token()),
+                Some(id),
+                "round-trip {id:?}"
+            );
+        }
+        // tokens are control-char-free and unique
+        let toks = [
+            StepId::Names.token(),
+            StepId::Metadata.token(),
+            StepId::Home.token(),
+            StepId::WorktreeScan.token(),
+        ];
+        assert_eq!(toks, ["names", "metadata", "home", "wt_scan"]);
     }
 }
