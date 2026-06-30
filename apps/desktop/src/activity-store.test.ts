@@ -33,12 +33,46 @@ describe("ActivityStore (passive recorder)", () => {
     expect(s.getPreview("p/a")).toBeUndefined();
   });
 
-  it("setPreview does not notify subscribers (preview is not part of the status snapshot)", () => {
+  it("setPreview notifies subscribers (via the preview snapshot, not the status snapshot)", () => {
     const s = new ActivityStore();
     const cb = vi.fn();
     s.subscribe(cb);
     s.setPreview("p/a", "run tests?");
-    expect(cb).not.toHaveBeenCalled();
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it("exposes previews via a reactive snapshot and notifies on setPreview", () => {
+    const store = new ActivityStore();
+    const listener = vi.fn();
+    store.subscribe(listener);
+
+    store.setPreview("k", "Approve running tests?");
+
+    expect(store.getPreviewSnapshot().get("k")).toBe("Approve running tests?");
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("setPreview does not churn the status snapshot identity", () => {
+    const store = new ActivityStore();
+    store.setStatus("k", "awaiting");
+    const before = store.getSnapshot();
+
+    store.setPreview("k", "anything");
+
+    // Status consumers must not see a change (referential equality preserved).
+    expect(store.getSnapshot()).toBe(before);
+  });
+
+  it("clear drops the preview from the snapshot and notifies", () => {
+    const store = new ActivityStore();
+    store.setPreview("k", "x");
+    const listener = vi.fn();
+    store.subscribe(listener);
+
+    store.clear("k");
+
+    expect(store.getPreviewSnapshot().has("k")).toBe(false);
+    expect(listener).toHaveBeenCalled();
   });
 
   it("getSnapshot returns a stable reference until a change", () => {

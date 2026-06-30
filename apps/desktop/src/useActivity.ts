@@ -14,3 +14,12 @@ export function useActivity() {
     activityStore.getSnapshot,
   );
 }
+
+/** Subscribe to the live `key → preview` snapshot (agent-claimed text). Separate
+ * from useActivity so a preview update never re-renders status-only consumers. */
+export function usePreviews() {
+  return useSyncExternalStore(
+    activityStore.subscribe,
+    activityStore.getPreviewSnapshot,
+  );
+}

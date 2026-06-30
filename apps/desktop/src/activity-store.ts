@@ -18,14 +18,15 @@ export interface ActivitySink {
  * the store records the latest value per key and notifies React subscribers
  * (via useSyncExternalStore) only on an actual change.
  *
- *   setStatus(key, s) ─▶ status map ─┐
- *   setPreview(key, t) ─▶ preview map ├▶ snapshot (status only) ─▶ UI
- *   clear(key)        ─▶ drop both   ┘   (commit only on status change)
+ *   setStatus(key, s) ─▶ status map ─▶ snapshot (status only) ─▶ UI
+ *   setPreview(key, t) ─▶ preview map ─▶ preview snapshot ─▶ UI (own commit; never churns the status snapshot)
+ *   clear(key)        ─▶ drop both   (each commits its own snapshot independently)
  */
 export class ActivityStore implements ActivitySink {
   private readonly status = new Map<string, ActivityState>();
   private readonly previews = new Map<string, string>();
   private snapshot: ReadonlyMap<string, ActivityState> = new Map();
+  private previewSnapshot: ReadonlyMap<string, string> = new Map();
   private readonly listeners = new Set<() => void>();
 
   subscribe = (listener: () => void): (() => void) => {
@@ -37,6 +38,8 @@ export class ActivityStore implements ActivitySink {
 
   getSnapshot = (): ReadonlyMap<string, ActivityState> => this.snapshot;
 
+  getPreviewSnapshot = (): ReadonlyMap<string, string> => this.previewSnapshot;
+
   getPreview = (key: string): string | undefined => this.previews.get(key);
 
   setStatus(key: string, status: ActivityState): void {
@@ -46,19 +49,25 @@ export class ActivityStore implements ActivitySink {
   }
 
   setPreview(key: string, preview: string): void {
-    // Preview is recorded for future consumers (#60/#73/#61); it is not part of
-    // the status snapshot, so recording it does not notify status subscribers.
+    if (this.previews.get(key) === preview) return; // no churn on unchanged text
     this.previews.set(key, preview);
+    this.commitPreviews();
   }
 
   clear(key: string): void {
-    const had = this.status.delete(key);
-    this.previews.delete(key);
-    if (had) this.commit();
+    const hadStatus = this.status.delete(key);
+    const hadPreview = this.previews.delete(key);
+    if (hadStatus) this.commit();
+    if (hadPreview) this.commitPreviews();
   }
 
   private commit(): void {
     this.snapshot = new Map(this.status);
+    for (const listener of this.listeners) listener();
+  }
+
+  private commitPreviews(): void {
+    this.previewSnapshot = new Map(this.previews);
     for (const listener of this.listeners) listener();
   }
 }
