@@ -80,20 +80,19 @@ pub(crate) enum BatchMode {
 }
 
 /// Frames one step into the script. Emits `<id><US>` first (using octal `\037`
-/// for the US byte so the script is pure printable ASCII and the whole string
-/// starts with `'` — satisfying the argv-shape invariant), runs the step in a
-/// brace group with `2>&1`, captures `$?` IMMEDIATELY (nothing between the
-/// group and the capture), then emits `<US><rc><RS>`. In `StopOnError`, a fatal
-/// step appends a halt guard. No `set -e` is ever emitted. `$__rc` is left
-/// unquoted in the tail printf because it is always a decimal 0–255 integer.
+/// for the US byte so the script is pure printable ASCII), runs the step in a
+/// subshell with `2>&1`, captures `$?` IMMEDIATELY (nothing between the
+/// subshell and the capture), then emits `<US><rc><RS>`. In `StopOnError`, a
+/// fatal step appends a halt guard. No `set -e` is ever emitted. `$__rc` is
+/// left unquoted in the tail printf because it is always a decimal 0–255
+/// integer. The whole assembled script is shell-quoted once by `build()`, so
+/// the per-step printf args here are written as bare single-quoted literals
+/// — do NOT quote the printf command name itself.
 fn frame_step(step: &Step, mode: BatchMode) -> String {
     let id = step.id.token();
     let mut s = String::new();
-    // Record head: id + US (\037 = 0x1f). 'printf' (quoted) is used so the
-    // script's very first byte is ' — satisfying the test's argv[2] assertion
-    // (`starts_with('\'') || !contains(' ')`) without shell-quoting the whole
-    // script, which would prevent sh from parsing it as a multi-command program.
-    s.push_str(&format!("'printf' '{id}\\037';"));
+    // Record head: id + US (\037 = 0x1f).
+    s.push_str(&format!("printf '{id}\\037';"));
     // The step body: stdout+stderr combined via 2>&1. A SUBSHELL (not brace
     // group) is used so that `exit` inside `cmd` terminates the subshell rather
     // than the whole batch script — the tail printf still runs and the record
@@ -102,7 +101,7 @@ fn frame_step(step: &Step, mode: BatchMode) -> String {
     // Capture $? IMMEDIATELY — nothing between the group and the capture.
     s.push_str("__rc=$?;");
     // Record tail: US (\037) + rc + RS (\036 = 0x1e).
-    s.push_str("'printf' '\\037%s\\036' $__rc");
+    s.push_str("printf '\\037%s\\036' $__rc");
     if matches!(mode, BatchMode::StopOnError) && step.fatal {
         // Halt: exit(0) after recording so the record stream stays parseable.
         s.push_str(";[ $__rc -ne 0 ]&&exit 0");
@@ -111,18 +110,33 @@ fn frame_step(step: &Step, mode: BatchMode) -> String {
     s
 }
 
-/// Builds the batched script and returns `["sh", "-c", <script>]` for
-/// `RemoteExec::run`. The script is passed as a raw (unquoted) `-c` argument:
-/// `sh -c` receives the program text directly via `execve`, so no outer
-/// shell-quoting is needed or correct here. Callers that embed the argv in a
-/// further shell invocation (e.g. the kubectl transport's token join) must
-/// quote `argv[2]` themselves at that layer with `shell_quote`.
+/// POSIX single-quotes a shell script for use as the `-c` argument to an
+/// enclosing shell. Unlike the per-token `shell_quote` (which uses
+/// `shlex::try_quote` and may produce double-quoted output for strings
+/// containing `$`), this wraps the ENTIRE script in `'…'` and escapes
+/// embedded single quotes via the `'"'"'` idiom. Starts with `'` by
+/// construction, satisfying the argv-shape invariant. `$__rc` inside the
+/// script is NOT expanded by the outer shell (single-quoting prevents it),
+/// so the inner `sh -c` receives the script verbatim and expands `$__rc` in
+/// context — which is exactly correct.
+fn quote_script(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Builds the batched script and returns `["sh", "-c", <quoted-script>]` for
+/// `RemoteExec::run`. The script token (`argv[2]`) is shell-quoted exactly
+/// once with `quote_script` so it survives a surrounding shell parse — both
+/// transports space-join these tokens into a command the enclosing shell
+/// re-parses (kubectl: `sh -c "export …; sh -c <token>"`; ssh: the remote
+/// login shell), so the token MUST be a single properly-quoted arg. A bare
+/// (unquoted) script would be word-split by that enclosing shell and `sh -c`
+/// would only see the first word.
 pub(crate) fn build(steps: &[Step], mode: BatchMode) -> Vec<String> {
     let mut script = String::new();
     for step in steps {
         script.push_str(&frame_step(step, mode));
     }
-    vec!["sh".into(), "-c".into(), script]
+    vec!["sh".into(), "-c".into(), quote_script(&script)]
 }
 
 /// Parses a batched script's stdout into per-step results. Each record is
@@ -171,6 +185,16 @@ mod tests {
     use super::super::remote::capture;
     use super::*;
 
+    /// Runs `build()`'s output the way a transport does: the tokens
+    /// `["sh", "-c", <quoted-script>]` are space-joined and handed to ONE
+    /// enclosing shell (kubectl's outer `sh -c`, or ssh's remote login shell),
+    /// which unquotes the script token and runs the inner `sh -c <script>`.
+    /// `capture()` alone would execve `sh -c <quoted>` directly with no
+    /// enclosing shell, which is NOT the production path.
+    fn run_batch(argv: &[String]) -> super::super::remote::RemoteOutput {
+        capture(&["sh".into(), "-c".into(), argv.join(" ")]).expect("sh runs")
+    }
+
     #[test]
     fn build_returns_sh_dash_c_with_one_quoted_arg() {
         let steps = [Step {
@@ -202,8 +226,7 @@ mod tests {
                 fatal: false,
             },
         ];
-        let argv = build(&steps, BatchMode::RunAll);
-        let out = capture(&argv).expect("sh runs");
+        let out = run_batch(&build(&steps, BatchMode::RunAll));
         let recs = parse_records(&out.stdout).expect("parse");
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].id, StepId::Fetch);
@@ -228,12 +251,10 @@ mod tests {
                 fatal: false,
             },
         ];
-        let argv = build(&steps, BatchMode::StopOnError);
-        let out = capture(&argv).expect("sh runs");
+        let out = run_batch(&build(&steps, BatchMode::StopOnError));
         let recs = parse_records(&out.stdout).expect("parse");
         // Only the fatal step's record is present; the chain exited before
-        // new_session. capture() reports !success (the script exit-code path),
-        // but the record stream is still valid and parseable.
+        // new_session. The record stream is still valid and parseable.
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].id, StepId::WorktreeAdd);
         assert_eq!(recs[0].rc, 3);
@@ -258,8 +279,7 @@ mod tests {
                 fatal: true,
             },
         ];
-        let argv = build(&steps, BatchMode::StopOnError);
-        let out = capture(&argv).expect("sh runs");
+        let out = run_batch(&build(&steps, BatchMode::StopOnError));
         let recs = parse_records(&out.stdout).expect("parse");
         assert_eq!(recs.len(), 2, "non-fatal fetch failure must not halt");
         assert_eq!(recs[0].rc, 7);
@@ -274,8 +294,7 @@ mod tests {
             cmd: "printf %s /home/dev".into(),
             fatal: false,
         }];
-        let argv = build(&steps, BatchMode::RunAll);
-        let out = capture(&argv).expect("sh runs");
+        let out = run_batch(&build(&steps, BatchMode::RunAll));
         let recs = parse_records(&out.stdout).expect("parse");
         assert_eq!(recs.len(), 1);
         assert_eq!(
@@ -299,8 +318,7 @@ mod tests {
             cmd,
             fatal: true,
         }];
-        let argv = build(&steps, BatchMode::StopOnError);
-        let out = capture(&argv).expect("sh runs");
+        let out = run_batch(&build(&steps, BatchMode::StopOnError));
         let recs = parse_records(&out.stdout).expect("parse");
         assert_eq!(recs[0].output, ";|Be concise");
         assert_eq!(recs[0].rc, 0);
