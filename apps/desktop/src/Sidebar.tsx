@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { ActivityState } from "./activity-store";
-import { rowTitle } from "./agent-claimed";
+import { previewWhenAwaiting, rowTitle } from "./agent-claimed";
 import wordmark from "./assets/remora-wordmark.svg";
 import { filterTree } from "./filter-tree";
 import type { HostTransport, ProjectNode, SessionNode } from "./session-tree";
@@ -326,7 +326,10 @@ function ProjectGroup({
                 active={session.key === activeKey}
                 aria-current={session.key === activeKey ? "true" : undefined}
                 title={rowTitle({
-                  preview: previews.get(session.key),
+                  preview: previewWhenAwaiting(
+                    activity.get(session.key),
+                    previews.get(session.key),
+                  ),
                   fallback: stopped ? "Stopped — click to respawn" : undefined,
                 })}
                 onClick={() => onOpenSession(session)}

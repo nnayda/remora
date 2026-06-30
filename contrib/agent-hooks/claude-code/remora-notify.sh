@@ -24,4 +24,4 @@ state="YXdhaXRpbmdfaW5wdXQ="   # base64("awaiting_input")
 
 # on-wire (tmux passthrough envelope, inner ESC doubled):
 #   ESC P tmux ; ESC ESC ] 7366 ; remora ; 1 ; state ; <state> ; <msg> BEL ESC \
-printf '\033Ptmux;\033\033]7366;remora;1;state;%s;%s\007\033\\' "$state" "$enc" > "$out"
+printf '\033Ptmux;\033\033]7366;remora;1;state;%s;%s\007\033\\' "$state" "$enc" > "$out" 2>/dev/null || exit 0

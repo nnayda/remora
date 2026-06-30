@@ -249,4 +249,98 @@ mod tests {
             "inner ESC must be doubled"
         );
     }
+
+    /// Regression guard: executes the actual shell script and asserts its
+    /// stdout bytes match the wire contract. A no-op in minimal environments
+    /// (no bash/jq), but is the live guard where tooling is present.
+    ///
+    /// This test ties the SCRIPT to the wire contract — editing the script
+    /// back to a bare OSC or stdout would fail here. The manual hermes
+    /// dogfood (/dev/tty + real tmux) remains the true e2e gate.
+    #[test]
+    fn script_output_matches_wire_contract() {
+        use base64::Engine as _;
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let script_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contrib/agent-hooks/claude-code/remora-notify.sh"
+        );
+
+        // Skip if the script file doesn't exist (e.g. partial checkout).
+        if !std::path::Path::new(script_path).exists() {
+            eprintln!("skip: script not found at {script_path}");
+            return;
+        }
+
+        // Skip if bash or jq is unavailable (minimal CI environments).
+        let has_jq = Command::new("bash")
+            .arg("-c")
+            .arg("command -v jq")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !has_jq {
+            eprintln!("skip: jq not found — skipping script round-trip test");
+            return;
+        }
+
+        // Run the script with REMORA_MARKER_OUT=/dev/stdout so the marker
+        // bytes go to captured stdout rather than /dev/tty.
+        let mut child = Command::new("bash")
+            .arg(script_path)
+            .env("REMORA_MARKER_OUT", "/dev/stdout")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("bash should spawn");
+
+        let msg = "Approve running tests?";
+        child
+            .stdin
+            .take()
+            .expect("stdin piped")
+            .write_all(format!("{{\"message\":\"{msg}\"}}\n").as_bytes())
+            .expect("write stdin");
+
+        let output = child.wait_with_output().expect("script should exit");
+        assert!(
+            output.status.success(),
+            "script exited non-zero: {:?}",
+            output.status
+        );
+
+        let state = "YXdhaXRpbmdfaW5wdXQ="; // base64("awaiting_input")
+        let enc = base64::engine::general_purpose::STANDARD.encode(msg);
+        let expected = format!("\x1bPtmux;\x1b\x1b]7366;remora;1;state;{state};{enc}\x07\x1b\\");
+
+        let stdout = String::from_utf8(output.stdout).expect("script output is utf-8");
+        // The script's printf emits no trailing newline; trim at most one in
+        // case the environment's printf adds one (some bash/base64 combos do).
+        let stdout = stdout.trim_end_matches('\n');
+
+        assert_eq!(
+            stdout, expected,
+            "script output does not match wire contract"
+        );
+
+        // Feed through the tmux-strip used by remora_notify_recipe_round_trip
+        // and assert the scanner produces the expected hit, tying the script
+        // output to the full scanner pipeline.
+        let inner = expected
+            .strip_prefix("\x1bPtmux;")
+            .and_then(|s| s.strip_suffix("\x1b\\"))
+            .expect("wrapped form has the tmux passthrough envelope")
+            .replace("\x1b\x1b", "\x1b");
+
+        let mut s = MarkerScanner::new();
+        let hits = s.feed(inner.as_bytes());
+        assert_eq!(hits.len(), 1, "exactly one marker from script output");
+        assert_eq!(hits[0].status, SessionStatus::Awaiting);
+        assert_eq!(
+            hits[0].preview.as_ref().expect("preview").as_str(),
+            "Approve running tests?"
+        );
+    }
 }

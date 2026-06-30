@@ -18,9 +18,9 @@ export interface ActivitySink {
  * the store records the latest value per key and notifies React subscribers
  * (via useSyncExternalStore) only on an actual change.
  *
- *   setStatus(key, s) ─▶ status map ─▶ snapshot (status only) ─▶ UI
+ *   setStatus(key, s)  ─▶ status map ─▶ snapshot (status only) ─▶ UI
  *   setPreview(key, t) ─▶ preview map ─▶ preview snapshot ─▶ UI (own commit; never churns the status snapshot)
- *   clear(key)        ─▶ drop both   (each commits its own snapshot independently)
+ *   clear(key)         ─▶ drop both   (each commits its own snapshot independently)
  */
 export class ActivityStore implements ActivitySink {
   private readonly status = new Map<string, ActivityState>();

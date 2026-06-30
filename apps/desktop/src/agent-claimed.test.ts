@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { rowTitle } from "./agent-claimed";
+import { rowTitle, previewWhenAwaiting } from "./agent-claimed";
 
 describe("rowTitle", () => {
   it("frames a preview as sandbox-claimed", () => {
@@ -22,5 +22,33 @@ describe("rowTitle", () => {
 
   it("returns undefined when neither is present", () => {
     expect(rowTitle({ preview: undefined })).toBeUndefined();
+  });
+});
+
+describe("previewWhenAwaiting", () => {
+  it("returns preview when activity is awaiting", () => {
+    expect(previewWhenAwaiting("awaiting", "Approve running tests?")).toBe(
+      "Approve running tests?",
+    );
+  });
+
+  it("returns undefined when activity is working", () => {
+    expect(previewWhenAwaiting("working", "stale preview")).toBeUndefined();
+  });
+
+  it("returns undefined when activity is idle", () => {
+    expect(previewWhenAwaiting("idle", "stale preview")).toBeUndefined();
+  });
+
+  it("returns undefined when activity is unknown", () => {
+    expect(previewWhenAwaiting("unknown", "stale preview")).toBeUndefined();
+  });
+
+  it("returns undefined when activity is undefined", () => {
+    expect(previewWhenAwaiting(undefined, "stale preview")).toBeUndefined();
+  });
+
+  it("returns undefined when preview is undefined even if awaiting", () => {
+    expect(previewWhenAwaiting("awaiting", undefined)).toBeUndefined();
   });
 });
