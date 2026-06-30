@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { ActivityState } from "./activity-store";
+import { previewWhenAwaiting, rowTitle } from "./agent-claimed";
 import wordmark from "./assets/remora-wordmark.svg";
 import { filterTree } from "./filter-tree";
 import type { HostTransport, ProjectNode, SessionNode } from "./session-tree";
@@ -52,6 +53,7 @@ interface SidebarProps {
   /** Open Settings deep-linked to the new-project form (section-header "+"). */
   onAddProject: () => void;
   activity: ReadonlyMap<string, ActivityState>;
+  previews: ReadonlyMap<string, string>;
   /** Collapse the sidebar to the narrow icon rail. */
   onCollapse?: () => void;
 }
@@ -93,6 +95,7 @@ export function Sidebar({
   onOpenSettings,
   onAddProject,
   activity,
+  previews,
   onCollapse,
 }: SidebarProps) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
@@ -202,6 +205,7 @@ export function Sidebar({
               onRemove={onRemove}
               onNewSession={onNewSession}
               activity={activity}
+              previews={previews}
             />
           ))
         )}
@@ -240,6 +244,7 @@ function ProjectGroup({
   onRemove,
   onNewSession,
   activity,
+  previews,
 }: {
   project: ProjectNode;
   collapsed: Set<string>;
@@ -252,6 +257,7 @@ function ProjectGroup({
   onRemove: (node: SessionNode) => void;
   onNewSession: (projectId: string) => void;
   activity: ReadonlyMap<string, ActivityState>;
+  previews: ReadonlyMap<string, string>;
 }) {
   const open = !collapsed.has(project.id);
   // Only fully configured projects can be pre-scoped: synthetic projects have
@@ -319,7 +325,13 @@ function ProjectGroup({
                 connecting={connectingKeys.has(session.key)}
                 active={session.key === activeKey}
                 aria-current={session.key === activeKey ? "true" : undefined}
-                title={stopped ? "Stopped — click to respawn" : undefined}
+                title={rowTitle({
+                  preview: previewWhenAwaiting(
+                    activity.get(session.key),
+                    previews.get(session.key),
+                  ),
+                  fallback: stopped ? "Stopped — click to respawn" : undefined,
+                })}
                 onClick={() => onOpenSession(session)}
                 reconnecting={session.reconnecting}
                 actions={
