@@ -824,13 +824,26 @@ mod tests {
         // cold-state signal. run_list passes it to classify_list_sessions which
         // matches stderr_signals_server_absent → empty names → empty result (not
         // Transport). The batched exec itself succeeds (success:true); only the
-        // Names step within it failed.
+        // Names step within it failed. RunAll runs every step unconditionally, so
+        // in real cold-state output all fixed-layout records are present —
+        // Metadata fails (no server), Home succeeds, WorktreeScan succeeds but
+        // returns nothing interesting.
         let config = test_config();
-        let stdout = rec(
-            batch::StepId::Names,
-            "no server running on /tmp/tmux-1000/default",
-            1,
-        );
+        let stdout = [
+            rec(
+                batch::StepId::Names,
+                "no server running on /tmp/tmux-1000/default",
+                1,
+            ),
+            rec(
+                batch::StepId::Metadata,
+                "no server running on /tmp/tmux-1000/default",
+                1,
+            ),
+            rec(batch::StepId::Home, "/home/dev", 0),
+            rec(batch::StepId::WorktreeScan, "", 0),
+        ]
+        .concat();
         let fake = Arc::new(FakeExec::new(vec![Ok(RemoteOutput {
             success: true,
             stdout,

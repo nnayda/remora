@@ -1069,6 +1069,24 @@ pub(crate) fn run_list(
             out.stderr
         }));
     };
+    // RunAll frames every step unconditionally, so a missing fixed-layout record
+    // (Metadata, Home, or fewer WorktreeScan records than configured projects)
+    // means the stream was truncated mid-flight — a transport cut-off, not
+    // best-effort degradation. Fail loud so the poll retries rather than silently
+    // dropping later projects' stopped worktrees.
+    let scan_count = records
+        .iter()
+        .filter(|r| matches!(r.id, StepId::WorktreeScan))
+        .count();
+    if !records.iter().any(|r| matches!(r.id, StepId::Metadata))
+        || !records.iter().any(|r| matches!(r.id, StepId::Home))
+        || scan_count < project_ids.len()
+    {
+        return Err(SourceError::Transport(
+            "batch: list() stream truncated (missing section record)".into(),
+        ));
+    }
+
     // Classify names via the existing classifier (cold state ⇒ empty, else
     // Transport). The frame is combined 2>&1; feed it as both stdout/stderr so
     // classify's success-branch (reads stdout) and failure-branch (reads
@@ -3272,6 +3290,33 @@ pub(crate) mod tests {
         assert!(
             !metas.iter().any(|m| m.session_id.as_str() == "x"),
             "ghost must not appear"
+        );
+    }
+
+    #[test]
+    fn run_list_truncated_stream_is_transport() {
+        // Stream cut off after Metadata — no Home, no WorktreeScan records.
+        // RunAll always emits every step, so absence means transport truncation.
+        let stdout = list_stdout(&[
+            (batch::StepId::Names, "remora_api_fix-login\n", 0),
+            (
+                batch::StepId::Metadata,
+                "remora_api_fix-login\tclaude\t\t\n",
+                0,
+            ),
+            // Home and WorktreeScan absent — stream was cut mid-flight.
+        ]);
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        assert!(
+            matches!(
+                run_list(&fake, &test_config()),
+                Err(SourceError::Transport(_))
+            ),
+            "truncated stream must be Transport, not silent degradation"
         );
     }
 

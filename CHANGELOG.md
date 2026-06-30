@@ -52,14 +52,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ADR-0017. The discovery poll's independent fan-out — the trusted session
   names, the inline `#{E:}` metadata enrichment, `$HOME`, and one `git worktree
   list` per configured project — now runs as a single `RunAll` batched `sh`
-  script instead of `3 + M` separate round-trips, parsed back into the exact
-  same discovery streams. Every property is preserved: the #108 trusted-names /
+  script instead of `3 + M` separate round-trips, parsed back into the same
+  discovery streams. Every property is preserved: the #108 trusted-names /
   untrusted-metadata split, the #190 stale-socket tolerance (a dead tmux server
   still scans worktrees), the #124 `$HOME` canonicalization and its degradation,
   and the per-project scan tolerance. The shared frame builder now strips the
   RS/US delimiter bytes from each step's captured output, so an attacker-set
   tmux `#{E:}` value can never forge a record boundary — making the framing
-  unforgeable by construction (this also retroactively hardens the spawn path). the shipped token system
+  unforgeable by construction (this also retroactively hardens the spawn path).
+- **Design system documented in `DESIGN.md`** (#150): the shipped token system
   (`apps/desktop/src/styles/tokens/*.css`) now has a written home in the
   [Google design.md](https://github.com/google-labs-code/design.md) format —
   machine-readable token front matter mirroring the CSS, plus prose for the
