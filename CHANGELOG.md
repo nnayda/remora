@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ADR-0017: reduce kubectl exec round-trips instead of reusing connections**
+  (#106): a throwaway benchmark against a live high-RTT k8s 1.36 cluster showed
+  operation latency is dominated by sequential round-trip *count* × RTT, not
+  per-connection setup. Batching the dependent `spawn` exec chain (~83% faster)
+  and parallelizing the independent `list()` fan-out (~82%) each beat a heavy
+  in-process `kube-rs` reused client (~47%, and 3× slower in absolute terms),
+  with no new dependency. The ADR records the decision to pursue the no-dep
+  round-trip reduction and reject `kube-rs`; implementation is tracked in #182.
 - **Design system documented in `DESIGN.md`** (#150): the shipped token system
   (`apps/desktop/src/styles/tokens/*.css`) now has a written home in the
   [Google design.md](https://github.com/google-labs-code/design.md) format —
