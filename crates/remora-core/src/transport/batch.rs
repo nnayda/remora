@@ -86,7 +86,6 @@ pub(crate) enum BatchMode {
     /// Spawn/respawn: a fatal step's non-zero exit halts the chain.
     StopOnError,
     /// list(): every step runs regardless of any individual exit (follow-up PR).
-    #[allow(dead_code)]
     RunAll,
 }
 

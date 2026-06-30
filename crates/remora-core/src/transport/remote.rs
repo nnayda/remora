@@ -3040,6 +3040,7 @@ pub(crate) mod tests {
         let metas = run_list(&fake, &cfg).expect("stale socket must not fail discovery");
         assert_eq!(metas.len(), 1, "surviving worktree session: {metas:?}");
         assert_eq!(metas[0].session_id.as_str(), "s1");
+        assert_eq!(metas[0].project_id.as_str(), "scratch");
     }
 
     #[test]
