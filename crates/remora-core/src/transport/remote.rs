@@ -809,10 +809,19 @@ pub(crate) fn run_spawn(
         .find(|r| r.rc != 0 && matches!(r.id, StepId::NewSession))
     {
         let err = classify_new_session_failure(&rec.output, &plan.project_id, &plan.session_id);
-        // Any new-session failure may orphan the worktree we created. Gate
-        // cleanup on a has-session probe (its own exec so stderr stays
-        // separable): remove the worktree only if the session is positively
-        // absent; leave it on any ambiguous (transport) probe.
+        // Reaching a NewSession record at all means WorktreeAdd SUCCEEDED:
+        // WorktreeAdd is a fatal step in the StopOnError batch, so its
+        // failure exits the script before a NewSession record is emitted.
+        // Therefore `plan.dir` is a worktree WE created this call — a
+        // pre-existing dir or branch would have failed WorktreeAdd (→
+        // `SessionExists`) and halted the script before here. This is why
+        // probe-gated cleanup is safe for the `SessionExists`/duplicate case
+        // as well as any other NewSession failure: in either case the
+        // worktree at `plan.dir` is a fresh orphan, not a foreign session's
+        // cwd. The `has-session` probe gates on "is a session LIVE under
+        // that name?" (its own exec so stderr is separable): a live session
+        // (probe success → `session_absent=false`) is never touched — the
+        // name was taken by whoever won the lock, and its worktree is theirs.
         if plan.branch.is_some() {
             let session_absent = exec
                 .run(&has_session_tokens(&plan.tmux_name))
@@ -2585,6 +2594,59 @@ pub(crate) mod tests {
         let err = run_spawn(&fake, &worktree_plan()).expect_err("transport");
         assert!(matches!(err, SourceError::Transport(_)), "{err}");
         assert_eq!(fake.opened.lock().expect("lock").len(), 0);
+    }
+
+    #[test]
+    fn run_spawn_duplicate_with_live_session_does_not_remove_worktree() {
+        // WorktreeAdd ok, NewSession duplicate. The cleanup-gate has-session
+        // probe shows the session is LIVE (success: true). The invariant:
+        // the worktree at plan.dir was created this call (WorktreeAdd
+        // succeeded before NewSession), but the name is now held by a live
+        // session — so the worktree must NOT be removed (it would yank a
+        // live session's cwd). The has-session probe safety check must veto
+        // removal in this case.
+        let script_stdout = [
+            rec(batch::StepId::Fetch, "", 0),
+            rec(batch::StepId::WorktreeAdd, "", 0),
+            rec(
+                batch::StepId::NewSession,
+                "duplicate session: remora_api_fix-login",
+                1,
+            ),
+        ]
+        .concat();
+        let fake = FakeExec::new(vec![
+            Ok(RemoteOutput {
+                success: true,
+                stdout: script_stdout,
+                stderr: String::new(),
+            }),
+            // cleanup-gate has-session probe: session is LIVE
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+        ]);
+        let err = run_spawn(&fake, &worktree_plan()).expect_err("duplicate");
+        assert!(
+            matches!(err, SourceError::SessionExists { .. }),
+            "expected SessionExists, got: {err}"
+        );
+        let calls = fake.calls.lock().expect("lock");
+        assert!(
+            calls.iter().any(|c| c.iter().any(|a| a == "has-session")),
+            "cleanup gate must probe has-session: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.iter().any(|a| a == "remove")),
+            "live session's worktree must NOT be removed: {calls:?}"
+        );
+        assert_eq!(
+            fake.opened.lock().expect("lock").len(),
+            0,
+            "no attach on failure"
+        );
     }
 
     // -----------------------------------------------------------------------
