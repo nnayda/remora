@@ -8,9 +8,12 @@
 use crate::SourceError;
 
 /// Unit separator between a record's fields; record separator between records.
-/// Control bytes, never present in a stored/sanitized value (`clean_metadata`
-/// bans control chars), so a malicious tmux `#{E:}` value cannot forge a record
-/// boundary — the #182/#108 framing-integrity invariant, no entropy needed.
+/// Framing integrity — the #182 invariant — is upheld by `frame_step`, which
+/// strips both delimiter bytes from each step's captured output via `tr -d`
+/// before emitting them. A step's output, including an attacker-set tmux
+/// `#{E:}` value, therefore can never contain a delimiter and can never forge
+/// a record boundary. `clean_metadata` is a separate display-side sanitisation
+/// that runs after parsing and does not contribute to this invariant.
 pub(crate) const US: char = '\u{1f}';
 pub(crate) const RS: char = '\u{1e}';
 
@@ -90,34 +93,38 @@ pub(crate) enum BatchMode {
 }
 
 /// Frames one step into the script. Emits `<id><US>` first (using octal `\037`
-/// for the US byte so the script is pure printable ASCII), runs the step in a
-/// subshell with `2>&1`, captures `$?` IMMEDIATELY (nothing between the
-/// subshell and the capture), then emits `<US><rc><RS>`. In `StopOnError`, a
-/// fatal step appends a halt guard. No `set -e` is ever emitted. `$__rc` is
-/// double-quoted in the tail printf for consistency (behavior is identical
-/// since it is always a decimal 0–255 integer). The whole assembled script is
-/// shell-quoted once by `build()`, so the per-step printf args here are
-/// written as bare single-quoted literals — do NOT quote the printf command
-/// name itself.
+/// for the US byte so the script is pure printable ASCII), captures the step's
+/// combined output (`2>&1`) into `$__out` via command substitution (which also
+/// propagates the exit status to `$?`), captures `$?` as `$__rc` IMMEDIATELY,
+/// then pipes `$__out` through `tr -d '\036\037'` to strip both delimiter bytes
+/// before emitting, then emits `<US><rc><RS>`. In `StopOnError`, a fatal step
+/// appends a halt guard. No `set -e` is ever emitted. `$__rc` is double-quoted
+/// in the tail printf for consistency (behavior is identical since it is always
+/// a decimal 0–255 integer). The whole assembled script is shell-quoted once
+/// by `build()`, so the per-step printf args here are written as bare
+/// single-quoted literals — do NOT quote the printf command name itself.
 fn frame_step(step: &Step, mode: BatchMode) -> String {
     let id = step.id.token();
     let mut s = String::new();
     // Record head: id + US (\037 = 0x1f).
-    s.push_str(&format!("printf '{id}\\037';"));
-    // The step body: stdout+stderr combined via 2>&1. A SUBSHELL (not brace
-    // group) is used so that `exit` inside `cmd` terminates the subshell rather
-    // than the whole batch script — the tail printf still runs and the record
-    // is fully emitted before StopOnError's halt guard fires.
-    s.push_str(&format!("({cmd}) 2>&1;", cmd = step.cmd));
-    // Capture $? IMMEDIATELY — nothing between the group and the capture.
-    s.push_str("__rc=$?;");
+    s.push_str(&format!("printf '{id}\\037'\n"));
+    // Capture the step's combined output into $__out. The inner ( … ) subshell
+    // contains any `exit` in cmd to this subshell; command substitution
+    // propagates the inner exit status through the assignment to $?.
+    s.push_str(&format!("__out=$( ( {cmd} ) 2>&1 )\n", cmd = step.cmd));
+    // Capture $? IMMEDIATELY — nothing between the substitution and the capture.
+    s.push_str("__rc=$?\n");
+    // Emit captured output with RS (\036) and US (\037) delimiter bytes stripped
+    // so a step's output — e.g. an attacker-set tmux #{E:} value — cannot forge
+    // a record boundary. `tr` is a POSIX baseline utility; octal escapes are
+    // interpreted by tr, not by the shell's single-quote literal.
+    s.push_str("printf '%s' \"$__out\" | tr -d '\\036\\037'\n");
     // Record tail: US (\037) + rc + RS (\036 = 0x1e).
-    s.push_str("printf '\\037%s\\036' \"$__rc\"");
+    s.push_str("printf '\\037%s\\036' \"$__rc\"\n");
     if matches!(mode, BatchMode::StopOnError) && step.fatal {
         // Halt: exit(0) after recording so the record stream stays parseable.
-        s.push_str(";[ $__rc -ne 0 ]&&exit 0");
+        s.push_str("[ $__rc -ne 0 ]&&exit 0\n");
     }
-    s.push('\n');
     s
 }
 
@@ -429,6 +436,39 @@ mod tests {
             parse_records(&stream),
             Err(SourceError::Transport(_))
         ));
+    }
+
+    #[test]
+    fn embedded_delimiter_bytes_in_output_are_stripped_and_cannot_forge_a_record() {
+        // A step whose printf output contains raw RS (0x1e = \036) and US
+        // (0x1f = \037) bytes. Without tr-stripping in frame_step, parse_records
+        // would split on the embedded RS/US and produce multiple/forged records.
+        // With the strip, exactly one record is returned and no delimiter bytes
+        // appear in the output field.
+        let cmd = "printf 'a\\036names\\037forged\\037'".to_string();
+        let steps = [Step {
+            id: StepId::Names,
+            cmd,
+            fatal: false,
+        }];
+        let out = run_batch(&build(&steps, BatchMode::RunAll));
+        let recs = parse_records(&out.stdout).expect("parse");
+        // Exactly one record — no forged record boundary.
+        assert_eq!(
+            recs.len(),
+            1,
+            "embedded delimiters must not forge extra records; got: {recs:?}"
+        );
+        assert_eq!(recs[0].id, StepId::Names);
+        assert_eq!(recs[0].rc, 0);
+        // The output must contain no RS or US bytes.
+        assert!(
+            !recs[0].output.contains('\u{1e}') && !recs[0].output.contains('\u{1f}'),
+            "output must not contain RS or US bytes: {:?}",
+            recs[0].output
+        );
+        // The non-delimiter content is preserved.
+        assert_eq!(recs[0].output, "anamesforged");
     }
 
     #[test]
