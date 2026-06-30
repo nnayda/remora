@@ -4526,8 +4526,9 @@ pub(crate) mod tests {
     /// Creates a temp dir with a work repo whose `origin` is a local bare repo.
     /// Each branch in `branches` gets a DISTINCT empty commit (so tests can tell
     /// which base was chosen by comparing commit hashes). After all pushes the
-    /// work repo's HEAD is the "local-init" commit. If `head` is Some("main"),
-    /// sets `origin/HEAD` to point there via `git remote set-head`.
+    /// work repo's HEAD is the "local-init" commit. `head` Some("main") sets
+    /// `origin/HEAD` there; `None` DELETES it (so the fall-through tests are not
+    /// derailed by a git version that auto-creates `origin/HEAD` on fetch).
     /// Returns (work_path, TempDir) — the guard keeps the directory alive.
     fn cascade_repo(branches: &[&str], head: Option<&str>) -> (String, tempfile::TempDir) {
         let td = tempfile::tempdir().expect("tempdir");
@@ -4548,9 +4549,15 @@ pub(crate) mod tests {
             })
             .collect();
 
-        let set_head = head
-            .map(|h| format!("git remote set-head origin {h};"))
-            .unwrap_or_default();
+        // origin/HEAD must be EXPLICIT, not left to chance: some git versions
+        // (and the `init.defaultBranch`/bare-repo default) auto-create
+        // `refs/remotes/origin/HEAD` on fetch, which would make the cascade's
+        // first arm resolve and defeat the fall-through tests. So set it when a
+        // head is wanted, and DELETE it otherwise.
+        let set_head = match head {
+            Some(h) => format!("git remote set-head origin {h};"),
+            None => "git remote set-head origin --delete 2>/dev/null || true;".to_string(),
+        };
 
         let script = format!(
             "set -e; \
