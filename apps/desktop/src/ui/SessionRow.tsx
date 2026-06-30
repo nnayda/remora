@@ -22,6 +22,10 @@ export interface SessionRowProps
    * status. When false the row reads as disconnected: no status dot (we can't
    * know the state) and muted text. @default true */
   connected?: boolean;
+  /** An open for this session is in flight (clicked, awaiting spawn/attach). A
+   * spinner fills the status slot until it resolves, so a slow connect reads as
+   * "working" rather than a dead click (#170). @default false */
+  connecting?: boolean;
   /** Selected session. @default false */
   active?: boolean;
   /** Unread / queued count chip. */
@@ -38,6 +42,7 @@ export function SessionRow({
   branch = null,
   state = "idle",
   connected = true,
+  connecting = false,
   active = false,
   count = null,
   actions = null,
@@ -62,7 +67,16 @@ export function SessionRow({
     <div className={cls}>
       <button className="rmra-srow__main" {...props}>
         <span className="rmra-srow__pulse">
-          {connected ? (
+          {connecting ? (
+            // Open in flight: spin in the dot's footprint so a slow connect
+            // reads as working, not a dead click (#170). Takes precedence over
+            // the status dot — there is no live status to show yet.
+            <span
+              className="rmra-srow__spinner"
+              role="status"
+              aria-label="Connecting…"
+            />
+          ) : connected ? (
             <StatusIndicator state={state} />
           ) : (
             // Not connected — we have no terminal, so no status to show. Reserve

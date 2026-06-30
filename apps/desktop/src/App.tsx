@@ -47,6 +47,7 @@ function App() {
   const {
     tabs,
     activeKey,
+    connecting,
     openSession,
     openViaRespawn,
     closeTab,
@@ -147,6 +148,9 @@ function App() {
   // and can therefore report an activity status. Drives the sidebar's "show the
   // status dot only when connected" rule.
   const openKeys = useMemo(() => new Set(tabs.map((t) => t.key)), [tabs]);
+  // Sessions whose open is in flight — the sidebar spins their rows until the
+  // open resolves to a live tab, fails, or is cancelled (#170).
+  const connectingKeys = useMemo(() => new Set(connecting), [connecting]);
 
   // Status of the active tab, so the focus effect re-fires when a freshly opened
   // or respawned session goes live (a stopped/reconnecting tab renders a
@@ -424,6 +428,7 @@ function App() {
             tree={tree}
             activeKey={activeKey}
             openKeys={openKeys}
+            connectingKeys={connectingKeys}
             onOpenSession={openFromSidebar}
             configError={configError}
             discoveryUnavailable={discoveryUnavailable}

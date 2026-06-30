@@ -519,6 +519,12 @@ export function Showcase() {
                 agent="Claude Code"
                 connected={false}
               />
+              <SessionRow
+                name="spin-up-db"
+                agent="Codex"
+                branch="feat/db-pool"
+                connecting
+              />
             </div>
           </Row>
           <Row label="SessionTab — the workspace tab bar">

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Connecting spinner in the sidebar session row** (#170): clicking a session
+  to open or attach it now spins a small marine indicator in the row's status
+  slot within a frame of the click, instead of reading as a dead click while a
+  slow `ssh`/`kubectl` spawn-or-attach runs for several seconds. The store
+  publishes the in-flight key the moment an open starts (deriving it from the
+  existing double-open `pending` guard, so it can't drift) and clears it when the
+  open resolves to a live tab, fails, or is cancelled. Covers both the attach
+  (`openSession`) and spawn-from-stopped (`openViaRespawn`) paths. The spinner
+  fills the activity-pulse footprint rather than animating beside it, staying
+  within the design system's one-expressive-animation rule.
 - **ADR-0017: reduce kubectl exec round-trips instead of reusing connections**
   (#106): a throwaway benchmark against a live high-RTT k8s 1.36 cluster showed
   operation latency is dominated by sequential round-trip *count* × RTT, not
