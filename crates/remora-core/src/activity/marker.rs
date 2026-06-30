@@ -205,4 +205,48 @@ mod tests {
         let mut s = MarkerScanner::new();
         assert!(s.feed(&marker(&b64)).is_empty());
     }
+
+    #[test]
+    fn remora_notify_recipe_round_trip() {
+        use base64::Engine as _;
+        // The literal message a Notification hook would carry.
+        let msg = "Approve running tests?";
+        let enc = base64::engine::general_purpose::STANDARD.encode(msg);
+        let state = "YXdhaXRpbmdfaW5wdXQ="; // base64("awaiting_input")
+
+        // The exact WRAPPED bytes remora-notify.sh emits (keep in sync with the script).
+        let wrapped = format!("\x1bPtmux;\x1b\x1b]7366;remora;1;state;{state};{enc}\x07\x1b\\");
+
+        // Reverse what tmux does on the way out: drop the envelope, un-double ESC.
+        let inner = wrapped
+            .strip_prefix("\x1bPtmux;")
+            .and_then(|s| s.strip_suffix("\x1b\\"))
+            .expect("wrapped form has the tmux passthrough envelope")
+            .replace("\x1b\x1b", "\x1b");
+
+        // Core only ever sees the inner form; assert the scanner accepts it.
+        let mut s = MarkerScanner::new();
+        let hits = s.feed(inner.as_bytes());
+        assert_eq!(hits.len(), 1, "exactly one marker, got {hits:?}");
+        assert_eq!(hits[0].status, SessionStatus::Awaiting);
+        assert_eq!(
+            hits[0].preview.as_ref().expect("preview").as_str(),
+            "Approve running tests?"
+        );
+    }
+
+    #[test]
+    fn wrapped_envelope_shape_is_tmux_passthrough() {
+        // Guards against regressing the recipe back to a bare OSC (which tmux eats).
+        let wrapped = "\x1bPtmux;\x1b\x1b]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=;QQ==\x07\x1b\\";
+        assert!(
+            wrapped.starts_with("\x1bPtmux;"),
+            "missing passthrough prefix"
+        );
+        assert!(wrapped.ends_with("\x1b\\"), "missing ST terminator");
+        assert!(
+            wrapped.contains("\x1b\x1b]7366;"),
+            "inner ESC must be doubled"
+        );
+    }
 }
