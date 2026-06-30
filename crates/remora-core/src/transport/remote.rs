@@ -1711,19 +1711,6 @@ pub(crate) mod tests {
             }
         }
 
-        /// Returns the first recorded argv that contains the given substring.
-        /// Panics if no call contains the substring.
-        #[allow(dead_code)]
-        pub fn recorded_argv_containing(&self, needle: &str) -> Vec<String> {
-            self.calls
-                .lock()
-                .expect("lock")
-                .iter()
-                .find(|argv| argv.iter().any(|a| a.contains(needle)))
-                .cloned()
-                .unwrap_or_else(|| panic!("no recorded argv contains {needle:?}"))
-        }
-
         /// Counts recorded calls whose argv contains the given substring.
         pub fn count_calls_with(&self, needle: &str) -> usize {
             self.calls
