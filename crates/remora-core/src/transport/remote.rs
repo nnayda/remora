@@ -794,6 +794,31 @@ pub(crate) fn run_spawn(
         return Err(err);
     }
 
+    // The session-creating lock (NewSession) must have a PRESENT, successful record
+    // before we attach. A truncated stream (the exec died mid-batch after an earlier
+    // step's record but before NewSession ran) leaves NewSession absent; attaching a
+    // never-created session would orphan the worktree we just made. The earlier
+    // rc!=0 branches handle a NewSession that ran AND failed; this handles one that
+    // never ran. (run_respawn is immune: NewSession is its first step, so a
+    // truncated/empty stream is already caught by parse error / records.is_empty().)
+    let new_session_ok = records
+        .iter()
+        .any(|r| matches!(r.id, StepId::NewSession) && r.rc == 0);
+    if !new_session_ok {
+        if plan.branch.is_some() {
+            let session_absent = exec
+                .run(&has_session_tokens(&plan.tmux_name))
+                .map(|o| !o.success && stderr_signals_session_absent(&o.stderr))
+                .unwrap_or(false);
+            if session_absent {
+                let _ = exec.run(&worktree_remove_tokens(&plan.project_path, &plan.dir));
+            }
+        }
+        return Err(SourceError::Transport(
+            "batch incomplete: new-session step did not complete".into(),
+        ));
+    }
+
     // All fatal steps succeeded. Passthrough + set-env are best-effort; if any
     // set-env record failed, confirm the fingerprint landed and re-stamp once
     // (same policy as the respawn batched tail).
@@ -2570,6 +2595,12 @@ pub(crate) mod tests {
                 .any(|c| c.iter().any(|a| a == "show-environment")),
             "fingerprint confirmed"
         );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.iter().any(|a| a == "set-environment")),
+            "re-stamp must fire when fingerprint is absent"
+        );
         assert_eq!(fake.opened.lock().expect("lock").len(), 1, "still attaches");
     }
 
@@ -2582,6 +2613,151 @@ pub(crate) mod tests {
             stderr: "Unable to connect to the server".into(),
         })]);
         let err = run_spawn(&fake, &worktree_plan()).expect_err("transport");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
+    }
+
+    #[test]
+    fn run_spawn_truncated_before_new_session_removes_orphan_and_errors() {
+        // The exec stream is truncated AFTER WorktreeAdd succeeded but BEFORE
+        // NewSession produced a record (channel death / pod killed mid-batch).
+        // run_spawn must detect the absent NewSession record, probe has-session
+        // (absent here), remove the orphaned worktree, and return Transport.
+        let stdout = [
+            rec(batch::StepId::Fetch, "", 0),
+            rec(batch::StepId::WorktreeAdd, "", 0),
+            // No NewSession record: stream truncated here.
+        ]
+        .concat();
+        let fake = FakeExec::new(vec![
+            Ok(RemoteOutput {
+                success: true,
+                stdout,
+                stderr: String::new(),
+            }),
+            // has-session probe: session absent
+            Ok(RemoteOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "can't find session".into(),
+            }),
+            // worktree remove
+            Ok(FakeExec::ok()),
+        ]);
+        let err = run_spawn(&fake, &worktree_plan()).expect_err("truncated stream is error");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
+        let calls = fake.calls.lock().expect("lock");
+        assert!(
+            calls.iter().any(|c| c.iter().any(|a| a == "has-session")),
+            "must probe has-session: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.iter().any(|a| a == "remove")),
+            "absent session ⇒ orphan worktree must be removed: {calls:?}"
+        );
+        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
+    }
+
+    #[test]
+    fn run_spawn_truncated_before_new_session_leaves_worktree_when_session_live() {
+        // Same truncated stream (no NewSession record), but the has-session probe
+        // returns LIVE — the worktree must NOT be removed (it could be another
+        // session's cwd; don't touch it).
+        let stdout = [
+            rec(batch::StepId::Fetch, "", 0),
+            rec(batch::StepId::WorktreeAdd, "", 0),
+        ]
+        .concat();
+        let fake = FakeExec::new(vec![
+            Ok(RemoteOutput {
+                success: true,
+                stdout,
+                stderr: String::new(),
+            }),
+            // has-session probe: session LIVE
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+        ]);
+        let err = run_spawn(&fake, &worktree_plan()).expect_err("truncated stream is error");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
+        let calls = fake.calls.lock().expect("lock");
+        assert!(
+            calls.iter().any(|c| c.iter().any(|a| a == "has-session")),
+            "must probe has-session: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.iter().any(|a| a == "remove")),
+            "live session ⇒ worktree must NOT be removed: {calls:?}"
+        );
+        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
+    }
+
+    #[test]
+    fn run_spawn_shared_mode_is_one_run_plus_attach() {
+        // A shared plan (branch = None) skips Fetch + WorktreeAdd and runs only
+        // NewSession → Passthrough → SetEnv. Exactly one batched run + one attach;
+        // no has-session / remove / add calls.
+        let mut plan = worktree_plan();
+        plan.branch = None;
+        let stdout = [
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        run_spawn(&fake, &plan).expect("spawn");
+        assert_eq!(fake.calls.lock().expect("lock").len(), 1, "one batched run");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1, "one attach");
+        assert_eq!(fake.count_calls_with("has-session"), 0);
+        assert_eq!(fake.count_calls_with("remove"), 0);
+        assert_eq!(fake.count_calls_with("add"), 0);
+    }
+
+    #[test]
+    fn run_spawn_passthrough_failure_does_not_fail_spawn() {
+        // Passthrough (allow-passthrough) is non-fatal: a tmux < 3.3 that rejects
+        // the option must not abort the spawn. The batch records rc=1 for it; run_spawn
+        // must still return Ok and open exactly one channel.
+        let stdout = [
+            rec(batch::StepId::Fetch, "", 0),
+            rec(batch::StepId::WorktreeAdd, "", 0),
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 1), // rc=1, non-fatal
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        run_spawn(&fake, &worktree_plan()).expect("spawn");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
+    #[test]
+    fn run_spawn_malformed_record_is_transport() {
+        // A record with an unknown step id is a Transport error — parse_records
+        // fails and run_spawn must propagate it without opening any channel.
+        let stdout = format!("bogus_id{}out{}0{}", batch::US, batch::US, batch::RS);
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        let err = run_spawn(&fake, &worktree_plan()).expect_err("malformed record is error");
         assert!(matches!(err, SourceError::Transport(_)), "{err}");
         assert_eq!(fake.opened.lock().expect("lock").len(), 0);
     }
@@ -4056,6 +4232,54 @@ pub(crate) mod tests {
         ]);
         run_respawn(&fake, &respawn_plan()).expect("respawn attaches");
         assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
+    #[test]
+    fn run_respawn_metadata_miss_confirms_fingerprint_and_restamps() {
+        // All fatal steps ok, but a SetEnv record reports rc!=0 (metadata miss).
+        // Runner confirms via show-environment; absent fingerprint ⇒ re-stamp.
+        // Call order: printf $HOME, git worktree list (empty → convention), test -d,
+        // batched tail, show-environment (no REMORA_*), set-environment x3 re-stamp.
+        let tail = [
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "lost", 1), // a write missed
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out("")),          // git worktree list: empty → convention
+            Ok(FakeExec::ok()),             // test -d: exists
+            Ok(RemoteOutput {
+                success: true,
+                stdout: tail,
+                stderr: String::new(),
+            }), // batched tail
+            // fingerprint_present check (show-environment): no REMORA_*
+            Ok(RemoteOutput {
+                success: true,
+                stdout: "PATH=/usr/bin\n".into(),
+                stderr: String::new(),
+            }),
+            // re-stamp set-environment x3 (best-effort; default Ok fills rest)
+        ]);
+        run_respawn(&fake, &respawn_plan()).expect("respawn still succeeds");
+        let calls = fake.calls.lock().expect("lock");
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.iter().any(|a| a == "show-environment")),
+            "fingerprint confirmed"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.iter().any(|a| a == "set-environment")),
+            "re-stamp must fire when fingerprint is absent"
+        );
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1, "still attaches");
     }
 
     // -----------------------------------------------------------------------

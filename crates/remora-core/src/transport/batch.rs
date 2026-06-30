@@ -209,8 +209,13 @@ mod tests {
         assert_eq!(argv.len(), 3);
         assert_eq!(argv[0], "sh");
         assert_eq!(argv[1], "-c");
-        // The whole script is a single shell-quoted arg.
-        assert!(argv[2].starts_with('\'') || !argv[2].contains(' '));
+        // The whole script is a single shell-quoted arg (always single-quoted by
+        // quote_script — the OR's second arm was dead and self-defeating).
+        assert!(
+            argv[2].starts_with('\''),
+            "script arg must be single-quoted: {:?}",
+            argv[2]
+        );
     }
 
     #[test]
@@ -396,6 +401,18 @@ mod tests {
     fn truncated_record_missing_separators_is_transport_error() {
         // Channel died mid-record: an id with no US/rc fields.
         let stream = format!("worktree_add partial output no seps{RS}");
+        assert!(matches!(
+            parse_records(&stream),
+            Err(SourceError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn truncated_record_missing_rc_separator_is_transport_error() {
+        // Channel died after the id+US field separator but before the trailing
+        // US+rc: `rsplit_once(US)` fails (no second US). Distinct from the
+        // previous test which hits the `split_once(US)` failure (no US at all).
+        let stream = format!("fetch{}partial no rc sep{}", US, RS);
         assert!(matches!(
             parse_records(&stream),
             Err(SourceError::Transport(_))
