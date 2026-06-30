@@ -11,6 +11,7 @@
 use portable_pty::CommandBuilder;
 use remora_protocol::{ProjectId, SessionId, SessionMeta};
 
+use super::batch::{Step, StepId};
 use super::pty_process::spawn_pty_channel;
 use crate::config::Config;
 use crate::discovery::{self, DiscoveredEnv};
@@ -1603,6 +1604,85 @@ pub(crate) fn run_remove(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Batched spawn step assembly (#182)
+// ---------------------------------------------------------------------------
+
+/// The WorktreeAdd shell command. When `plan.base` is set, the base is a quoted
+/// literal start-point. Otherwise the start-point is the **shell base cascade**:
+/// an UNQUOTED `$(...)` so an empty result drops the positional start-point
+/// (legacy local-HEAD base) instead of passing `""` (which git rejects). Refs
+/// contain no IFS/whitespace, so the unquoted substitution is a single word.
+/// The cascade: verified `origin/HEAD` -> `origin/main` -> `origin/master`,
+/// each peeled with `^{commit}` to defeat a `refs/tags/origin/main` and reject
+/// a dangling ref.
+#[cfg_attr(not(test), allow(dead_code))]
+fn worktree_add_cmd(plan: &SpawnPlan) -> String {
+    let project = quote_remote_path(&plan.project_path);
+    let branch = shell_quote(plan.branch.as_deref().unwrap_or_default());
+    let dir = quote_remote_path(&plan.dir);
+    let start_point = match &plan.base {
+        Some(base) => shell_quote(base),
+        None => format!(
+            "$(r=$(git -C {p} symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null); \
+             if [ -n \"$r\" ] && git -C {p} rev-parse --verify --quiet \"refs/remotes/$r^{{commit}}\" >/dev/null 2>&1; then printf %s \"$r\"; \
+             elif git -C {p} rev-parse --verify --quiet \"refs/remotes/origin/main^{{commit}}\" >/dev/null 2>&1; then printf %s origin/main; \
+             elif git -C {p} rev-parse --verify --quiet \"refs/remotes/origin/master^{{commit}}\" >/dev/null 2>&1; then printf %s origin/master; fi)",
+            p = project
+        ),
+    };
+    format!("git -C {project} worktree add -b {branch} {dir} {start_point}")
+}
+
+/// Joins already-quoted logical tokens into one shell command for a step.
+/// Tokens are pre-quoted by their builders (e.g. `set_environment_tokens`,
+/// `new_session_tokens`); `batch::build` quotes the whole script once, so this
+/// must NOT re-quote.
+#[cfg_attr(not(test), allow(dead_code))]
+fn join_cmd(tokens: &[String]) -> String {
+    tokens.join(" ")
+}
+
+/// The ordered batched-spawn step list. Worktree mode: Fetch (non-fatal) ->
+/// WorktreeAdd (fatal, with cascade) -> NewSession (fatal) -> Passthrough
+/// (non-fatal) -> SetEnv x N (non-fatal, one per `plan.env` entry). Shared
+/// mode (no branch): omit Fetch + WorktreeAdd. Mirrors the pre-batch `run_spawn`
+/// order.
+#[cfg_attr(not(test), allow(dead_code))]
+fn build_spawn_steps(plan: &SpawnPlan) -> Vec<Step> {
+    let mut steps = Vec::new();
+    if plan.branch.is_some() {
+        steps.push(Step {
+            id: StepId::Fetch,
+            cmd: join_cmd(&fetch_tokens(&plan.project_path)),
+            fatal: false,
+        });
+        steps.push(Step {
+            id: StepId::WorktreeAdd,
+            cmd: worktree_add_cmd(plan),
+            fatal: true,
+        });
+    }
+    steps.push(Step {
+        id: StepId::NewSession,
+        cmd: join_cmd(&new_session_tokens(plan)),
+        fatal: true,
+    });
+    steps.push(Step {
+        id: StepId::Passthrough,
+        cmd: join_cmd(&set_passthrough_tokens(&plan.tmux_name)),
+        fatal: false,
+    });
+    for (key, value) in &plan.env {
+        steps.push(Step {
+            id: StepId::SetEnv,
+            cmd: join_cmd(&set_environment_tokens(&plan.tmux_name, key, value)),
+            fatal: false,
+        });
+    }
+    steps
+}
+
 #[cfg(all(test, unix))]
 pub(crate) mod tests {
     use std::sync::Arc;
@@ -1610,6 +1690,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::config::{Config, WorkspaceMode};
     use crate::spawn_plan::SpawnPlan;
+    use crate::transport::batch;
     use remora_protocol::{ProjectId, SessionId, SessionState};
 
     fn worktree_plan() -> SpawnPlan {
@@ -4079,5 +4160,77 @@ pub(crate) mod tests {
             "must retry the fingerprint read until the stamp lands"
         );
         assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_spawn_steps + worktree_add_cmd tests (#182, Task 3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn worktree_add_cmd_uses_cascade_when_no_base() {
+        let plan = worktree_plan(); // branch Some("remora/fix-login"), base None
+        let cmd = worktree_add_cmd(&plan);
+        assert!(cmd.contains("worktree add -b"));
+        assert!(cmd.contains("symbolic-ref --short refs/remotes/origin/HEAD"));
+        assert!(cmd.contains("origin/main"));
+        assert!(cmd.contains("origin/master"));
+        assert!(cmd.contains("^{commit}"), "must peel to a commit");
+        // The cascade feeds the start-point via UNQUOTED $(...) so an empty
+        // result drops the arg (local HEAD) instead of passing "" (an error).
+        assert!(cmd.contains("$("), "cascade is a command substitution");
+    }
+
+    #[test]
+    fn worktree_add_cmd_uses_literal_base_when_present() {
+        let mut plan = worktree_plan();
+        plan.base = Some("origin/release".into());
+        let cmd = worktree_add_cmd(&plan);
+        assert!(cmd.contains("origin/release"));
+        assert!(
+            !cmd.contains("symbolic-ref"),
+            "explicit base skips the cascade"
+        );
+    }
+
+    #[test]
+    fn spawn_steps_worktree_mode_order_and_fatality() {
+        let plan = worktree_plan();
+        let steps = build_spawn_steps(&plan);
+        let ids: Vec<_> = steps.iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                batch::StepId::Fetch,
+                batch::StepId::WorktreeAdd,
+                batch::StepId::NewSession,
+                batch::StepId::Passthrough,
+                batch::StepId::SetEnv,
+                batch::StepId::SetEnv,
+                batch::StepId::SetEnv,
+            ]
+        );
+        // Only worktree-add + new-session are fatal.
+        for s in &steps {
+            let want_fatal = matches!(s.id, batch::StepId::WorktreeAdd | batch::StepId::NewSession);
+            assert_eq!(s.fatal, want_fatal, "fatality for {:?}", s.id);
+        }
+    }
+
+    #[test]
+    fn spawn_steps_shared_mode_omits_fetch_and_worktree_add() {
+        let mut plan = worktree_plan();
+        plan.branch = None;
+        let steps = build_spawn_steps(&plan);
+        let ids: Vec<_> = steps.iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                batch::StepId::NewSession,
+                batch::StepId::Passthrough,
+                batch::StepId::SetEnv,
+                batch::StepId::SetEnv,
+                batch::StepId::SetEnv,
+            ]
+        );
     }
 }
