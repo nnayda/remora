@@ -655,25 +655,41 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_through_fake_exec_attaches() {
+        // ssh spawn issues ONE batched script (no probe). The script encodes
+        // fetch → worktree-add → new-session → passthrough → set-env×3.
         let config = test_config();
-        let fake = Arc::new(FakeExec::new(vec![]));
+        let batch_stdout = [
+            rec(batch::StepId::Fetch, "", 0),
+            rec(batch::StepId::WorktreeAdd, "", 0),
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
+        let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::out(&batch_stdout)), // ONE batched spawn script
+        ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let result = source.spawn(spec()).await;
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(fake.opened.lock().expect("lock").len(), 1);
-        // The plan's tmux name and env reached the recorded argv (not just
-        // that the wiring dispatched).
+        // Exactly ONE run call (round-trip guard); it is the batched sh -c script.
         let calls = fake.calls.lock().expect("lock");
+        assert_eq!(calls.len(), 1, "one batched run for ssh spawn");
         assert!(
-            calls.iter().any(|c| c.iter().any(|a| a == "new-session"))
-                && calls
-                    .iter()
-                    .any(|c| c.iter().any(|a| a == "remora_api_fix-login")),
-            "new-session argv carries the planned tmux name"
+            calls[0][0] == "sh" && calls[0][1] == "-c",
+            "batched spawn must be sh -c"
+        );
+        // The script carries the plan's tmux name and the REMORA_AGENT metadata.
+        assert!(
+            calls[0][2].contains("new-session") && calls[0][2].contains("remora_api_fix-login"),
+            "batched script must carry the planned tmux name"
         );
         assert!(
-            calls.iter().any(|c| c.iter().any(|a| a == "REMORA_AGENT")),
-            "metadata was written via set-environment"
+            calls[0][2].contains("REMORA_AGENT"),
+            "metadata was written via set-environment in the script"
         );
     }
 
@@ -1123,26 +1139,39 @@ mod tests {
     #[tokio::test]
     async fn respawn_uses_the_supplied_agent_not_the_project_default() {
         // Project default is "claude"; respawn with "codex" must launch codex.
+        let tail = [
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
         let fake = Arc::new(FakeExec::new(vec![
-            Ok(FakeExec::ok()), // printf $HOME → home = "~" (fallback)
-            Ok(FakeExec::ok()), // git worktree list → empty → None → convention
-            Ok(FakeExec::ok()), // test -d preflight: dir exists
-            Ok(FakeExec::ok()), // new-session ok
+            Ok(FakeExec::ok()),       // printf $HOME → home = "~" (fallback)
+            Ok(FakeExec::ok()),       // git worktree list → empty → None → convention
+            Ok(FakeExec::ok()),       // test -d preflight: dir exists
+            Ok(FakeExec::out(&tail)), // batched tail
         ]));
         let src =
             SshSource::with_exec(host("devbox", None, None), two_agent_config(), fake.clone());
-        let _ = src
-            .respawn(
-                &pid("api"),
-                &sid("fix"),
-                Some(AgentId::new("codex").expect("slug")),
-            )
-            .await;
-        // The new-session argv carries the codex launch command.
-        let new_session = fake.recorded_argv_containing("new-session");
+        src.respawn(
+            &pid("api"),
+            &sid("fix"),
+            Some(AgentId::new("codex").expect("slug")),
+        )
+        .await
+        .expect("respawn with codex agent must succeed");
+        // The batched tail script (calls[3]) carries the codex launch command.
+        let calls = fake.calls.lock().expect("lock");
         assert!(
-            new_session.iter().any(|a| a.contains("codex")),
-            "respawn should launch the supplied agent, got: {new_session:?}"
+            calls[3][0] == "sh" && calls[3][1] == "-c",
+            "batched tail must be sh -c"
+        );
+        assert!(
+            calls[3][2].contains("codex"),
+            "respawn should launch the supplied agent; script arg: {:?}",
+            &calls[3][2][..calls[3][2].len().min(400)]
         );
     }
 }

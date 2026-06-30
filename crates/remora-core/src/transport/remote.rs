@@ -1713,6 +1713,7 @@ pub(crate) mod tests {
 
         /// Returns the first recorded argv that contains the given substring.
         /// Panics if no call contains the substring.
+        #[allow(dead_code)]
         pub fn recorded_argv_containing(&self, needle: &str) -> Vec<String> {
             self.calls
                 .lock()

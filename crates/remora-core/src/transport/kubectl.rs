@@ -360,8 +360,10 @@ impl SessionSource for KubectlSource {
 mod tests {
     use std::sync::Arc;
 
+    use super::super::remote::tests::rec;
     use super::*;
     use crate::config::{Config, KubectlHost, WorkspaceMode};
+    use crate::transport::batch;
 
     struct FakeExec {
         results: std::sync::Mutex<std::collections::VecDeque<Result<RemoteOutput, SourceError>>>,
@@ -628,14 +630,20 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_through_fake_exec_probes_then_attaches() {
-        // probe ok, fetch ok, symbolic-ref ok, verify ok, worktree add ok, new-session ok, 3x set-env ok -> attach.
+        // probe ok, then ONE batched script carrying all spawn steps -> attach.
+        let batch_stdout = [
+            rec(batch::StepId::Fetch, "", 0),
+            rec(batch::StepId::WorktreeAdd, "", 0),
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
         let fake = Arc::new(FakeExec::new(vec![
-            Ok(FakeExec::ok()),                 // probe (binary check)
-            Ok(FakeExec::ok()),                 // fetch
-            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
-            Ok(FakeExec::ok()),                 // verify
-            Ok(FakeExec::ok()),                 // worktree add
-            Ok(FakeExec::ok()),                 // new-session
+            Ok(FakeExec::ok()),               // probe (binary check)
+            Ok(FakeExec::out(&batch_stdout)), // batched spawn script
         ]));
         let kh = KubectlHost {
             pod: KubectlField::Literal("sandbox-0".into()),
@@ -655,22 +663,29 @@ mod tests {
         };
         source.spawn(spec).await.expect("spawn");
         assert_eq!(*fake.opened.lock().expect("lock"), 1);
-        // First call is the probe (single loop token); fetch follows; then worktree add.
         let calls = fake.calls.lock().expect("lock");
+        // (a) probe is first: a single token containing the loop keyword.
         assert!(
             calls[0].len() == 1 && calls[0][0].contains("for b in"),
             "first call must be the probe loop token"
         );
-        // #54: the probe loop stays first; fetch is issued before worktree add.
-        let fetch_i = calls
-            .iter()
-            .position(|a| a.iter().any(|t| t == "fetch"))
-            .expect("fetch");
-        let add_i = calls
-            .iter()
-            .position(|a| a.iter().any(|t| t == "worktree"))
-            .expect("add");
-        assert!(calls[0][0].contains("for b in") && fetch_i < add_i);
+        // (b) exactly 2 calls: probe + ONE batched run (round-trip guard).
+        assert_eq!(calls.len(), 2, "probe + ONE batched run");
+        // (c) the batched run is sh -c <script>.
+        assert!(
+            calls[1][0] == "sh" && calls[1][1] == "-c",
+            "batched script must be sh -c"
+        );
+        // (d) the script carries the tmux name and the new-session step.
+        assert!(
+            calls[1][2].contains("new-session"),
+            "batched script must contain new-session: {:?}",
+            &calls[1][2][..calls[1][2].len().min(200)]
+        );
+        assert!(
+            calls[1][2].contains("remora_api_fix-login"),
+            "batched script must carry the planned tmux name"
+        );
     }
 
     #[tokio::test]
@@ -845,10 +860,19 @@ mod tests {
     async fn spawn_resolves_command_form_pod_through_real_runner() {
         // pod is a COMMAND; resolution runs the real local runner (`echo`), and the
         // remote kubectl exec is faked. Proves resolve->build runs per method.
+        let batch_stdout = [
+            rec(batch::StepId::Fetch, "", 0),
+            rec(batch::StepId::WorktreeAdd, "", 0),
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
         let fake = Arc::new(FakeExec::new(vec![
-            Ok(FakeExec::ok()), // probe
-            Ok(FakeExec::ok()), // worktree add
-            Ok(FakeExec::ok()), // new-session
+            Ok(FakeExec::ok()),               // probe
+            Ok(FakeExec::out(&batch_stdout)), // batched spawn script
         ]));
         let kh = KubectlHost {
             pod: KubectlField::Command("echo sandbox-9".into()),
