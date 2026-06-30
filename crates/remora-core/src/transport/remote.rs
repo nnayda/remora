@@ -306,7 +306,7 @@ pub(crate) fn branch_delete_tokens(project_path: &str, branch: &str) -> Vec<Stri
 ///
 /// `allow-passthrough` is intentionally NOT chained here: it is absent on
 /// tmux < 3.3 and would cause the whole invocation to fail on those versions,
-/// orphaning the just-created session. It is applied after `create_session`
+/// orphaning the just-created session. It is applied after the new-session step
 /// succeeds via [`set_passthrough_tokens`] and tolerated on failure.
 ///
 /// The `;` is **shell-quoted** (`';'`) so the remote login shell passes it to
@@ -365,7 +365,7 @@ pub(crate) fn new_session_tokens(plan: &SpawnPlan) -> Vec<String> {
 }
 
 /// Tokens for `tmux set-option -t <name> allow-passthrough on`. Applied
-/// AFTER `create_session` succeeds — best-effort, absent on tmux < 3.3,
+/// after the new-session step succeeds — best-effort, absent on tmux < 3.3,
 /// degrades to quiescence-only activity detection, must never fail the spawn.
 /// Called by `run_spawn` and `run_respawn` with its result tolerated (ignored).
 pub(crate) fn set_passthrough_tokens(tmux_name: &str) -> Vec<String> {
@@ -619,22 +619,6 @@ fn attach_stderr_signals_absent(stderr: &str) -> bool {
 // Orchestration (transport-neutral; called by every transport's SessionSource)
 // ---------------------------------------------------------------------------
 
-/// `tmux new-session -d` — the atomic creation lock. `Ok` on success;
-/// `Err(SessionExists)` on a duplicate name (case-insensitive); otherwise
-/// `Err(Transport)`. Opens no channel.
-pub(crate) fn create_session(exec: &dyn RemoteExec, plan: &SpawnPlan) -> Result<(), SourceError> {
-    let out = exec.run(&new_session_tokens(plan))?;
-    if out.success {
-        Ok(())
-    } else {
-        Err(classify_new_session_failure(
-            &out.stderr,
-            &plan.project_id,
-            &plan.session_id,
-        ))
-    }
-}
-
 /// Writes the `REMORA_*` env metadata. Every call is tolerated: a metadata
 /// failure must never fail an already-live session (values are untrusted /
 /// display-only — ADR-0004). Returns whether *all* writes succeeded so the
@@ -664,30 +648,6 @@ fn fingerprint_present(exec: &dyn RemoteExec, tmux_name: &str) -> bool {
     exec.run(&show_environment_tokens(tmux_name))
         .map(|out| out.success && has_remora_fingerprint(&out.stdout))
         .unwrap_or(false)
-}
-
-/// The shared spawn/respawn tail: enable passthrough, write the `REMORA_*`
-/// metadata, ensure the fingerprint actually landed, then open the channel.
-///
-/// allow-passthrough is best-effort (absent on tmux < 3.3, degrades to
-/// quiescence-only activity detection). The metadata write is best-effort too,
-/// but its `REMORA_*` env is load-bearing: attach/reconnect fingerprints the
-/// session by it (#105). So when a write reports failure, confirm at least one
-/// var stuck and re-stamp once on a total miss — otherwise a transient blip at
-/// spawn would leave a live but permanently unreconnectable session. The verify
-/// round-trip is paid only on a write failure; the happy path costs nothing
-/// extra. Still never fails an already-live session on a metadata hiccup: a
-/// fingerprint that refuses to stick degrades to pre-#105 behavior, not a failed
-/// spawn.
-fn stamp_and_attach(
-    exec: &dyn RemoteExec,
-    plan: &SpawnPlan,
-) -> Result<SessionChannel, SourceError> {
-    let _ = exec.run(&set_passthrough_tokens(&plan.tmux_name));
-    if !write_metadata(exec, plan) && !fingerprint_present(exec, &plan.tmux_name) {
-        let _ = write_metadata(exec, plan);
-    }
-    attach_channel(exec, &plan.tmux_name)
 }
 
 /// Opens the PTY attach channel to an existing session (no liveness
@@ -747,7 +707,7 @@ pub(crate) fn run_attach(
 /// Fingerprinted attach for the respawn duplicate-session race. When
 /// `run_respawn`'s `new-session` lock loses to a concurrent respawner, the
 /// winner created the session but may not have stamped its `REMORA_*` metadata
-/// yet (it stamps just after the lock — see `stamp_and_attach`), so a straight
+/// yet (passthrough + set-env follow immediately in the batch), so a straight
 /// [`run_attach`] could momentarily see an unfingerprinted session and reject
 /// it. Retry the fingerprinted attach a few times to absorb that stamp window.
 /// Only `SessionNotFound` is retried; a real impostor never gains a fingerprint,
@@ -836,7 +796,7 @@ pub(crate) fn run_spawn(
 
     // All fatal steps succeeded. Passthrough + set-env are best-effort; if any
     // set-env record failed, confirm the fingerprint landed and re-stamp once
-    // (same policy as the pre-batch `stamp_and_attach`).
+    // (same policy as the respawn batched tail).
     let metadata_missed = records
         .iter()
         .any(|r| matches!(r.id, StepId::SetEnv) && r.rc != 0);
@@ -924,18 +884,60 @@ pub(crate) fn run_respawn(
             Err(SourceError::Transport(probe.stderr))
         };
     }
-    match create_session(exec, effective) {
-        Ok(()) => stamp_and_attach(exec, effective),
-        // A concurrent respawner already created it (ADR-0004). Attach to the
-        // live session — but still through the fingerprint gate (#105), so a
-        // same-named impostor holding the name can't receive the PTY by winning
-        // this branch. The bounded retry absorbs the window where the concurrent
-        // respawner has taken the new-session lock but not yet stamped metadata.
-        Err(SourceError::SessionExists { .. }) => {
-            run_attach_awaiting_fingerprint(exec, &effective.project_id, &effective.session_id)
-        }
-        Err(err) => Err(err),
+    // Batched stamp tail: new-session (the atomic lock) + passthrough + set-env,
+    // one script. No worktree-add / fetch / cascade (the worktree survives).
+    let mut steps = vec![Step {
+        id: StepId::NewSession,
+        cmd: join_cmd(&new_session_tokens(effective)),
+        fatal: true,
+    }];
+    steps.push(Step {
+        id: StepId::Passthrough,
+        cmd: join_cmd(&set_passthrough_tokens(&effective.tmux_name)),
+        fatal: false,
+    });
+    for (key, value) in &effective.env {
+        steps.push(Step {
+            id: StepId::SetEnv,
+            cmd: join_cmd(&set_environment_tokens(&effective.tmux_name, key, value)),
+            fatal: false,
+        });
     }
+    let out = exec.run(&batch::build(&steps, batch::BatchMode::StopOnError))?;
+    let records = batch::parse_records(&out.stdout)?;
+    if records.is_empty() {
+        return Err(SourceError::Transport(if out.stderr.trim().is_empty() {
+            out.stdout
+        } else {
+            out.stderr
+        }));
+    }
+    if let Some(rec) = records
+        .iter()
+        .find(|r| r.rc != 0 && matches!(r.id, StepId::NewSession))
+    {
+        return match classify_new_session_failure(
+            &rec.output,
+            &effective.project_id,
+            &effective.session_id,
+        ) {
+            // A concurrent respawner already created it (ADR-0004): attach to
+            // the live session through the fingerprint gate (bounded retry
+            // absorbs the stamp window).
+            SourceError::SessionExists { .. } => {
+                run_attach_awaiting_fingerprint(exec, &effective.project_id, &effective.session_id)
+            }
+            other => Err(other),
+        };
+    }
+    // new-session ok; best-effort metadata re-stamp on a set-env miss.
+    let metadata_missed = records
+        .iter()
+        .any(|r| matches!(r.id, StepId::SetEnv) && r.rc != 0);
+    if metadata_missed && !fingerprint_present(exec, &effective.tmux_name) {
+        let _ = write_metadata(exec, effective);
+    }
+    attach_channel(exec, &effective.tmux_name)
 }
 
 /// Reads the inline `#{E:}` session metadata into a `name → env` map
@@ -1906,8 +1908,8 @@ pub(crate) mod tests {
         // allow-passthrough is intentionally NOT in the atomic new-session chain:
         // it is absent on tmux < 3.3 and would cause the whole invocation to fail
         // on those versions, orphaning the just-created session. It is applied
-        // separately (best-effort) via set_passthrough_tokens after create_session
-        // succeeds.
+        // separately (best-effort) via set_passthrough_tokens after the
+        // new-session step succeeds.
         let plan = worktree_plan();
         let tokens = new_session_tokens(&plan);
         assert!(
@@ -2400,7 +2402,7 @@ pub(crate) mod tests {
     // -----------------------------------------------------------------------
 
     /// Builds one batch record string for FakeExec stdout.
-    fn rec(id: batch::StepId, output: &str, rc: i32) -> String {
+    pub(crate) fn rec(id: batch::StepId, output: &str, rc: i32) -> String {
         format!(
             "{}{}{}{}{}{}",
             id.token(),
@@ -3713,11 +3715,23 @@ pub(crate) mod tests {
                          worktree /mnt/work/feat/login\n\
                          HEAD def\n\
                          branch refs/heads/feat/login\n";
+        let tail = [
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out("/home/dev")), // printf $HOME
             Ok(FakeExec::out(porcelain)),   // git worktree list
             Ok(FakeExec::ok()),             // test -d REAL path
-            Ok(FakeExec::ok()),             // tmux new-session
+            Ok(RemoteOutput {
+                success: true,
+                stdout: tail,
+                stderr: String::new(),
+            }), // batched tail
         ]);
         assert!(
             run_respawn(&fake, &plan).is_ok(),
@@ -3737,10 +3751,10 @@ pub(crate) mod tests {
             !probe.iter().any(|a| a.contains(".remora/worktrees")),
             "preflight must NOT probe the convention path: {probe:?}"
         );
-        // new-session must also reference the REAL path as the start directory.
+        // new-session must also reference the REAL path (embedded in the batch script).
         let new_session = calls
             .iter()
-            .find(|c| c.iter().any(|a| a == "new-session"))
+            .find(|c| c.iter().any(|a| a.contains("new-session")))
             .expect("new-session must run");
         assert!(
             new_session
@@ -3770,11 +3784,23 @@ pub(crate) mod tests {
         let porcelain = "worktree /home/dev/api\n\
                          HEAD abc\n\
                          branch refs/heads/main\n"; // no remora/fix-login entry
+        let tail = [
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out("/home/dev")), // printf $HOME
             Ok(FakeExec::out(porcelain)),   // git worktree list → no match → None
             Ok(FakeExec::ok()),             // test -d convention dir
-            Ok(FakeExec::ok()),             // tmux new-session
+            Ok(RemoteOutput {
+                success: true,
+                stdout: tail,
+                stderr: String::new(),
+            }), // batched tail
         ]);
         assert!(
             run_respawn(&fake, &plan).is_ok(),
@@ -3805,11 +3831,20 @@ pub(crate) mod tests {
         // not by tmux name alone.
         let plan = worktree_plan();
         let porcelain = "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n";
+        let dup_tail = rec(
+            batch::StepId::NewSession,
+            "duplicate session: remora_api_fix-login",
+            1,
+        );
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out("/home/dev")), // printf $HOME
             Ok(FakeExec::out(porcelain)),   // git worktree list → convention
             Ok(FakeExec::ok()),             // test -d
-            Ok(FakeExec::fail("duplicate session: remora_api_fix-login")), // lost the lock
+            Ok(RemoteOutput {
+                success: true,
+                stdout: dup_tail,
+                stderr: String::new(),
+            }), // batched tail: duplicate
             Ok(FakeExec::out("REMORA_AGENT=claude\n")), // show-environment: fingerprint present
         ]);
         assert!(
@@ -3831,14 +3866,23 @@ pub(crate) mod tests {
         // no channel, never attach by name (#105).
         let plan = worktree_plan();
         let porcelain = "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n";
+        let dup_tail = rec(
+            batch::StepId::NewSession,
+            "duplicate session: remora_api_fix-login",
+            1,
+        );
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out("/home/dev")),
             Ok(FakeExec::out(porcelain)),
             Ok(FakeExec::ok()),
-            Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
-            // Every show-environment retry returns no fingerprint: the default
-            // FakeExec result is a successful empty-stdout reply once the queue
-            // drains, so the fingerprint stays absent across all attempts.
+            Ok(RemoteOutput {
+                success: true,
+                stdout: dup_tail,
+                stderr: String::new(),
+            }), // batched tail: duplicate
+                // Every show-environment retry returns no fingerprint: the default
+                // FakeExec result is a successful empty-stdout reply once the queue
+                // drains, so the fingerprint stays absent across all attempts.
         ]);
         let err = run_respawn(&fake, &plan).expect_err("impostor must be refused");
         assert!(matches!(err, SourceError::SessionNotFound { .. }), "{err}");
@@ -3852,11 +3896,20 @@ pub(crate) mod tests {
         // stamp window instead of spuriously failing a legit concurrent respawn.
         let plan = worktree_plan();
         let porcelain = "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n";
+        let dup_tail = rec(
+            batch::StepId::NewSession,
+            "duplicate session: remora_api_fix-login",
+            1,
+        );
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out("/home/dev")),
             Ok(FakeExec::out(porcelain)),
             Ok(FakeExec::ok()),
-            Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
+            Ok(RemoteOutput {
+                success: true,
+                stdout: dup_tail,
+                stderr: String::new(),
+            }), // batched tail: duplicate
             Ok(FakeExec::out("PATH=/usr/bin\n")), // 1st read: not stamped yet
             Ok(FakeExec::out("REMORA_AGENT=claude\n")), // 2nd read: stamp landed
         ]);
@@ -3869,6 +3922,151 @@ pub(crate) mod tests {
             2,
             "must retry the fingerprint read until the stamp lands"
         );
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // run_respawn batched tail tests (Task 5)
+    // -----------------------------------------------------------------------
+
+    fn respawn_plan() -> SpawnPlan {
+        worktree_plan()
+    }
+
+    #[test]
+    fn run_respawn_batches_stamp_tail_and_attaches() {
+        // Order: printf $HOME (Rust), git worktree list (Rust, empty→convention),
+        // test -d (Rust, exists), batched tail script (new-session+passthrough+
+        // set-env, all ok) → attach.
+        let tail = [
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
+        let fake = FakeExec::new(vec![
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // $HOME → "~"
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // worktree list empty
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // test -d ok
+            Ok(RemoteOutput {
+                success: true,
+                stdout: tail,
+                stderr: String::new(),
+            }), // batched tail
+        ]);
+        run_respawn(&fake, &respawn_plan()).expect("respawn");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+        let calls = fake.calls.lock().expect("lock");
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.iter().any(|a| a == "test") && c.iter().any(|a| a == "-d")),
+            "test -d stays a separate Rust round-trip"
+        );
+        assert!(
+            !calls.iter().any(|c| c.iter().any(|a| a == "add")),
+            "no worktree add on respawn"
+        );
+    }
+
+    #[test]
+    fn run_respawn_test_d_gone_is_session_not_found_no_script() {
+        let fake = FakeExec::new(vec![
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // $HOME
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // worktree list
+            Ok(RemoteOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // test -d: empty stderr ⇒ gone
+        ]);
+        let err = run_respawn(&fake, &respawn_plan()).expect_err("gone");
+        assert!(matches!(err, SourceError::SessionNotFound { .. }), "{err}");
+        assert!(fake.opened.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn run_respawn_test_d_probe_error_is_transport() {
+        let fake = FakeExec::new(vec![
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+            Ok(RemoteOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "connection refused".into(),
+            }), // non-empty ⇒ Transport
+        ]);
+        let err = run_respawn(&fake, &respawn_plan()).expect_err("probe error");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
+    }
+
+    #[test]
+    fn run_respawn_duplicate_attaches_through_fingerprint() {
+        // The batched NewSession reports a duplicate; the runner falls to the
+        // fingerprinted attach retry, which finds the live session.
+        let tail = rec(
+            batch::StepId::NewSession,
+            "duplicate session: remora_api_fix-login",
+            1,
+        );
+        let fake = FakeExec::new(vec![
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // $HOME
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // worktree list
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // test -d ok
+            Ok(RemoteOutput {
+                success: true,
+                stdout: tail,
+                stderr: String::new(),
+            }), // batched tail: duplicate
+            Ok(RemoteOutput {
+                success: true,
+                stdout: "REMORA_AGENT=claude\n".into(),
+                stderr: String::new(),
+            }), // show-environment fingerprint
+        ]);
+        run_respawn(&fake, &respawn_plan()).expect("respawn attaches");
         assert_eq!(fake.opened.lock().expect("lock").len(), 1);
     }
 

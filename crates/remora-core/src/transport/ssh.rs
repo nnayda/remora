@@ -221,7 +221,8 @@ impl SessionSource for SshSource {
 mod tests {
     use std::sync::Arc;
 
-    use super::super::remote::tests::{test_config, FakeExec};
+    use super::super::remote::tests::{rec, test_config, FakeExec};
+    use super::super::remote::RemoteOutput;
     use super::super::remote::{
         attach_tokens, has_session_tokens, list_sessions_tokens, new_session_tokens,
         set_environment_tokens, worktree_add_tokens,
@@ -230,6 +231,7 @@ mod tests {
     use super::*;
     use crate::config::WorkspaceMode;
     use crate::spawn_plan::SpawnPlan;
+    use crate::transport::batch;
     use crate::SessionSource;
     use remora_protocol::{AgentId, ProjectId, SessionId, SessionState, SpawnSpec};
 
@@ -896,11 +898,23 @@ mod tests {
     #[tokio::test]
     async fn respawn_creates_without_worktree_add_and_attaches() {
         let config = test_config(); // api is worktree-mode
+        let tail = [
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
         let fake = Arc::new(FakeExec::new(vec![
             Ok(FakeExec::ok()), // printf $HOME → home = "~" (fallback)
             Ok(FakeExec::ok()), // git worktree list → empty → None → convention
             Ok(FakeExec::ok()), // test -d preflight: dir exists
-            Ok(FakeExec::ok()), // new-session ok
+            Ok(RemoteOutput {
+                success: true,
+                stdout: tail,
+                stderr: String::new(),
+            }), // batched tail
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let (project, session) = (pid("api"), sid("fix-login"));
@@ -910,10 +924,10 @@ mod tests {
             .expect("respawn");
         let calls = fake.calls.lock().expect("lock");
         // calls[0] = printf $HOME; calls[1] = git worktree list;
-        // calls[2] = test -d preflight; calls[3] = new-session.
+        // calls[2] = test -d preflight; calls[3] = batched tail (sh -c <script>).
         // Never a `git worktree add` (the worktree survives).
         assert!(calls[2].iter().any(|a| a == "test") && calls[2].iter().any(|a| a == "-d"));
-        assert!(calls[3].iter().any(|a| a == "new-session"));
+        assert!(calls[3].iter().any(|a| a.contains("new-session")));
         assert!(!calls.iter().any(|c| c.iter().any(|a| a == "add")));
         assert_eq!(fake.opened.lock().expect("lock").len(), 1);
     }
@@ -924,11 +938,20 @@ mod tests {
         // the live session — but through the fingerprint gate (#105), so the
         // show-environment preflight must report the REMORA_* fingerprint.
         let config = test_config();
+        let dup_tail = rec(
+            batch::StepId::NewSession,
+            "duplicate session: remora_api_fix-login",
+            1,
+        );
         let fake = Arc::new(FakeExec::new(vec![
             Ok(FakeExec::ok()), // printf $HOME → home = "~" (fallback)
             Ok(FakeExec::ok()), // git worktree list → empty → None → convention
             Ok(FakeExec::ok()), // test -d preflight: dir exists
-            Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
+            Ok(RemoteOutput {
+                success: true,
+                stdout: dup_tail,
+                stderr: String::new(),
+            }), // batched tail: duplicate
             Ok(FakeExec::out("REMORA_AGENT=claude\n")), // show-environment: fingerprint present
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
@@ -1066,11 +1089,23 @@ mod tests {
             command = ["claude"]
         "#;
         let config = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let tail = [
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
         let fake = Arc::new(FakeExec::new(vec![
             Ok(FakeExec::ok()), // printf $HOME → home = "~" (fallback)
             Ok(FakeExec::ok()), // git worktree list → empty → None → convention
             Ok(FakeExec::ok()), // test -d: worktree dir exists
-            Ok(FakeExec::ok()), // new-session ok
+            Ok(RemoteOutput {
+                success: true,
+                stdout: tail,
+                stderr: String::new(),
+            }), // batched tail
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let (project, session) = (pid("scratch"), sid("s1"));
