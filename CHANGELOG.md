@@ -470,6 +470,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Tabs reflow live while dragging to reorder** (#185): dragging a tab now
+  shuffles the other tabs out of the way in real time and slides the dragged
+  tab (dimmed) into its prospective slot, instead of showing a static drop
+  indicator that only committed on release. The previewed order and the order
+  that lands on drop are computed by one shared `reorderTabs` helper, so they
+  can never diverge, and the whole strip accepts the drag so the native cursor
+  reads "move" rather than the stray "+" copy glyph. Midpoint hysteresis to
+  damp boundary flicker is a follow-up (#209).
+- **Dropped the "Remora" window title-bar text** (#186): the native OS window
+  title is now empty (`app.windows[0].title` in `tauri.conf.json`) instead of
+  duplicating the wordmark logo the app already renders in its own chrome. The
+  traffic-light controls and window dragging are unaffected — only the redundant
+  title text is gone.
+
 - **Activity-pulse glow unified on marine** (#180): the pulse halo now uses the
   signature marine accent end to end instead of a legacy lavender. `--glow-pulse`
   (dark + light) and the `remora-pulse-glow` keyframe derive from `--marine-pulse`
@@ -504,6 +518,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Clicking a session in the sidebar now revives it when the local tab is
+  dead but the session is reachable** (#189, inverse of #178). Two dropped-intent
+  gaps: the live-attach path short-circuited on `key === activeKey` alone, so
+  re-clicking a `stopped`/`disconnected` *active* tab focused an empty pane and
+  returned without reconnecting; and "reopen" skipped the respawn for a
+  `reconnecting` tab whose retry loop was doomed once discovery reported the
+  server session gone. The store now revives any non-live sidebar dedupe — the
+  live-attach path re-attaches in place (new `reconnectTab`, guarded so it can't
+  orphan an in-flight respawn), the respawn path respawns a `reconnecting` tab —
+  and the click's focus-intent gate is liveness-aware. A revive that terminally
+  fails now clears the armed focus flag so it can't steal focus onto the next
+  tab.
 - **Removing a session no longer resurrects it as an orphaned worktree row.**
   Opening a discovered *live* session whose local tab was gone (e.g. after an
   app restart or reconnect — the common persistent-session flow) went through
@@ -739,3 +765,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   class — a 28×28 bordered, rounded hit area with a larger gear and a hover
   state, wired into the existing focus-visible outline. Visual-only; the button
   kept its `aria-label`/`title="Settings"`, so accessibility is unchanged.
+
+### Security
+
+- **Bound combining marks in the activity-preview sanitizer** (#197): a sandbox
+  payload could stack Unicode combining marks (Zalgo) on a base glyph to garble
+  the preview tooltip — the marks pass `char::is_control()` and survived the
+  earlier control/bidi/zero-width scrub (#193). The sanitizer now caps stacking
+  marks (Mn/Me) to four per grapheme cluster and drops orphan marks with no
+  base. Bounding per grapheme cluster (not a per-char run) means interleaved
+  spacing marks or other extenders can't reset the budget to smuggle an
+  unbounded stack back in, while legitimate decomposed accents (e.g. NFD `é`) and
+  3–4-mark scripts like Biblical Hebrew stay intact.

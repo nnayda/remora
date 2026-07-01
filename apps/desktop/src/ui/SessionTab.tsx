@@ -20,10 +20,6 @@ export interface SessionTabProps
   onClose?: (e: React.MouseEvent) => void;
   /** Drag-to-reorder: this tab is the one being dragged (dimmed). @default false */
   dragging?: boolean;
-  /** Drag-to-reorder: show a drop indicator on the leading edge. @default false */
-  dropBefore?: boolean;
-  /** Drag-to-reorder: show a drop indicator on the trailing edge. @default false */
-  dropAfter?: boolean;
   /** Drag-to-reorder handlers — applied to the tab container, not the button. */
   drag?: {
     draggable?: boolean;
@@ -42,8 +38,6 @@ export function SessionTab({
   onClose,
   className = "",
   dragging = false,
-  dropBefore = false,
-  dropAfter = false,
   drag,
   ...props
 }: SessionTabProps) {
@@ -52,8 +46,6 @@ export function SessionTab({
     active ? "rmra-tab--active" : "",
     onClose ? "rmra-tab--closable" : "",
     dragging ? "rmra-tab--dragging" : "",
-    dropBefore ? "rmra-tab--drop-before" : "",
-    dropAfter ? "rmra-tab--drop-after" : "",
     className,
   ]
     .filter(Boolean)
