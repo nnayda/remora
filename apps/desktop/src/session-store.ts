@@ -491,7 +491,11 @@ export class SessionStore {
     if (existing) {
       this.activeKey = key;
       this.commit();
-      if (existing.status === "stopped" || existing.status === "disconnected") {
+      // Respawn any non-live existing tab — including `reconnecting`, whose
+      // attach-retry loop is doomed once discovery reports the server session
+      // gone (#189 Bug B). Never respawn a `live` tab: discovery is stale and
+      // respawning would kill a locally-live session.
+      if (existing.status !== "live") {
         void this.respawnTab(key);
       }
       return { ok: true, attached: false, opened: false };
@@ -525,6 +529,12 @@ export class SessionStore {
     if (existing) {
       this.activeKey = key;
       this.commit();
+      // Discovery reports the session live; if the local tab is non-live,
+      // re-attach it in place rather than silently focusing a dead pane
+      // (#189 Bug A). A live tab is just focused.
+      if (existing.status !== "live") {
+        this.reconnectTab(key);
+      }
       return { ok: true, attached: existing.attached, opened: false };
     }
 
@@ -571,6 +581,28 @@ export class SessionStore {
       return;
     }
     this.swapConnection(key, next, "live");
+  };
+
+  /**
+   * Re-attach an existing dead/reconnecting tab in place — the attach twin of
+   * `respawnTab`. Used when discovery reports the session LIVE but the local tab
+   * is non-live (#189 Bug A): the session is alive on the server, so re-attach
+   * rather than respawn (which would fabricate a duplicate). `startReconnect`'s
+   * classifier lands the tab back at `stopped`/`disconnected` if the session is
+   * actually gone, so a stale-discovery misclick can't spawn a duplicate.
+   *
+   * Guards on the full `busy(key)` (not `respawnTab`'s narrower pending/teardown):
+   * a `reconnectTab` racing an in-flight respawn would cancel the respawn's token
+   * via `newReconnectToken` after the respawn opener may have already created a
+   * tmux, orphaning that detached session while the attach loop proceeds.
+   * Deferring to the in-flight respawn is correct — it is already reviving the tab.
+   */
+  reconnectTab = (key: string): void => {
+    if (this.disposed || this.busy(key)) return;
+    const tab = this.tabs.find((t) => t.key === key);
+    if (!tab) return;
+    this.setStatus(key, "reconnecting", null);
+    void this.startReconnect(key, 0);
   };
 
   /** Decrement the in-flight respawn count for `key`, dropping the entry at 0. */
