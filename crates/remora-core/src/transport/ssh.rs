@@ -221,7 +221,8 @@ impl SessionSource for SshSource {
 mod tests {
     use std::sync::Arc;
 
-    use super::super::remote::tests::{test_config, FakeExec};
+    use super::super::remote::tests::{rec, test_config, FakeExec};
+    use super::super::remote::RemoteOutput;
     use super::super::remote::{
         attach_tokens, has_session_tokens, list_sessions_tokens, new_session_tokens,
         set_environment_tokens, worktree_add_tokens,
@@ -230,6 +231,7 @@ mod tests {
     use super::*;
     use crate::config::WorkspaceMode;
     use crate::spawn_plan::SpawnPlan;
+    use crate::transport::batch;
     use crate::SessionSource;
     use remora_protocol::{AgentId, ProjectId, SessionId, SessionState, SpawnSpec};
 
@@ -653,57 +655,86 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_through_fake_exec_attaches() {
+        // ssh spawn issues ONE batched script (no probe). The script encodes
+        // fetch → worktree-add → new-session → passthrough → set-env×3.
         let config = test_config();
-        let fake = Arc::new(FakeExec::new(vec![]));
+        let batch_stdout = [
+            rec(batch::StepId::Fetch, "", 0),
+            rec(batch::StepId::WorktreeAdd, "", 0),
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
+        let fake = Arc::new(FakeExec::new(vec![
+            Ok(FakeExec::out(&batch_stdout)), // ONE batched spawn script
+        ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let result = source.spawn(spec()).await;
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(fake.opened.lock().expect("lock").len(), 1);
-        // The plan's tmux name and env reached the recorded argv (not just
-        // that the wiring dispatched).
+        // Exactly ONE run call (round-trip guard); it is the batched sh -c script.
         let calls = fake.calls.lock().expect("lock");
+        assert_eq!(calls.len(), 1, "one batched run for ssh spawn");
         assert!(
-            calls.iter().any(|c| c.iter().any(|a| a == "new-session"))
-                && calls
-                    .iter()
-                    .any(|c| c.iter().any(|a| a == "remora_api_fix-login")),
-            "new-session argv carries the planned tmux name"
+            calls[0][0] == "sh" && calls[0][1] == "-c",
+            "batched spawn must be sh -c"
+        );
+        // The script carries the plan's tmux name and the REMORA_AGENT metadata.
+        assert!(
+            calls[0][2].contains("new-session") && calls[0][2].contains("remora_api_fix-login"),
+            "batched script must carry the planned tmux name"
         );
         assert!(
-            calls.iter().any(|c| c.iter().any(|a| a == "REMORA_AGENT")),
-            "metadata was written via set-environment"
+            calls[0][2].contains("REMORA_AGENT"),
+            "metadata was written via set-environment in the script"
         );
     }
 
     #[tokio::test]
     async fn list_joins_live_metadata_stopped_and_filters_unconfigured() {
         // Config has project `api` (worktree, path /home/dev/api). `ghost` is NOT configured.
+        // One batched RunAll exec returns four section records: names (api+ghost+unparseable),
+        // metadata (fix-login enrichment), home (/home/dev), wt_scan(api) with primary+two
+        // worktrees. Exactly ONE round-trip (the #182 win).
         let config = test_config();
-        // Discovery call order: names, metadata, printf $HOME, worktree scan (#108, #124):
-        //  1) list-sessions names -> api (configured) + ghost (unconfigured) +
-        //     `main` & `remora__bad` (unparseable). Only api survives.
-        //  2) list-sessions inline metadata -> enrichment keyed by trusted name.
-        //     workspace_path is absolute so the path-anchored join can match (#124).
-        //  3) printf $HOME -> "/home/dev" for A2′ primary-checkout detection.
-        //  4) git worktree list for api -> realistic output: primary checkout first
-        //     (as real git always emits), followed by worktree entries.
-        let fake = Arc::new(FakeExec::new(vec![
-            Ok(FakeExec::out(
+        let stdout = [
+            rec(
+                batch::StepId::Names,
                 "remora_api_fix-login\nremora_ghost_x\nmain\nremora__bad\n",
-            )),
-            Ok(FakeExec::out(
+                0,
+            ),
+            rec(
+                batch::StepId::Metadata,
                 "remora_api_fix-login\tclaude\t/home/dev/.remora/worktrees/api/fix-login\t1765500000\n",
-            )),
-            Ok(FakeExec::out("/home/dev")), // printf $HOME
-            Ok(FakeExec::out(
+                0,
+            ),
+            rec(batch::StepId::Home, "/home/dev", 0),
+            rec(
+                batch::StepId::WorktreeScan,
                 "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n\n\
                  worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n\n\
                  worktree /home/dev/.remora/worktrees/api/add-tests\nbranch refs/heads/remora/add-tests\n",
-            )),
-        ]));
+                0,
+            ),
+        ]
+        .concat();
+        let fake = Arc::new(FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let metas = source.list().await.expect("list");
 
+        // Round-trip guard: one batched exec (was 3+M separate calls).
+        assert_eq!(
+            fake.calls.lock().expect("lock").len(),
+            1,
+            "list() must issue exactly ONE batched exec (#182)"
+        );
         // ghost filtered out (R1). api/add-tests is Stopped+Worktree; api/fix-login is Live+Worktree.
         // The primary checkout (/home/dev/api == project path) surfaces as Stopped+Shared (A2′).
         assert_eq!(
@@ -739,28 +770,35 @@ mod tests {
 
     #[tokio::test]
     async fn list_home_fetch_non_absolute_degrades_tilde_session_to_shared() {
-        // When the `printf $HOME` probe returns a NON-ABSOLUTE value, `run_list`
-        // rejects it (ADR-0004 never-trust) and falls back to home = "~". A live
-        // session whose REMORA_WORKSPACE is a logical `~/…` path then canonicalizes
-        // to `~/…` (unexpanded) and so fails to match the absolute worktree paths —
-        // it surfaces as Live + Shared instead of Live + Worktree. This is the
+        // When the Home record returns a NON-ABSOLUTE value, `run_list` rejects it
+        // (ADR-0004 never-trust) and falls back to home = "~". A live session whose
+        // REMORA_WORKSPACE is a logical `~/…` path then canonicalizes to `~/…`
+        // (unexpanded) and so fails to match the absolute worktree paths — it
+        // surfaces as Live + Shared instead of Live + Worktree. This is the
         // documented "acceptable degradation" (#124); the test pins it so a
         // regression in the $HOME-validation policy is caught.
-        //
-        // Discovery call order: 1) names, 2) metadata, 3) printf $HOME, 4) worktree
-        // list. Here (3) returns a non-absolute string so the fallback engages.
         let config = test_config();
-        let fake = Arc::new(FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names
-            Ok(FakeExec::out(
+        let stdout = [
+            rec(batch::StepId::Names, "remora_api_fix-login\n", 0),
+            rec(
+                batch::StepId::Metadata,
                 "remora_api_fix-login\tclaude\t~/.remora/worktrees/api/fix-login\t1765500000\n",
-            )), // 2) metadata: logical ~/… workspace
-            Ok(FakeExec::out("not-an-absolute-path")), // 3) printf $HOME → not absolute → home = "~"
-            Ok(FakeExec::out(
+                0,
+            ),
+            rec(batch::StepId::Home, "not-an-absolute-path", 0), // not absolute → home = "~"
+            rec(
+                batch::StepId::WorktreeScan,
                 "worktree /home/dev/api\nbranch refs/heads/main\n\n\
                  worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n",
-            )), // 4) worktree list (absolute paths)
-        ]));
+                0,
+            ),
+        ]
+        .concat();
+        let fake = Arc::new(FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let metas = source.list().await.expect("list");
         // The live `fix-login` session could not be path-matched to its worktree
@@ -782,27 +820,57 @@ mod tests {
 
     #[tokio::test]
     async fn list_treats_no_server_as_empty() {
+        // A Names record with rc=1 carrying the "no server running" phrase is the
+        // cold-state signal. run_list passes it to classify_list_sessions which
+        // matches stderr_signals_server_absent → empty names → empty result (not
+        // Transport). The batched exec itself succeeds (success:true); only the
+        // Names step within it failed. RunAll runs every step unconditionally, so
+        // in real cold-state output all fixed-layout records are present —
+        // Metadata fails (no server), Home succeeds, WorktreeScan succeeds but
+        // returns nothing interesting.
         let config = test_config();
-        let fake = Arc::new(FakeExec::new(vec![Ok(FakeExec::fail(
-            "no server running on /tmp/tmux-1000/default",
-        ))]));
+        let stdout = [
+            rec(
+                batch::StepId::Names,
+                "no server running on /tmp/tmux-1000/default",
+                1,
+            ),
+            rec(
+                batch::StepId::Metadata,
+                "no server running on /tmp/tmux-1000/default",
+                1,
+            ),
+            rec(batch::StepId::Home, "/home/dev", 0),
+            rec(batch::StepId::WorktreeScan, "", 0),
+        ]
+        .concat();
+        let fake = Arc::new(FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         assert!(source.list().await.expect("list").is_empty());
     }
 
     #[tokio::test]
     async fn list_keeps_session_live_when_metadata_read_flakes() {
-        // The session is in the trusted names listing, but the inline-metadata
-        // read flakes (transient, or tmux < 3.0). It must still list as Live with
+        // The session is in the trusted names listing, but the Metadata section
+        // failed (transient, or tmux < 3.0). It must still list as Live with
         // empty metadata — metadata is best-effort enrichment (#108).
-        // Call order: 1) names, 2) metadata (flakes), 3) printf $HOME, 4) worktree list.
         let config = test_config();
-        let fake = Arc::new(FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names
-            Ok(FakeExec::fail("connection reset")),      // 2) metadata flakes
-            Ok(FakeExec::out("/home/dev")),              // 3) printf $HOME (#124)
-            Ok(FakeExec::out("")),                       // 4) worktree empty
-        ]));
+        let stdout = [
+            rec(batch::StepId::Names, "remora_api_fix-login\n", 0),
+            rec(batch::StepId::Metadata, "connection reset", 1), // flake: rc!=0
+            rec(batch::StepId::Home, "/home/dev", 0),
+            rec(batch::StepId::WorktreeScan, "", 0), // empty scan
+        ]
+        .concat();
+        let fake = Arc::new(FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let metas = source.list().await.expect("list");
         assert_eq!(metas.len(), 1);
@@ -813,16 +881,30 @@ mod tests {
 
     #[tokio::test]
     async fn list_survives_worktree_list_failure_per_decision_8() {
-        // Call order: 1) names, 2) metadata, 3) printf $HOME, 4) worktree list (FAILS).
-        // The FakeExec::fail at position 4 must land on the WORKTREE LIST call —
-        // not on $HOME — so decision 8 is actually exercised.
+        // WorktreeScan section rc!=0 → decision 8: the project is excluded from
+        // `scanned`, so the live session is not joined against any worktree and
+        // surfaces as Live (not dropped). list() must not return an error.
         let config = test_config();
-        let fake = Arc::new(FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names
-            Ok(FakeExec::out("remora_api_fix-login\tclaude\t\t\n")), // 2) metadata
-            Ok(FakeExec::out("/home/dev")),              // 3) printf $HOME (#124)
-            Ok(FakeExec::fail("fatal: not a git repository")), // 4) worktree list FAILS → decision 8
-        ]));
+        let stdout = [
+            rec(batch::StepId::Names, "remora_api_fix-login\n", 0),
+            rec(
+                batch::StepId::Metadata,
+                "remora_api_fix-login\tclaude\t\t\n",
+                0,
+            ),
+            rec(batch::StepId::Home, "/home/dev", 0),
+            rec(
+                batch::StepId::WorktreeScan,
+                "fatal: not a git repository",
+                1,
+            ), // rc!=0 → decision 8
+        ]
+        .concat();
+        let fake = Arc::new(FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let metas = source.list().await.expect("list must not fail");
         assert_eq!(metas.len(), 1);
@@ -896,11 +978,23 @@ mod tests {
     #[tokio::test]
     async fn respawn_creates_without_worktree_add_and_attaches() {
         let config = test_config(); // api is worktree-mode
+        let tail = [
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
         let fake = Arc::new(FakeExec::new(vec![
             Ok(FakeExec::ok()), // printf $HOME → home = "~" (fallback)
             Ok(FakeExec::ok()), // git worktree list → empty → None → convention
             Ok(FakeExec::ok()), // test -d preflight: dir exists
-            Ok(FakeExec::ok()), // new-session ok
+            Ok(RemoteOutput {
+                success: true,
+                stdout: tail,
+                stderr: String::new(),
+            }), // batched tail
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let (project, session) = (pid("api"), sid("fix-login"));
@@ -910,10 +1004,10 @@ mod tests {
             .expect("respawn");
         let calls = fake.calls.lock().expect("lock");
         // calls[0] = printf $HOME; calls[1] = git worktree list;
-        // calls[2] = test -d preflight; calls[3] = new-session.
+        // calls[2] = test -d preflight; calls[3] = batched tail (sh -c <script>).
         // Never a `git worktree add` (the worktree survives).
         assert!(calls[2].iter().any(|a| a == "test") && calls[2].iter().any(|a| a == "-d"));
-        assert!(calls[3].iter().any(|a| a == "new-session"));
+        assert!(calls[3].iter().any(|a| a.contains("new-session")));
         assert!(!calls.iter().any(|c| c.iter().any(|a| a == "add")));
         assert_eq!(fake.opened.lock().expect("lock").len(), 1);
     }
@@ -924,11 +1018,20 @@ mod tests {
         // the live session — but through the fingerprint gate (#105), so the
         // show-environment preflight must report the REMORA_* fingerprint.
         let config = test_config();
+        let dup_tail = rec(
+            batch::StepId::NewSession,
+            "duplicate session: remora_api_fix-login",
+            1,
+        );
         let fake = Arc::new(FakeExec::new(vec![
             Ok(FakeExec::ok()), // printf $HOME → home = "~" (fallback)
             Ok(FakeExec::ok()), // git worktree list → empty → None → convention
             Ok(FakeExec::ok()), // test -d preflight: dir exists
-            Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
+            Ok(RemoteOutput {
+                success: true,
+                stdout: dup_tail,
+                stderr: String::new(),
+            }), // batched tail: duplicate
             Ok(FakeExec::out("REMORA_AGENT=claude\n")), // show-environment: fingerprint present
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
@@ -1066,11 +1169,23 @@ mod tests {
             command = ["claude"]
         "#;
         let config = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let tail = [
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
         let fake = Arc::new(FakeExec::new(vec![
             Ok(FakeExec::ok()), // printf $HOME → home = "~" (fallback)
             Ok(FakeExec::ok()), // git worktree list → empty → None → convention
             Ok(FakeExec::ok()), // test -d: worktree dir exists
-            Ok(FakeExec::ok()), // new-session ok
+            Ok(RemoteOutput {
+                success: true,
+                stdout: tail,
+                stderr: String::new(),
+            }), // batched tail
         ]));
         let source = SshSource::with_exec(host("devbox", None, None), config, fake.clone());
         let (project, session) = (pid("scratch"), sid("s1"));
@@ -1088,26 +1203,39 @@ mod tests {
     #[tokio::test]
     async fn respawn_uses_the_supplied_agent_not_the_project_default() {
         // Project default is "claude"; respawn with "codex" must launch codex.
+        let tail = [
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
         let fake = Arc::new(FakeExec::new(vec![
-            Ok(FakeExec::ok()), // printf $HOME → home = "~" (fallback)
-            Ok(FakeExec::ok()), // git worktree list → empty → None → convention
-            Ok(FakeExec::ok()), // test -d preflight: dir exists
-            Ok(FakeExec::ok()), // new-session ok
+            Ok(FakeExec::ok()),       // printf $HOME → home = "~" (fallback)
+            Ok(FakeExec::ok()),       // git worktree list → empty → None → convention
+            Ok(FakeExec::ok()),       // test -d preflight: dir exists
+            Ok(FakeExec::out(&tail)), // batched tail
         ]));
         let src =
             SshSource::with_exec(host("devbox", None, None), two_agent_config(), fake.clone());
-        let _ = src
-            .respawn(
-                &pid("api"),
-                &sid("fix"),
-                Some(AgentId::new("codex").expect("slug")),
-            )
-            .await;
-        // The new-session argv carries the codex launch command.
-        let new_session = fake.recorded_argv_containing("new-session");
+        src.respawn(
+            &pid("api"),
+            &sid("fix"),
+            Some(AgentId::new("codex").expect("slug")),
+        )
+        .await
+        .expect("respawn with codex agent must succeed");
+        // The batched tail script (calls[3]) carries the codex launch command.
+        let calls = fake.calls.lock().expect("lock");
         assert!(
-            new_session.iter().any(|a| a.contains("codex")),
-            "respawn should launch the supplied agent, got: {new_session:?}"
+            calls[3][0] == "sh" && calls[3][1] == "-c",
+            "batched tail must be sh -c"
+        );
+        assert!(
+            calls[3][2].contains("codex"),
+            "respawn should launch the supplied agent; script arg: {:?}",
+            &calls[3][2][..calls[3][2].len().min(400)]
         );
     }
 }

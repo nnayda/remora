@@ -18,14 +18,15 @@ export interface ActivitySink {
  * the store records the latest value per key and notifies React subscribers
  * (via useSyncExternalStore) only on an actual change.
  *
- *   setStatus(key, s) ─▶ status map ─┐
- *   setPreview(key, t) ─▶ preview map ├▶ snapshot (status only) ─▶ UI
- *   clear(key)        ─▶ drop both   ┘   (commit only on status change)
+ *   setStatus(key, s)  ─▶ status map (+ expire stale preview) ─▶ snapshot ─▶ UI
+ *   setPreview(key, t) ─▶ preview map ─▶ preview snapshot ─▶ UI (own commit; never churns the status snapshot)
+ *   clear(key)         ─▶ drop both   (snapshots updated independently; at most one notification)
  */
 export class ActivityStore implements ActivitySink {
   private readonly status = new Map<string, ActivityState>();
   private readonly previews = new Map<string, string>();
   private snapshot: ReadonlyMap<string, ActivityState> = new Map();
+  private previewSnapshot: ReadonlyMap<string, string> = new Map();
   private readonly listeners = new Set<() => void>();
 
   subscribe = (listener: () => void): (() => void) => {
@@ -37,28 +38,45 @@ export class ActivityStore implements ActivitySink {
 
   getSnapshot = (): ReadonlyMap<string, ActivityState> => this.snapshot;
 
+  getPreviewSnapshot = (): ReadonlyMap<string, string> => this.previewSnapshot;
+
   getPreview = (key: string): string | undefined => this.previews.get(key);
 
   setStatus(key: string, status: ActivityState): void {
     if (this.status.get(key) === status) return; // no churn on unchanged status
     this.status.set(key, status);
-    this.commit();
+    // A preview belongs to the status episode it arrived in. A status change
+    // makes any prior preview stale, so drop it — otherwise re-entering
+    // `awaiting` without a fresh preview would re-show the previous prompt as
+    // agent-claimed text. The detector emits Status before Preview within one
+    // marker (ADR-0013), so a marker that does carry a preview re-sets it on the
+    // very next call; this only expires orphaned text.
+    const hadPreview = this.previews.delete(key);
+    this.snapshot = new Map(this.status);
+    if (hadPreview) this.previewSnapshot = new Map(this.previews);
+    this.notify();
   }
 
   setPreview(key: string, preview: string): void {
-    // Preview is recorded for future consumers (#60/#73/#61); it is not part of
-    // the status snapshot, so recording it does not notify status subscribers.
+    if (this.previews.get(key) === preview) return; // no churn on unchanged text
     this.previews.set(key, preview);
+    this.commitPreviews();
   }
 
   clear(key: string): void {
-    const had = this.status.delete(key);
-    this.previews.delete(key);
-    if (had) this.commit();
+    const hadStatus = this.status.delete(key);
+    const hadPreview = this.previews.delete(key);
+    if (hadStatus) this.snapshot = new Map(this.status);
+    if (hadPreview) this.previewSnapshot = new Map(this.previews);
+    if (hadStatus || hadPreview) this.notify();
   }
 
-  private commit(): void {
-    this.snapshot = new Map(this.status);
+  private notify(): void {
     for (const listener of this.listeners) listener();
+  }
+
+  private commitPreviews(): void {
+    this.previewSnapshot = new Map(this.previews);
+    this.notify();
   }
 }

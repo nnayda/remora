@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Agent prompt preview** (#61): when an agent is waiting on you, the sidebar
+  session row now shows what it asked ("the session says: …") on hover. A
+  Claude Code Notification hook (`contrib/agent-hooks/claude-code/`) emits the
+  text over the existing in-band activity marker; Remora core sanitizes and
+  length-caps the untrusted payload and the UI renders it as sandbox-claimed.
+  See `docs/agent-hooks.md` and ADR-0018. The richer Activity panel and a phone
+  push (with the relay) are follow-ups.
+- **Connecting spinner in the sidebar session row** (#170): clicking a session
+  to open or attach it now spins a small marine indicator in the row's status
+  slot within a frame of the click, instead of reading as a dead click while a
+  slow `ssh`/`kubectl` spawn-or-attach runs for several seconds. The store
+  publishes the in-flight key the moment an open starts (deriving it from the
+  existing double-open `pending` guard, so it can't drift) and clears it when the
+  open resolves to a live tab, fails, or is cancelled. Covers both the attach
+  (`openSession`) and spawn-from-stopped (`openViaRespawn`) paths. The spinner
+  fills the activity-pulse footprint rather than animating beside it, staying
+  within the design system's one-expressive-animation rule.
+- **ADR-0017: reduce kubectl exec round-trips instead of reusing connections**
+  (#106): a throwaway benchmark against a live high-RTT k8s 1.36 cluster showed
+  operation latency is dominated by sequential round-trip *count* × RTT, not
+  per-connection setup. Batching the dependent `spawn` exec chain (~83% faster)
+  and parallelizing the independent `list()` fan-out (~82%) each beat a heavy
+  in-process `kube-rs` reused client (~47%, and 3× slower in absolute terms),
+  with no new dependency. The ADR records the decision to pursue the no-dep
+  round-trip reduction and reject `kube-rs`; implementation is tracked in #182.
+- **Batched `spawn`/`respawn` exec chains** (#182): the spawn-side
+  implementation of ADR-0017. The dependent `spawn` chain (fetch →
+  base-resolution → worktree-add → new-session → passthrough → metadata) and the
+  `respawn` stamp tail now run as a single in-pod `sh` script behind the
+  existing `RemoteExec` seam — steps framed by ASCII control bytes and parsed
+  back in Rust, with per-step failure classification, the worktree-cleanup gate,
+  and the #105 fingerprint all preserved. This cuts kubectl worktree-spawn from
+  ~11 round-trips to 3 (the kubectl-only binary probe + one script + the
+  interactive attach) and ssh to 2, with no new dependency and no change to the
+  pod contract (`sh` + `tmux` + `git`). The git base cascade (`origin/HEAD` →
+  `origin/main` → `origin/master`, each peeled with `^{commit}`) moves into the
+  shell script as the single source of truth — the Rust `resolve_base` is
+  removed — and is covered by real-`sh` tests against a live local git repo.
+  Discovery (`list()`) batching is the follow-up half of #182.
+- **Batched `list()` discovery fan-out** (#182): the second and final half of
+  ADR-0017. The discovery poll's independent fan-out — the trusted session
+  names, the inline `#{E:}` metadata enrichment, `$HOME`, and one `git worktree
+  list` per configured project — now runs as a single `RunAll` batched `sh`
+  script instead of `3 + M` separate round-trips, parsed back into the same
+  discovery streams. Every property is preserved: the #108 trusted-names /
+  untrusted-metadata split, the #190 stale-socket tolerance (a dead tmux server
+  still scans worktrees), the #124 `$HOME` canonicalization and its degradation,
+  and the per-project scan tolerance. The shared frame builder now strips the
+  RS/US delimiter bytes from each step's captured output, so an attacker-set
+  tmux `#{E:}` value can never forge a record boundary — making the framing
+  unforgeable by construction (this also retroactively hardens the spawn path).
 - **Design system documented in `DESIGN.md`** (#150): the shipped token system
   (`apps/desktop/src/styles/tokens/*.css`) now has a written home in the
   [Google design.md](https://github.com/google-labs-code/design.md) format —
@@ -436,6 +487,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Discovery no longer drops a host's worktrees after a Kubernetes pod
+  restart** (#190). After a pod restart on a persistent volume the tmux server
+  dies but its socket file survives, so `tmux list-sessions` fails with `error
+  connecting to <sock> (No such file or directory)`. The discovery (`list`)
+  classifier only treated `no server running` / `no sessions` as the benign cold
+  state, so it mapped the stale socket to a transport error and aborted
+  `run_list` before the worktree scan — the host went `available:false` and its
+  rows were pruned after the reconnect grace (ADR-0016), reappearing only once a
+  new spawn restarted tmux. The list path now shares the attach path's "server
+  gone" tolerance through a single `stderr_signals_server_absent` helper: a
+  stale-socket failure is the cold state (empty live set), so discovery proceeds
+  to surface the surviving stopped/respawnable sessions. The stale-socket arm
+  requires both `error connecting to` and the `No such file or directory` detail,
+  so a live-but-unreachable socket (`Permission denied`) and genuine ssh/kubectl
+  connection failures still surface as transport errors rather than wrongly
+  clearing a host that is merely unreachable.
 - **Re-clicking the already-active live session in the sidebar now focuses its
   terminal** (#141). Clicking a sidebar session whose local tab was already the
   active, live tab did nothing: `openSession`'s dedupe set `activeKey` to its

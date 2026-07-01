@@ -130,6 +130,21 @@ mod tests {
         format!("\x1b]7366;remora;1;state;{state_b64}\x07").into_bytes()
     }
 
+    const AWAITING_INPUT_B64: &str = "YXdhaXRpbmdfaW5wdXQ="; // base64("awaiting_input")
+
+    fn make_wrapped(state_b64: &str, msg_b64: &str) -> String {
+        // tmux passthrough envelope (inner ESC doubled), ADR-0010 on-wire form.
+        format!("\x1bPtmux;\x1b\x1b]7366;remora;1;state;{state_b64};{msg_b64}\x07\x1b\\")
+    }
+
+    fn strip_tmux_passthrough(wrapped: &str) -> String {
+        wrapped
+            .strip_prefix("\x1bPtmux;")
+            .and_then(|s| s.strip_suffix("\x1b\\"))
+            .expect("tmux passthrough envelope")
+            .replace("\x1b\x1b", "\x1b")
+    }
+
     #[test]
     fn parses_a_whole_state_marker() {
         let mut s = MarkerScanner::new();
@@ -204,5 +219,135 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode("working\0");
         let mut s = MarkerScanner::new();
         assert!(s.feed(&marker(&b64)).is_empty());
+    }
+
+    #[test]
+    fn remora_notify_recipe_round_trip() {
+        use base64::Engine as _;
+        // The literal message a Notification hook would carry.
+        let msg = "Approve running tests?";
+        let enc = base64::engine::general_purpose::STANDARD.encode(msg);
+
+        // The exact WRAPPED bytes remora-notify.sh emits (keep in sync with the script).
+        let wrapped = make_wrapped(AWAITING_INPUT_B64, &enc);
+
+        // Reverse what tmux does on the way out: drop the envelope, un-double ESC.
+        let inner = strip_tmux_passthrough(&wrapped);
+
+        // Core only ever sees the inner form; assert the scanner accepts it.
+        let mut s = MarkerScanner::new();
+        let hits = s.feed(inner.as_bytes());
+        assert_eq!(hits.len(), 1, "exactly one marker, got {hits:?}");
+        assert_eq!(hits[0].status, SessionStatus::Awaiting);
+        assert_eq!(
+            hits[0].preview.as_ref().expect("preview").as_str(),
+            "Approve running tests?"
+        );
+    }
+
+    #[test]
+    fn wrapped_envelope_shape_is_tmux_passthrough() {
+        // Guards against regressing the recipe back to a bare OSC (which tmux eats).
+        // Built via make_wrapped so the shape test is tied to the real construction helper.
+        let wrapped = make_wrapped(AWAITING_INPUT_B64, "QQ==");
+        assert!(
+            wrapped.starts_with("\x1bPtmux;"),
+            "missing passthrough prefix"
+        );
+        assert!(wrapped.ends_with("\x1b\\"), "missing ST terminator");
+        assert!(
+            wrapped.contains("\x1b\x1b]7366;"),
+            "inner ESC must be doubled"
+        );
+    }
+
+    /// Regression guard: executes the actual shell script and asserts its
+    /// stdout bytes match the wire contract. A no-op in minimal environments
+    /// (no bash/jq), but is the live guard where tooling is present.
+    ///
+    /// This test ties the SCRIPT to the wire contract — editing the script
+    /// back to a bare OSC or stdout would fail here. The manual hermes
+    /// dogfood (/dev/tty + real tmux) remains the true e2e gate.
+    #[test]
+    fn script_output_matches_wire_contract() {
+        use base64::Engine as _;
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let script_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contrib/agent-hooks/claude-code/remora-notify.sh"
+        );
+
+        // Skip if the script file doesn't exist (e.g. partial checkout).
+        if !std::path::Path::new(script_path).exists() {
+            eprintln!("skip: script not found at {script_path}");
+            return;
+        }
+
+        // Skip if bash or jq is unavailable (minimal CI environments).
+        let has_jq = Command::new("bash")
+            .arg("-c")
+            .arg("command -v jq")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !has_jq {
+            eprintln!("skip: jq not found — skipping script round-trip test");
+            return;
+        }
+
+        // Run the script with REMORA_MARKER_OUT=/dev/stdout so the marker
+        // bytes go to captured stdout rather than /dev/tty.
+        let mut child = Command::new("bash")
+            .arg(script_path)
+            .env("REMORA_MARKER_OUT", "/dev/stdout")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("bash should spawn");
+
+        let msg = "Approve running tests?";
+        // Use serde_json to build the JSON so quotes/backslashes in msg can't malform it.
+        let stdin_json = serde_json::json!({ "message": msg }).to_string();
+        child
+            .stdin
+            .take()
+            .expect("stdin piped")
+            .write_all(format!("{stdin_json}\n").as_bytes())
+            .expect("write stdin");
+
+        let output = child.wait_with_output().expect("script should exit");
+        assert!(
+            output.status.success(),
+            "script exited non-zero: {:?}",
+            output.status
+        );
+
+        let enc = base64::engine::general_purpose::STANDARD.encode(msg);
+        let expected = make_wrapped(AWAITING_INPUT_B64, &enc);
+
+        let stdout = String::from_utf8(output.stdout).expect("script output is utf-8");
+        // The script's printf emits no trailing newline; trim at most one in
+        // case the environment's printf adds one (some bash/base64 combos do).
+        let stdout = stdout.trim_end_matches('\n');
+
+        assert_eq!(
+            stdout, expected,
+            "script output does not match wire contract"
+        );
+
+        // Feed through strip_tmux_passthrough and assert the scanner produces
+        // the expected hit, tying the script output to the full scanner pipeline.
+        let inner = strip_tmux_passthrough(&expected);
+
+        let mut s = MarkerScanner::new();
+        let hits = s.feed(inner.as_bytes());
+        assert_eq!(hits.len(), 1, "exactly one marker from script output");
+        assert_eq!(hits[0].status, SessionStatus::Awaiting);
+        assert_eq!(
+            hits[0].preview.as_ref().expect("preview").as_str(),
+            "Approve running tests?"
+        );
     }
 }

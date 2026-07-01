@@ -50,6 +50,11 @@ export interface Tab {
 export interface Snapshot {
   tabs: Tab[];
   activeKey: string | null;
+  /** Keys whose open (spawn/attach/respawn) is in flight but not yet committed
+   * as a tab. Drives the sidebar row's connecting spinner (#170): a fresh open
+   * has no tab to carry a status until it resolves, so this transient set is the
+   * only signal the click registered. Mirrors the `pending` open guard. */
+  connecting: string[];
 }
 
 export interface StoreOpeners {
@@ -116,7 +121,7 @@ export class SessionStore {
   private reconnectTokens = new Map<string, ReconnectToken>();
   private disposed = false;
   private listeners = new Set<() => void>();
-  private snapshot: Snapshot = { tabs: [], activeKey: null };
+  private snapshot: Snapshot = { tabs: [], activeKey: null, connecting: [] };
   private teardownPending = new Set<string>();
   // Per-key count of in-flight respawns. A respawn is an "open" for
   // mutual-exclusion purposes but, unlike `openTab`, isn't tracked in `pending`
@@ -160,6 +165,9 @@ export class SessionStore {
     this.snapshot = {
       tabs: this.tabs.map((t) => ({ ...t })),
       activeKey: this.activeKey,
+      // `pending` is exactly the set of in-flight opens (set/cleared only in
+      // openTab), so it doubles as the connecting set the UI spins on.
+      connecting: [...this.pending.keys()],
     };
     for (const listener of this.listeners) listener();
   }
@@ -311,6 +319,9 @@ export class SessionStore {
     }
     const token = { cancelled: false };
     this.pending.set(key, token);
+    // Publish the in-flight key now (synchronously, before the await suspends)
+    // so the sidebar row spins within a frame of the click (#170).
+    this.commit();
     let opened: { connection: SessionConnection; attached: boolean };
     try {
       opened = await open(
@@ -324,12 +335,14 @@ export class SessionStore {
       );
     } catch (error) {
       this.pending.delete(key);
+      this.commit(); // clear the spinner on failure
       return { ok: false, error };
     }
     this.pending.delete(key);
 
     if (token.cancelled || this.disposed) {
       void opened.connection.close().catch(() => {});
+      this.commit(); // clear the spinner on cancel/dispose
       return { ok: false, error: OPEN_CANCELLED };
     }
 

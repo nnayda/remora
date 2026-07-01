@@ -11,9 +11,10 @@
 use portable_pty::CommandBuilder;
 use remora_protocol::{ProjectId, SessionId, SessionMeta};
 
+use super::batch::{self, Step, StepId};
 use super::pty_process::spawn_pty_channel;
 use crate::config::Config;
-use crate::discovery::{self, DiscoveredEnv};
+use crate::discovery;
 use crate::naming::{
     derive_session_id, parse_tmux_session_name, tmux_session_name, ENV_AGENT, ENV_CREATED_AT,
     ENV_PREFIX, ENV_WORKSPACE,
@@ -173,6 +174,8 @@ pub(crate) fn attach_tokens(tmux_name: &str) -> Vec<String> {
 /// Tokens for `git -C <project> worktree add -b <branch> <worktree> [<start>]`.
 /// `start_point` (a resolved base ref, #54) is appended last and shell-quoted
 /// when present; `None` reproduces the legacy local-HEAD behavior.
+/// Used by the ssh transport tests to verify token composition.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn worktree_add_tokens(plan: &SpawnPlan, start_point: Option<&str>) -> Vec<String> {
     let branch = plan.branch.as_deref().unwrap_or_default();
     let mut tokens = vec![
@@ -202,36 +205,6 @@ pub(crate) fn fetch_tokens(project_path: &str) -> Vec<String> {
         quote_remote_path(project_path),
         "fetch".into(),
         "origin".into(),
-    ]
-}
-
-/// Tokens for `git -C <project> symbolic-ref --short refs/remotes/origin/HEAD`
-/// — prints origin's default branch (e.g. `origin/main`).
-pub(crate) fn remote_head_tokens(project_path: &str) -> Vec<String> {
-    vec![
-        "git".into(),
-        "-C".into(),
-        quote_remote_path(project_path),
-        "symbolic-ref".into(),
-        "--short".into(),
-        "refs/remotes/origin/HEAD".into(),
-    ]
-}
-
-/// Tokens for `git -C <project> rev-parse --verify --quiet <ref>^{commit}` —
-/// confirms `git_ref` resolves to a commit. The exact (fully-qualified) ref
-/// plus the `^{commit}` peel defeats DWIM resolution against a tag like
-/// `refs/tags/origin/main` and rejects a dangling symbolic ref. The ref is
-/// shell-quoted because `^{}` are shell-special.
-pub(crate) fn verify_commit_tokens(project_path: &str, git_ref: &str) -> Vec<String> {
-    vec![
-        "git".into(),
-        "-C".into(),
-        quote_remote_path(project_path),
-        "rev-parse".into(),
-        "--verify".into(),
-        "--quiet".into(),
-        shell_quote(&format!("{git_ref}^{{commit}}")),
     ]
 }
 
@@ -333,7 +306,7 @@ pub(crate) fn branch_delete_tokens(project_path: &str, branch: &str) -> Vec<Stri
 ///
 /// `allow-passthrough` is intentionally NOT chained here: it is absent on
 /// tmux < 3.3 and would cause the whole invocation to fail on those versions,
-/// orphaning the just-created session. It is applied after `create_session`
+/// orphaning the just-created session. It is applied after the new-session step
 /// succeeds via [`set_passthrough_tokens`] and tolerated on failure.
 ///
 /// The `;` is **shell-quoted** (`';'`) so the remote login shell passes it to
@@ -392,7 +365,7 @@ pub(crate) fn new_session_tokens(plan: &SpawnPlan) -> Vec<String> {
 }
 
 /// Tokens for `tmux set-option -t <name> allow-passthrough on`. Applied
-/// AFTER `create_session` succeeds — best-effort, absent on tmux < 3.3,
+/// after the new-session step succeeds — best-effort, absent on tmux < 3.3,
 /// degrades to quiescence-only activity detection, must never fail the spawn.
 /// Called by `run_spawn` and `run_respawn` with its result tolerated (ignored).
 pub(crate) fn set_passthrough_tokens(tmux_name: &str) -> Vec<String> {
@@ -547,17 +520,43 @@ pub(crate) fn has_remora_fingerprint(show_environment_stdout: &str) -> bool {
 // Error classifiers
 // ---------------------------------------------------------------------------
 
+/// Whether a failed `tmux list-sessions` stderr positively means "no tmux
+/// server is reachable, so there are zero live sessions" — the benign cold
+/// state for a *list*, as opposed to an ambiguous transport failure. Matched
+/// case-insensitively so an odd-case variant still trips (the phrases aren't
+/// localized by tmux/ssh/kubectl, so this is case-folding, not locale-proofing).
+/// Covers the two cold-state phrasings tmux emits (`no server running` when the
+/// server is gone, `no sessions` when it's up but empty) plus the stale-socket
+/// case a pod/host restart on a persistent volume leaves behind: the server
+/// process dies with the pod but its socket file survives on the volume, so
+/// `list-sessions` prints `error connecting to <sock> (No such file or
+/// directory)` instead (#190). The stale-socket arm requires BOTH `error
+/// connecting to` AND `no such file`: pairing the connect failure with the
+/// ENOENT detail proves the socket is actually gone, so a live-but-unreachable
+/// socket (`error connecting to <sock> (Permission denied)` — server still up,
+/// wrong uid/mode) stays `Transport` rather than wrongly clearing a host that
+/// still has live sessions. The `error connecting to` phrase is tmux-specific —
+/// ssh prints `connect to host …` and kubectl `unable to connect to the
+/// server`, so a genuine transport failure still falls through to `Transport`
+/// rather than being mistaken for an empty host. Shared with the attach
+/// preflight via [`attach_stderr_signals_absent`].
+fn stderr_signals_server_absent(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("no server running")
+        || lower.contains("no sessions")
+        || (lower.contains("error connecting to") && lower.contains("no such file"))
+}
+
 /// Classifies `tmux list-sessions`: success → the stdout rows (each a
 /// `name<SEP>agent<SEP>workspace<SEP>created_at` line, parsed by
-/// `discovery::parse_session_line`); a no-server / no-sessions stderr → empty
-/// (the normal cold state, decision 9, matched case-insensitively); any other
+/// `discovery::parse_session_line`); a server-absent stderr → empty (the normal
+/// cold state, decision 9; see [`stderr_signals_server_absent`]); any other
 /// failure → `Transport`.
 pub(crate) fn classify_list_sessions(out: &RemoteOutput) -> Result<Vec<String>, SourceError> {
     if out.success {
         return Ok(out.stdout.lines().map(str::to_string).collect());
     }
-    let lower = out.stderr.to_ascii_lowercase();
-    if lower.contains("no server running") || lower.contains("no sessions") {
+    if stderr_signals_server_absent(&out.stderr) {
         Ok(Vec::new())
     } else {
         Err(SourceError::Transport(out.stderr.clone()))
@@ -624,7 +623,9 @@ pub(crate) fn stderr_signals_session_absent(stderr: &str) -> bool {
 }
 
 /// Attach-only "session absent" classifier: the shared
-/// [`stderr_signals_session_absent`] plus the fully-torn-down-server case.
+/// [`stderr_signals_session_absent`] plus the fully-torn-down-server case
+/// ([`stderr_signals_server_absent`], which adds the stale-socket
+/// `error connecting to … (No such file or directory)`).
 ///
 /// When the tmux server itself is gone (socket missing), tmux prints
 /// `error connecting to <sock> (No such file or directory)` rather than a
@@ -633,34 +634,18 @@ pub(crate) fn stderr_signals_session_absent(stderr: &str) -> bool {
 /// genuinely absent → `SessionNotFound`. The phrase is tmux-specific: ssh prints
 /// `connect to host …` and kubectl `unable to connect to the server`, so a real
 /// connection failure still surfaces as `Transport`, not a misleading "not
-/// found". This is deliberately NOT folded into the shared classifier: the spawn
-/// cleanup gate must stay conservative, since a connection error there could
-/// mean the session was created just before the link dropped, and reclaiming its
-/// worktree would yank a live session's cwd (#105 review).
+/// found". This is deliberately NOT folded into the shared
+/// `stderr_signals_session_absent`: the spawn cleanup gate must stay
+/// conservative, since a connection error there could mean the session was
+/// created just before the link dropped, and reclaiming its worktree would yank
+/// a live session's cwd (#105 review).
 fn attach_stderr_signals_absent(stderr: &str) -> bool {
-    stderr_signals_session_absent(stderr)
-        || stderr.to_ascii_lowercase().contains("error connecting to")
+    stderr_signals_session_absent(stderr) || stderr_signals_server_absent(stderr)
 }
 
 // ---------------------------------------------------------------------------
 // Orchestration (transport-neutral; called by every transport's SessionSource)
 // ---------------------------------------------------------------------------
-
-/// `tmux new-session -d` — the atomic creation lock. `Ok` on success;
-/// `Err(SessionExists)` on a duplicate name (case-insensitive); otherwise
-/// `Err(Transport)`. Opens no channel.
-pub(crate) fn create_session(exec: &dyn RemoteExec, plan: &SpawnPlan) -> Result<(), SourceError> {
-    let out = exec.run(&new_session_tokens(plan))?;
-    if out.success {
-        Ok(())
-    } else {
-        Err(classify_new_session_failure(
-            &out.stderr,
-            &plan.project_id,
-            &plan.session_id,
-        ))
-    }
-}
 
 /// Writes the `REMORA_*` env metadata. Every call is tolerated: a metadata
 /// failure must never fail an already-live session (values are untrusted /
@@ -691,30 +676,6 @@ fn fingerprint_present(exec: &dyn RemoteExec, tmux_name: &str) -> bool {
     exec.run(&show_environment_tokens(tmux_name))
         .map(|out| out.success && has_remora_fingerprint(&out.stdout))
         .unwrap_or(false)
-}
-
-/// The shared spawn/respawn tail: enable passthrough, write the `REMORA_*`
-/// metadata, ensure the fingerprint actually landed, then open the channel.
-///
-/// allow-passthrough is best-effort (absent on tmux < 3.3, degrades to
-/// quiescence-only activity detection). The metadata write is best-effort too,
-/// but its `REMORA_*` env is load-bearing: attach/reconnect fingerprints the
-/// session by it (#105). So when a write reports failure, confirm at least one
-/// var stuck and re-stamp once on a total miss — otherwise a transient blip at
-/// spawn would leave a live but permanently unreconnectable session. The verify
-/// round-trip is paid only on a write failure; the happy path costs nothing
-/// extra. Still never fails an already-live session on a metadata hiccup: a
-/// fingerprint that refuses to stick degrades to pre-#105 behavior, not a failed
-/// spawn.
-fn stamp_and_attach(
-    exec: &dyn RemoteExec,
-    plan: &SpawnPlan,
-) -> Result<SessionChannel, SourceError> {
-    let _ = exec.run(&set_passthrough_tokens(&plan.tmux_name));
-    if !write_metadata(exec, plan) && !fingerprint_present(exec, &plan.tmux_name) {
-        let _ = write_metadata(exec, plan);
-    }
-    attach_channel(exec, &plan.tmux_name)
 }
 
 /// Opens the PTY attach channel to an existing session (no liveness
@@ -774,7 +735,7 @@ pub(crate) fn run_attach(
 /// Fingerprinted attach for the respawn duplicate-session race. When
 /// `run_respawn`'s `new-session` lock loses to a concurrent respawner, the
 /// winner created the session but may not have stamped its `REMORA_*` metadata
-/// yet (it stamps just after the lock — see `stamp_and_attach`), so a straight
+/// yet (passthrough + set-env follow immediately in the batch), so a straight
 /// [`run_attach`] could momentarily see an unfingerprinted session and reject
 /// it. Retry the fingerprinted attach a few times to absorb that stamp window.
 /// Only `SessionNotFound` is retried; a real impostor never gains a fingerprint,
@@ -796,102 +757,63 @@ fn run_attach_awaiting_fingerprint(
     result
 }
 
-/// Resolves the git start-point for a new worktree (#54): fetch origin
-/// (best-effort), then the cascade — explicit `plan.base` → detected
-/// `origin/HEAD` (verified) → `origin/main` → `origin/master` → `None` (omit
-/// the start-point, branch off local `HEAD`). Only the fetch swallows errors;
-/// a detection exec `Err` (transport down) propagates, while a non-zero exit
-/// (ref absent) falls through.
-pub(crate) fn resolve_base(
-    exec: &dyn RemoteExec,
-    plan: &SpawnPlan,
-) -> Result<Option<String>, SourceError> {
-    // 1. Fetch — best-effort: swallow both Err and a non-zero exit.
-    let _ = exec.run(&fetch_tokens(&plan.project_path));
-
-    // 2. Explicit per-session/per-project base wins; no detection round-trips.
-    if let Some(base) = &plan.base {
-        return Ok(Some(base.clone()));
-    }
-
-    // 3. origin/HEAD, verified to resolve to a commit (guards stale/dangling).
-    let head = exec.run(&remote_head_tokens(&plan.project_path))?;
-    if head.success {
-        let candidate = head.stdout.trim();
-        if !candidate.is_empty()
-            && ref_resolves(
-                exec,
-                &plan.project_path,
-                &format!("refs/remotes/{candidate}"),
-            )?
-        {
-            return Ok(Some(candidate.to_string()));
-        }
-    }
-
-    // 4. Probe origin/main then origin/master (exact refspec, exit-only fall-through).
-    for short in ["origin/main", "origin/master"] {
-        if ref_resolves(exec, &plan.project_path, &format!("refs/remotes/{short}"))? {
-            return Ok(Some(short.to_string()));
-        }
-    }
-
-    // 5. Nothing resolved — omit the start-point (legacy local-HEAD base).
-    Ok(None)
-}
-
-/// Whether `git_ref^{commit}` resolves. Exec `Err` (transport) propagates; a
-/// non-zero exit (ref absent / dangling) is `false`.
-fn ref_resolves(
-    exec: &dyn RemoteExec,
-    project_path: &str,
-    git_ref: &str,
-) -> Result<bool, SourceError> {
-    Ok(exec
-        .run(&verify_commit_tokens(project_path, git_ref))?
-        .success)
-}
-
-/// Orchestrates the full spawn sequence: optional worktree creation, tmux
-/// new-session (the atomic lock, which also applies `remain-on-exit`), env
-/// metadata, then attach. Each step crosses the `RemoteExec` seam so tests can
-/// inject a `FakeExec` without touching the network.
+/// Orchestrates spawn as a single batched script + attach. The script runs
+/// fetch → (cascade) worktree-add → new-session → passthrough → set-env,
+/// each framed; a fatal step (worktree-add / new-session) halts the chain. The
+/// runner drives off the PARSED RECORDS, never `out.success` (a fatal `exit`
+/// makes the exec report failure while the records are still valid). The
+/// cleanup gate (has-session probe + worktree remove) and the metadata
+/// re-stamp stay in Rust, paid only on failure or a missed write.
 pub(crate) fn run_spawn(
     exec: &dyn RemoteExec,
     plan: &SpawnPlan,
 ) -> Result<SessionChannel, SourceError> {
-    if plan.branch.is_some() {
-        let start_point = resolve_base(exec, plan)?;
-        let out = exec.run(&worktree_add_tokens(plan, start_point.as_deref()))?;
-        if !out.success {
-            return Err(classify_worktree_add_failure(
-                &out.stderr,
-                &plan.project_id,
-                &plan.session_id,
-            ));
-        }
+    let steps = build_spawn_steps(plan);
+    let out = exec.run(&batch::build(&steps, batch::BatchMode::StopOnError))?;
+    let records = batch::parse_records(&out.stdout)?;
+
+    if records.is_empty() {
+        // No records at all ⇒ the exec itself failed before the script ran.
+        return Err(SourceError::Transport(if out.stderr.trim().is_empty() {
+            out.stdout
+        } else {
+            out.stderr
+        }));
     }
 
-    if let Err(err) = create_session(exec, plan) {
-        // A non-duplicate failure usually means no session was created, so the
-        // worktree we just made is orphaned — best-effort remove it so the slot
-        // stays retryable. A duplicate means a live session already owns it.
-        //
-        // But the lock command chains `new-session ';' set-option …` under one
-        // exit code (#28, #53): a non-zero exit can also mean the session WAS
-        // created and only a trailing set-option failed. Force-removing the worktree then
-        // would yank a LIVE session's cwd out from under it. So gate the cleanup
-        // on a has-session probe and remove only once it confirms no session
-        // exists; if the probe can't run, leave the worktree (better an orphan
-        // than a nuked live session).
-        if plan.branch.is_some() && !matches!(err, SourceError::SessionExists { .. }) {
-            // A non-zero `has-session` does NOT by itself mean "absent": an
-            // ssh/auth/network failure also exits non-zero (as `Ok(success=
-            // false)`, not `Err`). Only a known tmux "no such session" stderr is
-            // safe to clean up on; treat anything ambiguous as "leave it".
+    // Classify the first FATAL step that failed (the chain halts there).
+    if let Some(rec) = records
+        .iter()
+        .find(|r| r.rc != 0 && matches!(r.id, StepId::WorktreeAdd))
+    {
+        return Err(classify_worktree_add_failure(
+            &rec.output,
+            &plan.project_id,
+            &plan.session_id,
+        ));
+    }
+    if let Some(rec) = records
+        .iter()
+        .find(|r| r.rc != 0 && matches!(r.id, StepId::NewSession))
+    {
+        let err = classify_new_session_failure(&rec.output, &plan.project_id, &plan.session_id);
+        // Reaching a NewSession record at all means WorktreeAdd SUCCEEDED:
+        // WorktreeAdd is a fatal step in the StopOnError batch, so its
+        // failure exits the script before a NewSession record is emitted.
+        // Therefore `plan.dir` is a worktree WE created this call — a
+        // pre-existing dir or branch would have failed WorktreeAdd (→
+        // `SessionExists`) and halted the script before here. This is why
+        // probe-gated cleanup is safe for the `SessionExists`/duplicate case
+        // as well as any other NewSession failure: in either case the
+        // worktree at `plan.dir` is a fresh orphan, not a foreign session's
+        // cwd. The `has-session` probe gates on "is a session LIVE under
+        // that name?" (its own exec so stderr is separable): a live session
+        // (probe success → `session_absent=false`) is never touched — the
+        // name was taken by whoever won the lock, and its worktree is theirs.
+        if plan.branch.is_some() {
             let session_absent = exec
                 .run(&has_session_tokens(&plan.tmux_name))
-                .map(|out| !out.success && stderr_signals_session_absent(&out.stderr))
+                .map(|o| !o.success && stderr_signals_session_absent(&o.stderr))
                 .unwrap_or(false);
             if session_absent {
                 let _ = exec.run(&worktree_remove_tokens(&plan.project_path, &plan.dir));
@@ -900,7 +822,41 @@ pub(crate) fn run_spawn(
         return Err(err);
     }
 
-    stamp_and_attach(exec, plan)
+    // The session-creating lock (NewSession) must have a PRESENT, successful record
+    // before we attach. A truncated stream (the exec died mid-batch after an earlier
+    // step's record but before NewSession ran) leaves NewSession absent; attaching a
+    // never-created session would orphan the worktree we just made. The earlier
+    // rc!=0 branches handle a NewSession that ran AND failed; this handles one that
+    // never ran. (run_respawn is immune: NewSession is its first step, so a
+    // truncated/empty stream is already caught by parse error / records.is_empty().)
+    let new_session_ok = records
+        .iter()
+        .any(|r| matches!(r.id, StepId::NewSession) && r.rc == 0);
+    if !new_session_ok {
+        if plan.branch.is_some() {
+            let session_absent = exec
+                .run(&has_session_tokens(&plan.tmux_name))
+                .map(|o| !o.success && stderr_signals_session_absent(&o.stderr))
+                .unwrap_or(false);
+            if session_absent {
+                let _ = exec.run(&worktree_remove_tokens(&plan.project_path, &plan.dir));
+            }
+        }
+        return Err(SourceError::Transport(
+            "batch incomplete: new-session step did not complete".into(),
+        ));
+    }
+
+    // All fatal steps succeeded. Passthrough + set-env are best-effort; if any
+    // set-env record failed, confirm the fingerprint landed and re-stamp once
+    // (same policy as the respawn batched tail).
+    let metadata_missed = records
+        .iter()
+        .any(|r| matches!(r.id, StepId::SetEnv) && r.rc != 0);
+    if metadata_missed && !fingerprint_present(exec, &plan.tmux_name) {
+        let _ = write_metadata(exec, plan);
+    }
+    attach_channel(exec, &plan.tmux_name)
 }
 
 /// Re-creates a stopped session's tmux session and attaches. Unlike spawn:
@@ -981,42 +937,108 @@ pub(crate) fn run_respawn(
             Err(SourceError::Transport(probe.stderr))
         };
     }
-    match create_session(exec, effective) {
-        Ok(()) => stamp_and_attach(exec, effective),
-        // A concurrent respawner already created it (ADR-0004). Attach to the
-        // live session — but still through the fingerprint gate (#105), so a
-        // same-named impostor holding the name can't receive the PTY by winning
-        // this branch. The bounded retry absorbs the window where the concurrent
-        // respawner has taken the new-session lock but not yet stamped metadata.
-        Err(SourceError::SessionExists { .. }) => {
-            run_attach_awaiting_fingerprint(exec, &effective.project_id, &effective.session_id)
-        }
-        Err(err) => Err(err),
+    // Batched stamp tail: new-session (the atomic lock) + passthrough + set-env,
+    // one script. No worktree-add / fetch / cascade (the worktree survives).
+    let mut steps = vec![Step {
+        id: StepId::NewSession,
+        cmd: join_cmd(&new_session_tokens(effective)),
+        fatal: true,
+    }];
+    steps.push(Step {
+        id: StepId::Passthrough,
+        cmd: join_cmd(&set_passthrough_tokens(&effective.tmux_name)),
+        fatal: false,
+    });
+    for (key, value) in &effective.env {
+        steps.push(Step {
+            id: StepId::SetEnv,
+            cmd: join_cmd(&set_environment_tokens(&effective.tmux_name, key, value)),
+            fatal: false,
+        });
     }
+    let out = exec.run(&batch::build(&steps, batch::BatchMode::StopOnError))?;
+    let records = batch::parse_records(&out.stdout)?;
+    if records.is_empty() {
+        return Err(SourceError::Transport(if out.stderr.trim().is_empty() {
+            out.stdout
+        } else {
+            out.stderr
+        }));
+    }
+    if let Some(rec) = records
+        .iter()
+        .find(|r| r.rc != 0 && matches!(r.id, StepId::NewSession))
+    {
+        return match classify_new_session_failure(
+            &rec.output,
+            &effective.project_id,
+            &effective.session_id,
+        ) {
+            // A concurrent respawner already created it (ADR-0004): attach to
+            // the live session through the fingerprint gate (bounded retry
+            // absorbs the stamp window).
+            SourceError::SessionExists { .. } => {
+                run_attach_awaiting_fingerprint(exec, &effective.project_id, &effective.session_id)
+            }
+            other => Err(other),
+        };
+    }
+    // The session-creating lock must have a PRESENT, successful record before we
+    // attach. `NewSession` is respawn's first batched step, so a truncated stream
+    // is normally caught earlier (parse error / `records.is_empty()`); this
+    // fail-closed guard mirrors `run_spawn` so a non-empty stream that somehow
+    // lacks a successful `NewSession` (a future step reorder, a partial frame)
+    // can never fall through to attaching a never-created session. No worktree
+    // cleanup here: respawn reuses the surviving worktree, it never creates one.
+    let new_session_ok = records
+        .iter()
+        .any(|r| matches!(r.id, StepId::NewSession) && r.rc == 0);
+    if !new_session_ok {
+        return Err(SourceError::Transport(
+            "batch incomplete: new-session step did not complete".into(),
+        ));
+    }
+    // new-session ok; best-effort metadata re-stamp on a set-env miss.
+    let metadata_missed = records
+        .iter()
+        .any(|r| matches!(r.id, StepId::SetEnv) && r.rc != 0);
+    if metadata_missed && !fingerprint_present(exec, &effective.tmux_name) {
+        let _ = write_metadata(exec, effective);
+    }
+    attach_channel(exec, &effective.tmux_name)
 }
 
-/// Reads the inline `#{E:}` session metadata into a `name → env` map
-/// (best-effort; a failed/`no-server` read yields an empty map). This is
-/// ENRICHMENT only: `run_list` keys it by a name already proven live by the
-/// trusted [`list_session_names_tokens`] listing, so a forged env value whose
-/// embedded newline fabricates an extra row here cannot introduce a session —
-/// the phantom name simply isn't in the trusted set. A forged row that reuses a
-/// real session's name can at worst set that session's own (already untrusted,
-/// display-only — ADR-0004) metadata, which its real env could do anyway. Last
-/// row wins on a duplicate name.
-fn read_inline_metadata(exec: &dyn RemoteExec) -> std::collections::HashMap<String, DiscoveredEnv> {
-    let mut map = std::collections::HashMap::new();
-    if let Ok(out) = exec.run(&list_sessions_tokens()) {
-        if out.success {
-            for row in out.stdout.lines() {
-                let (name, env) = discovery::parse_session_line(row);
-                if !name.is_empty() {
-                    map.insert(name.to_string(), env);
-                }
-            }
-        }
+/// The `RunAll` list step list and the project ids in build order (a
+/// `BTreeMap` iteration, so deterministic). The `WorktreeScan` records parse
+/// back to these projects by index.
+fn build_list_steps(config: &Config) -> (Vec<Step>, Vec<ProjectId>) {
+    let mut steps = vec![
+        Step {
+            id: StepId::Names,
+            cmd: join_cmd(&list_session_names_tokens()),
+            fatal: false,
+        },
+        Step {
+            id: StepId::Metadata,
+            cmd: join_cmd(&list_sessions_tokens()),
+            fatal: false,
+        },
+        Step {
+            id: StepId::Home,
+            cmd: join_cmd(&remote_home_tokens()),
+            fatal: false,
+        },
+    ];
+    let mut project_ids = Vec::new();
+    for (project_id, project) in &config.projects {
+        steps.push(Step {
+            id: StepId::WorktreeScan,
+            cmd: join_cmd(&worktree_list_tokens(&project.path)),
+            fatal: false,
+        });
+        project_ids.push(project_id.clone());
     }
-    map
+    (steps, project_ids)
 }
 
 /// Discovers sessions on the host and joins them to local config. Config-
@@ -1024,72 +1046,116 @@ fn read_inline_metadata(exec: &dyn RemoteExec) -> std::collections::HashMap<Stri
 /// the worktree scan runs for every configured project (a worktree-override
 /// session can live on a shared-default project).
 ///
-/// Two listings, both one round-trip each (cheap over the shared ControlMaster,
-/// #63), replace the old `1 + N` per-session show-environment fan-out (#108):
-/// the TRUSTED names-only [`list_session_names_tokens`] decides the live set
-/// (env-free, so unforgeable), and [`read_inline_metadata`] enriches each by
-/// name. A live session whose metadata is missing (tmux < 3.0, or a metadata
-/// read flake) still lists, just with empty metadata.
+/// Issues one batched `RunAll` script (names + metadata + home +
+/// WorktreeScan×M) instead of 3+M round-trips, driving off parsed records
+/// (#182 / ADR-0017). A missing `names` record (exec never framed anything)
+/// surfaces as Transport. The stale-socket phrase in the names record
+/// classifies to empty (cold) via [`classify_list_sessions`], exactly as the
+/// pre-batch code did (#190).
 pub(crate) fn run_list(
     exec: &dyn RemoteExec,
     config: &Config,
 ) -> Result<Vec<SessionMeta>, SourceError> {
-    let names = classify_list_sessions(&exec.run(&list_session_names_tokens())?)?;
+    let (steps, project_ids) = build_list_steps(config);
+    let out = exec.run(&batch::build(&steps, batch::BatchMode::RunAll))?;
+    let records = batch::parse_records(&out.stdout)?;
 
-    // Skip the metadata round-trip entirely when nothing is live (matches the
-    // pre-#108 "no names ⇒ no per-session reads" behavior).
-    let metadata = if names.is_empty() {
-        std::collections::HashMap::new()
-    } else {
-        read_inline_metadata(exec)
+    // Find each section. A missing `names` record means the exec never framed
+    // anything (transport failure) — surface it rather than reporting cold.
+    let Some(names_rec) = records.iter().find(|r| matches!(r.id, StepId::Names)) else {
+        return Err(SourceError::Transport(if out.stderr.trim().is_empty() {
+            out.stdout
+        } else {
+            out.stderr
+        }));
     };
+    // RunAll frames every step unconditionally, so a missing fixed-layout record
+    // (Metadata, Home, or fewer WorktreeScan records than configured projects)
+    // means the stream was truncated mid-flight — a transport cut-off, not
+    // best-effort degradation. Fail loud so the poll retries rather than silently
+    // dropping later projects' stopped worktrees.
+    let scan_count = records
+        .iter()
+        .filter(|r| matches!(r.id, StepId::WorktreeScan))
+        .count();
+    if !records.iter().any(|r| matches!(r.id, StepId::Metadata))
+        || !records.iter().any(|r| matches!(r.id, StepId::Home))
+        || scan_count < project_ids.len()
+    {
+        return Err(SourceError::Transport(
+            "batch: list() stream truncated (missing section record)".into(),
+        ));
+    }
+
+    // Classify names via the existing classifier (cold state ⇒ empty, else
+    // Transport). The frame is combined 2>&1; feed it as both stdout/stderr so
+    // classify's success-branch (reads stdout) and failure-branch (reads
+    // stderr) both see it.
+    let names = classify_list_sessions(&RemoteOutput {
+        success: names_rec.rc == 0,
+        stdout: names_rec.output.clone(),
+        stderr: names_rec.output.clone(),
+    })?;
+
+    // Metadata enrichment (best-effort): parse the metadata record's rows,
+    // keyed later by the TRUSTED names. A failed/absent metadata record yields
+    // an empty map (#108 — a live session without metadata still lists).
+    let mut metadata = std::collections::HashMap::new();
+    if let Some(meta_rec) = records.iter().find(|r| matches!(r.id, StepId::Metadata)) {
+        if meta_rec.rc == 0 {
+            for row in meta_rec.output.lines() {
+                let (name, env) = discovery::parse_session_line(row);
+                if !name.is_empty() {
+                    metadata.insert(name.to_string(), env);
+                }
+            }
+        }
+    }
 
     let mut live = Vec::new();
     for name in &names {
         let Some((project, session)) = parse_tmux_session_name(name) else {
-            continue; // forged / non-remora name dropped
+            continue;
         };
         if !config.projects.contains_key(&project) {
-            continue; // R1: configured projects only
+            continue; // R1
         }
         let env = metadata.get(name.as_str()).cloned().unwrap_or_default();
         live.push((project, session, env));
     }
 
-    // Remote $HOME for path canonicalization (A1, #124). Best-effort: on
-    // failure (exec error, non-zero exit, or a non-absolute result), fall back
-    // to "~", which makes only `~/…` logical paths fail to canonicalize —
-    // they won't match any worktree, which is acceptable degradation and never
-    // a panic. Validates `starts_with('/')` per ADR-0004's never-trust rule.
-    let home = exec
-        .run(&remote_home_tokens())
-        .ok()
-        .filter(|o| o.success)
-        .map(|o| o.stdout.trim().to_string())
+    // $HOME (best-effort, validated absolute else "~").
+    let home = records
+        .iter()
+        .find(|r| matches!(r.id, StepId::Home) && r.rc == 0)
+        .map(|r| r.output.trim().to_string())
         .filter(|h| h.starts_with('/'))
         .unwrap_or_else(|| "~".to_string());
 
+    // Worktree scans: the i-th WorktreeScan record ↔ project_ids[i].
     let mut worktrees: Vec<(ProjectId, discovery::WorktreeInfo)> = Vec::new();
     let mut project_paths: std::collections::HashMap<ProjectId, String> =
         std::collections::HashMap::new();
     let mut scanned = std::collections::HashSet::new();
-    for (project_id, project) in &config.projects {
-        // Scan EVERY project: a worktree-override session can live on a
-        // shared-default project. Record which projects scanned cleanly so
-        // `join` can tell "scanned, no worktree" (⇒ Shared) apart from "scan
-        // failed" (⇒ unknown), instead of conflating a transient failure with
-        // Shared.
-        if let Ok(out) = exec.run(&worktree_list_tokens(&project.path)) {
-            if out.success {
-                scanned.insert(project_id.clone());
-                project_paths.insert(
-                    project_id.clone(),
-                    discovery::canonicalize_remote_path(&project.path, &home),
-                );
-                for wt in discovery::parse_worktree_porcelain(&out.stdout) {
-                    worktrees.push((project_id.clone(), wt));
-                }
-            }
+    let scan_recs: Vec<&batch::StepResult> = records
+        .iter()
+        .filter(|r| matches!(r.id, StepId::WorktreeScan))
+        .collect();
+    for (i, project_id) in project_ids.iter().enumerate() {
+        let Some(scan_rec) = scan_recs.get(i) else {
+            continue;
+        };
+        if scan_rec.rc != 0 {
+            continue; // decision 8: scan failed ⇒ not in `scanned`
+        }
+        let project = &config.projects[project_id];
+        scanned.insert(project_id.clone());
+        project_paths.insert(
+            project_id.clone(),
+            discovery::canonicalize_remote_path(&project.path, &home),
+        );
+        for wt in discovery::parse_worktree_porcelain(&scan_rec.output) {
+            worktrees.push((project_id.clone(), wt));
         }
     }
 
@@ -1603,6 +1669,82 @@ pub(crate) fn run_remove(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Batched spawn step assembly (#182)
+// ---------------------------------------------------------------------------
+
+/// The WorktreeAdd shell command. When `plan.base` is set, the base is a quoted
+/// literal start-point. Otherwise the start-point is the **shell base cascade**:
+/// an UNQUOTED `$(...)` so an empty result drops the positional start-point
+/// (legacy local-HEAD base) instead of passing `""` (which git rejects). Refs
+/// contain no IFS/whitespace, so the unquoted substitution is a single word.
+/// The cascade: verified `origin/HEAD` -> `origin/main` -> `origin/master`,
+/// each peeled with `^{commit}` to defeat a `refs/tags/origin/main` and reject
+/// a dangling ref.
+fn worktree_add_cmd(plan: &SpawnPlan) -> String {
+    let project = quote_remote_path(&plan.project_path);
+    let branch = shell_quote(plan.branch.as_deref().unwrap_or_default());
+    let dir = quote_remote_path(&plan.dir);
+    let start_point = match &plan.base {
+        Some(base) => shell_quote(base),
+        None => format!(
+            "$(r=$(git -C {p} symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null); \
+             if [ -n \"$r\" ] && git -C {p} rev-parse --verify --quiet \"refs/remotes/$r^{{commit}}\" >/dev/null 2>&1; then printf %s \"$r\"; \
+             elif git -C {p} rev-parse --verify --quiet \"refs/remotes/origin/main^{{commit}}\" >/dev/null 2>&1; then printf %s origin/main; \
+             elif git -C {p} rev-parse --verify --quiet \"refs/remotes/origin/master^{{commit}}\" >/dev/null 2>&1; then printf %s origin/master; fi)",
+            p = project
+        ),
+    };
+    format!("git -C {project} worktree add -b {branch} {dir} {start_point}")
+}
+
+/// Joins already-quoted logical tokens into one shell command for a step.
+/// Tokens are pre-quoted by their builders (e.g. `set_environment_tokens`,
+/// `new_session_tokens`); `batch::build` quotes the whole script once, so this
+/// must NOT re-quote.
+fn join_cmd(tokens: &[String]) -> String {
+    tokens.join(" ")
+}
+
+/// The ordered batched-spawn step list. Worktree mode: Fetch (non-fatal) ->
+/// WorktreeAdd (fatal, with cascade) -> NewSession (fatal) -> Passthrough
+/// (non-fatal) -> SetEnv x N (non-fatal, one per `plan.env` entry). Shared
+/// mode (no branch): omit Fetch + WorktreeAdd. Mirrors the pre-batch `run_spawn`
+/// order.
+fn build_spawn_steps(plan: &SpawnPlan) -> Vec<Step> {
+    let mut steps = Vec::new();
+    if plan.branch.is_some() {
+        steps.push(Step {
+            id: StepId::Fetch,
+            cmd: join_cmd(&fetch_tokens(&plan.project_path)),
+            fatal: false,
+        });
+        steps.push(Step {
+            id: StepId::WorktreeAdd,
+            cmd: worktree_add_cmd(plan),
+            fatal: true,
+        });
+    }
+    steps.push(Step {
+        id: StepId::NewSession,
+        cmd: join_cmd(&new_session_tokens(plan)),
+        fatal: true,
+    });
+    steps.push(Step {
+        id: StepId::Passthrough,
+        cmd: join_cmd(&set_passthrough_tokens(&plan.tmux_name)),
+        fatal: false,
+    });
+    for (key, value) in &plan.env {
+        steps.push(Step {
+            id: StepId::SetEnv,
+            cmd: join_cmd(&set_environment_tokens(&plan.tmux_name, key, value)),
+            fatal: false,
+        });
+    }
+    steps
+}
+
 #[cfg(all(test, unix))]
 pub(crate) mod tests {
     use std::sync::Arc;
@@ -1610,6 +1752,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::config::{Config, WorkspaceMode};
     use crate::spawn_plan::SpawnPlan;
+    use crate::transport::batch;
     use remora_protocol::{ProjectId, SessionId, SessionState};
 
     fn worktree_plan() -> SpawnPlan {
@@ -1687,18 +1830,6 @@ pub(crate) mod tests {
                 stdout: String::new(),
                 stderr: stderr.into(),
             }
-        }
-
-        /// Returns the first recorded argv that contains the given substring.
-        /// Panics if no call contains the substring.
-        pub fn recorded_argv_containing(&self, needle: &str) -> Vec<String> {
-            self.calls
-                .lock()
-                .expect("lock")
-                .iter()
-                .find(|argv| argv.iter().any(|a| a.contains(needle)))
-                .cloned()
-                .unwrap_or_else(|| panic!("no recorded argv contains {needle:?}"))
         }
 
         /// Counts recorded calls whose argv contains the given substring.
@@ -1886,8 +2017,8 @@ pub(crate) mod tests {
         // allow-passthrough is intentionally NOT in the atomic new-session chain:
         // it is absent on tmux < 3.3 and would cause the whole invocation to fail
         // on those versions, orphaning the just-created session. It is applied
-        // separately (best-effort) via set_passthrough_tokens after create_session
-        // succeeds.
+        // separately (best-effort) via set_passthrough_tokens after the
+        // new-session step succeeds.
         let plan = worktree_plan();
         let tokens = new_session_tokens(&plan);
         assert!(
@@ -1907,28 +2038,6 @@ pub(crate) mod tests {
         assert_eq!(tokens[3], "remora_api_fix-login");
         assert_eq!(tokens[4], "allow-passthrough");
         assert_eq!(tokens[5], "on");
-    }
-
-    #[test]
-    fn failing_passthrough_set_does_not_fail_spawn() {
-        // allow-passthrough is tolerated: a non-zero exit (tmux < 3.3 "unknown
-        // option") must never fail an already-live session.
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                 // fetch
-            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
-            Ok(FakeExec::ok()),                 // verify
-            Ok(FakeExec::ok()),                 // worktree add
-            Ok(FakeExec::ok()),                 // new-session (success)
-            Ok(FakeExec::fail("unknown option: allow-passthrough")), // passthrough — FAILS
-                                                // remaining set-environment calls succeed by default
-        ]);
-        let result = run_spawn(&fake, &plan);
-        assert!(
-            result.is_ok(),
-            "a failing allow-passthrough must not fail spawn: {result:?}"
-        );
-        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
     }
 
     #[test]
@@ -2397,499 +2506,817 @@ pub(crate) mod tests {
         ));
     }
 
-    // -----------------------------------------------------------------------
-    // run_spawn orchestration tests
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn shared_spawn_skips_worktree_add() {
-        let plan = SpawnPlan {
-            branch: None,
-            workspace: WorkspaceMode::Shared,
-            dir: "/home/dev/api".into(),
-            ..worktree_plan()
+    fn classify_list_sessions_treats_stale_socket_as_empty() {
+        // After a pod/host restart the tmux server is dead but its socket file
+        // survives on the persistent volume, so `list-sessions` prints
+        // `error connecting to <sock>` rather than `no server running` (#190).
+        // The list path must treat this as the cold state (empty) — not a
+        // transport error — or discovery aborts before scanning worktrees and
+        // drops the host's stopped sessions until a new spawn restarts tmux.
+        let stale = RemoteOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "error connecting to /tmp/tmux-1000/default (No such file or directory)".into(),
         };
-        let fake = FakeExec::new(vec![
-            // Only new-session should fire; all other run() calls succeed by default.
-            Ok(FakeExec::ok()),
-        ]);
-        let result = run_spawn(&fake, &plan);
-        assert!(result.is_ok(), "{result:?}");
-        // First call must be new-session (no worktree-add).
-        let calls = fake.calls.lock().expect("lock");
-        assert!(
-            calls[0].iter().any(|a| a == "new-session"),
-            "first call is new-session"
-        );
-        assert!(!calls[0].iter().any(|a| a == "worktree"), "no worktree-add");
-        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
-    }
-
-    #[test]
-    fn existing_worktree_aborts_before_create() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                                   // fetch
-            Ok(FakeExec::out("origin/main\n")),                   // symbolic-ref
-            Ok(FakeExec::ok()),                                   // verify
-            Ok(FakeExec::fail("fatal: '<path>' already exists")), // worktree add FAILS
-        ]);
-        let err = run_spawn(&fake, &plan).expect_err("worktree already exists");
-        assert!(matches!(err, SourceError::SessionExists { .. }), "{err}");
-        // 4 calls: fetch + symbolic-ref + verify + worktree-add, no channel opened.
-        assert_eq!(fake.calls.lock().expect("lock").len(), 4);
-        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
-    }
-
-    #[test]
-    fn duplicate_session_does_not_open_a_channel() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                 // fetch
-            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
-            Ok(FakeExec::ok()),                 // verify
-            // worktree add succeeds
-            Ok(FakeExec::ok()),
-            // new-session fails with duplicate
-            Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
-        ]);
-        let err = run_spawn(&fake, &plan).expect_err("duplicate session");
-        assert!(matches!(err, SourceError::SessionExists { .. }), "{err}");
-        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
-    }
-
-    #[test]
-    fn run_spawn_opens_exactly_one_channel_on_success() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![]);
-        let result = run_spawn(&fake, &plan);
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
-    }
-
-    #[test]
-    fn run_spawn_attach_tokens_end_with_tmux_name() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![]);
-        let _ = run_spawn(&fake, &plan);
-        let opened = fake.opened.lock().expect("lock");
-        let attach = &opened[0];
         assert_eq!(
-            attach.last().map(String::as_str),
-            Some("remora_api_fix-login")
+            classify_list_sessions(&stale).expect("stale socket is the cold state"),
+            Vec::<String>::new()
         );
     }
 
     #[test]
-    fn worktree_spawn_runs_add_create_passthrough_metadata_then_attaches_in_order() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                 // fetch
-            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
-            Ok(FakeExec::ok()),                 // verify
-            Ok(FakeExec::ok()),                 // worktree add
-            Ok(FakeExec::ok()),                 // new-session
-            Ok(FakeExec::ok()),                 // set-option allow-passthrough (best-effort)
-            Ok(FakeExec::ok()),                 // set-environment REMORA_AGENT
-            Ok(FakeExec::ok()),                 // set-environment REMORA_WORKSPACE
-            Ok(FakeExec::ok()),                 // set-environment REMORA_CREATED_AT
-        ]);
-        let result = run_spawn(&fake, &plan);
-        assert!(result.is_ok());
-        let calls = fake.calls.lock().expect("lock");
-        // fetch + symbolic-ref + verify + worktree add + new-session
-        // (remain-on-exit folded in atomically) + allow-passthrough (best-effort)
-        // + 3x set-environment = 9 blocking cmds.
-        assert_eq!(calls.len(), 9);
-        assert!(calls[3].iter().any(|a| a == "worktree"));
-        assert!(calls[4].iter().any(|a| a == "new-session"));
-        // remain-on-exit rides on the new-session call, not a follow-up exec:
-        // its `set-option` lives inside calls[4], never as a standalone call.
-        assert!(calls[4].iter().any(|a| a == "set-option"));
-        assert!(calls[4].iter().any(|a| a == "remain-on-exit"));
-        // calls[5] is the best-effort allow-passthrough set-option.
-        assert!(calls[5].iter().any(|a| a == "allow-passthrough"));
-        // calls[6..] are the set-environment metadata writes.
-        assert!(calls[6].iter().any(|a| a == "set-environment"));
+    fn classify_list_sessions_keeps_real_connection_failures_as_transport() {
+        // A genuine transport failure (ssh/kubectl can't reach the host) is NOT
+        // the cold state: surfacing it as empty would wrongly clear a host whose
+        // sessions are merely unreachable. ssh prints `connect to host …` and
+        // kubectl `unable to connect to the server` — neither is tmux's
+        // stale-socket `error connecting to`, so both must stay `Transport`.
+        for stderr in [
+            "ssh: connect to host hermes port 22: Connection refused",
+            "Unable to connect to the server: dial tcp: i/o timeout",
+        ] {
+            let out = RemoteOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: stderr.into(),
+            };
+            assert!(
+                matches!(classify_list_sessions(&out), Err(SourceError::Transport(_))),
+                "{stderr:?} should stay Transport"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_list_sessions_keeps_unreachable_live_socket_as_transport() {
+        // The stale-socket arm is pinned to the ENOENT detail, not the bare
+        // `error connecting to` phrase: `(Permission denied)` means the socket
+        // is still THERE and the server may be ALIVE (wrong uid/mode), so it is
+        // NOT the cold state. Classifying it as empty would clear a host whose
+        // sessions are live but momentarily unreachable — the same visibility
+        // loss #190 set out to prevent, from a different cause. Must stay
+        // `Transport` (#190 review: care not to over-broaden the phrase).
+        let perm = RemoteOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "error connecting to /tmp/tmux-1000/default (Permission denied)".into(),
+        };
         assert!(
-            !calls[6..]
-                .iter()
-                .any(|c| c.iter().any(|a| a == "set-option")),
-            "remain-on-exit is not a standalone follow-up call after metadata"
+            matches!(
+                classify_list_sessions(&perm),
+                Err(SourceError::Transport(_))
+            ),
+            "live-but-unreachable socket must stay Transport"
         );
-        // Happy path pays no verify round-trip: when every set-environment
-        // succeeds, the fingerprint confirm/re-stamp (#105) is skipped entirely.
+    }
+
+    // -----------------------------------------------------------------------
+    // run_spawn orchestration tests (batched — #182)
+    // -----------------------------------------------------------------------
+
+    /// Builds one batch record string for FakeExec stdout.
+    pub(crate) fn rec(id: batch::StepId, output: &str, rc: i32) -> String {
+        format!(
+            "{}{}{}{}{}{}",
+            id.token(),
+            batch::US,
+            output,
+            batch::US,
+            rc,
+            batch::RS
+        )
+    }
+
+    #[test]
+    fn run_spawn_worktree_happy_path_is_one_run_plus_attach() {
+        // The batched script succeeds: all records present, all rc 0.
+        let stdout = [
+            rec(batch::StepId::Fetch, "", 0),
+            rec(batch::StepId::WorktreeAdd, "Preparing worktree", 0),
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        run_spawn(&fake, &worktree_plan()).expect("spawn");
+        // Exactly ONE run (the batched script) + ONE channel open (attach).
+        assert_eq!(fake.calls.lock().expect("lock").len(), 1, "one batched run");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1, "one attach");
+    }
+
+    #[test]
+    fn run_spawn_worktree_add_already_exists_is_session_exists() {
+        // Fatal WorktreeAdd failed; the chain halted (only its record present).
+        let stdout = [
+            rec(batch::StepId::Fetch, "", 0),
+            rec(
+                batch::StepId::WorktreeAdd,
+                "fatal: '...' already exists",
+                128,
+            ),
+        ]
+        .concat();
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        let err = run_spawn(&fake, &worktree_plan()).expect_err("already exists");
+        assert!(matches!(err, SourceError::SessionExists { .. }), "{err}");
+        assert_eq!(
+            fake.opened.lock().expect("lock").len(),
+            0,
+            "no attach on failure"
+        );
+    }
+
+    #[test]
+    fn run_spawn_new_session_duplicate_is_session_exists_and_runs_cleanup_gate() {
+        // WorktreeAdd ok, NewSession duplicate. Runner then issues the cleanup
+        // gate: a separate has-session probe; here it reports the session ABSENT
+        // (a torn-down race), so the worktree is removed.
+        let script_stdout = [
+            rec(batch::StepId::Fetch, "", 0),
+            rec(batch::StepId::WorktreeAdd, "", 0),
+            rec(
+                batch::StepId::NewSession,
+                "duplicate session: remora_api_fix-login",
+                1,
+            ),
+        ]
+        .concat();
+        let fake = FakeExec::new(vec![
+            Ok(RemoteOutput {
+                success: true,
+                stdout: script_stdout,
+                stderr: String::new(),
+            }),
+            // cleanup-gate has-session probe: absent
+            Ok(RemoteOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "can't find session".into(),
+            }),
+            // worktree remove
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+        ]);
+        let err = run_spawn(&fake, &worktree_plan()).expect_err("duplicate");
+        assert!(matches!(err, SourceError::SessionExists { .. }), "{err}");
+        let calls = fake.calls.lock().expect("lock");
         assert!(
-            !calls
+            calls.iter().any(|c| c.iter().any(|a| a == "has-session")),
+            "cleanup gate probes"
+        );
+        assert!(
+            calls.iter().any(|c| c.iter().any(|a| a == "remove")),
+            "absent ⇒ worktree removed"
+        );
+        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
+    }
+
+    #[test]
+    fn run_spawn_generic_new_session_failure_with_ambiguous_has_session_leaves_worktree() {
+        // NewSession failed generically (Transport). The cleanup gate's
+        // has-session probe returns an AMBIGUOUS error (not a tmux "absent"
+        // phrase): the worktree must NOT be removed (could be a live session).
+        let script_stdout = [
+            rec(batch::StepId::Fetch, "", 0),
+            rec(batch::StepId::WorktreeAdd, "", 0),
+            rec(batch::StepId::NewSession, "tmux: connection refused", 1),
+        ]
+        .concat();
+        let fake = FakeExec::new(vec![
+            Ok(RemoteOutput {
+                success: true,
+                stdout: script_stdout,
+                stderr: String::new(),
+            }),
+            // cleanup-gate probe: ambiguous (not an "absent" phrase)
+            Ok(RemoteOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "ssh: connect to host: Connection refused".into(),
+            }),
+        ]);
+        let err = run_spawn(&fake, &worktree_plan()).expect_err("generic");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
+        let calls = fake.calls.lock().expect("lock");
+        assert!(calls.iter().any(|c| c.iter().any(|a| a == "has-session")));
+        assert!(
+            !calls.iter().any(|c| c.iter().any(|a| a == "remove")),
+            "ambiguous ⇒ leave worktree"
+        );
+    }
+
+    #[test]
+    fn run_spawn_metadata_miss_confirms_fingerprint_and_restamps() {
+        // All fatal steps ok, but a SetEnv record reports rc!=0 (metadata miss).
+        // Runner confirms via show-environment; absent fingerprint ⇒ re-stamp.
+        let script_stdout = [
+            rec(batch::StepId::Fetch, "", 0),
+            rec(batch::StepId::WorktreeAdd, "", 0),
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "lost", 1), // a write missed
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
+        let fake = FakeExec::new(vec![
+            Ok(RemoteOutput {
+                success: true,
+                stdout: script_stdout,
+                stderr: String::new(),
+            }),
+            // fingerprint_present check (show-environment): no REMORA_*
+            Ok(RemoteOutput {
+                success: true,
+                stdout: "PATH=/usr/bin\n".into(),
+                stderr: String::new(),
+            }),
+            // re-stamp set-environment x3 (best-effort; default Ok fills rest)
+        ]);
+        run_spawn(&fake, &worktree_plan()).expect("spawn still succeeds");
+        let calls = fake.calls.lock().expect("lock");
+        assert!(
+            calls
                 .iter()
                 .any(|c| c.iter().any(|a| a == "show-environment")),
-            "no fingerprint verify when metadata writes all succeed"
+            "fingerprint confirmed"
         );
-        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
-    }
-
-    #[test]
-    fn spawn_restamps_metadata_when_every_write_fails_so_session_stays_reconnectable() {
-        // All three set-environment writes fail at spawn (transient blip), but
-        // the session is live. The REMORA_* env is load-bearing for reconnect
-        // (#105), so the tail confirms the fingerprint, finds it absent, and
-        // re-stamps once — otherwise every later attach would reject this live
-        // session as SessionNotFound forever.
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                   // fetch
-            Ok(FakeExec::out("origin/main\n")),   // symbolic-ref
-            Ok(FakeExec::ok()),                   // verify
-            Ok(FakeExec::ok()),                   // worktree add
-            Ok(FakeExec::ok()),                   // new-session
-            Ok(FakeExec::ok()),                   // allow-passthrough
-            Ok(FakeExec::fail("blip")),           // set-environment REMORA_AGENT (FAIL)
-            Ok(FakeExec::fail("blip")),           // set-environment REMORA_WORKSPACE (FAIL)
-            Ok(FakeExec::fail("blip")),           // set-environment REMORA_CREATED_AT (FAIL)
-            Ok(FakeExec::out("PATH=/usr/bin\n")), // show-environment: no fingerprint
-            Ok(FakeExec::ok()),                   // re-stamp REMORA_AGENT
-            Ok(FakeExec::ok()),                   // re-stamp REMORA_WORKSPACE
-            Ok(FakeExec::ok()),                   // re-stamp REMORA_CREATED_AT
-        ]);
-        let result = run_spawn(&fake, &plan);
         assert!(
-            result.is_ok(),
-            "a metadata blip must not fail spawn: {result:?}"
+            calls
+                .iter()
+                .any(|c| c.iter().any(|a| a == "set-environment")),
+            "re-stamp must fire when fingerprint is absent"
         );
-        // One verify round-trip, and the three writes were retried (3 + 3 = 6).
-        assert_eq!(fake.count_calls_with("show-environment"), 1);
-        assert_eq!(fake.count_calls_with("set-environment"), 6);
-        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1, "still attaches");
     }
 
     #[test]
-    fn spawn_does_not_restamp_when_one_metadata_write_survives() {
-        // A partial write still leaves a usable fingerprint (any single REMORA_*
-        // var suffices), so the tail confirms it and skips the re-stamp.
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                         // fetch
-            Ok(FakeExec::out("origin/main\n")),         // symbolic-ref
-            Ok(FakeExec::ok()),                         // verify
-            Ok(FakeExec::ok()),                         // worktree add
-            Ok(FakeExec::ok()),                         // new-session
-            Ok(FakeExec::ok()),                         // allow-passthrough
-            Ok(FakeExec::ok()),                         // set-environment REMORA_AGENT (ok)
-            Ok(FakeExec::fail("blip")),                 // set-environment REMORA_WORKSPACE (FAIL)
-            Ok(FakeExec::fail("blip")),                 // set-environment REMORA_CREATED_AT (FAIL)
-            Ok(FakeExec::out("REMORA_AGENT=claude\n")), // show-environment: fingerprint present
-        ]);
-        let result = run_spawn(&fake, &plan);
-        assert!(result.is_ok(), "{result:?}");
-        // Verified once, NOT re-stamped: only the original 3 writes happened.
-        assert_eq!(fake.count_calls_with("show-environment"), 1);
-        assert_eq!(fake.count_calls_with("set-environment"), 3);
-        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    fn run_spawn_transport_failure_with_no_records_is_transport() {
+        // kubectl/ssh itself failed before the script produced records.
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "Unable to connect to the server".into(),
+        })]);
+        let err = run_spawn(&fake, &worktree_plan()).expect_err("transport");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
     }
 
     #[test]
-    fn metadata_failure_is_tolerated_and_still_attaches() {
-        let plan = worktree_plan();
+    fn run_spawn_truncated_before_new_session_removes_orphan_and_errors() {
+        // The exec stream is truncated AFTER WorktreeAdd succeeded but BEFORE
+        // NewSession produced a record (channel death / pod killed mid-batch).
+        // run_spawn must detect the absent NewSession record, probe has-session
+        // (absent here), remove the orphaned worktree, and return Transport.
+        let stdout = [
+            rec(batch::StepId::Fetch, "", 0),
+            rec(batch::StepId::WorktreeAdd, "", 0),
+            // No NewSession record: stream truncated here.
+        ]
+        .concat();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                                      // fetch
-            Ok(FakeExec::out("origin/main\n")),                      // symbolic-ref
-            Ok(FakeExec::ok()),                                      // verify
-            Ok(FakeExec::ok()),                                      // worktree add
-            Ok(FakeExec::ok()), // new-session (live! remain-on-exit folded in)
-            Ok(FakeExec::fail("unknown option: allow-passthrough")), // passthrough — tolerated
-            Ok(FakeExec::fail("set-env boom")), // REMORA_AGENT — tolerated
-            Err(SourceError::Transport("net".into())), // REMORA_WORKSPACE — tolerated
-            Ok(FakeExec::ok()), // REMORA_CREATED_AT
+            Ok(RemoteOutput {
+                success: true,
+                stdout,
+                stderr: String::new(),
+            }),
+            // has-session probe: session absent
+            Ok(RemoteOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "can't find session".into(),
+            }),
+            // worktree remove
+            Ok(FakeExec::ok()),
         ]);
-        let result = run_spawn(&fake, &plan);
-        assert!(
-            result.is_ok(),
-            "metadata failures must not fail a live session"
-        );
-        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
-    }
-
-    #[test]
-    fn new_session_generic_failure_is_transport_and_opens_no_channel() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                      // fetch
-            Ok(FakeExec::out("origin/main\n")),      // symbolic-ref
-            Ok(FakeExec::ok()),                      // verify
-            Ok(FakeExec::ok()),                      // worktree add
-            Ok(FakeExec::fail("no server running")), // new-session: generic failure
-            Ok(FakeExec::fail("no server running")), // has-session: confirms no session
-        ]);
-        let err = run_spawn(&fake, &plan).expect_err("should fail");
-        assert!(matches!(err, SourceError::Transport(_)));
-        assert!(fake.opened.lock().expect("lock").is_empty());
-        // The orphaned worktree is cleaned up so the slot stays retryable.
-        let calls = fake.calls.lock().expect("lock");
-        assert!(
-            calls.last().expect("a call").iter().any(|a| a == "remove"),
-            "non-duplicate failure removes the orphaned worktree"
-        );
-    }
-
-    #[test]
-    fn live_session_worktree_is_not_removed_when_set_option_fails() {
-        // The atomic new-session+set-option command shares one exit code (#28):
-        // a non-zero exit can mean the session WAS created but the trailing
-        // set-option failed. The session is then live, so its worktree must NOT
-        // be force-removed. A has-session probe gates the orphan cleanup.
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                                               // fetch
-            Ok(FakeExec::out("origin/main\n")),                               // symbolic-ref
-            Ok(FakeExec::ok()),                                               // verify
-            Ok(FakeExec::ok()),                                               // worktree add
-            Ok(FakeExec::fail("set-option: unknown option: remain-on-exit")), // created, set-option failed
-            Ok(FakeExec::ok()), // has-session: the session IS live
-        ]);
-        let err = run_spawn(&fake, &plan).expect_err("transport error");
+        let err = run_spawn(&fake, &worktree_plan()).expect_err("truncated stream is error");
         assert!(matches!(err, SourceError::Transport(_)), "{err}");
         let calls = fake.calls.lock().expect("lock");
         assert!(
-            !calls.iter().any(|c| c.iter().any(|a| a == "remove")),
-            "a live session's worktree must never be force-removed"
+            calls.iter().any(|c| c.iter().any(|a| a == "has-session")),
+            "must probe has-session: {calls:?}"
         );
+        assert!(
+            calls.iter().any(|c| c.iter().any(|a| a == "remove")),
+            "absent session ⇒ orphan worktree must be removed: {calls:?}"
+        );
+        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
     }
 
     #[test]
-    fn ambiguous_has_session_probe_failure_does_not_remove_the_worktree() {
-        // An ssh/network/auth failure surfaces as a non-zero remote command
-        // (`Ok(success=false)`), NOT as `Err`. A bare `!success` probe would
-        // read that as "session absent" and remove a possibly-live worktree.
-        // Only known tmux "absent" stderr is safe to clean up on; anything
-        // ambiguous leaves the worktree.
-        let plan = worktree_plan();
+    fn run_spawn_truncated_before_new_session_leaves_worktree_when_session_live() {
+        // Same truncated stream (no NewSession record), but the has-session probe
+        // returns LIVE — the worktree must NOT be removed (it could be another
+        // session's cwd; don't touch it).
+        let stdout = [
+            rec(batch::StepId::Fetch, "", 0),
+            rec(batch::StepId::WorktreeAdd, "", 0),
+        ]
+        .concat();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                                               // fetch
-            Ok(FakeExec::out("origin/main\n")),                               // symbolic-ref
-            Ok(FakeExec::ok()),                                               // verify
-            Ok(FakeExec::ok()),                                               // worktree add
-            Ok(FakeExec::fail("set-option: unknown option: remain-on-exit")), // created, set-option failed
-            Ok(FakeExec::fail(
-                "ssh: connect to host devbox port 22: Connection refused",
-            )), // has-session probe itself failed
+            Ok(RemoteOutput {
+                success: true,
+                stdout,
+                stderr: String::new(),
+            }),
+            // has-session probe: session LIVE
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
         ]);
-        let err = run_spawn(&fake, &plan).expect_err("transport error");
+        let err = run_spawn(&fake, &worktree_plan()).expect_err("truncated stream is error");
         assert!(matches!(err, SourceError::Transport(_)), "{err}");
         let calls = fake.calls.lock().expect("lock");
         assert!(
-            !calls.iter().any(|c| c.iter().any(|a| a == "remove")),
-            "an ambiguous probe failure must not trigger worktree removal"
+            calls.iter().any(|c| c.iter().any(|a| a == "has-session")),
+            "must probe has-session: {calls:?}"
         );
+        assert!(
+            !calls.iter().any(|c| c.iter().any(|a| a == "remove")),
+            "live session ⇒ worktree must NOT be removed: {calls:?}"
+        );
+        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
     }
 
     #[test]
-    fn duplicate_session_does_not_remove_the_worktree() {
-        // A duplicate means a LIVE session owns the worktree — never remove it.
-        let plan = worktree_plan();
+    fn run_spawn_shared_mode_is_one_run_plus_attach() {
+        // A shared plan (branch = None) skips Fetch + WorktreeAdd and runs only
+        // NewSession → Passthrough → SetEnv. Exactly one batched run + one attach;
+        // no has-session / remove / add calls.
+        let mut plan = worktree_plan();
+        plan.branch = None;
+        let stdout = [
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        run_spawn(&fake, &plan).expect("spawn");
+        assert_eq!(fake.calls.lock().expect("lock").len(), 1, "one batched run");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1, "one attach");
+        assert_eq!(fake.count_calls_with("has-session"), 0);
+        assert_eq!(fake.count_calls_with("remove"), 0);
+        assert_eq!(fake.count_calls_with("add"), 0);
+    }
+
+    #[test]
+    fn run_spawn_passthrough_failure_does_not_fail_spawn() {
+        // Passthrough (allow-passthrough) is non-fatal: a tmux < 3.3 that rejects
+        // the option must not abort the spawn. The batch records rc=1 for it; run_spawn
+        // must still return Ok and open exactly one channel.
+        let stdout = [
+            rec(batch::StepId::Fetch, "", 0),
+            rec(batch::StepId::WorktreeAdd, "", 0),
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 1), // rc=1, non-fatal
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        run_spawn(&fake, &worktree_plan()).expect("spawn");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
+    #[test]
+    fn run_spawn_malformed_record_is_transport() {
+        // A record with an unknown step id is a Transport error — parse_records
+        // fails and run_spawn must propagate it without opening any channel.
+        let stdout = format!("bogus_id{}out{}0{}", batch::US, batch::US, batch::RS);
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        let err = run_spawn(&fake, &worktree_plan()).expect_err("malformed record is error");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 0);
+    }
+
+    #[test]
+    fn run_spawn_duplicate_with_live_session_does_not_remove_worktree() {
+        // WorktreeAdd ok, NewSession duplicate. The cleanup-gate has-session
+        // probe shows the session is LIVE (success: true). The invariant:
+        // the worktree at plan.dir was created this call (WorktreeAdd
+        // succeeded before NewSession), but the name is now held by a live
+        // session — so the worktree must NOT be removed (it would yank a
+        // live session's cwd). The has-session probe safety check must veto
+        // removal in this case.
+        let script_stdout = [
+            rec(batch::StepId::Fetch, "", 0),
+            rec(batch::StepId::WorktreeAdd, "", 0),
+            rec(
+                batch::StepId::NewSession,
+                "duplicate session: remora_api_fix-login",
+                1,
+            ),
+        ]
+        .concat();
         let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                 // fetch
-            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
-            Ok(FakeExec::ok()),                 // verify
-            Ok(FakeExec::ok()),                 // worktree add
-            Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
+            Ok(RemoteOutput {
+                success: true,
+                stdout: script_stdout,
+                stderr: String::new(),
+            }),
+            // cleanup-gate has-session probe: session is LIVE
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
         ]);
-        let err = run_spawn(&fake, &plan).expect_err("dup");
-        assert!(matches!(err, SourceError::SessionExists { .. }));
+        let err = run_spawn(&fake, &worktree_plan()).expect_err("duplicate");
+        assert!(
+            matches!(err, SourceError::SessionExists { .. }),
+            "expected SessionExists, got: {err}"
+        );
         let calls = fake.calls.lock().expect("lock");
         assert!(
+            calls.iter().any(|c| c.iter().any(|a| a == "has-session")),
+            "cleanup gate must probe has-session: {calls:?}"
+        );
+        assert!(
             !calls.iter().any(|c| c.iter().any(|a| a == "remove")),
-            "must not remove a live session's worktree"
+            "live session's worktree must NOT be removed: {calls:?}"
+        );
+        assert_eq!(
+            fake.opened.lock().expect("lock").len(),
+            0,
+            "no attach on failure"
         );
     }
 
     // -----------------------------------------------------------------------
-    // run_list orchestration tests
+    // run_list orchestration tests (batched — #182)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn list_joins_live_metadata_stopped_and_filters_unconfigured() {
-        // Config has project `api` (worktree, path /home/dev/api). `ghost` is NOT configured.
-        let config = test_config();
-        // Scripted exec, in call order (two listings, HOME fetch, then worktree scan, #108, #124):
-        //  1) list-sessions names -> api (configured) + ghost (unconfigured) +
-        //     `main` & `remora__bad` (unparseable). Only api survives.
-        //  2) list-sessions inline metadata -> enrichment keyed by trusted name.
-        //     workspace_path is absolute so the path-anchored join can match (#124).
-        //  3) printf $HOME -> "/home/dev" so paths beginning with /home/dev/api
-        //     canonicalize correctly for the A2′ primary-checkout detection.
-        //  4) git worktree list for api -> realistic output: primary checkout first
-        //     (as real git always emits), then fix-login (live) + add-tests (stopped).
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::out(
-                "remora_api_fix-login\nremora_ghost_x\nmain\nremora__bad\n",
-            )),
-            Ok(FakeExec::out(
-                "remora_api_fix-login\tclaude\t/home/dev/.remora/worktrees/api/fix-login\t1765500000\n",
-            )),
-            Ok(FakeExec::out("/home/dev")), // printf $HOME
-            Ok(FakeExec::out(
-                "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n\n\
-                 worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n\n\
-                 worktree /home/dev/.remora/worktrees/api/add-tests\nbranch refs/heads/remora/add-tests\n",
-            )),
-        ]);
-        let metas = run_list(&fake, &config).expect("list");
+    /// Build one RunAll batched stdout from section records.
+    fn list_stdout(sections: &[(batch::StepId, &str, i32)]) -> String {
+        sections
+            .iter()
+            .map(|(id, out, rc)| rec(*id, out, *rc))
+            .collect::<Vec<_>>()
+            .concat()
+    }
 
-        // ghost filtered out (R1). api/add-tests is Stopped+Worktree; api/fix-login is Live+Worktree.
-        // The primary checkout (/home/dev/api == project path) surfaces as Stopped+Shared (A2′).
+    #[test]
+    fn run_list_batches_into_one_call_and_joins() {
+        // test_config has one project `api` (worktree, /home/dev/api).
+        // One batched call returns: names (including an unconfigured ghost),
+        // metadata, home, wt_scan(api) with primary checkout + worktree.
+        let cfg = test_config();
+        let stdout = list_stdout(&[
+            // remora_ghost_x is live but "ghost" is not in config → R1 drops it.
+            (
+                batch::StepId::Names,
+                "remora_api_fix-login\nremora_ghost_x\n",
+                0,
+            ),
+            (batch::StepId::Metadata, "remora_api_fix-login\tclaude\t/home/dev/.remora/worktrees/api/fix-login\t1765500000\n", 0),
+            (batch::StepId::Home, "/home/dev", 0),
+            // WorktreeScan includes both the primary checkout (/home/dev/api,
+            // A2': surfaces as Shared) and the fix-login worktree.
+            (batch::StepId::WorktreeScan, "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n\nworktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n", 0),
+        ]);
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        let metas = run_list(&fake, &cfg).expect("list");
         assert_eq!(
-            metas.len(),
-            3,
-            "expected 3 rows (add-tests, fix-login, main-checkout), got: {metas:?}"
+            fake.calls.lock().expect("lock").len(),
+            1,
+            "exactly ONE batched run (was 3+M)"
         );
-        let main_row = metas
-            .iter()
-            .find(|m| m.branch.as_deref() == Some("main"))
-            .expect("primary-checkout main row missing");
-        assert_eq!(
-            main_row.workspace,
-            Some(WorkspaceMode::Shared),
-            "primary checkout must be Shared (A2′): {main_row:?}"
+        // R1: the unconfigured ghost session must be filtered out.
+        assert!(
+            !metas.iter().any(|m| m.session_id.as_str() == "x"),
+            "R1: ghost session must not appear in list: {metas:?}"
         );
-        let add_tests = metas
+        // A2': the primary checkout (/home/dev/api) surfaces as Shared.
+        let primary = metas
             .iter()
-            .find(|m| m.session_id.as_str() == "add-tests")
-            .expect("add-tests row");
-        let fix_login = metas
+            .find(|m| m.workspace == Some(WorkspaceMode::Shared))
+            .expect("primary checkout must carry WorkspaceMode::Shared");
+        assert_eq!(primary.workspace, Some(WorkspaceMode::Shared));
+        // The live worktree session is present with the expected metadata.
+        let live = metas
             .iter()
             .find(|m| m.session_id.as_str() == "fix-login")
-            .expect("fix-login row");
-        assert_eq!(add_tests.state, SessionState::Stopped);
-        assert_eq!(fix_login.state, SessionState::Live);
-        assert_eq!(fix_login.agent.as_deref(), Some("claude"));
-        // Stopped carries the real discovered worktree path (R6).
+            .expect("live row");
+        assert_eq!(live.state, SessionState::Live);
+        assert_eq!(live.agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn run_list_maps_each_worktree_scan_to_its_own_project() {
+        // Two worktree projects: api (alphabetically first) and zeta.
+        // build_list_steps iterates config.projects (BTreeMap order = alphabetical),
+        // so the WorktreeScan records come out api-then-zeta. Assert that each
+        // resulting session is attributed to the correct project (not cross-mapped).
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.api]
+            host = "devbox"
+            path = "/home/dev/api"
+            workspace = "worktree"
+            agent = "claude"
+            [projects.zeta]
+            host = "devbox"
+            path = "/home/dev/zeta"
+            workspace = "worktree"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+        "#;
+        let cfg = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let stdout = list_stdout(&[
+            (
+                batch::StepId::Names,
+                "remora_api_fix-login\nremora_zeta_work\n",
+                0,
+            ),
+            (
+                batch::StepId::Metadata,
+                "remora_api_fix-login\tclaude\t/home/dev/.remora/worktrees/api/fix-login\t1765500000\n\
+                 remora_zeta_work\tclaude\t/home/dev/.remora/worktrees/zeta/work\t1765500001\n",
+                0,
+            ),
+            (batch::StepId::Home, "/home/dev", 0),
+            // api WorktreeScan first (BTreeMap: api < zeta alphabetically)
+            (
+                batch::StepId::WorktreeScan,
+                "worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n",
+                0,
+            ),
+            // zeta WorktreeScan second
+            (
+                batch::StepId::WorktreeScan,
+                "worktree /home/dev/.remora/worktrees/zeta/work\nbranch refs/heads/remora/work\n",
+                0,
+            ),
+        ]);
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        let metas = run_list(&fake, &cfg).expect("list");
+        // Each session must be attributed to its own project, not cross-mapped.
+        let api_row = metas
+            .iter()
+            .find(|m| m.session_id.as_str() == "fix-login")
+            .expect("api session must be present");
         assert_eq!(
-            add_tests.workspace_path.as_deref(),
-            Some("/home/dev/.remora/worktrees/api/add-tests")
+            api_row.project_id.as_str(),
+            "api",
+            "fix-login session must belong to api, not zeta"
+        );
+        let zeta_row = metas
+            .iter()
+            .find(|m| m.session_id.as_str() == "work")
+            .expect("zeta session must be present");
+        assert_eq!(
+            zeta_row.project_id.as_str(),
+            "zeta",
+            "work session must belong to zeta, not api"
         );
     }
 
     #[test]
-    fn list_treats_no_server_as_empty() {
-        let config = test_config();
-        let fake = FakeExec::new(vec![Ok(FakeExec::fail(
-            "no server running on /tmp/tmux-1000/default",
-        ))]);
-        assert!(run_list(&fake, &config).expect("list").is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // resolve_base tests (#54)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn resolve_base_uses_explicit_plan_base_without_detection() {
-        let plan = SpawnPlan {
-            base: Some("origin/dev".into()),
-            ..worktree_plan()
-        };
-        let fake = FakeExec::new(vec![Ok(FakeExec::ok())]); // only the fetch
-        let got = resolve_base(&fake, &plan).expect("ok");
-        assert_eq!(got.as_deref(), Some("origin/dev"));
-        // fetch happened, no symbolic-ref/rev-parse probes.
-        assert_eq!(fake.count_calls_with("fetch"), 1);
-        assert_eq!(fake.count_calls_with("symbolic-ref"), 0);
-    }
-
-    #[test]
-    fn resolve_base_detects_origin_head_when_verified() {
-        let plan = worktree_plan(); // base: None
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                 // fetch
-            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
-            Ok(FakeExec::ok()),                 // verify refs/remotes/origin/main^{commit}
+    fn run_list_stale_socket_names_still_scans_worktrees() {
+        // #190: names section fails with the stale-socket phrase (server gone),
+        // but worktrees still surface (cold state ⇒ empty live set, not Err).
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.scratch]
+            host = "devbox"
+            path = "/home/dev/scratch"
+            workspace = "shared"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+        "#;
+        let cfg = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let stdout = list_stdout(&[
+            (
+                batch::StepId::Names,
+                "error connecting to /tmp/tmux-1000/default (No such file or directory)",
+                1,
+            ),
+            (batch::StepId::Metadata, "", 1),
+            (batch::StepId::Home, "/home/dev", 0),
+            (
+                batch::StepId::WorktreeScan,
+                "worktree /home/dev/.remora/worktrees/scratch/s1\nbranch refs/heads/remora/s1\n",
+                0,
+            ),
         ]);
-        assert_eq!(
-            resolve_base(&fake, &plan).expect("ok").as_deref(),
-            Some("origin/main")
-        );
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        let metas = run_list(&fake, &cfg).expect("stale socket must not fail discovery");
+        assert_eq!(metas.len(), 1, "surviving worktree session: {metas:?}");
+        assert_eq!(metas[0].session_id.as_str(), "s1");
+        assert_eq!(metas[0].project_id.as_str(), "scratch");
+        assert_eq!(metas[0].state, SessionState::Stopped);
     }
 
     #[test]
-    fn resolve_base_falls_through_dangling_origin_head_to_main() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                 // fetch
-            Ok(FakeExec::out("origin/gone\n")), // symbolic-ref succeeds
-            Ok(FakeExec::fail("")),             // verify origin/gone -> dangling
-            Ok(FakeExec::ok()),                 // verify refs/remotes/origin/main -> ok
-        ]);
-        assert_eq!(
-            resolve_base(&fake, &plan).expect("ok").as_deref(),
-            Some("origin/main")
-        );
-    }
-
-    #[test]
-    fn resolve_base_probes_master_then_omits() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),     // fetch
-            Ok(FakeExec::fail("")), // symbolic-ref: origin/HEAD unset (non-zero exit)
-            Ok(FakeExec::fail("")), // verify origin/main -> absent
-            Ok(FakeExec::fail("")), // verify origin/master -> absent
-        ]);
-        assert_eq!(resolve_base(&fake, &plan).expect("ok"), None);
-    }
-
-    #[test]
-    fn resolve_base_propagates_detection_transport_error() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                             // fetch
-            Err(SourceError::Transport("ssh down".into())), // symbolic-ref Err
-        ]);
+    fn run_list_no_records_is_transport() {
+        // The whole exec failed before framing any record (kubectl/ssh down).
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "Unable to connect to the server".into(),
+        })]);
         assert!(matches!(
-            resolve_base(&fake, &plan),
+            run_list(&fake, &test_config()),
             Err(SourceError::Transport(_))
         ));
     }
 
     #[test]
-    fn resolve_base_swallows_fetch_failure() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Err(SourceError::Transport("offline".into())), // fetch Err -> swallowed
-            Ok(FakeExec::out("origin/main\n")),            // symbolic-ref
-            Ok(FakeExec::ok()),                            // verify
+    fn run_list_names_real_error_is_transport() {
+        // names section fails with a NON-cold phrase ⇒ Transport (not empty).
+        let stdout = list_stdout(&[
+            (batch::StepId::Names, "some unexpected tmux failure", 1),
+            (batch::StepId::Metadata, "", 1),
+            (batch::StepId::Home, "/home/dev", 0),
+            (batch::StepId::WorktreeScan, "", 0),
         ]);
-        assert_eq!(
-            resolve_base(&fake, &plan).expect("ok").as_deref(),
-            Some("origin/main")
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        assert!(matches!(
+            run_list(&fake, &test_config()),
+            Err(SourceError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn run_list_metadata_flake_keeps_session_live() {
+        // names ok, metadata rc!=0 ⇒ Live with empty metadata (#108 best-effort).
+        let stdout = list_stdout(&[
+            (batch::StepId::Names, "remora_api_fix-login\n", 0),
+            (batch::StepId::Metadata, "connection reset", 1),
+            (batch::StepId::Home, "/home/dev", 0),
+            (batch::StepId::WorktreeScan, "", 0),
+        ]);
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        let metas = run_list(&fake, &test_config()).expect("list");
+        let live = metas
+            .iter()
+            .find(|m| m.state == SessionState::Live)
+            .expect("live");
+        assert_eq!(live.agent, None);
+    }
+
+    #[test]
+    fn run_list_home_non_absolute_degrades() {
+        // home rc=0 but non-absolute ⇒ fall back to "~" (#124 degradation: a
+        // ~/… live session can't path-match its worktree ⇒ Shared).
+        let stdout = list_stdout(&[
+            (batch::StepId::Names, "remora_api_fix-login\n", 0),
+            (batch::StepId::Metadata, "remora_api_fix-login\tclaude\t~/.remora/worktrees/api/fix-login\t1765500000\n", 0),
+            (batch::StepId::Home, "not-absolute", 0),
+            (batch::StepId::WorktreeScan, "worktree /home/dev/api\nbranch refs/heads/main\n\nworktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n", 0),
+        ]);
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        let metas = run_list(&fake, &test_config()).expect("list");
+        let live = metas
+            .iter()
+            .find(|m| m.state == SessionState::Live)
+            .expect("live");
+        assert_eq!(live.workspace, Some(WorkspaceMode::Shared));
+    }
+
+    #[test]
+    fn run_list_worktree_scan_failure_per_decision_8() {
+        // wt_scan rc!=0 ⇒ project NOT scanned (session still Live).
+        let stdout = list_stdout(&[
+            (batch::StepId::Names, "remora_api_fix-login\n", 0),
+            (
+                batch::StepId::Metadata,
+                "remora_api_fix-login\tclaude\t\t\n",
+                0,
+            ),
+            (batch::StepId::Home, "/home/dev", 0),
+            (
+                batch::StepId::WorktreeScan,
+                "fatal: not a git repository",
+                1,
+            ),
+        ]);
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        let metas = run_list(&fake, &test_config()).expect("list must not fail");
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].session_id.as_str(), "fix-login");
+        assert!(metas.iter().all(|m| m.state == SessionState::Live));
+    }
+
+    #[test]
+    fn run_list_forged_metadata_cannot_inject_a_names_row() {
+        // #108: a metadata row for a name NOT in the trusted names section is
+        // dropped (it can't fabricate a session). names = only api; metadata
+        // also lists a `ghost` row.
+        let stdout = list_stdout(&[
+            (batch::StepId::Names, "remora_api_fix-login\n", 0),
+            (
+                batch::StepId::Metadata,
+                "remora_api_fix-login\tclaude\t\t\nremora_ghost_x\tevil\t\t\n",
+                0,
+            ),
+            (batch::StepId::Home, "/home/dev", 0),
+            (batch::StepId::WorktreeScan, "", 0),
+        ]);
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        let metas = run_list(&fake, &test_config()).expect("list");
+        assert!(
+            !metas.iter().any(|m| m.session_id.as_str() == "x"),
+            "ghost must not appear"
         );
     }
 
     #[test]
-    fn resolve_base_swallows_fetch_nonzero_exit() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::fail("error: could not fetch origin")), // fetch Ok(non-zero) -> swallowed
-            Ok(FakeExec::out("origin/main\n")),                  // symbolic-ref
-            Ok(FakeExec::ok()), // verify refs/remotes/origin/main^{commit}
+    fn run_list_truncated_stream_is_transport() {
+        // Stream cut off after Metadata — no Home, no WorktreeScan records.
+        // RunAll always emits every step, so absence means transport truncation.
+        let stdout = list_stdout(&[
+            (batch::StepId::Names, "remora_api_fix-login\n", 0),
+            (
+                batch::StepId::Metadata,
+                "remora_api_fix-login\tclaude\t\t\n",
+                0,
+            ),
+            // Home and WorktreeScan absent — stream was cut mid-flight.
         ]);
-        assert_eq!(
-            resolve_base(&fake, &plan).expect("ok").as_deref(),
-            Some("origin/main")
-        );
-    }
-
-    #[test]
-    fn resolve_base_probes_master_when_main_absent() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),     // fetch
-            Ok(FakeExec::fail("")), // symbolic-ref: origin/HEAD unset (non-zero exit)
-            Ok(FakeExec::fail("")), // verify refs/remotes/origin/main -> absent
-            Ok(FakeExec::ok()),     // verify refs/remotes/origin/master -> resolves
-        ]);
-        assert_eq!(
-            resolve_base(&fake, &plan).expect("ok").as_deref(),
-            Some("origin/master")
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        assert!(
+            matches!(
+                run_list(&fake, &test_config()),
+                Err(SourceError::Transport(_))
+            ),
+            "truncated stream must be Transport, not silent degradation"
         );
     }
 
@@ -2909,172 +3336,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn run_spawn_fetches_before_worktree_add() {
-        let plan = worktree_plan();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::ok()),                 // fetch
-            Ok(FakeExec::out("origin/main\n")), // symbolic-ref
-            Ok(FakeExec::ok()),                 // verify
-            Ok(FakeExec::ok()),                 // worktree add
-            Ok(FakeExec::ok()),                 // new-session
-        ]);
-        let _ = run_spawn(&fake, &plan);
-        let calls = fake.calls.lock().expect("lock");
-        let fetch_i = calls
-            .iter()
-            .position(|a| a.iter().any(|t| t == "fetch"))
-            .expect("fetch");
-        let add_i = calls
-            .iter()
-            .position(|a| a.iter().any(|t| t == "worktree"))
-            .expect("add");
-        assert!(fetch_i < add_i, "fetch must precede worktree add");
-    }
-
-    #[test]
     fn fetch_tokens_targets_origin() {
         assert_eq!(
             fetch_tokens("/home/dev/api"),
             vec!["git", "-C", "/home/dev/api", "fetch", "origin"]
         );
-    }
-
-    #[test]
-    fn remote_head_tokens_reads_origin_head() {
-        let t = remote_head_tokens("/home/dev/api");
-        assert_eq!(t[3], "symbolic-ref");
-        assert_eq!(t[4], "--short");
-        assert_eq!(t[5], "refs/remotes/origin/HEAD");
-    }
-
-    #[test]
-    fn verify_commit_tokens_peels_to_commit_with_exact_ref() {
-        let t = verify_commit_tokens("/home/dev/api", "refs/remotes/origin/main");
-        assert_eq!(t[3], "rev-parse");
-        assert_eq!(t[4], "--verify");
-        assert_eq!(t[5], "--quiet");
-        // exact ref + ^{commit} peel defeats DWIM tag collisions / dangling refs.
-        assert_eq!(t[6], shell_quote("refs/remotes/origin/main^{commit}"));
-    }
-
-    #[test]
-    fn list_keeps_session_live_when_metadata_read_flakes() {
-        // The session is in the trusted names listing, but the inline-metadata
-        // read flakes (transient, or tmux < 3.0). It must stay Live with empty
-        // metadata, not be downgraded — metadata is best-effort enrichment (#108).
-        // Call order: 1) names, 2) metadata (flakes), 3) printf $HOME, 4) worktree list.
-        let config = test_config();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names: live set
-            Ok(FakeExec::fail("connection reset")),      // 2) metadata read flakes
-            Ok(FakeExec::out("/home/dev")),              // 3) printf $HOME (#124)
-            Ok(FakeExec::out("")),                       // 4) worktree list: empty
-        ]);
-        let metas = run_list(&fake, &config).expect("list");
-        assert_eq!(metas.len(), 1);
-        assert_eq!(metas[0].state, SessionState::Live);
-        assert_eq!(metas[0].agent, None);
-        assert_eq!(metas[0].created_at, None);
-    }
-
-    #[test]
-    fn list_ignores_phantom_row_not_in_trusted_names() {
-        // A forged env value with an embedded newline fabricates an extra inline
-        // metadata row (`remora_api_evil...`). Because the live set comes from the
-        // trusted names-only listing, the phantom name — absent there — must be
-        // dropped, never surfaced as a Live session (#108 regression guard).
-        // Call order: 1) names, 2) metadata (with injected phantom), 3) printf $HOME, 4) worktree list.
-        let config = test_config();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names: ONLY the real session
-            Ok(FakeExec::out(
-                "remora_api_fix-login\tx\t\t\n\
-                 remora_api_evil\t/ws\t9999999999\t\n", // 2) metadata: real + injected phantom
-            )),
-            Ok(FakeExec::out("/home/dev")), // 3) printf $HOME (#124)
-            Ok(FakeExec::out("")),          // 4) worktree list: empty
-        ]);
-        let metas = run_list(&fake, &config).expect("list");
-        assert_eq!(metas.len(), 1, "phantom must not appear: {metas:?}");
-        assert_eq!(metas[0].session_id.as_str(), "fix-login");
-    }
-
-    #[test]
-    fn list_survives_worktree_list_failure_per_decision_8() {
-        // A failed `git worktree list` for one project yields empty for that
-        // project, never a failed discovery (decision 8): the live session
-        // still lists, just with no Stopped twin.
-        // Call order: 1) names, 2) metadata, 3) printf $HOME, 4) worktree list (FAILS).
-        // The FakeExec::fail at position 4 must land on the WORKTREE LIST call —
-        // not on $HOME — so decision 8 is actually exercised.
-        let config = test_config();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names: live set
-            Ok(FakeExec::out("remora_api_fix-login\tclaude\t\t\n")), // 2) inline metadata
-            Ok(FakeExec::out("/home/dev")),              // 3) printf $HOME (#124)
-            Ok(FakeExec::fail("fatal: not a git repository")), // 4) worktree list FAILS → decision 8
-        ]);
-        let metas = run_list(&fake, &config).expect("list must not fail");
-        assert_eq!(metas.len(), 1);
-        assert_eq!(metas[0].session_id.as_str(), "fix-login");
-        assert_eq!(metas[0].state, SessionState::Live);
-        assert!(metas.iter().all(|m| m.state == SessionState::Live));
-    }
-
-    #[test]
-    fn list_discovers_worktree_session_on_shared_default_project() {
-        // Before the fix, the worktree scan was guarded by
-        // `project.workspace == WorkspaceMode::Worktree`, so a worktree-override
-        // session on a shared-default project was silently lost. This test is the
-        // RED proof: on the old code the assertion fails (session not discovered);
-        // on the new code it passes.
-        //
-        // Config: `api` (worktree-default) + `scratch` (shared-default).
-        // No live sessions. The `scratch` project has one surviving worktree at
-        // ~/.remora/worktrees/scratch/s1.
-        //
-        // FakeExec call order (config is a BTreeMap, sorted: api first, scratch second):
-        //   1) list-sessions        -> empty (no live sessions)
-        //   2) printf $HOME         -> "/home/dev" for path canonicalization (#124)
-        //   3) git worktree list for `api`     -> empty
-        //   4) git worktree list for `scratch` -> s1 worktree entry
-        let toml = r#"
-            [hosts.devbox]
-            transport = "ssh"
-            host = "devbox"
-            [projects.api]
-            host = "devbox"
-            path = "/home/dev/api"
-            workspace = "worktree"
-            agent = "claude"
-            [projects.scratch]
-            host = "devbox"
-            path = "/home/dev/scratch"
-            workspace = "shared"
-            agent = "claude"
-            [agents.claude]
-            command = ["claude"]
-        "#;
-        let config = Arc::new(Config::from_toml_str(toml).expect("config"));
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::out("")),          // list-sessions: no live sessions
-            Ok(FakeExec::out("/home/dev")), // printf $HOME
-            Ok(FakeExec::out("")),          // worktree list for api: empty
-            Ok(FakeExec::out(
-                "worktree /home/dev/.remora/worktrees/scratch/s1\nbranch refs/heads/remora/s1\n",
-            )), // worktree list for scratch: one worktree session
-        ]);
-        let metas = run_list(&fake, &config).expect("list");
-        // The scratch/s1 worktree session must be discovered as Stopped + Worktree.
-        assert_eq!(
-            metas.len(),
-            1,
-            "expected one discovered session, got: {metas:?}"
-        );
-        assert_eq!(metas[0].project_id.as_str(), "scratch");
-        assert_eq!(metas[0].session_id.as_str(), "s1");
-        assert_eq!(metas[0].state, SessionState::Stopped);
-        assert_eq!(metas[0].workspace, Some(WorkspaceMode::Worktree));
     }
 
     // -----------------------------------------------------------------------
@@ -3922,11 +4188,23 @@ pub(crate) mod tests {
                          worktree /mnt/work/feat/login\n\
                          HEAD def\n\
                          branch refs/heads/feat/login\n";
+        let tail = [
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out("/home/dev")), // printf $HOME
             Ok(FakeExec::out(porcelain)),   // git worktree list
             Ok(FakeExec::ok()),             // test -d REAL path
-            Ok(FakeExec::ok()),             // tmux new-session
+            Ok(RemoteOutput {
+                success: true,
+                stdout: tail,
+                stderr: String::new(),
+            }), // batched tail
         ]);
         assert!(
             run_respawn(&fake, &plan).is_ok(),
@@ -3946,10 +4224,10 @@ pub(crate) mod tests {
             !probe.iter().any(|a| a.contains(".remora/worktrees")),
             "preflight must NOT probe the convention path: {probe:?}"
         );
-        // new-session must also reference the REAL path as the start directory.
+        // new-session must also reference the REAL path (embedded in the batch script).
         let new_session = calls
             .iter()
-            .find(|c| c.iter().any(|a| a == "new-session"))
+            .find(|c| c.iter().any(|a| a.contains("new-session")))
             .expect("new-session must run");
         assert!(
             new_session
@@ -3979,11 +4257,23 @@ pub(crate) mod tests {
         let porcelain = "worktree /home/dev/api\n\
                          HEAD abc\n\
                          branch refs/heads/main\n"; // no remora/fix-login entry
+        let tail = [
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out("/home/dev")), // printf $HOME
             Ok(FakeExec::out(porcelain)),   // git worktree list → no match → None
             Ok(FakeExec::ok()),             // test -d convention dir
-            Ok(FakeExec::ok()),             // tmux new-session
+            Ok(RemoteOutput {
+                success: true,
+                stdout: tail,
+                stderr: String::new(),
+            }), // batched tail
         ]);
         assert!(
             run_respawn(&fake, &plan).is_ok(),
@@ -4014,11 +4304,20 @@ pub(crate) mod tests {
         // not by tmux name alone.
         let plan = worktree_plan();
         let porcelain = "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n";
+        let dup_tail = rec(
+            batch::StepId::NewSession,
+            "duplicate session: remora_api_fix-login",
+            1,
+        );
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out("/home/dev")), // printf $HOME
             Ok(FakeExec::out(porcelain)),   // git worktree list → convention
             Ok(FakeExec::ok()),             // test -d
-            Ok(FakeExec::fail("duplicate session: remora_api_fix-login")), // lost the lock
+            Ok(RemoteOutput {
+                success: true,
+                stdout: dup_tail,
+                stderr: String::new(),
+            }), // batched tail: duplicate
             Ok(FakeExec::out("REMORA_AGENT=claude\n")), // show-environment: fingerprint present
         ]);
         assert!(
@@ -4040,14 +4339,23 @@ pub(crate) mod tests {
         // no channel, never attach by name (#105).
         let plan = worktree_plan();
         let porcelain = "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n";
+        let dup_tail = rec(
+            batch::StepId::NewSession,
+            "duplicate session: remora_api_fix-login",
+            1,
+        );
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out("/home/dev")),
             Ok(FakeExec::out(porcelain)),
             Ok(FakeExec::ok()),
-            Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
-            // Every show-environment retry returns no fingerprint: the default
-            // FakeExec result is a successful empty-stdout reply once the queue
-            // drains, so the fingerprint stays absent across all attempts.
+            Ok(RemoteOutput {
+                success: true,
+                stdout: dup_tail,
+                stderr: String::new(),
+            }), // batched tail: duplicate
+                // Every show-environment retry returns no fingerprint: the default
+                // FakeExec result is a successful empty-stdout reply once the queue
+                // drains, so the fingerprint stays absent across all attempts.
         ]);
         let err = run_respawn(&fake, &plan).expect_err("impostor must be refused");
         assert!(matches!(err, SourceError::SessionNotFound { .. }), "{err}");
@@ -4061,11 +4369,20 @@ pub(crate) mod tests {
         // stamp window instead of spuriously failing a legit concurrent respawn.
         let plan = worktree_plan();
         let porcelain = "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n";
+        let dup_tail = rec(
+            batch::StepId::NewSession,
+            "duplicate session: remora_api_fix-login",
+            1,
+        );
         let fake = FakeExec::new(vec![
             Ok(FakeExec::out("/home/dev")),
             Ok(FakeExec::out(porcelain)),
             Ok(FakeExec::ok()),
-            Ok(FakeExec::fail("duplicate session: remora_api_fix-login")),
+            Ok(RemoteOutput {
+                success: true,
+                stdout: dup_tail,
+                stderr: String::new(),
+            }), // batched tail: duplicate
             Ok(FakeExec::out("PATH=/usr/bin\n")), // 1st read: not stamped yet
             Ok(FakeExec::out("REMORA_AGENT=claude\n")), // 2nd read: stamp landed
         ]);
@@ -4079,5 +4396,560 @@ pub(crate) mod tests {
             "must retry the fingerprint read until the stamp lands"
         );
         assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // run_respawn batched tail tests (Task 5)
+    // -----------------------------------------------------------------------
+
+    fn respawn_plan() -> SpawnPlan {
+        worktree_plan()
+    }
+
+    #[test]
+    fn run_respawn_batches_stamp_tail_and_attaches() {
+        // Order: printf $HOME (Rust), git worktree list (Rust, empty→convention),
+        // test -d (Rust, exists), batched tail script (new-session+passthrough+
+        // set-env, all ok) → attach.
+        let tail = [
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
+        let fake = FakeExec::new(vec![
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // $HOME → "~"
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // worktree list empty
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // test -d ok
+            Ok(RemoteOutput {
+                success: true,
+                stdout: tail,
+                stderr: String::new(),
+            }), // batched tail
+        ]);
+        run_respawn(&fake, &respawn_plan()).expect("respawn");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+        let calls = fake.calls.lock().expect("lock");
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.iter().any(|a| a == "test") && c.iter().any(|a| a == "-d")),
+            "test -d stays a separate Rust round-trip"
+        );
+        assert!(
+            !calls.iter().any(|c| c.iter().any(|a| a == "add")),
+            "no worktree add on respawn"
+        );
+    }
+
+    #[test]
+    fn run_respawn_non_empty_stream_without_new_session_is_transport_no_attach() {
+        // Fail-closed guard (mirrors run_spawn): a non-empty batched-tail stream
+        // that lacks a *successful* NewSession record must NOT fall through to
+        // attaching a never-created session. Here the tail carries only a
+        // Passthrough record (no NewSession) — run_respawn must return Transport
+        // and open no channel.
+        let tail = rec(batch::StepId::Passthrough, "", 0);
+        let fake = FakeExec::new(vec![
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // $HOME
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // worktree list empty
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // test -d ok
+            Ok(RemoteOutput {
+                success: true,
+                stdout: tail,
+                stderr: String::new(),
+            }), // batched tail: no NewSession record
+        ]);
+        let err = run_respawn(&fake, &respawn_plan()).expect_err("missing new-session");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
+        assert_eq!(
+            fake.opened.lock().expect("lock").len(),
+            0,
+            "must not attach a never-created session"
+        );
+    }
+
+    #[test]
+    fn run_respawn_test_d_gone_is_session_not_found_no_script() {
+        let fake = FakeExec::new(vec![
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // $HOME
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // worktree list
+            Ok(RemoteOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // test -d: empty stderr ⇒ gone
+        ]);
+        let err = run_respawn(&fake, &respawn_plan()).expect_err("gone");
+        assert!(matches!(err, SourceError::SessionNotFound { .. }), "{err}");
+        assert!(fake.opened.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn run_respawn_test_d_probe_error_is_transport() {
+        let fake = FakeExec::new(vec![
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+            Ok(RemoteOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "connection refused".into(),
+            }), // non-empty ⇒ Transport
+        ]);
+        let err = run_respawn(&fake, &respawn_plan()).expect_err("probe error");
+        assert!(matches!(err, SourceError::Transport(_)), "{err}");
+    }
+
+    #[test]
+    fn run_respawn_duplicate_attaches_through_fingerprint() {
+        // The batched NewSession reports a duplicate; the runner falls to the
+        // fingerprinted attach retry, which finds the live session.
+        let tail = rec(
+            batch::StepId::NewSession,
+            "duplicate session: remora_api_fix-login",
+            1,
+        );
+        let fake = FakeExec::new(vec![
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // $HOME
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // worktree list
+            Ok(RemoteOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            }), // test -d ok
+            Ok(RemoteOutput {
+                success: true,
+                stdout: tail,
+                stderr: String::new(),
+            }), // batched tail: duplicate
+            Ok(RemoteOutput {
+                success: true,
+                stdout: "REMORA_AGENT=claude\n".into(),
+                stderr: String::new(),
+            }), // show-environment fingerprint
+        ]);
+        run_respawn(&fake, &respawn_plan()).expect("respawn attaches");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
+    #[test]
+    fn run_respawn_metadata_miss_confirms_fingerprint_and_restamps() {
+        // All fatal steps ok, but a SetEnv record reports rc!=0 (metadata miss).
+        // Runner confirms via show-environment; absent fingerprint ⇒ re-stamp.
+        // Call order: printf $HOME, git worktree list (empty → convention), test -d,
+        // batched tail, show-environment (no REMORA_*), set-environment x3 re-stamp.
+        let tail = [
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "lost", 1), // a write missed
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out("")),          // git worktree list: empty → convention
+            Ok(FakeExec::ok()),             // test -d: exists
+            Ok(RemoteOutput {
+                success: true,
+                stdout: tail,
+                stderr: String::new(),
+            }), // batched tail
+            // fingerprint_present check (show-environment): no REMORA_*
+            Ok(RemoteOutput {
+                success: true,
+                stdout: "PATH=/usr/bin\n".into(),
+                stderr: String::new(),
+            }),
+            // re-stamp set-environment x3 (best-effort; default Ok fills rest)
+        ]);
+        run_respawn(&fake, &respawn_plan()).expect("respawn still succeeds");
+        let calls = fake.calls.lock().expect("lock");
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.iter().any(|a| a == "show-environment")),
+            "fingerprint confirmed"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.iter().any(|a| a == "set-environment")),
+            "re-stamp must fire when fingerprint is absent"
+        );
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1, "still attaches");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_spawn_steps + worktree_add_cmd tests (#182, Task 3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn worktree_add_cmd_uses_cascade_when_no_base() {
+        let plan = worktree_plan(); // branch Some("remora/fix-login"), base None
+        let cmd = worktree_add_cmd(&plan);
+        assert!(cmd.contains("worktree add -b"));
+        assert!(cmd.contains("symbolic-ref --short refs/remotes/origin/HEAD"));
+        assert!(cmd.contains("origin/main"));
+        assert!(cmd.contains("origin/master"));
+        assert!(cmd.contains("^{commit}"), "must peel to a commit");
+        // The cascade feeds the start-point via UNQUOTED $(...) so an empty
+        // result drops the arg (local HEAD) instead of passing "" (an error).
+        assert!(cmd.contains("$("), "cascade is a command substitution");
+    }
+
+    #[test]
+    fn worktree_add_cmd_uses_literal_base_when_present() {
+        let mut plan = worktree_plan();
+        plan.base = Some("origin/release".into());
+        let cmd = worktree_add_cmd(&plan);
+        assert!(cmd.contains("origin/release"));
+        assert!(
+            !cmd.contains("symbolic-ref"),
+            "explicit base skips the cascade"
+        );
+    }
+
+    #[test]
+    fn spawn_steps_worktree_mode_order_and_fatality() {
+        let plan = worktree_plan();
+        let steps = build_spawn_steps(&plan);
+        let ids: Vec<_> = steps.iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                batch::StepId::Fetch,
+                batch::StepId::WorktreeAdd,
+                batch::StepId::NewSession,
+                batch::StepId::Passthrough,
+                batch::StepId::SetEnv,
+                batch::StepId::SetEnv,
+                batch::StepId::SetEnv,
+            ]
+        );
+        // Only worktree-add + new-session are fatal.
+        for s in &steps {
+            let want_fatal = matches!(s.id, batch::StepId::WorktreeAdd | batch::StepId::NewSession);
+            assert_eq!(s.fatal, want_fatal, "fatality for {:?}", s.id);
+        }
+    }
+
+    #[test]
+    fn spawn_steps_shared_mode_omits_fetch_and_worktree_add() {
+        let mut plan = worktree_plan();
+        plan.branch = None;
+        let steps = build_spawn_steps(&plan);
+        let ids: Vec<_> = steps.iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                batch::StepId::NewSession,
+                batch::StepId::Passthrough,
+                batch::StepId::SetEnv,
+                batch::StepId::SetEnv,
+                batch::StepId::SetEnv,
+            ]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Real-sh cascade integration tests (Task 6 — #182)
+    //
+    // Each test builds a real local bare+work repo (no network), runs the FULL
+    // worktree_add_cmd(plan) through `sh -c`, then asserts the new worktree's
+    // HEAD commit matches the expected source ref. These are the safety net
+    // proving the shell cascade picks the right base across every branch
+    // topology — the behavior the deleted Rust resolve_base used to own.
+    // -----------------------------------------------------------------------
+
+    /// Runs `sh -c <script>` and returns the process output.
+    fn sh(script: &str) -> std::process::Output {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("sh")
+    }
+
+    /// Returns the trimmed commit hash for `rev` in `repo_dir`.
+    fn git_rev(repo_dir: &str, rev: &str) -> String {
+        let out = sh(&format!("git -C {repo_dir} rev-parse {rev}"));
+        assert!(
+            out.status.success(),
+            "git rev-parse {rev} in {repo_dir} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Creates a temp dir with a work repo whose `origin` is a local bare repo.
+    /// Each branch in `branches` gets a DISTINCT empty commit (so tests can tell
+    /// which base was chosen by comparing commit hashes). After all pushes the
+    /// work repo's HEAD is the "local-init" commit. `head` Some("main") sets
+    /// `origin/HEAD` there; `None` DELETES it (so the fall-through tests are not
+    /// derailed by a git version that auto-creates `origin/HEAD` on fetch).
+    /// Returns (work_path, TempDir) — the guard keeps the directory alive.
+    fn cascade_repo(branches: &[&str], head: Option<&str>) -> (String, tempfile::TempDir) {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path().to_str().expect("utf8").to_string();
+
+        // For each branch: make a distinct commit, point the branch there, push,
+        // then reset back to local-init (HEAD~1) so local HEAD stays constant.
+        let branch_cmds: String = branches
+            .iter()
+            .map(|b| {
+                format!(
+                    "git commit -q --allow-empty -m for-{b}; \
+                     git branch -f {b}; \
+                     git push -q origin {b}; \
+                     git reset -q --hard HEAD~1; ",
+                    b = b
+                )
+            })
+            .collect();
+
+        // origin/HEAD must be EXPLICIT, not left to chance: some git versions
+        // (and the `init.defaultBranch`/bare-repo default) auto-create
+        // `refs/remotes/origin/HEAD` on fetch, which would make the cascade's
+        // first arm resolve and defeat the fall-through tests. So set it when a
+        // head is wanted, and DELETE it otherwise.
+        let set_head = match head {
+            Some(h) => format!("git remote set-head origin {h};"),
+            None => "git remote set-head origin --delete 2>/dev/null || true;".to_string(),
+        };
+
+        let script = format!(
+            "set -e; \
+             cd {root}; \
+             git init -q bare.git --bare; \
+             git init -q work; \
+             cd work; \
+             git config user.email a@b.c; \
+             git config user.name a; \
+             git remote add origin ../bare.git; \
+             git commit -q --allow-empty -m local-init; \
+             git branch -m _local-init; \
+             {branch_cmds}\
+             git fetch -q origin; \
+             {set_head}",
+            root = root,
+            branch_cmds = branch_cmds,
+            set_head = set_head,
+        );
+        let out = sh(&script);
+        assert!(
+            out.status.success(),
+            "cascade_repo setup failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (format!("{root}/work"), td)
+    }
+
+    /// Builds a minimal SpawnPlan for cascade tests: branch = Some("test-branch"),
+    /// base = None (so the cascade runs), no agent, no env.
+    fn cascade_plan(project_path: &str, wt_dir: &str) -> SpawnPlan {
+        SpawnPlan {
+            project_id: ProjectId::new("api").expect("slug"),
+            session_id: SessionId::new("test-branch").expect("slug"),
+            tmux_name: "remora_api_test-branch".into(),
+            workspace: WorkspaceMode::Worktree,
+            project_path: project_path.to_string(),
+            dir: wt_dir.to_string(),
+            branch: Some("test-branch".into()),
+            base: None,
+            env: vec![],
+            agent_argv: vec![],
+        }
+    }
+
+    #[test]
+    fn cascade_prefers_verified_origin_head() {
+        // origin/HEAD → main; both main and master exist.
+        // Cascade must pick origin/main (via the symbolic-ref arm).
+        let (repo, _guard) = cascade_repo(&["main", "master"], Some("main"));
+        let wt = format!("{repo}/../wt-head");
+        let plan = cascade_plan(&repo, &wt);
+        let cmd = worktree_add_cmd(&plan);
+        let out = sh(&cmd);
+        assert!(
+            out.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let wt_commit = git_rev(&wt, "HEAD");
+        let expected = git_rev(&repo, "refs/remotes/origin/main");
+        assert_eq!(
+            wt_commit, expected,
+            "cascade must pick origin/main (via origin/HEAD → main)"
+        );
+    }
+
+    #[test]
+    fn cascade_falls_back_to_origin_main() {
+        // No origin/HEAD; both main and master exist → origin/main wins (first
+        // fallback arm).
+        let (repo, _guard) = cascade_repo(&["main", "master"], None);
+        let wt = format!("{repo}/../wt-main");
+        let plan = cascade_plan(&repo, &wt);
+        let cmd = worktree_add_cmd(&plan);
+        let out = sh(&cmd);
+        assert!(
+            out.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let wt_commit = git_rev(&wt, "HEAD");
+        let expected = git_rev(&repo, "refs/remotes/origin/main");
+        assert_ne!(
+            git_rev(&repo, "refs/remotes/origin/main"),
+            git_rev(&repo, "refs/remotes/origin/master"),
+            "test setup must give main and master distinct commits"
+        );
+        assert_eq!(wt_commit, expected, "cascade must fall back to origin/main");
+    }
+
+    #[test]
+    fn cascade_falls_back_to_origin_master() {
+        // Only master pushed; no main, no origin/HEAD → origin/master wins
+        // (second fallback arm).
+        let (repo, _guard) = cascade_repo(&["master"], None);
+        let wt = format!("{repo}/../wt-master");
+        let plan = cascade_plan(&repo, &wt);
+        let cmd = worktree_add_cmd(&plan);
+        let out = sh(&cmd);
+        assert!(
+            out.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let wt_commit = git_rev(&wt, "HEAD");
+        let expected = git_rev(&repo, "refs/remotes/origin/master");
+        assert_eq!(
+            wt_commit, expected,
+            "cascade must fall back to origin/master"
+        );
+    }
+
+    #[test]
+    fn cascade_none_uses_local_head() {
+        // Origin has neither main nor master (only a dev branch), no origin/HEAD.
+        // Cascade outputs nothing → git worktree add runs without a start-point
+        // → new branch based on local HEAD. Command must still SUCCEED.
+        let (repo, _guard) = cascade_repo(&["dev"], None);
+        let local_head = git_rev(&repo, "HEAD");
+        let wt = format!("{repo}/../wt-none");
+        let plan = cascade_plan(&repo, &wt);
+        let cmd = worktree_add_cmd(&plan);
+        let out = sh(&cmd);
+        assert!(
+            out.status.success(),
+            "worktree add must succeed even with no cascade match: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let wt_commit = git_rev(&wt, "HEAD");
+        assert_eq!(
+            wt_commit, local_head,
+            "empty cascade → worktree based on local HEAD"
+        );
+    }
+
+    #[test]
+    fn cascade_rejects_tag_named_like_branch() {
+        // A TAG `refs/tags/origin/main` exists at a DISTINCT commit, but there is
+        // NO remote-tracking branch `refs/remotes/origin/main`. The cascade uses
+        // `rev-parse --verify "refs/remotes/origin/main^{commit}"` which must NOT
+        // match the tag (wrong ref namespace). Falls through to local HEAD.
+        let (repo, _guard) = cascade_repo(&[], None); // no branches pushed
+        let local_head = git_rev(&repo, "HEAD");
+
+        // Create a distinct commit and tag it as "origin/main" (tag name, not ref).
+        let tag_setup = format!(
+            "set -e; \
+             cd {repo}; \
+             git commit -q --allow-empty -m for-tag; \
+             git tag origin/main HEAD; \
+             git reset -q --hard HEAD~1;",
+            repo = repo
+        );
+        let out = sh(&tag_setup);
+        assert!(
+            out.status.success(),
+            "tag setup failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let tag_commit = git_rev(&repo, "refs/tags/origin/main");
+        assert_ne!(
+            tag_commit, local_head,
+            "tag must point at a distinct commit from local HEAD (test setup invariant)"
+        );
+
+        let wt = format!("{repo}/../wt-tag");
+        let plan = cascade_plan(&repo, &wt);
+        let cmd = worktree_add_cmd(&plan);
+        let out = sh(&cmd);
+        assert!(
+            out.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let wt_commit = git_rev(&wt, "HEAD");
+        assert_eq!(
+            wt_commit, local_head,
+            "cascade must NOT pick the same-named tag — must fall through to local HEAD"
+        );
+        assert_ne!(
+            wt_commit, tag_commit,
+            "cascade must reject the refs/tags/origin/main tag (wrong namespace)"
+        );
     }
 }
