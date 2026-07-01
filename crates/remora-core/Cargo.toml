@@ -19,6 +19,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
 toml = { workspace = true }
 toml_edit = { workspace = true }
+unicode-general-category = { workspace = true }
+unicode-segmentation = { workspace = true }
 vte = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
