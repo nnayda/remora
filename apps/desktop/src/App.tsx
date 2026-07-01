@@ -195,6 +195,15 @@ function App() {
     // guard below would never consume the flag. Clear it here so it can't steal
     // focus on a later activeKey change — e.g. closing this tab refocuses a live
     // neighbour (#189; also closes the latent respawn-path steal).
+    //
+    // Load-bearing invariant: openViaAttach/openViaRespawn flip a revived tab to
+    // "reconnecting" synchronously (reconnectTab/respawnTab setStatus before any
+    // await), in the same batched click handler as the activeKey commit. React
+    // coalesces both store notifications into one render that reads the final
+    // "reconnecting" status, so this branch never observes the pre-revive
+    // stopped/disconnected as a transient — only as a terminal revive failure.
+    // If an opener ever yields between the activeKey commit and the status flip,
+    // that transient would leak here and prematurely disarm the arm (see #189).
     if (activeStatus === "stopped" || activeStatus === "disconnected") {
       focusOnSelect.current = false;
       return;
