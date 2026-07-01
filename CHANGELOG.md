@@ -487,6 +487,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Removing a session no longer resurrects it as an orphaned worktree row.**
+  Opening a discovered *live* session whose local tab was gone (e.g. after an
+  app restart or reconnect — the common persistent-session flow) went through
+  the spawn-first path. Because the sidebar open passes no branch, the backend
+  planned the *back-compat* convention worktree (`remora/<session_id>` at
+  `~/.remora/worktrees/<project>/<session_id>`), which differs from a session
+  created with an explicit branch. `git worktree add` therefore *succeeded*,
+  creating a second worktree; the following `tmux new-session` failed
+  `SessionExists` (the live original held the name) and the just-added worktree
+  was left on disk (cleanup only removes it when the session is *absent*). The
+  duplicate stayed masked in discovery (same `session_id` as the live original),
+  then `remove` deleted only the first-matched worktree and un-masked the orphan
+  as a "new" stopped row named `remora/<slug>-<hash>`. Two fixes: the sidebar now
+  **attaches** to a live session instead of spawn-first (falling back to respawn
+  if it died since the poll), so no duplicate is ever created; and `run_remove`
+  now tears down **every** worktree+branch whose branch derives to the target
+  `session_id` (not just the first), cleaning up any pre-existing orphan. The
+  dirty-gate ignores a back-compat orphan twin's inherited unpushed-commit count
+  (base commits it never used), so a phantom twin can't soft-lock removal of an
+  otherwise-clean session; the twin's own uncommitted files still block, and
+  single-worktree sessions keep the full gate.
 - **Discovery no longer drops a host's worktrees after a Kubernetes pod
   restart** (#190). After a pod restart on a persistent volume the tmux server
   dies but its socket file survives, so `tmux list-sessions` fails with `error
