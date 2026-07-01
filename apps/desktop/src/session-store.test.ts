@@ -884,6 +884,198 @@ describe("SessionStore reconnect machine", () => {
     expect(tab.status).toBe("live");
     expect(tab.connection).toBe(conn2.conn);
   });
+
+  // A minimal SpawnInput for p/s used across the #189 revival tests.
+  const ps = {
+    projectId: "p",
+    sessionId: "s",
+    agent: null,
+    base: null,
+    workspace: "worktree" as const,
+  };
+
+  it("reconnectTab re-attaches a disconnected tab back to live (#189)", async () => {
+    let attachFails = true;
+    const fresh = fakeConn();
+    const { store, spawned } = makeStore({
+      attach: () =>
+        attachFails
+          ? Promise.reject({ kind: "config", message: "unknown host" })
+          : Promise.resolve(fresh.conn),
+    });
+    await store.openSession(ps);
+    spawned.die(); // death → reconnect → config = terminal → disconnected
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.getSnapshot().tabs[0].status).toBe("disconnected");
+
+    attachFails = false;
+    store.reconnectTab("p/s");
+    expect(store.getSnapshot().tabs[0].status).toBe("reconnecting");
+    await Promise.resolve();
+    await Promise.resolve();
+    const tab = store.getSnapshot().tabs[0];
+    expect(tab.status).toBe("live");
+    expect(tab.connection).toBe(fresh.conn);
+  });
+
+  it("reconnectTab on a truly-gone session lands back at stopped, never respawns (#189)", async () => {
+    const respawn = vi.fn(() => Promise.resolve(fakeConn().conn));
+    const { store, spawned } = makeStore({
+      attach: () =>
+        Promise.reject({ kind: "sessionNotFound", message: "gone" }),
+      respawn,
+    });
+    await store.openSession(ps);
+    spawned.die(); // → stopped (sessionNotFound)
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.getSnapshot().tabs[0].status).toBe("stopped");
+
+    store.reconnectTab("p/s");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.getSnapshot().tabs[0].status).toBe("stopped");
+    expect(respawn).not.toHaveBeenCalled(); // attach-only, no duplicate session
+  });
+
+  it("reconnectTab defers to an in-flight respawn (busy guard) (#189)", async () => {
+    let release: () => void = () => {};
+    const respawnConn = fakeConn();
+    const respawn = vi.fn(
+      () =>
+        new Promise<SessionConnection>((res) => {
+          release = () => res(respawnConn.conn);
+        }),
+    );
+    const attach = vi.fn(() => Promise.resolve(fakeConn().conn));
+    const { store } = makeStore({ respawn, attach });
+    await store.openSession(ps);
+
+    const p = store.respawnTab("p/s"); // respawning.has("p/s") = true, awaits
+    expect(store.getSnapshot().tabs[0].status).toBe("reconnecting");
+
+    store.reconnectTab("p/s"); // busy → no-op
+    expect(attach).not.toHaveBeenCalled(); // did not start an attach loop
+
+    release();
+    await p;
+    await Promise.resolve();
+    const tab = store.getSnapshot().tabs[0];
+    expect(tab.status).toBe("live");
+    expect(tab.connection).toBe(respawnConn.conn);
+  });
+
+  it("openViaAttach reconnects a non-live ACTIVE dedupe in place (#189 Bug A)", async () => {
+    let attachFails = true;
+    const fresh = fakeConn();
+    const attach = vi.fn(() =>
+      attachFails
+        ? Promise.reject({ kind: "config", message: "bad" })
+        : Promise.resolve(fresh.conn),
+    );
+    const { store, spawned } = makeStore({ attach });
+    await store.openSession(ps);
+    spawned.die();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.getSnapshot().tabs[0].status).toBe("disconnected");
+    const attachCallsBefore = attach.mock.calls.length;
+
+    attachFails = false;
+    const r = await store.openViaAttach(ps); // dedupe to the disconnected active tab
+    expect(r).toEqual({ ok: true, attached: false, opened: false });
+    expect(attach.mock.calls.length).toBe(attachCallsBefore + 1); // a fresh attach fired
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.getSnapshot().tabs[0].status).toBe("live"); // revived in place
+  });
+
+  it("openViaAttach flips activeKey to a non-live BACKGROUND tab AND reconnects it (#189)", async () => {
+    let bFails = true;
+    const freshB = fakeConn();
+    const attach = vi.fn(() =>
+      bFails
+        ? Promise.reject({ kind: "config", message: "bad" })
+        : Promise.resolve(freshB.conn),
+    );
+    const bConn = fakeConn();
+    let spawnCall = 0;
+    const spawn = vi.fn(() => {
+      spawnCall += 1;
+      return Promise.resolve({
+        connection: spawnCall === 2 ? bConn.conn : fakeConn().conn,
+        attached: false,
+      });
+    });
+    const { store } = makeStore({ attach, spawn });
+    await store.openSession(ps); // tab A (p/s), active
+    await store.openSession({ ...ps, sessionId: "b" }); // tab B (p/b), active
+    bConn.die(); // B dies → reconnect → config → disconnected
+    await Promise.resolve();
+    await Promise.resolve();
+    store.focusTab("p/s"); // A active again; B disconnected in background
+    expect(store.getSnapshot().activeKey).toBe("p/s");
+
+    bFails = false;
+    const attachBefore = attach.mock.calls.length;
+    await store.openViaAttach({ ...ps, sessionId: "b" }); // click background B
+    expect(store.getSnapshot().activeKey).toBe("p/b"); // flipped active
+    expect(attach.mock.calls.length).toBe(attachBefore + 1); // a reconnect fired
+    await Promise.resolve();
+    await Promise.resolve();
+    const tabB = store.getSnapshot().tabs.find((t) => t.key === "p/b");
+    expect(tabB?.status).toBe("live"); // and revived to live
+  });
+
+  it("openViaAttach only focuses a LIVE dedupe (no reconnect) (#189)", async () => {
+    const attach = vi.fn(() => Promise.resolve(fakeConn().conn));
+    const { store } = makeStore({ attach });
+    await store.openSession(ps); // A live
+    await store.openSession({ ...ps, sessionId: "b" }); // B live, active
+    store.focusTab("p/s");
+    const before = attach.mock.calls.length;
+    await store.openViaAttach({ ...ps, sessionId: "b" }); // dedupe to live B
+    expect(store.getSnapshot().activeKey).toBe("p/b");
+    expect(attach.mock.calls.length).toBe(before); // no reconnect fired
+    expect(store.getSnapshot().tabs.find((t) => t.key === "p/b")?.status).toBe(
+      "live",
+    );
+  });
+
+  it("REGRESSION #189 Bug B: openViaRespawn respawns a reconnecting tab", async () => {
+    const respawnConn = fakeConn();
+    const respawn = vi.fn(() => Promise.resolve(respawnConn.conn));
+    const { store, spawned } = makeStore({
+      attach: () => Promise.reject({ kind: "transport", message: "down" }),
+      respawn,
+    });
+    await store.openSession(ps);
+    spawned.die(); // → reconnecting (transport = retry fate, backoff scheduled)
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.getSnapshot().tabs[0].status).toBe("reconnecting");
+
+    const r = await store.openViaRespawn(ps); // discovery says stopped
+    expect(r).toEqual({ ok: true, attached: false, opened: false });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(respawn).toHaveBeenCalledTimes(1); // reconnecting tab WAS respawned
+    const tab = store.getSnapshot().tabs[0];
+    expect(tab.status).toBe("live");
+    expect(tab.connection).toBe(respawnConn.conn);
+  });
+
+  it("openViaRespawn never respawns a LIVE dedupe (focus only) (#189)", async () => {
+    const respawn = vi.fn(() => Promise.resolve(fakeConn().conn));
+    const { store } = makeStore({ respawn });
+    await store.openSession(ps); // A live
+    await store.openSession({ ...ps, sessionId: "b" }); // B live, active
+    store.focusTab("p/s");
+    await store.openViaRespawn({ ...ps, sessionId: "b" }); // dedupe to live B
+    expect(respawn).not.toHaveBeenCalled(); // must not kill a live session
+    expect(store.getSnapshot().activeKey).toBe("p/b");
+  });
 });
 
 describe("SessionStore reconnect token-refetch race", () => {
