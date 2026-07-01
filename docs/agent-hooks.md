@@ -24,6 +24,49 @@ Notification event is its "needs your attention" signal, so Remora maps it to
    }
    ```
 
+## Claude Code: confirm the hook install is actually working
+
+The Notification hook above is silent until the agent asks you something, so
+there's nothing to prove a fresh install is wired correctly before that first
+question. Install the liveness recipe and point it at **both**
+`SessionStart` and `UserPromptSubmit` — these fire early and often, so a
+correct install confirms itself without the agent having to ask anything.
+
+1. Copy `contrib/agent-hooks/claude-code/remora-ping.sh` into the sandbox and
+   make it executable (`chmod +x`). It has no dependencies (a plain `printf`,
+   no `jq`/`base64`).
+2. Add to the sandbox's `~/.claude/settings.json`:
+
+   ```json
+   {
+     "hooks": {
+       "SessionStart": [
+         { "hooks": [ { "type": "command", "command": "/path/to/remora-ping.sh" } ] }
+       ],
+       "UserPromptSubmit": [
+         { "hooks": [ { "type": "command", "command": "/path/to/remora-ping.sh" } ] }
+       ]
+     }
+   }
+   ```
+
+Once Remora sees any marker on this session — a ping or a Notification — the
+sidebar row's hover tooltip shows **"Activity hook active."** `SessionStart`
+proves a fresh session's hook before the agent asks anything; `UserPromptSubmit`
+re-earns the affirmation on the next interaction after a reconnect (`SessionStart`
+fires on Claude *process* start, not on re-attaching a terminal, so it doesn't
+fire again just because you reconnected).
+
+**`/dev/tty`, never stdout, is doubly important here.** As with
+`remora-notify.sh`, Claude Code captures a hook's stdout so a stdout `printf`
+never reaches the PTY byte stream Remora reads — but for `SessionStart` and
+`UserPromptSubmit` specifically, stdout is also **injected directly into the
+model's context.** Printing raw OSC escape bytes there on every prompt would
+corrupt the agent's own context window, not just fail to reach Remora. The
+recipe writes only to `/dev/tty` (override with `REMORA_MARKER_OUT` for local
+testing) and fails silently if no controlling terminal is present (some
+`kubectl exec`/`ssh` paths lack one), exactly like `remora-notify.sh`.
+
 ## Why the recipe looks the way it does
 
 - **tmux passthrough wrapping is mandatory.** Remora spawns the agent in its own
@@ -42,9 +85,13 @@ Notification event is its "needs your attention" signal, so Remora maps it to
 - The Notification event's text is often generic ("Claude needs your permission
   to use Bash") rather than the literal question, and it also fires for the idle
   reminder. Richer/structured prompt text is future work.
-- A misconfigured or missing hook is a silent no-op (Remora shows no preview;
-  activity still works via quiescence). A "did a marker ever arrive" diagnostic
-  is a follow-up.
+- The sidebar row's tooltip shows a positive **"Activity hook active"**
+  affirmation once Remora has seen any marker (a ping or a Notification) on
+  that session's current attach — see ADR-0019. This is per-attach: it clears
+  on detach and is re-earned by the next marker after a reconnect. Absence is
+  *not* framed as broken — a healthy, freshly reconnected session that hasn't
+  said anything yet also shows no affirmation, so silence never means "hook is
+  misconfigured," only "not confirmed yet this attach."
 
 ## Security
 

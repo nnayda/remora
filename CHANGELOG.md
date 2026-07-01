@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Activity-hook confirmation** (#198): the sidebar session row now shows
+  "Activity hook active" on hover once Remora sees any activity marker on the
+  session, so you can tell a working hook install from one that never fires. A
+  new liveness recipe (`contrib/agent-hooks/claude-code/remora-ping.sh`, wired to
+  Claude Code's SessionStart + UserPromptSubmit) makes a correct install confirm
+  itself without the agent having to ask anything. See `docs/agent-hooks.md` and
+  ADR-0019. The signal is surfaced positively (absence is never shown as
+  "broken", which would false-positive on reconnect).
 - **Agent prompt preview** (#61): when an agent is waiting on you, the sidebar
   session row now shows what it asked ("the session says: …") on hover. A
   Claude Code Notification hook (`contrib/agent-hooks/claude-code/`) emits the
