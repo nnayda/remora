@@ -18,7 +18,7 @@
 
   /* accent glow — used ONLY on the activity pulse + primary focus */
   --glow-accent: 0 0 0 3px var(--focus-ring);
-  --glow-pulse: 0 0 16px rgba(169, 156, 255, 0.4);
+  --glow-pulse: 0 0 16px rgba(110, 164, 255, 0.4); /* marine-pulse #6ea4ff */
 }
 
 @media (prefers-color-scheme: light) {
@@ -29,7 +29,7 @@
     --shadow-lg: 0 16px 40px rgba(20, 21, 26, 0.14);
     --shadow-popover: 0 8px 28px rgba(20, 21, 26, 0.14);
     --ring-inset-top: inset 0 1px 0 rgba(255, 255, 255, 0.6);
-    --glow-pulse: 0 0 16px rgba(124, 108, 240, 0.3);
+    --glow-pulse: 0 0 16px rgba(30, 111, 245, 0.3); /* marine-500 #1e6ff5 */
   }
 }
 
@@ -40,5 +40,5 @@
   --shadow-lg: 0 16px 40px rgba(20, 21, 26, 0.14);
   --shadow-popover: 0 8px 28px rgba(20, 21, 26, 0.14);
   --ring-inset-top: inset 0 1px 0 rgba(255, 255, 255, 0.6);
-  --glow-pulse: 0 0 16px rgba(124, 108, 240, 0.3);
+  --glow-pulse: 0 0 16px rgba(30, 111, 245, 0.3); /* marine-500 #1e6ff5 */
 }
