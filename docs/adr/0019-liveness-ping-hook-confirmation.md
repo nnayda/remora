@@ -68,9 +68,12 @@ only as a **positive affirmation on presence**, never as a message on absence.
   version handshake has an accurate number to read. **Nothing reads
   `PROTOCOL_VERSION` today — there is no handshake.** The actual runtime
   fail-closed behavior — an older peer erroring out on an unrecognized
-  `marker_seen` tag instead of silently misinterpreting it — comes from
-  `ChannelOutput` being an externally-tagged `#[non_exhaustive]` enum, not from
-  the constant. Do not read this ADR as claiming the version bump itself
+  `marker_seen` tag instead of silently misinterpreting it — comes from serde's
+  **externally-tagged** representation of `ChannelOutput`: deserializing an
+  unknown variant tag is a hard error, with no `#[serde(other)]` catch-all to
+  swallow it. (`#[non_exhaustive]` is a separate, Rust-side concern — it forces
+  downstream `match`es to carry a wildcard arm; it does not affect wire
+  deserialization.) Do not read this ADR as claiming the version bump itself
   enforces compatibility; it doesn't, yet.
 
 - **Recipe: `contrib/agent-hooks/claude-code/remora-ping.sh`**, wired to

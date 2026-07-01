@@ -35,11 +35,17 @@ correct install confirms itself without the agent having to ask anything.
 1. Copy `contrib/agent-hooks/claude-code/remora-ping.sh` into the sandbox and
    make it executable (`chmod +x`). It has no dependencies (a plain `printf`,
    no `jq`/`base64`).
-2. Add to the sandbox's `~/.claude/settings.json`:
+2. Add the `SessionStart` and `UserPromptSubmit` entries to the sandbox's
+   `~/.claude/settings.json` **alongside** the `Notification` entry from the
+   section above — they live under the same `hooks` object, so keep all three
+   rather than replacing it (dropping `Notification` would regress the preview):
 
    ```json
    {
      "hooks": {
+       "Notification": [
+         { "hooks": [ { "type": "command", "command": "/path/to/remora-notify.sh" } ] }
+       ],
        "SessionStart": [
          { "hooks": [ { "type": "command", "command": "/path/to/remora-ping.sh" } ] }
        ],
