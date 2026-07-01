@@ -23,6 +23,29 @@ describe("rowTitle", () => {
   it("returns undefined when neither is present", () => {
     expect(rowTitle({ preview: undefined })).toBeUndefined();
   });
+
+  it("appends the hook affirmation below a preview", () => {
+    expect(
+      rowTitle({ preview: "Approve running tests?", hookActive: true }),
+    ).toBe("the session says: Approve running tests?\nActivity hook active");
+  });
+
+  it("shows the affirmation alone when there is no preview or fallback", () => {
+    expect(rowTitle({ hookActive: true })).toBe("Activity hook active");
+  });
+
+  it("shows the affirmation below a stopped fallback", () => {
+    expect(
+      rowTitle({ fallback: "Stopped — click to respawn", hookActive: true }),
+    ).toBe("Stopped — click to respawn\nActivity hook active");
+  });
+
+  it("omits the affirmation when the hook is not confirmed", () => {
+    expect(rowTitle({ preview: "Pick a file", hookActive: false })).toBe(
+      "the session says: Pick a file",
+    );
+    expect(rowTitle({ hookActive: false })).toBeUndefined();
+  });
 });
 
 describe("previewWhenAwaiting", () => {
