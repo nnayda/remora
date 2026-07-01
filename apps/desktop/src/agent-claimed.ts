@@ -1,18 +1,24 @@
 import type { ActivityState } from "./activity-store";
 
-/** Compose the tooltip text for a session row. A live agent preview is rendered
- * as *sandbox-claimed* — the byte stream is untrusted, so we never present it as
- * authoritative chrome (ADR-0010/0018 threat model). Falls back to a caller-
- * supplied title (e.g. the stopped-state hint) when there is no preview. */
+/** Compose the tooltip text for a session row. A live agent preview renders as
+ * *sandbox-claimed* (never authoritative chrome; ADR-0010/0018 threat model).
+ * When the session's activity hook is confirmed (`hookActive`, #198), a positive
+ * "Activity hook active" line is appended — the honest, false-positive-free
+ * surfacing (absence is ambiguous, presence is not; see ADR-0019). Falls back to
+ * a caller-supplied title (e.g. the stopped-state hint) when there is no preview. */
 export function rowTitle({
   preview,
   fallback,
+  hookActive,
 }: {
   preview?: string;
   fallback?: string;
+  hookActive?: boolean;
 }): string | undefined {
-  if (preview) return `the session says: ${preview}`;
-  return fallback;
+  const base = preview ? `the session says: ${preview}` : fallback;
+  if (!hookActive) return base;
+  const affirmation = "Activity hook active";
+  return base ? `${base}\n${affirmation}` : affirmation;
 }
 
 /** Gate a stored preview on the session being actively awaiting input.

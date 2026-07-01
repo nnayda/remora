@@ -54,6 +54,7 @@ interface SidebarProps {
   onAddProject: () => void;
   activity: ReadonlyMap<string, ActivityState>;
   previews: ReadonlyMap<string, string>;
+  markerSeen: ReadonlySet<string>;
   /** Collapse the sidebar to the narrow icon rail. */
   onCollapse?: () => void;
 }
@@ -96,6 +97,7 @@ export function Sidebar({
   onAddProject,
   activity,
   previews,
+  markerSeen,
   onCollapse,
 }: SidebarProps) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
@@ -206,6 +208,7 @@ export function Sidebar({
               onNewSession={onNewSession}
               activity={activity}
               previews={previews}
+              markerSeen={markerSeen}
             />
           ))
         )}
@@ -245,6 +248,7 @@ function ProjectGroup({
   onNewSession,
   activity,
   previews,
+  markerSeen,
 }: {
   project: ProjectNode;
   collapsed: Set<string>;
@@ -258,6 +262,7 @@ function ProjectGroup({
   onNewSession: (projectId: string) => void;
   activity: ReadonlyMap<string, ActivityState>;
   previews: ReadonlyMap<string, string>;
+  markerSeen: ReadonlySet<string>;
 }) {
   const open = !collapsed.has(project.id);
   // Only fully configured projects can be pre-scoped: synthetic projects have
@@ -331,6 +336,7 @@ function ProjectGroup({
                     previews.get(session.key),
                   ),
                   fallback: stopped ? "Stopped — click to respawn" : undefined,
+                  hookActive: markerSeen.has(session.key),
                 })}
                 onClick={() => onOpenSession(session)}
                 reconnecting={session.reconnecting}

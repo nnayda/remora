@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Activity-hook confirmation** (#198): the sidebar session row now shows
+  "Activity hook active" on hover once Remora sees any activity marker on the
+  session, so you can tell a working hook install from one that never fires. A
+  new liveness recipe (`contrib/agent-hooks/claude-code/remora-ping.sh`, wired to
+  Claude Code's SessionStart + UserPromptSubmit) makes a correct install confirm
+  itself without the agent having to ask anything. See `docs/agent-hooks.md` and
+  ADR-0019. The signal is surfaced positively (absence is never shown as
+  "broken", which would false-positive on reconnect).
 - **Agent prompt preview** (#61): when an agent is waiting on you, the sidebar
   session row now shows what it asked ("the session says: …") on hover. A
   Claude Code Notification hook (`contrib/agent-hooks/claude-code/`) emits the
@@ -461,6 +469,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `remora-core` / `remora-protocol` crates, CI, and community docs.
 
 ### Changed
+
+- **Tabs reflow live while dragging to reorder** (#185): dragging a tab now
+  shuffles the other tabs out of the way in real time and slides the dragged
+  tab (dimmed) into its prospective slot, instead of showing a static drop
+  indicator that only committed on release. The previewed order and the order
+  that lands on drop are computed by one shared `reorderTabs` helper, so they
+  can never diverge, and the whole strip accepts the drag so the native cursor
+  reads "move" rather than the stray "+" copy glyph. Midpoint hysteresis to
+  damp boundary flicker is a follow-up (#209).
+- **Dropped the "Remora" window title-bar text** (#186): the native OS window
+  title is now empty (`app.windows[0].title` in `tauri.conf.json`) instead of
+  duplicating the wordmark logo the app already renders in its own chrome. The
+  traffic-light controls and window dragging are unaffected — only the redundant
+  title text is gone.
 
 - **Activity-pulse glow unified on marine** (#180): the pulse halo now uses the
   signature marine accent end to end instead of a legacy lavender. `--glow-pulse`

@@ -4,7 +4,12 @@ import type { BridgeOutput, OnOutput, SessionConnection } from "./connection";
 // Mock activity-store and useActivity so tests don't pull in the real singleton.
 vi.mock("./activity-store");
 vi.mock("./useActivity", () => ({
-  activityStore: { setStatus: vi.fn(), setPreview: vi.fn(), clear: vi.fn() },
+  activityStore: {
+    setStatus: vi.fn(),
+    setPreview: vi.fn(),
+    noteMarkerSeen: vi.fn(),
+    clear: vi.fn(),
+  },
 }));
 
 // Mock xterm: capture the constructed Terminal/FitAddon so tests can inspect
@@ -514,7 +519,12 @@ describe("TerminalController", () => {
   }
 
   it("records core statusChange and previewUpdate events into the activity sink", () => {
-    const sink = { setStatus: vi.fn(), setPreview: vi.fn(), clear: vi.fn() };
+    const sink = {
+      setStatus: vi.fn(),
+      setPreview: vi.fn(),
+      noteMarkerSeen: vi.fn(),
+      clear: vi.fn(),
+    };
     const { el: hEl, conn } = makeHarness();
     new TerminalController(
       hEl,
@@ -524,12 +534,19 @@ describe("TerminalController", () => {
     );
     conn.emit({ event: "statusChange", status: "working" });
     conn.emit({ event: "previewUpdate", preview: "run tests?" });
+    conn.emit({ event: "markerSeen" });
     expect(sink.setStatus).toHaveBeenCalledWith("p/a", "working");
     expect(sink.setPreview).toHaveBeenCalledWith("p/a", "run tests?");
+    expect(sink.noteMarkerSeen).toHaveBeenCalledWith("p/a");
   });
 
   it("clears the sink on a closed event", () => {
-    const sink = { setStatus: vi.fn(), setPreview: vi.fn(), clear: vi.fn() };
+    const sink = {
+      setStatus: vi.fn(),
+      setPreview: vi.fn(),
+      noteMarkerSeen: vi.fn(),
+      clear: vi.fn(),
+    };
     const { el: hEl, conn } = makeHarness();
     new TerminalController(
       hEl,

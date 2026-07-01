@@ -227,6 +227,7 @@ impl From<DetectorEvent> for ChannelOutput {
         match ev {
             DetectorEvent::Status(s) => ChannelOutput::StatusChange(s),
             DetectorEvent::Preview(t) => ChannelOutput::PreviewUpdate(t.into_string()),
+            DetectorEvent::MarkerSeen => ChannelOutput::MarkerSeen,
         }
     }
 }
@@ -237,6 +238,15 @@ mod tests {
     use remora_protocol::TerminalSize;
     use std::process::Command as StdCommand;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn marker_seen_event_maps_to_channel_output() {
+        use crate::activity::DetectorEvent;
+        assert_eq!(
+            ChannelOutput::from(DetectorEvent::MarkerSeen),
+            ChannelOutput::MarkerSeen
+        );
+    }
 
     /// POSIX liveness probe without `libc`/`unsafe`: `kill -0` succeeds iff
     /// the process still exists.

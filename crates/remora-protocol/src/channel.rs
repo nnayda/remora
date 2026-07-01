@@ -124,6 +124,10 @@ pub enum ChannelOutput {
     /// (ADR-0013). The sender (core) control-strips + length-caps the untrusted
     /// payload before constructing this; consumers render it as text.
     PreviewUpdate(String),
+    /// One-shot: the OSC-7366 scanner parsed its first well-formed marker on this
+    /// channel this attach (#198). Proves the agent's activity hook is wired,
+    /// independent of activity state. Carries no data — presence is the signal.
+    MarkerSeen,
 }
 
 #[cfg(test)]
@@ -229,5 +233,19 @@ mod tests {
         assert_eq!(json, r#"{"preview_update":"run tests? (y/n)"}"#);
         let back: ChannelOutput = serde_json::from_str(&json).expect("de");
         assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn marker_seen_wire_format() {
+        let msg = ChannelOutput::MarkerSeen;
+        let json = serde_json::to_string(&msg).expect("ser");
+        assert_eq!(json, r#""marker_seen""#);
+        let back: ChannelOutput = serde_json::from_str(&json).expect("de");
+        assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn protocol_version_is_two() {
+        assert_eq!(crate::PROTOCOL_VERSION, 2);
     }
 }

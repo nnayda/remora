@@ -34,10 +34,19 @@ impl From<remora_protocol::SessionStatus> for SessionStatusDto {
 #[derive(Clone, Debug, serde::Serialize, specta::Type)]
 #[serde(tag = "event", rename_all = "camelCase")]
 pub enum BridgeOutput {
-    Bytes { bytes: Vec<u8> },
+    Bytes {
+        bytes: Vec<u8>,
+    },
     Closed,
-    StatusChange { status: SessionStatusDto },
-    PreviewUpdate { preview: String },
+    StatusChange {
+        status: SessionStatusDto,
+    },
+    PreviewUpdate {
+        preview: String,
+    },
+    /// The activity-hook pipeline is confirmed wired for this session (#198):
+    /// core parsed its first OSC-7366 marker this attach. Presence is the signal.
+    MarkerSeen,
 }
 
 /// The frontend stopped listening (its Channel receiver is gone).
@@ -106,6 +115,13 @@ mod tests {
             serde_json::to_string(&b).expect("serialize"),
             r#"{"event":"previewUpdate","preview":"run tests?"}"#
         );
+    }
+
+    #[test]
+    fn marker_seen_wire_format() {
+        let b = BridgeOutput::MarkerSeen;
+        let json = serde_json::to_string(&b).expect("serialize");
+        assert_eq!(json, r#"{"event":"markerSeen"}"#);
     }
 
     #[test]

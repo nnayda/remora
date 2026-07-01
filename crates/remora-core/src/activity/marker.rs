@@ -4,7 +4,8 @@
 //! OSC reassembly and bounds its own buffers (the untrusted-input DoS cap).
 //!
 //! Grammar (inner, after tmux passthrough unwraps it):
-//!   ESC ] 7366 ; remora ; <ver> ; <type> ; <state-b64> [ ; <msg-b64> ] BEL
+//!   state:  ESC ] 7366 ; remora ; <ver> ; state ; <state-b64> [ ; <msg-b64> ] BEL
+//!   ping:   ESC ] 7366 ; remora ; <ver> ; ping BEL   (payload-free liveness marker, #198/ADR-0019)
 //! vte splits the OSC string on ';' and hands us the segments (the `7366` code
 //! is the first segment).
 
@@ -17,13 +18,19 @@ const CODE: &[u8] = b"7366";
 const TOKEN: &[u8] = b"remora";
 const VERSION: &[u8] = b"1";
 const TYPE_STATE: &[u8] = b"state";
+const TYPE_PING: &[u8] = b"ping";
 const PAYLOAD_CAP: usize = 80;
 
-/// A recognized marker: the asserted status and an optional preview message.
+/// A recognized marker. `State` carries the asserted status + optional preview
+/// (ADR-0010/0013). `Liveness` is the payload-free `ping` (#198): it proves the
+/// agent's hook pipeline is wired without asserting any activity state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MarkerHit {
-    pub status: SessionStatus,
-    pub preview: Option<SanitizedText>,
+pub enum MarkerHit {
+    State {
+        status: SessionStatus,
+        preview: Option<SanitizedText>,
+    },
+    Liveness,
 }
 
 /// Incremental scanner. Feed PTY chunks; vte buffers partial markers between
@@ -82,18 +89,23 @@ impl vte::Perform for MarkerSink {
 }
 
 fn parse_marker(params: &[&[u8]]) -> Option<MarkerHit> {
-    // [7366, remora, ver, type, state-b64, (msg-b64)?]
-    if params.len() < 5 || params.len() > 6 {
+    // Common prefix: [7366, remora, ver, type, ...]
+    if params.len() < 4 || params[0] != CODE || params[1] != TOKEN || params[2] != VERSION {
         return None;
     }
-    if params[0] != CODE || params[1] != TOKEN || params[2] != VERSION || params[3] != TYPE_STATE {
+    // Liveness ping: exactly [7366, remora, 1, ping] — no payload. A ping with
+    // any trailing segment is a forgery attempt and is dropped.
+    if params[3] == TYPE_PING {
+        return (params.len() == 4).then_some(MarkerHit::Liveness);
+    }
+    // State marker: [7366, remora, 1, state, state-b64, (msg-b64)?].
+    if params[3] != TYPE_STATE || params.len() < 5 || params.len() > 6 {
         return None;
     }
     // The state token is matched against a fixed allowlist, so it is decoded
     // RAW (no sanitize): scrubbing control chars first would let a forged
-    // `working\x00` normalize to a valid `working`. The allowlist is the
-    // validation; anything not exactly equal is ignored. Only the free-text
-    // preview below is sanitized (control/format-stripped, capped).
+    // `working\x00` normalize to a valid `working`. Only the free-text preview
+    // is sanitized (control/format-stripped, capped).
     let status = decode_utf8(params[4])
         .as_deref()
         .and_then(status_from_token)?;
@@ -102,7 +114,7 @@ fn parse_marker(params: &[&[u8]]) -> Option<MarkerHit> {
         let s = sanitize(&text, PAYLOAD_CAP);
         (!s.is_empty()).then_some(s)
     });
-    Some(MarkerHit { status, preview })
+    Some(MarkerHit::State { status, preview })
 }
 
 fn decode_utf8(seg: &[u8]) -> Option<String> {
@@ -150,15 +162,21 @@ mod tests {
         let mut s = MarkerScanner::new();
         let hits = s.feed(&marker("d29ya2luZw==")); // "working"
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].status, SessionStatus::Working);
-        assert!(hits[0].preview.is_none());
+        let MarkerHit::State { status, preview } = &hits[0] else {
+            panic!("expected State, got {:?}", hits[0]);
+        };
+        assert_eq!(*status, SessionStatus::Working);
+        assert!(preview.is_none());
     }
 
     #[test]
     fn awaiting_token_maps_to_awaiting() {
         let mut s = MarkerScanner::new();
         let hits = s.feed(&marker("YXdhaXRpbmdfaW5wdXQ=")); // "awaiting_input"
-        assert_eq!(hits[0].status, SessionStatus::Awaiting);
+        let MarkerHit::State { status, .. } = &hits[0] else {
+            panic!("expected State, got {:?}", hits[0]);
+        };
+        assert_eq!(*status, SessionStatus::Awaiting);
     }
 
     #[test]
@@ -169,7 +187,59 @@ mod tests {
         assert!(s.feed(a).is_empty()); // incomplete: vte buffers internally
         let hits = s.feed(b);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].status, SessionStatus::Idle);
+        let MarkerHit::State { status, .. } = &hits[0] else {
+            panic!("expected State, got {:?}", hits[0]);
+        };
+        assert_eq!(*status, SessionStatus::Idle);
+    }
+
+    fn ping_marker() -> Vec<u8> {
+        b"\x1b]7366;remora;1;ping\x07".to_vec()
+    }
+
+    fn make_wrapped_ping() -> String {
+        // tmux passthrough envelope (inner ESC doubled), ADR-0010 on-wire form.
+        "\x1bPtmux;\x1b\x1b]7366;remora;1;ping\x07\x1b\\".to_string()
+    }
+
+    #[test]
+    fn parses_a_liveness_ping() {
+        let mut s = MarkerScanner::new();
+        let hits = s.feed(&ping_marker());
+        assert_eq!(hits, vec![MarkerHit::Liveness]);
+    }
+
+    #[test]
+    fn reassembles_ping_split_across_feeds() {
+        // The ping shares the vte reassembly path with state markers; guard it
+        // with its own regression test so a split read boundary still yields one
+        // Liveness hit (parity with reassembles_marker_split_across_feeds).
+        let bytes = ping_marker();
+        let (a, b) = bytes.split_at(10);
+        let mut s = MarkerScanner::new();
+        assert!(s.feed(a).is_empty()); // incomplete: vte buffers internally
+        assert_eq!(s.feed(b), vec![MarkerHit::Liveness]);
+    }
+
+    #[test]
+    fn ping_with_extra_segment_is_rejected() {
+        // A forged ping carrying a payload is not the 4-segment liveness form.
+        let mut s = MarkerScanner::new();
+        assert!(s.feed(b"\x1b]7366;remora;1;ping;Ym9ndXM=\x07").is_empty());
+    }
+
+    #[test]
+    fn remora_ping_recipe_round_trip() {
+        // The exact WRAPPED bytes remora-ping.sh emits (keep in sync with the script).
+        let wrapped = make_wrapped_ping();
+        let inner = strip_tmux_passthrough(&wrapped);
+        let mut s = MarkerScanner::new();
+        let hits = s.feed(inner.as_bytes());
+        assert_eq!(
+            hits,
+            vec![MarkerHit::Liveness],
+            "exactly one liveness marker"
+        );
     }
 
     #[test]
@@ -195,11 +265,11 @@ mod tests {
         // "working" + "Run tests?" (base64 "UnVuIHRlc3RzPw==").
         let mut s = MarkerScanner::new();
         let hits = s.feed(b"\x1b]7366;remora;1;state;d29ya2luZw==;UnVuIHRlc3RzPw==\x07");
-        assert_eq!(hits[0].status, SessionStatus::Working);
-        assert_eq!(
-            hits[0].preview.as_ref().expect("preview").as_str(),
-            "Run tests?"
-        );
+        let MarkerHit::State { status, preview } = &hits[0] else {
+            panic!("expected State, got {:?}", hits[0]);
+        };
+        assert_eq!(*status, SessionStatus::Working);
+        assert_eq!(preview.as_ref().expect("preview").as_str(), "Run tests?");
     }
 
     #[test]
@@ -238,9 +308,12 @@ mod tests {
         let mut s = MarkerScanner::new();
         let hits = s.feed(inner.as_bytes());
         assert_eq!(hits.len(), 1, "exactly one marker, got {hits:?}");
-        assert_eq!(hits[0].status, SessionStatus::Awaiting);
+        let MarkerHit::State { status, preview } = &hits[0] else {
+            panic!("expected State, got {:?}", hits[0]);
+        };
+        assert_eq!(*status, SessionStatus::Awaiting);
         assert_eq!(
-            hits[0].preview.as_ref().expect("preview").as_str(),
+            preview.as_ref().expect("preview").as_str(),
             "Approve running tests?"
         );
     }
@@ -259,6 +332,65 @@ mod tests {
             wrapped.contains("\x1b\x1b]7366;"),
             "inner ESC must be doubled"
         );
+    }
+
+    /// Regression guard: executes the remora-ping.sh script and asserts its
+    /// stdout bytes match the wire contract. A no-op in minimal environments
+    /// (no bash), but is the live guard where tooling is present.
+    ///
+    /// This test ties the SCRIPT to the wire contract — editing the script
+    /// back to a bare OSC or stdout would fail here. The manual hermes
+    /// dogfood (/dev/tty + real tmux) remains the true e2e gate.
+    #[test]
+    fn ping_script_output_matches_wire_contract() {
+        use std::process::{Command, Stdio};
+
+        let script_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contrib/agent-hooks/claude-code/remora-ping.sh"
+        );
+        if !std::path::Path::new(script_path).exists() {
+            eprintln!("skip: script not found at {script_path}");
+            return;
+        }
+        let has_bash = Command::new("bash")
+            .arg("-c")
+            .arg("true")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !has_bash {
+            eprintln!("skip: bash not found");
+            return;
+        }
+
+        let output = Command::new("bash")
+            .arg(script_path)
+            .env("REMORA_MARKER_OUT", "/dev/stdout")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("bash should spawn")
+            .wait_with_output()
+            .expect("script should exit");
+        assert!(
+            output.status.success(),
+            "script exited non-zero: {:?}",
+            output.status
+        );
+
+        let stdout = String::from_utf8(output.stdout).expect("utf-8");
+        let stdout = stdout.trim_end_matches('\n');
+        assert_eq!(
+            stdout,
+            make_wrapped_ping(),
+            "ping script output does not match wire contract"
+        );
+
+        // Tie script output to the scanner: it must parse to Liveness.
+        let inner = strip_tmux_passthrough(&make_wrapped_ping());
+        let mut s = MarkerScanner::new();
+        assert_eq!(s.feed(inner.as_bytes()), vec![MarkerHit::Liveness]);
     }
 
     /// Regression guard: executes the actual shell script and asserts its
@@ -344,9 +476,12 @@ mod tests {
         let mut s = MarkerScanner::new();
         let hits = s.feed(inner.as_bytes());
         assert_eq!(hits.len(), 1, "exactly one marker from script output");
-        assert_eq!(hits[0].status, SessionStatus::Awaiting);
+        let MarkerHit::State { status, preview } = &hits[0] else {
+            panic!("expected State, got {:?}", hits[0]);
+        };
+        assert_eq!(*status, SessionStatus::Awaiting);
         assert_eq!(
-            hits[0].preview.as_ref().expect("preview").as_str(),
+            preview.as_ref().expect("preview").as_str(),
             "Approve running tests?"
         );
     }

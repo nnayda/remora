@@ -220,7 +220,12 @@ export type BridgeError = { kind: "sessionExists"; message: string } | { kind: "
  * so the generated TS is a clean discriminated union. A local bridge<->frontend
  * DTO (NOT a wire-protocol type), so it is free to grow.
  */
-export type BridgeOutput = { event: "bytes"; bytes: number[] } | { event: "closed" } | { event: "statusChange"; status: SessionStatusDto } | { event: "previewUpdate"; preview: string }
+export type BridgeOutput = { event: "bytes"; bytes: number[] } | { event: "closed" } | { event: "statusChange"; status: SessionStatusDto } | { event: "previewUpdate"; preview: string } | 
+/**
+ * The activity-hook pipeline is confirmed wired for this session (#198):
+ * core parsed its first OSC-7366 marker this attach. Presence is the signal.
+ */
+{ event: "markerSeen" }
 /**
  * Opaque handle the frontend uses to address one open channel (write/resize/close).
  */
