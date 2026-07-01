@@ -33,7 +33,10 @@ describe("shouldDisarmAfterSidebarOpen", () => {
 
   it("disarms on a real failure (a no-op open would leave the flag armed)", () => {
     expect(
-      shouldDisarmAfterSidebarOpen({ ok: false, error: new Error("boom") }, null),
+      shouldDisarmAfterSidebarOpen(
+        { ok: false, error: new Error("boom") },
+        null,
+      ),
     ).toBe(true);
   });
 
@@ -46,7 +49,9 @@ describe("shouldDisarmAfterSidebarOpen", () => {
 
 describe("shouldFocusActiveTabInPlace", () => {
   it("focuses in place when re-clicking the active, locally-live tab", () => {
-    expect(shouldFocusActiveTabInPlace("api/fix", "api/fix", "live")).toBe(true);
+    expect(shouldFocusActiveTabInPlace("api/fix", "api/fix", "live")).toBe(
+      true,
+    );
   });
 
   it("does NOT focus in place when the active tab is non-live (must revive) — Bug A", () => {
@@ -57,7 +62,9 @@ describe("shouldFocusActiveTabInPlace", () => {
   });
 
   it("does NOT focus in place when the clicked tab is not the active one", () => {
-    expect(shouldFocusActiveTabInPlace("api/fix", "web/ui", "live")).toBe(false);
+    expect(shouldFocusActiveTabInPlace("api/fix", "web/ui", "live")).toBe(
+      false,
+    );
     expect(shouldFocusActiveTabInPlace(null, "web/ui", "live")).toBe(false);
   });
 });

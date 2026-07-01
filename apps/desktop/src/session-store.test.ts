@@ -922,7 +922,8 @@ describe("SessionStore reconnect machine", () => {
   it("reconnectTab on a truly-gone session lands back at stopped, never respawns (#189)", async () => {
     const respawn = vi.fn(() => Promise.resolve(fakeConn().conn));
     const { store, spawned } = makeStore({
-      attach: () => Promise.reject({ kind: "sessionNotFound", message: "gone" }),
+      attach: () =>
+        Promise.reject({ kind: "sessionNotFound", message: "gone" }),
       respawn,
     });
     await store.openSession(ps);
