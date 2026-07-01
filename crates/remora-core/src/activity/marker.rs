@@ -17,13 +17,19 @@ const CODE: &[u8] = b"7366";
 const TOKEN: &[u8] = b"remora";
 const VERSION: &[u8] = b"1";
 const TYPE_STATE: &[u8] = b"state";
+const TYPE_PING: &[u8] = b"ping";
 const PAYLOAD_CAP: usize = 80;
 
-/// A recognized marker: the asserted status and an optional preview message.
+/// A recognized marker. `State` carries the asserted status + optional preview
+/// (ADR-0010/0013). `Liveness` is the payload-free `ping` (#198): it proves the
+/// agent's hook pipeline is wired without asserting any activity state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MarkerHit {
-    pub status: SessionStatus,
-    pub preview: Option<SanitizedText>,
+pub enum MarkerHit {
+    State {
+        status: SessionStatus,
+        preview: Option<SanitizedText>,
+    },
+    Liveness,
 }
 
 /// Incremental scanner. Feed PTY chunks; vte buffers partial markers between
@@ -82,18 +88,23 @@ impl vte::Perform for MarkerSink {
 }
 
 fn parse_marker(params: &[&[u8]]) -> Option<MarkerHit> {
-    // [7366, remora, ver, type, state-b64, (msg-b64)?]
-    if params.len() < 5 || params.len() > 6 {
+    // Common prefix: [7366, remora, ver, type, ...]
+    if params.len() < 4 || params[0] != CODE || params[1] != TOKEN || params[2] != VERSION {
         return None;
     }
-    if params[0] != CODE || params[1] != TOKEN || params[2] != VERSION || params[3] != TYPE_STATE {
+    // Liveness ping: exactly [7366, remora, 1, ping] — no payload. A ping with
+    // any trailing segment is a forgery attempt and is dropped.
+    if params[3] == TYPE_PING {
+        return (params.len() == 4).then_some(MarkerHit::Liveness);
+    }
+    // State marker: [7366, remora, 1, state, state-b64, (msg-b64)?].
+    if params[3] != TYPE_STATE || params.len() < 5 || params.len() > 6 {
         return None;
     }
     // The state token is matched against a fixed allowlist, so it is decoded
     // RAW (no sanitize): scrubbing control chars first would let a forged
-    // `working\x00` normalize to a valid `working`. The allowlist is the
-    // validation; anything not exactly equal is ignored. Only the free-text
-    // preview below is sanitized (control/format-stripped, capped).
+    // `working\x00` normalize to a valid `working`. Only the free-text preview
+    // is sanitized (control/format-stripped, capped).
     let status = decode_utf8(params[4])
         .as_deref()
         .and_then(status_from_token)?;
@@ -102,7 +113,7 @@ fn parse_marker(params: &[&[u8]]) -> Option<MarkerHit> {
         let s = sanitize(&text, PAYLOAD_CAP);
         (!s.is_empty()).then_some(s)
     });
-    Some(MarkerHit { status, preview })
+    Some(MarkerHit::State { status, preview })
 }
 
 fn decode_utf8(seg: &[u8]) -> Option<String> {
@@ -150,15 +161,22 @@ mod tests {
         let mut s = MarkerScanner::new();
         let hits = s.feed(&marker("d29ya2luZw==")); // "working"
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].status, SessionStatus::Working);
-        assert!(hits[0].preview.is_none());
+        let MarkerHit::State { status, preview } = &hits[0] else {
+            panic!("expected State, got {:?}", hits[0]);
+        };
+        assert_eq!(*status, SessionStatus::Working);
+        assert!(preview.is_none());
     }
 
     #[test]
     fn awaiting_token_maps_to_awaiting() {
         let mut s = MarkerScanner::new();
         let hits = s.feed(&marker("YXdhaXRpbmdfaW5wdXQ=")); // "awaiting_input"
-        assert_eq!(hits[0].status, SessionStatus::Awaiting);
+        let MarkerHit::State { status, preview } = &hits[0] else {
+            panic!("expected State, got {:?}", hits[0]);
+        };
+        assert_eq!(*status, SessionStatus::Awaiting);
+        let _ = preview;
     }
 
     #[test]
@@ -169,7 +187,44 @@ mod tests {
         assert!(s.feed(a).is_empty()); // incomplete: vte buffers internally
         let hits = s.feed(b);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].status, SessionStatus::Idle);
+        let MarkerHit::State { status, preview } = &hits[0] else {
+            panic!("expected State, got {:?}", hits[0]);
+        };
+        assert_eq!(*status, SessionStatus::Idle);
+        let _ = preview;
+    }
+
+    fn ping_marker() -> Vec<u8> {
+        b"\x1b]7366;remora;1;ping\x07".to_vec()
+    }
+
+    fn make_wrapped_ping() -> String {
+        // tmux passthrough envelope (inner ESC doubled), ADR-0010 on-wire form.
+        "\x1bPtmux;\x1b\x1b]7366;remora;1;ping\x07\x1b\\".to_string()
+    }
+
+    #[test]
+    fn parses_a_liveness_ping() {
+        let mut s = MarkerScanner::new();
+        let hits = s.feed(&ping_marker());
+        assert_eq!(hits, vec![MarkerHit::Liveness]);
+    }
+
+    #[test]
+    fn ping_with_extra_segment_is_rejected() {
+        // A forged ping carrying a payload is not the 4-segment liveness form.
+        let mut s = MarkerScanner::new();
+        assert!(s.feed(b"\x1b]7366;remora;1;ping;Ym9ndXM=\x07").is_empty());
+    }
+
+    #[test]
+    fn remora_ping_recipe_round_trip() {
+        // The exact WRAPPED bytes remora-ping.sh emits (keep in sync with the script).
+        let wrapped = make_wrapped_ping();
+        let inner = strip_tmux_passthrough(&wrapped);
+        let mut s = MarkerScanner::new();
+        let hits = s.feed(inner.as_bytes());
+        assert_eq!(hits, vec![MarkerHit::Liveness], "exactly one liveness marker");
     }
 
     #[test]
@@ -195,11 +250,11 @@ mod tests {
         // "working" + "Run tests?" (base64 "UnVuIHRlc3RzPw==").
         let mut s = MarkerScanner::new();
         let hits = s.feed(b"\x1b]7366;remora;1;state;d29ya2luZw==;UnVuIHRlc3RzPw==\x07");
-        assert_eq!(hits[0].status, SessionStatus::Working);
-        assert_eq!(
-            hits[0].preview.as_ref().expect("preview").as_str(),
-            "Run tests?"
-        );
+        let MarkerHit::State { status, preview } = &hits[0] else {
+            panic!("expected State, got {:?}", hits[0]);
+        };
+        assert_eq!(*status, SessionStatus::Working);
+        assert_eq!(preview.as_ref().expect("preview").as_str(), "Run tests?");
     }
 
     #[test]
@@ -238,9 +293,12 @@ mod tests {
         let mut s = MarkerScanner::new();
         let hits = s.feed(inner.as_bytes());
         assert_eq!(hits.len(), 1, "exactly one marker, got {hits:?}");
-        assert_eq!(hits[0].status, SessionStatus::Awaiting);
+        let MarkerHit::State { status, preview } = &hits[0] else {
+            panic!("expected State, got {:?}", hits[0]);
+        };
+        assert_eq!(*status, SessionStatus::Awaiting);
         assert_eq!(
-            hits[0].preview.as_ref().expect("preview").as_str(),
+            preview.as_ref().expect("preview").as_str(),
             "Approve running tests?"
         );
     }
@@ -344,9 +402,12 @@ mod tests {
         let mut s = MarkerScanner::new();
         let hits = s.feed(inner.as_bytes());
         assert_eq!(hits.len(), 1, "exactly one marker from script output");
-        assert_eq!(hits[0].status, SessionStatus::Awaiting);
+        let MarkerHit::State { status, preview } = &hits[0] else {
+            panic!("expected State, got {:?}", hits[0]);
+        };
+        assert_eq!(*status, SessionStatus::Awaiting);
         assert_eq!(
-            hits[0].preview.as_ref().expect("preview").as_str(),
+            preview.as_ref().expect("preview").as_str(),
             "Approve running tests?"
         );
     }
