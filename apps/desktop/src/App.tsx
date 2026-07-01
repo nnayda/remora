@@ -9,7 +9,10 @@ import { SettingsDialog, type View as SettingsView } from "./SettingsDialog";
 import { Sidebar } from "./Sidebar";
 import { canRespawn, OPEN_CANCELLED, tabKey } from "./session-store";
 import { buildTree, type SessionNode } from "./session-tree";
-import { shouldDisarmAfterSidebarOpen } from "./sidebar-focus";
+import {
+  shouldDisarmAfterSidebarOpen,
+  shouldDisarmAfterSidebarRespawn,
+} from "./sidebar-focus";
 import { SIDEBAR_COLLAPSE_LABEL, SIDEBAR_EXPAND_LABEL } from "./sidebar-labels";
 import { TabBar } from "./TabBar";
 import { Terminal, type TerminalHandle } from "./Terminal";
@@ -212,7 +215,27 @@ function App() {
     setNotice(null);
     setMobilePane("session");
     focusOnSelect.current = true;
+    const key = tabKey(node.projectId, node.sessionId);
     if (node.state === "stopped") {
+      // Stale discovery, the other way (#178, twin of #141/#136): discovery
+      // reports this session stopped (server reaped it), but the matching local
+      // tab hasn't torn down. Sample the tab fresh from the store, not the
+      // render closure — a status flip can land between render and this click
+      // (the sibling live-attach disarm reads fresh for the same reason).
+      const snap = sessionStore.getSnapshot();
+      const preStatus = snap.tabs.find((t) => t.key === key)?.status ?? null;
+      // Re-clicking the active, locally-live tab: openViaRespawn would dedupe to
+      // it, trigger no respawn (its status isn't stopped/disconnected), and
+      // leave activeKey/activeStatus unchanged — so the activeKey-gated focus
+      // effect never fires to consume focusOnSelect, leaking the armed flag onto
+      // the next unrelated change. Gate on local liveness, not key equality
+      // alone: a genuinely-stopped active tab (preStatus !== "live") must still
+      // fall through and respawn. Focus directly and disarm, as live-attach does.
+      if (key === snap.activeKey && preStatus === "live") {
+        focusOnSelect.current = false;
+        terminals.current.get(key)?.focus();
+        return;
+      }
       void openViaRespawn({
         projectId: node.projectId,
         sessionId: node.sessionId,
@@ -221,10 +244,18 @@ function App() {
         workspace: node.workspace ?? "worktree",
       })
         .then((r) => {
-          if (!r.ok && r.error !== OPEN_CANCELLED) {
-            // A failed open never changes activeKey, so the intent flag would
-            // stay armed and steal focus on the next unrelated change. Disarm.
+          // Disarm where no controlled path to a live terminal follows — a real
+          // failure, or a dedupe to a reconnecting/vanished tab whose recovery
+          // we don't own (#136 policy). Keep the arm for a fresh spawn, a live
+          // dedupe, or a stopped/disconnected tab openViaRespawn respawns, so
+          // the focus effect lands focus once it goes live. Decide from the
+          // pre-call status: respawnTab flips stopped→reconnecting synchronously,
+          // so a post-call read would misjudge a tab that is legitimately
+          // respawning.
+          if (shouldDisarmAfterSidebarRespawn(r, preStatus)) {
             focusOnSelect.current = false;
+          }
+          if (!r.ok && r.error !== OPEN_CANCELLED) {
             setNotice("Could not respawn the session.");
           }
         })
@@ -240,7 +271,6 @@ function App() {
     // focus the terminal nor consume focusOnSelect, leaking the armed flag onto
     // the next unrelated activeStatus change (#133/#136 focus-steal class).
     // Mirror the TabBar onFocus path: focus the terminal directly and disarm.
-    const key = tabKey(node.projectId, node.sessionId);
     if (key === activeKey) {
       focusOnSelect.current = false;
       terminals.current.get(key)?.focus();
