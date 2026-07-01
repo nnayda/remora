@@ -28,6 +28,8 @@ the old one rather than editing history (see
 | [0015](0015-branch-identified-worktree-discovery.md) | Identify worktree sessions by branch, discover by path | Accepted |
 | [0016](0016-host-grouped-discovery-list.md) | Report discovery as per-host buckets, retain a transiently-down host's rows | Accepted |
 | [0017](0017-kubectl-exec-round-trip-reduction.md) | Reduce kubectl exec round-trips (batch spawn, parallelize list); don't reuse connections via kube-rs | Accepted |
+| [0018](0018-agent-prompt-preview-live.md) | Make the agent-prompt preview live: wrapped marker + sidebar tooltip | Accepted |
+| [0019](0019-liveness-ping-hook-confirmation.md) | Confirm activity-hook installs with a positive affirmation, never a silence accusation | Accepted |
 
 ## Statuses
 

@@ -27,7 +27,7 @@ import {
   useRailWidth,
 } from "./ui";
 import { ChevronRight } from "./ui/icons";
-import { useActivity, usePreviews } from "./useActivity";
+import { useActivity, useMarkerSeen, usePreviews } from "./useActivity";
 import { discoveryStore, useDiscovery } from "./useDiscovery";
 import { useReconnect } from "./useReconnect";
 import { sessionStore, useSessions } from "./useSessions";
@@ -64,6 +64,7 @@ function App() {
   useReconnect(sessionStore);
   const activity = useActivity();
   const previews = usePreviews();
+  const markerSeen = useMarkerSeen();
   const {
     config,
     sessions,
@@ -467,6 +468,7 @@ function App() {
             onAddProject={openAddProject}
             activity={activity}
             previews={previews}
+            markerSeen={markerSeen}
             onCollapse={isMobile ? undefined : toggleCollapsed}
           />
         )}
