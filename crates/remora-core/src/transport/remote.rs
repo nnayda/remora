@@ -937,25 +937,10 @@ pub(crate) fn run_respawn(
             Err(SourceError::Transport(probe.stderr))
         };
     }
-    // Batched stamp tail: new-session (the atomic lock) + passthrough + set-env,
-    // one script. No worktree-add / fetch / cascade (the worktree survives).
-    let mut steps = vec![Step {
-        id: StepId::NewSession,
-        cmd: join_cmd(&new_session_tokens(effective)),
-        fatal: true,
-    }];
-    steps.push(Step {
-        id: StepId::Passthrough,
-        cmd: join_cmd(&set_passthrough_tokens(&effective.tmux_name)),
-        fatal: false,
-    });
-    for (key, value) in &effective.env {
-        steps.push(Step {
-            id: StepId::SetEnv,
-            cmd: join_cmd(&set_environment_tokens(&effective.tmux_name, key, value)),
-            fatal: false,
-        });
-    }
+    // Batched stamp tail: [provision] + new-session (the atomic lock) +
+    // passthrough + set-env, one script. No worktree-add / fetch / cascade
+    // (the worktree survives a respawn).
+    let steps = build_respawn_steps(effective);
     let out = exec.run(&batch::build(&steps, batch::BatchMode::StopOnError))?;
     let records = batch::parse_records(&out.stdout)?;
     if records.is_empty() {
@@ -1796,6 +1781,43 @@ fn build_spawn_steps(plan: &SpawnPlan) -> Vec<Step> {
             id: StepId::Provision,
             cmd: provision_cmd(p),
             fatal: false, // best-effort; never aborts the spawn (like Passthrough)
+        });
+    }
+    steps.push(Step {
+        id: StepId::NewSession,
+        cmd: join_cmd(&new_session_tokens(plan)),
+        fatal: true,
+    });
+    steps.push(Step {
+        id: StepId::Passthrough,
+        cmd: join_cmd(&set_passthrough_tokens(&plan.tmux_name)),
+        fatal: false,
+    });
+    for (key, value) in &plan.env {
+        steps.push(Step {
+            id: StepId::SetEnv,
+            cmd: join_cmd(&set_environment_tokens(&plan.tmux_name, key, value)),
+            fatal: false,
+        });
+    }
+    steps
+}
+
+/// The ordered batched-respawn step list: [Provision (non-fatal, only when
+/// `plan.provision` is set)] -> NewSession (fatal) -> Passthrough (non-fatal)
+/// -> SetEnv x N (non-fatal, one per `plan.env` entry). No worktree-add /
+/// fetch / cascade (the worktree survives a respawn). Provision mirrors
+/// `build_spawn_steps` so a respawn re-writes the hook script exactly like a
+/// spawn does (ADR-0019) — otherwise a provisioned file that goes missing
+/// while the worktree survives (e.g. node recycled in k8s) stays missing
+/// forever and activity markers silently die.
+fn build_respawn_steps(plan: &SpawnPlan) -> Vec<Step> {
+    let mut steps = Vec::new();
+    if let Some(p) = &plan.provision {
+        steps.push(Step {
+            id: StepId::Provision,
+            cmd: provision_cmd(p),
+            fatal: false, // best-effort; never aborts the respawn (like spawn)
         });
     }
     steps.push(Step {
@@ -4823,6 +4845,60 @@ pub(crate) mod tests {
             "re-stamp must fire when fingerprint is absent"
         );
         assert_eq!(fake.opened.lock().expect("lock").len(), 1, "still attaches");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_respawn_steps provision tests (#196) — respawn must re-provision
+    // the hook exactly like spawn does (ADR-0019), so a hook file that goes
+    // missing while the worktree survives gets re-written on the next respawn.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn respawn_steps_include_provision_before_new_session_when_present() {
+        let mut plan = respawn_plan();
+        plan.provision = Some(crate::config::ProvisionFile {
+            path: "~/.remora/hooks/claude-notify.sh".into(),
+            content: "x".into(),
+            mode: Some(0o755),
+        });
+        let steps = build_respawn_steps(&plan);
+        let prov = steps
+            .iter()
+            .position(|s| matches!(s.id, batch::StepId::Provision))
+            .expect("provision step present");
+        let new = steps
+            .iter()
+            .position(|s| matches!(s.id, batch::StepId::NewSession))
+            .expect("new_session step present");
+        assert!(prov < new, "provision must precede new_session");
+        assert!(
+            !steps[prov].fatal,
+            "provision must be non-fatal (best-effort), like spawn"
+        );
+    }
+
+    #[test]
+    fn respawn_steps_omit_provision_when_absent() {
+        let plan = respawn_plan(); // provision: None (from worktree_plan())
+        let steps = build_respawn_steps(&plan);
+        assert!(
+            !steps
+                .iter()
+                .any(|s| matches!(s.id, batch::StepId::Provision)),
+            "no provision file ⇒ no Provision step"
+        );
+        let ids: Vec<_> = steps.iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                batch::StepId::NewSession,
+                batch::StepId::Passthrough,
+                batch::StepId::SetEnv,
+                batch::StepId::SetEnv,
+                batch::StepId::SetEnv,
+            ],
+            "unchanged order/fatality for the non-provision case"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -113,9 +113,11 @@ silent-misconfig pain; that is PR2 (see Consequences).
 - `Agent` config gains `provision` under `#[serde(default)]`, so existing
   `[agents.x] command = [...]` configs keep parsing unchanged (`provision =
   None`); the format-preserving TOML writer round-trips a
-  `[agents.<id>.provision]` sub-table using a TOML multi-line literal string
-  for `content` (the script contains backslashes and single quotes that a
-  basic string would mis-escape).
+  `[agents.<id>.provision]` sub-table by writing `content` as a plain string
+  value (`toml_edit`'s `value()` helper), which the serializer renders as an
+  escaped basic string — backslashes, quotes, and newlines in the script are
+  auto-escaped, not hand-escaped by us — and this round-trip is unit-tested
+  for byte-identical content.
 - **Deferred (follow-up issues, tracked per AGENTS.md):**
   - **The misconfig/"did a marker ever arrive" diagnostic (PR2).** Its trigger
     signal needs its own design: "agent has `provision` ⇒ expects a marker" is
