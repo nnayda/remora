@@ -19,4 +19,4 @@ pub use session::{SessionMeta, SessionState, SessionStatus, SpawnSpec, Workspace
 /// message enum (or changing a representation) is a breaking change: bump
 /// this constant and gate compatibility on it. The tmux naming and worktree
 /// conventions of ADR-0004 version alongside it.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
