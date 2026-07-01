@@ -48,6 +48,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shell script as the single source of truth — the Rust `resolve_base` is
   removed — and is covered by real-`sh` tests against a live local git repo.
   Discovery (`list()`) batching is the follow-up half of #182.
+- **Batched `list()` discovery fan-out** (#182): the second and final half of
+  ADR-0017. The discovery poll's independent fan-out — the trusted session
+  names, the inline `#{E:}` metadata enrichment, `$HOME`, and one `git worktree
+  list` per configured project — now runs as a single `RunAll` batched `sh`
+  script instead of `3 + M` separate round-trips, parsed back into the same
+  discovery streams. Every property is preserved: the #108 trusted-names /
+  untrusted-metadata split, the #190 stale-socket tolerance (a dead tmux server
+  still scans worktrees), the #124 `$HOME` canonicalization and its degradation,
+  and the per-project scan tolerance. The shared frame builder now strips the
+  RS/US delimiter bytes from each step's captured output, so an attacker-set
+  tmux `#{E:}` value can never forge a record boundary — making the framing
+  unforgeable by construction (this also retroactively hardens the spawn path).
 - **Design system documented in `DESIGN.md`** (#150): the shipped token system
   (`apps/desktop/src/styles/tokens/*.css`) now has a written home in the
   [Google design.md](https://github.com/google-labs-code/design.md) format —

@@ -14,7 +14,7 @@ use remora_protocol::{ProjectId, SessionId, SessionMeta};
 use super::batch::{self, Step, StepId};
 use super::pty_process::spawn_pty_channel;
 use crate::config::Config;
-use crate::discovery::{self, DiscoveredEnv};
+use crate::discovery;
 use crate::naming::{
     derive_session_id, parse_tmux_session_name, tmux_session_name, ENV_AGENT, ENV_CREATED_AT,
     ENV_PREFIX, ENV_WORKSPACE,
@@ -1008,28 +1008,37 @@ pub(crate) fn run_respawn(
     attach_channel(exec, &effective.tmux_name)
 }
 
-/// Reads the inline `#{E:}` session metadata into a `name → env` map
-/// (best-effort; a failed/`no-server` read yields an empty map). This is
-/// ENRICHMENT only: `run_list` keys it by a name already proven live by the
-/// trusted [`list_session_names_tokens`] listing, so a forged env value whose
-/// embedded newline fabricates an extra row here cannot introduce a session —
-/// the phantom name simply isn't in the trusted set. A forged row that reuses a
-/// real session's name can at worst set that session's own (already untrusted,
-/// display-only — ADR-0004) metadata, which its real env could do anyway. Last
-/// row wins on a duplicate name.
-fn read_inline_metadata(exec: &dyn RemoteExec) -> std::collections::HashMap<String, DiscoveredEnv> {
-    let mut map = std::collections::HashMap::new();
-    if let Ok(out) = exec.run(&list_sessions_tokens()) {
-        if out.success {
-            for row in out.stdout.lines() {
-                let (name, env) = discovery::parse_session_line(row);
-                if !name.is_empty() {
-                    map.insert(name.to_string(), env);
-                }
-            }
-        }
+/// The `RunAll` list step list and the project ids in build order (a
+/// `BTreeMap` iteration, so deterministic). The `WorktreeScan` records parse
+/// back to these projects by index.
+fn build_list_steps(config: &Config) -> (Vec<Step>, Vec<ProjectId>) {
+    let mut steps = vec![
+        Step {
+            id: StepId::Names,
+            cmd: join_cmd(&list_session_names_tokens()),
+            fatal: false,
+        },
+        Step {
+            id: StepId::Metadata,
+            cmd: join_cmd(&list_sessions_tokens()),
+            fatal: false,
+        },
+        Step {
+            id: StepId::Home,
+            cmd: join_cmd(&remote_home_tokens()),
+            fatal: false,
+        },
+    ];
+    let mut project_ids = Vec::new();
+    for (project_id, project) in &config.projects {
+        steps.push(Step {
+            id: StepId::WorktreeScan,
+            cmd: join_cmd(&worktree_list_tokens(&project.path)),
+            fatal: false,
+        });
+        project_ids.push(project_id.clone());
     }
-    map
+    (steps, project_ids)
 }
 
 /// Discovers sessions on the host and joins them to local config. Config-
@@ -1037,72 +1046,116 @@ fn read_inline_metadata(exec: &dyn RemoteExec) -> std::collections::HashMap<Stri
 /// the worktree scan runs for every configured project (a worktree-override
 /// session can live on a shared-default project).
 ///
-/// Two listings, both one round-trip each (cheap over the shared ControlMaster,
-/// #63), replace the old `1 + N` per-session show-environment fan-out (#108):
-/// the TRUSTED names-only [`list_session_names_tokens`] decides the live set
-/// (env-free, so unforgeable), and [`read_inline_metadata`] enriches each by
-/// name. A live session whose metadata is missing (tmux < 3.0, or a metadata
-/// read flake) still lists, just with empty metadata.
+/// Issues one batched `RunAll` script (names + metadata + home +
+/// WorktreeScan×M) instead of 3+M round-trips, driving off parsed records
+/// (#182 / ADR-0017). A missing `names` record (exec never framed anything)
+/// surfaces as Transport. The stale-socket phrase in the names record
+/// classifies to empty (cold) via [`classify_list_sessions`], exactly as the
+/// pre-batch code did (#190).
 pub(crate) fn run_list(
     exec: &dyn RemoteExec,
     config: &Config,
 ) -> Result<Vec<SessionMeta>, SourceError> {
-    let names = classify_list_sessions(&exec.run(&list_session_names_tokens())?)?;
+    let (steps, project_ids) = build_list_steps(config);
+    let out = exec.run(&batch::build(&steps, batch::BatchMode::RunAll))?;
+    let records = batch::parse_records(&out.stdout)?;
 
-    // Skip the metadata round-trip entirely when nothing is live (matches the
-    // pre-#108 "no names ⇒ no per-session reads" behavior).
-    let metadata = if names.is_empty() {
-        std::collections::HashMap::new()
-    } else {
-        read_inline_metadata(exec)
+    // Find each section. A missing `names` record means the exec never framed
+    // anything (transport failure) — surface it rather than reporting cold.
+    let Some(names_rec) = records.iter().find(|r| matches!(r.id, StepId::Names)) else {
+        return Err(SourceError::Transport(if out.stderr.trim().is_empty() {
+            out.stdout
+        } else {
+            out.stderr
+        }));
     };
+    // RunAll frames every step unconditionally, so a missing fixed-layout record
+    // (Metadata, Home, or fewer WorktreeScan records than configured projects)
+    // means the stream was truncated mid-flight — a transport cut-off, not
+    // best-effort degradation. Fail loud so the poll retries rather than silently
+    // dropping later projects' stopped worktrees.
+    let scan_count = records
+        .iter()
+        .filter(|r| matches!(r.id, StepId::WorktreeScan))
+        .count();
+    if !records.iter().any(|r| matches!(r.id, StepId::Metadata))
+        || !records.iter().any(|r| matches!(r.id, StepId::Home))
+        || scan_count < project_ids.len()
+    {
+        return Err(SourceError::Transport(
+            "batch: list() stream truncated (missing section record)".into(),
+        ));
+    }
+
+    // Classify names via the existing classifier (cold state ⇒ empty, else
+    // Transport). The frame is combined 2>&1; feed it as both stdout/stderr so
+    // classify's success-branch (reads stdout) and failure-branch (reads
+    // stderr) both see it.
+    let names = classify_list_sessions(&RemoteOutput {
+        success: names_rec.rc == 0,
+        stdout: names_rec.output.clone(),
+        stderr: names_rec.output.clone(),
+    })?;
+
+    // Metadata enrichment (best-effort): parse the metadata record's rows,
+    // keyed later by the TRUSTED names. A failed/absent metadata record yields
+    // an empty map (#108 — a live session without metadata still lists).
+    let mut metadata = std::collections::HashMap::new();
+    if let Some(meta_rec) = records.iter().find(|r| matches!(r.id, StepId::Metadata)) {
+        if meta_rec.rc == 0 {
+            for row in meta_rec.output.lines() {
+                let (name, env) = discovery::parse_session_line(row);
+                if !name.is_empty() {
+                    metadata.insert(name.to_string(), env);
+                }
+            }
+        }
+    }
 
     let mut live = Vec::new();
     for name in &names {
         let Some((project, session)) = parse_tmux_session_name(name) else {
-            continue; // forged / non-remora name dropped
+            continue;
         };
         if !config.projects.contains_key(&project) {
-            continue; // R1: configured projects only
+            continue; // R1
         }
         let env = metadata.get(name.as_str()).cloned().unwrap_or_default();
         live.push((project, session, env));
     }
 
-    // Remote $HOME for path canonicalization (A1, #124). Best-effort: on
-    // failure (exec error, non-zero exit, or a non-absolute result), fall back
-    // to "~", which makes only `~/…` logical paths fail to canonicalize —
-    // they won't match any worktree, which is acceptable degradation and never
-    // a panic. Validates `starts_with('/')` per ADR-0004's never-trust rule.
-    let home = exec
-        .run(&remote_home_tokens())
-        .ok()
-        .filter(|o| o.success)
-        .map(|o| o.stdout.trim().to_string())
+    // $HOME (best-effort, validated absolute else "~").
+    let home = records
+        .iter()
+        .find(|r| matches!(r.id, StepId::Home) && r.rc == 0)
+        .map(|r| r.output.trim().to_string())
         .filter(|h| h.starts_with('/'))
         .unwrap_or_else(|| "~".to_string());
 
+    // Worktree scans: the i-th WorktreeScan record ↔ project_ids[i].
     let mut worktrees: Vec<(ProjectId, discovery::WorktreeInfo)> = Vec::new();
     let mut project_paths: std::collections::HashMap<ProjectId, String> =
         std::collections::HashMap::new();
     let mut scanned = std::collections::HashSet::new();
-    for (project_id, project) in &config.projects {
-        // Scan EVERY project: a worktree-override session can live on a
-        // shared-default project. Record which projects scanned cleanly so
-        // `join` can tell "scanned, no worktree" (⇒ Shared) apart from "scan
-        // failed" (⇒ unknown), instead of conflating a transient failure with
-        // Shared.
-        if let Ok(out) = exec.run(&worktree_list_tokens(&project.path)) {
-            if out.success {
-                scanned.insert(project_id.clone());
-                project_paths.insert(
-                    project_id.clone(),
-                    discovery::canonicalize_remote_path(&project.path, &home),
-                );
-                for wt in discovery::parse_worktree_porcelain(&out.stdout) {
-                    worktrees.push((project_id.clone(), wt));
-                }
-            }
+    let scan_recs: Vec<&batch::StepResult> = records
+        .iter()
+        .filter(|r| matches!(r.id, StepId::WorktreeScan))
+        .collect();
+    for (i, project_id) in project_ids.iter().enumerate() {
+        let Some(scan_rec) = scan_recs.get(i) else {
+            continue;
+        };
+        if scan_rec.rc != 0 {
+            continue; // decision 8: scan failed ⇒ not in `scanned`
+        }
+        let project = &config.projects[project_id];
+        scanned.insert(project_id.clone());
+        project_paths.insert(
+            project_id.clone(),
+            discovery::canonicalize_remote_path(&project.path, &home),
+        );
+        for wt in discovery::parse_worktree_porcelain(&scan_rec.output) {
+            worktrees.push((project_id.clone(), wt));
         }
     }
 
@@ -2924,95 +2977,149 @@ pub(crate) mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // run_list orchestration tests
+    // run_list orchestration tests (batched — #182)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn list_joins_live_metadata_stopped_and_filters_unconfigured() {
-        // Config has project `api` (worktree, path /home/dev/api). `ghost` is NOT configured.
-        let config = test_config();
-        // Scripted exec, in call order (two listings, HOME fetch, then worktree scan, #108, #124):
-        //  1) list-sessions names -> api (configured) + ghost (unconfigured) +
-        //     `main` & `remora__bad` (unparseable). Only api survives.
-        //  2) list-sessions inline metadata -> enrichment keyed by trusted name.
-        //     workspace_path is absolute so the path-anchored join can match (#124).
-        //  3) printf $HOME -> "/home/dev" so paths beginning with /home/dev/api
-        //     canonicalize correctly for the A2′ primary-checkout detection.
-        //  4) git worktree list for api -> realistic output: primary checkout first
-        //     (as real git always emits), then fix-login (live) + add-tests (stopped).
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::out(
-                "remora_api_fix-login\nremora_ghost_x\nmain\nremora__bad\n",
-            )),
-            Ok(FakeExec::out(
-                "remora_api_fix-login\tclaude\t/home/dev/.remora/worktrees/api/fix-login\t1765500000\n",
-            )),
-            Ok(FakeExec::out("/home/dev")), // printf $HOME
-            Ok(FakeExec::out(
-                "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n\n\
-                 worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n\n\
-                 worktree /home/dev/.remora/worktrees/api/add-tests\nbranch refs/heads/remora/add-tests\n",
-            )),
-        ]);
-        let metas = run_list(&fake, &config).expect("list");
+    /// Build one RunAll batched stdout from section records.
+    fn list_stdout(sections: &[(batch::StepId, &str, i32)]) -> String {
+        sections
+            .iter()
+            .map(|(id, out, rc)| rec(*id, out, *rc))
+            .collect::<Vec<_>>()
+            .concat()
+    }
 
-        // ghost filtered out (R1). api/add-tests is Stopped+Worktree; api/fix-login is Live+Worktree.
-        // The primary checkout (/home/dev/api == project path) surfaces as Stopped+Shared (A2′).
+    #[test]
+    fn run_list_batches_into_one_call_and_joins() {
+        // test_config has one project `api` (worktree, /home/dev/api).
+        // One batched call returns: names (including an unconfigured ghost),
+        // metadata, home, wt_scan(api) with primary checkout + worktree.
+        let cfg = test_config();
+        let stdout = list_stdout(&[
+            // remora_ghost_x is live but "ghost" is not in config → R1 drops it.
+            (
+                batch::StepId::Names,
+                "remora_api_fix-login\nremora_ghost_x\n",
+                0,
+            ),
+            (batch::StepId::Metadata, "remora_api_fix-login\tclaude\t/home/dev/.remora/worktrees/api/fix-login\t1765500000\n", 0),
+            (batch::StepId::Home, "/home/dev", 0),
+            // WorktreeScan includes both the primary checkout (/home/dev/api,
+            // A2': surfaces as Shared) and the fix-login worktree.
+            (batch::StepId::WorktreeScan, "worktree /home/dev/api\nHEAD abc\nbranch refs/heads/main\n\nworktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n", 0),
+        ]);
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        let metas = run_list(&fake, &cfg).expect("list");
         assert_eq!(
-            metas.len(),
-            3,
-            "expected 3 rows (add-tests, fix-login, main-checkout), got: {metas:?}"
+            fake.calls.lock().expect("lock").len(),
+            1,
+            "exactly ONE batched run (was 3+M)"
         );
-        let main_row = metas
-            .iter()
-            .find(|m| m.branch.as_deref() == Some("main"))
-            .expect("primary-checkout main row missing");
-        assert_eq!(
-            main_row.workspace,
-            Some(WorkspaceMode::Shared),
-            "primary checkout must be Shared (A2′): {main_row:?}"
+        // R1: the unconfigured ghost session must be filtered out.
+        assert!(
+            !metas.iter().any(|m| m.session_id.as_str() == "x"),
+            "R1: ghost session must not appear in list: {metas:?}"
         );
-        let add_tests = metas
+        // A2': the primary checkout (/home/dev/api) surfaces as Shared.
+        let primary = metas
             .iter()
-            .find(|m| m.session_id.as_str() == "add-tests")
-            .expect("add-tests row");
-        let fix_login = metas
+            .find(|m| m.workspace == Some(WorkspaceMode::Shared))
+            .expect("primary checkout must carry WorkspaceMode::Shared");
+        assert_eq!(primary.workspace, Some(WorkspaceMode::Shared));
+        // The live worktree session is present with the expected metadata.
+        let live = metas
             .iter()
             .find(|m| m.session_id.as_str() == "fix-login")
-            .expect("fix-login row");
-        assert_eq!(add_tests.state, SessionState::Stopped);
-        assert_eq!(fix_login.state, SessionState::Live);
-        assert_eq!(fix_login.agent.as_deref(), Some("claude"));
-        // Stopped carries the real discovered worktree path (R6).
+            .expect("live row");
+        assert_eq!(live.state, SessionState::Live);
+        assert_eq!(live.agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn run_list_maps_each_worktree_scan_to_its_own_project() {
+        // Two worktree projects: api (alphabetically first) and zeta.
+        // build_list_steps iterates config.projects (BTreeMap order = alphabetical),
+        // so the WorktreeScan records come out api-then-zeta. Assert that each
+        // resulting session is attributed to the correct project (not cross-mapped).
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+            [projects.api]
+            host = "devbox"
+            path = "/home/dev/api"
+            workspace = "worktree"
+            agent = "claude"
+            [projects.zeta]
+            host = "devbox"
+            path = "/home/dev/zeta"
+            workspace = "worktree"
+            agent = "claude"
+            [agents.claude]
+            command = ["claude"]
+        "#;
+        let cfg = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let stdout = list_stdout(&[
+            (
+                batch::StepId::Names,
+                "remora_api_fix-login\nremora_zeta_work\n",
+                0,
+            ),
+            (
+                batch::StepId::Metadata,
+                "remora_api_fix-login\tclaude\t/home/dev/.remora/worktrees/api/fix-login\t1765500000\n\
+                 remora_zeta_work\tclaude\t/home/dev/.remora/worktrees/zeta/work\t1765500001\n",
+                0,
+            ),
+            (batch::StepId::Home, "/home/dev", 0),
+            // api WorktreeScan first (BTreeMap: api < zeta alphabetically)
+            (
+                batch::StepId::WorktreeScan,
+                "worktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n",
+                0,
+            ),
+            // zeta WorktreeScan second
+            (
+                batch::StepId::WorktreeScan,
+                "worktree /home/dev/.remora/worktrees/zeta/work\nbranch refs/heads/remora/work\n",
+                0,
+            ),
+        ]);
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        let metas = run_list(&fake, &cfg).expect("list");
+        // Each session must be attributed to its own project, not cross-mapped.
+        let api_row = metas
+            .iter()
+            .find(|m| m.session_id.as_str() == "fix-login")
+            .expect("api session must be present");
         assert_eq!(
-            add_tests.workspace_path.as_deref(),
-            Some("/home/dev/.remora/worktrees/api/add-tests")
+            api_row.project_id.as_str(),
+            "api",
+            "fix-login session must belong to api, not zeta"
+        );
+        let zeta_row = metas
+            .iter()
+            .find(|m| m.session_id.as_str() == "work")
+            .expect("zeta session must be present");
+        assert_eq!(
+            zeta_row.project_id.as_str(),
+            "zeta",
+            "work session must belong to zeta, not api"
         );
     }
 
     #[test]
-    fn list_treats_no_server_as_empty() {
-        let config = test_config();
-        let fake = FakeExec::new(vec![Ok(FakeExec::fail(
-            "no server running on /tmp/tmux-1000/default",
-        ))]);
-        assert!(run_list(&fake, &config).expect("list").is_empty());
-    }
-
-    #[test]
-    fn list_recovers_worktrees_after_stale_socket_list_sessions() {
-        // #190: after a k8s pod restart the tmux server is dead but its socket
-        // survives on the persistent volume, so `list-sessions` fails with
-        // `error connecting to <sock>`. The whole-host discovery must treat that
-        // as the cold state and STILL scan worktrees — otherwise the stopped
-        // (respawnable) sessions vanish from the sidebar until a new spawn
-        // restarts tmux. Before the fix `run_list` returned Err here.
-        //
-        // FakeExec call order (one shared-default project with a surviving
-        // worktree at ~/.remora/worktrees/scratch/s1):
-        //   1) list-sessions -> stale-socket failure (server gone)
-        //   2) printf $HOME  -> "/home/dev" for path canonicalization
-        //   3) git worktree list for scratch -> s1 worktree entry
+    fn run_list_stale_socket_names_still_scans_worktrees() {
+        // #190: names section fails with the stale-socket phrase (server gone),
+        // but worktrees still surface (cold state ⇒ empty live set, not Err).
         let toml = r#"
             [hosts.devbox]
             transport = "ssh"
@@ -3025,24 +3132,192 @@ pub(crate) mod tests {
             [agents.claude]
             command = ["claude"]
         "#;
-        let config = Arc::new(Config::from_toml_str(toml).expect("config"));
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::fail(
+        let cfg = Arc::new(Config::from_toml_str(toml).expect("config"));
+        let stdout = list_stdout(&[
+            (
+                batch::StepId::Names,
                 "error connecting to /tmp/tmux-1000/default (No such file or directory)",
-            )), // list-sessions: stale socket, server gone
-            Ok(FakeExec::out("/home/dev")), // printf $HOME
-            Ok(FakeExec::out(
+                1,
+            ),
+            (batch::StepId::Metadata, "", 1),
+            (batch::StepId::Home, "/home/dev", 0),
+            (
+                batch::StepId::WorktreeScan,
                 "worktree /home/dev/.remora/worktrees/scratch/s1\nbranch refs/heads/remora/s1\n",
-            )), // worktree list for scratch
+                0,
+            ),
         ]);
-        let metas = run_list(&fake, &config).expect("stale socket must not fail discovery");
-        assert_eq!(
-            metas.len(),
-            1,
-            "expected the surviving worktree session, got: {metas:?}"
-        );
-        assert_eq!(metas[0].project_id.as_str(), "scratch");
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        let metas = run_list(&fake, &cfg).expect("stale socket must not fail discovery");
+        assert_eq!(metas.len(), 1, "surviving worktree session: {metas:?}");
         assert_eq!(metas[0].session_id.as_str(), "s1");
+        assert_eq!(metas[0].project_id.as_str(), "scratch");
+        assert_eq!(metas[0].state, SessionState::Stopped);
+    }
+
+    #[test]
+    fn run_list_no_records_is_transport() {
+        // The whole exec failed before framing any record (kubectl/ssh down).
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "Unable to connect to the server".into(),
+        })]);
+        assert!(matches!(
+            run_list(&fake, &test_config()),
+            Err(SourceError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn run_list_names_real_error_is_transport() {
+        // names section fails with a NON-cold phrase ⇒ Transport (not empty).
+        let stdout = list_stdout(&[
+            (batch::StepId::Names, "some unexpected tmux failure", 1),
+            (batch::StepId::Metadata, "", 1),
+            (batch::StepId::Home, "/home/dev", 0),
+            (batch::StepId::WorktreeScan, "", 0),
+        ]);
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        assert!(matches!(
+            run_list(&fake, &test_config()),
+            Err(SourceError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn run_list_metadata_flake_keeps_session_live() {
+        // names ok, metadata rc!=0 ⇒ Live with empty metadata (#108 best-effort).
+        let stdout = list_stdout(&[
+            (batch::StepId::Names, "remora_api_fix-login\n", 0),
+            (batch::StepId::Metadata, "connection reset", 1),
+            (batch::StepId::Home, "/home/dev", 0),
+            (batch::StepId::WorktreeScan, "", 0),
+        ]);
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        let metas = run_list(&fake, &test_config()).expect("list");
+        let live = metas
+            .iter()
+            .find(|m| m.state == SessionState::Live)
+            .expect("live");
+        assert_eq!(live.agent, None);
+    }
+
+    #[test]
+    fn run_list_home_non_absolute_degrades() {
+        // home rc=0 but non-absolute ⇒ fall back to "~" (#124 degradation: a
+        // ~/… live session can't path-match its worktree ⇒ Shared).
+        let stdout = list_stdout(&[
+            (batch::StepId::Names, "remora_api_fix-login\n", 0),
+            (batch::StepId::Metadata, "remora_api_fix-login\tclaude\t~/.remora/worktrees/api/fix-login\t1765500000\n", 0),
+            (batch::StepId::Home, "not-absolute", 0),
+            (batch::StepId::WorktreeScan, "worktree /home/dev/api\nbranch refs/heads/main\n\nworktree /home/dev/.remora/worktrees/api/fix-login\nbranch refs/heads/remora/fix-login\n", 0),
+        ]);
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        let metas = run_list(&fake, &test_config()).expect("list");
+        let live = metas
+            .iter()
+            .find(|m| m.state == SessionState::Live)
+            .expect("live");
+        assert_eq!(live.workspace, Some(WorkspaceMode::Shared));
+    }
+
+    #[test]
+    fn run_list_worktree_scan_failure_per_decision_8() {
+        // wt_scan rc!=0 ⇒ project NOT scanned (session still Live).
+        let stdout = list_stdout(&[
+            (batch::StepId::Names, "remora_api_fix-login\n", 0),
+            (
+                batch::StepId::Metadata,
+                "remora_api_fix-login\tclaude\t\t\n",
+                0,
+            ),
+            (batch::StepId::Home, "/home/dev", 0),
+            (
+                batch::StepId::WorktreeScan,
+                "fatal: not a git repository",
+                1,
+            ),
+        ]);
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        let metas = run_list(&fake, &test_config()).expect("list must not fail");
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].session_id.as_str(), "fix-login");
+        assert!(metas.iter().all(|m| m.state == SessionState::Live));
+    }
+
+    #[test]
+    fn run_list_forged_metadata_cannot_inject_a_names_row() {
+        // #108: a metadata row for a name NOT in the trusted names section is
+        // dropped (it can't fabricate a session). names = only api; metadata
+        // also lists a `ghost` row.
+        let stdout = list_stdout(&[
+            (batch::StepId::Names, "remora_api_fix-login\n", 0),
+            (
+                batch::StepId::Metadata,
+                "remora_api_fix-login\tclaude\t\t\nremora_ghost_x\tevil\t\t\n",
+                0,
+            ),
+            (batch::StepId::Home, "/home/dev", 0),
+            (batch::StepId::WorktreeScan, "", 0),
+        ]);
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        let metas = run_list(&fake, &test_config()).expect("list");
+        assert!(
+            !metas.iter().any(|m| m.session_id.as_str() == "x"),
+            "ghost must not appear"
+        );
+    }
+
+    #[test]
+    fn run_list_truncated_stream_is_transport() {
+        // Stream cut off after Metadata — no Home, no WorktreeScan records.
+        // RunAll always emits every step, so absence means transport truncation.
+        let stdout = list_stdout(&[
+            (batch::StepId::Names, "remora_api_fix-login\n", 0),
+            (
+                batch::StepId::Metadata,
+                "remora_api_fix-login\tclaude\t\t\n",
+                0,
+            ),
+            // Home and WorktreeScan absent — stream was cut mid-flight.
+        ]);
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        assert!(
+            matches!(
+                run_list(&fake, &test_config()),
+                Err(SourceError::Transport(_))
+            ),
+            "truncated stream must be Transport, not silent degradation"
+        );
     }
 
     #[test]
@@ -3066,126 +3341,6 @@ pub(crate) mod tests {
             fetch_tokens("/home/dev/api"),
             vec!["git", "-C", "/home/dev/api", "fetch", "origin"]
         );
-    }
-
-    #[test]
-    fn list_keeps_session_live_when_metadata_read_flakes() {
-        // The session is in the trusted names listing, but the inline-metadata
-        // read flakes (transient, or tmux < 3.0). It must stay Live with empty
-        // metadata, not be downgraded — metadata is best-effort enrichment (#108).
-        // Call order: 1) names, 2) metadata (flakes), 3) printf $HOME, 4) worktree list.
-        let config = test_config();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names: live set
-            Ok(FakeExec::fail("connection reset")),      // 2) metadata read flakes
-            Ok(FakeExec::out("/home/dev")),              // 3) printf $HOME (#124)
-            Ok(FakeExec::out("")),                       // 4) worktree list: empty
-        ]);
-        let metas = run_list(&fake, &config).expect("list");
-        assert_eq!(metas.len(), 1);
-        assert_eq!(metas[0].state, SessionState::Live);
-        assert_eq!(metas[0].agent, None);
-        assert_eq!(metas[0].created_at, None);
-    }
-
-    #[test]
-    fn list_ignores_phantom_row_not_in_trusted_names() {
-        // A forged env value with an embedded newline fabricates an extra inline
-        // metadata row (`remora_api_evil...`). Because the live set comes from the
-        // trusted names-only listing, the phantom name — absent there — must be
-        // dropped, never surfaced as a Live session (#108 regression guard).
-        // Call order: 1) names, 2) metadata (with injected phantom), 3) printf $HOME, 4) worktree list.
-        let config = test_config();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names: ONLY the real session
-            Ok(FakeExec::out(
-                "remora_api_fix-login\tx\t\t\n\
-                 remora_api_evil\t/ws\t9999999999\t\n", // 2) metadata: real + injected phantom
-            )),
-            Ok(FakeExec::out("/home/dev")), // 3) printf $HOME (#124)
-            Ok(FakeExec::out("")),          // 4) worktree list: empty
-        ]);
-        let metas = run_list(&fake, &config).expect("list");
-        assert_eq!(metas.len(), 1, "phantom must not appear: {metas:?}");
-        assert_eq!(metas[0].session_id.as_str(), "fix-login");
-    }
-
-    #[test]
-    fn list_survives_worktree_list_failure_per_decision_8() {
-        // A failed `git worktree list` for one project yields empty for that
-        // project, never a failed discovery (decision 8): the live session
-        // still lists, just with no Stopped twin.
-        // Call order: 1) names, 2) metadata, 3) printf $HOME, 4) worktree list (FAILS).
-        // The FakeExec::fail at position 4 must land on the WORKTREE LIST call —
-        // not on $HOME — so decision 8 is actually exercised.
-        let config = test_config();
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::out("remora_api_fix-login\n")), // 1) names: live set
-            Ok(FakeExec::out("remora_api_fix-login\tclaude\t\t\n")), // 2) inline metadata
-            Ok(FakeExec::out("/home/dev")),              // 3) printf $HOME (#124)
-            Ok(FakeExec::fail("fatal: not a git repository")), // 4) worktree list FAILS → decision 8
-        ]);
-        let metas = run_list(&fake, &config).expect("list must not fail");
-        assert_eq!(metas.len(), 1);
-        assert_eq!(metas[0].session_id.as_str(), "fix-login");
-        assert_eq!(metas[0].state, SessionState::Live);
-        assert!(metas.iter().all(|m| m.state == SessionState::Live));
-    }
-
-    #[test]
-    fn list_discovers_worktree_session_on_shared_default_project() {
-        // Before the fix, the worktree scan was guarded by
-        // `project.workspace == WorkspaceMode::Worktree`, so a worktree-override
-        // session on a shared-default project was silently lost. This test is the
-        // RED proof: on the old code the assertion fails (session not discovered);
-        // on the new code it passes.
-        //
-        // Config: `api` (worktree-default) + `scratch` (shared-default).
-        // No live sessions. The `scratch` project has one surviving worktree at
-        // ~/.remora/worktrees/scratch/s1.
-        //
-        // FakeExec call order (config is a BTreeMap, sorted: api first, scratch second):
-        //   1) list-sessions        -> empty (no live sessions)
-        //   2) printf $HOME         -> "/home/dev" for path canonicalization (#124)
-        //   3) git worktree list for `api`     -> empty
-        //   4) git worktree list for `scratch` -> s1 worktree entry
-        let toml = r#"
-            [hosts.devbox]
-            transport = "ssh"
-            host = "devbox"
-            [projects.api]
-            host = "devbox"
-            path = "/home/dev/api"
-            workspace = "worktree"
-            agent = "claude"
-            [projects.scratch]
-            host = "devbox"
-            path = "/home/dev/scratch"
-            workspace = "shared"
-            agent = "claude"
-            [agents.claude]
-            command = ["claude"]
-        "#;
-        let config = Arc::new(Config::from_toml_str(toml).expect("config"));
-        let fake = FakeExec::new(vec![
-            Ok(FakeExec::out("")),          // list-sessions: no live sessions
-            Ok(FakeExec::out("/home/dev")), // printf $HOME
-            Ok(FakeExec::out("")),          // worktree list for api: empty
-            Ok(FakeExec::out(
-                "worktree /home/dev/.remora/worktrees/scratch/s1\nbranch refs/heads/remora/s1\n",
-            )), // worktree list for scratch: one worktree session
-        ]);
-        let metas = run_list(&fake, &config).expect("list");
-        // The scratch/s1 worktree session must be discovered as Stopped + Worktree.
-        assert_eq!(
-            metas.len(),
-            1,
-            "expected one discovered session, got: {metas:?}"
-        );
-        assert_eq!(metas[0].project_id.as_str(), "scratch");
-        assert_eq!(metas[0].session_id.as_str(), "s1");
-        assert_eq!(metas[0].state, SessionState::Stopped);
-        assert_eq!(metas[0].workspace, Some(WorkspaceMode::Worktree));
     }
 
     // -----------------------------------------------------------------------
