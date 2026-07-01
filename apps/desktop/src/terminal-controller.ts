@@ -103,6 +103,8 @@ export class TerminalController {
       } else if (msg.event === "previewUpdate") {
         if (this.sessionKey)
           this.activity.setPreview(this.sessionKey, msg.preview);
+      } else if (msg.event === "markerSeen") {
+        if (this.sessionKey) this.activity.noteMarkerSeen(this.sessionKey);
       } else if (msg.event === "closed") {
         this.handleClosed();
       }
