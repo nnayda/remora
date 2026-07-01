@@ -23,3 +23,13 @@ export function usePreviews() {
     activityStore.getPreviewSnapshot,
   );
 }
+
+/** Subscribe to the live set of session keys whose activity hook is confirmed
+ * (a marker was seen this attach). Separate snapshot so it never re-renders
+ * status-only consumers. */
+export function useMarkerSeen() {
+  return useSyncExternalStore(
+    activityStore.subscribe,
+    activityStore.getMarkerSeenSnapshot,
+  );
+}
