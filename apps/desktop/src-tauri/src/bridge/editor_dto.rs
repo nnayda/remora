@@ -312,6 +312,7 @@ impl AgentInputDto {
     pub fn into_agent(self) -> Agent {
         Agent {
             command: self.command,
+            provision: None,
         }
     }
 }
@@ -405,6 +406,7 @@ mod tests {
             AgentId::new("claude").expect("id"),
             Agent {
                 command: vec!["claude".into(), "--flag".into()],
+                provision: None,
             },
         );
         config

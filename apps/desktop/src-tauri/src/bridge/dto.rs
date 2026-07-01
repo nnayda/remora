@@ -172,6 +172,7 @@ mod tests {
             AgentId::new("claude").expect("id"),
             Agent {
                 command: vec!["claude".into()],
+                provision: None,
             },
         );
 
@@ -196,12 +197,14 @@ mod tests {
             AgentId::new("zeta").expect("id"),
             Agent {
                 command: vec!["zeta-cli".into()],
+                provision: None,
             },
         );
         config.agents.insert(
             AgentId::new("alpha").expect("id"),
             Agent {
                 command: vec!["alpha-cli".into()],
+                provision: None,
             },
         );
 
