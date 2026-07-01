@@ -172,11 +172,10 @@ mod tests {
     fn awaiting_token_maps_to_awaiting() {
         let mut s = MarkerScanner::new();
         let hits = s.feed(&marker("YXdhaXRpbmdfaW5wdXQ=")); // "awaiting_input"
-        let MarkerHit::State { status, preview } = &hits[0] else {
+        let MarkerHit::State { status, .. } = &hits[0] else {
             panic!("expected State, got {:?}", hits[0]);
         };
         assert_eq!(*status, SessionStatus::Awaiting);
-        let _ = preview;
     }
 
     #[test]
@@ -187,11 +186,10 @@ mod tests {
         assert!(s.feed(a).is_empty()); // incomplete: vte buffers internally
         let hits = s.feed(b);
         assert_eq!(hits.len(), 1);
-        let MarkerHit::State { status, preview } = &hits[0] else {
+        let MarkerHit::State { status, .. } = &hits[0] else {
             panic!("expected State, got {:?}", hits[0]);
         };
         assert_eq!(*status, SessionStatus::Idle);
-        let _ = preview;
     }
 
     fn ping_marker() -> Vec<u8> {
