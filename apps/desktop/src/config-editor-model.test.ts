@@ -392,7 +392,11 @@ describe("agent form", () => {
   });
 
   it("prefills argv from a dto", () => {
-    const form = agentFormFromDto({ id: "claude", command: ["claude", "-r"] });
+    const form = agentFormFromDto({
+      id: "claude",
+      command: ["claude", "-r"],
+      provision: null,
+    });
     expect(form.id).toBe("claude");
     expect(form.command).toEqual(["claude", "-r"]);
   });
@@ -457,12 +461,13 @@ describe("agent form", () => {
   });
 
   it("seeds plainShell from an empty dto command", () => {
-    const shell = agentFormFromDto({ id: "shell", command: [] });
+    const shell = agentFormFromDto({ id: "shell", command: [], provision: null });
     expect(shell.plainShell).toBe(true);
     // One editable row is restored so unchecking the toggle has something to show.
     expect(shell.command).toEqual([""]);
     expect(
-      agentFormFromDto({ id: "claude", command: ["claude"] }).plainShell,
+      agentFormFromDto({ id: "claude", command: ["claude"], provision: null })
+        .plainShell,
     ).toBe(false);
   });
 
