@@ -1743,6 +1743,24 @@ fn worktree_add_cmd(plan: &SpawnPlan) -> String {
     format!("git -C {project} worktree add -b {branch} {dir} {start_point}")
 }
 
+/// Shell command for a `StepId::Provision` step: create the parent dir, write
+/// the file's bytes (base64-decoded, so arbitrary content — control bytes,
+/// quotes, newlines — survives exactly), and chmod when a mode is set. The
+/// path is `$HOME`-resolved via `quote_remote_path`, matching how the hook
+/// command in the inline `--settings` JSON reads it. Best-effort: emitted as a
+/// non-fatal step so a write failure degrades to no-marker, never aborts spawn.
+fn provision_cmd(f: &crate::config::ProvisionFile) -> String {
+    use base64::Engine as _;
+    let qpath = quote_remote_path(&f.path);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(f.content.as_bytes());
+    let mut cmd =
+        format!("mkdir -p \"$(dirname {qpath})\" && printf %s '{b64}' | base64 -d > {qpath}");
+    if let Some(mode) = f.mode {
+        cmd.push_str(&format!(" && chmod {:o} {qpath}", mode));
+    }
+    cmd
+}
+
 /// Joins already-quoted logical tokens into one shell command for a step.
 /// Tokens are pre-quoted by their builders (e.g. `set_environment_tokens`,
 /// `new_session_tokens`); `batch::build` quotes the whole script once, so this
@@ -1752,10 +1770,13 @@ fn join_cmd(tokens: &[String]) -> String {
 }
 
 /// The ordered batched-spawn step list. Worktree mode: Fetch (non-fatal) ->
-/// WorktreeAdd (fatal, with cascade) -> NewSession (fatal) -> Passthrough
-/// (non-fatal) -> SetEnv x N (non-fatal, one per `plan.env` entry). Shared
-/// mode (no branch): omit Fetch + WorktreeAdd. Mirrors the pre-batch `run_spawn`
-/// order.
+/// WorktreeAdd (fatal, with cascade) -> [Provision (non-fatal, only when
+/// `plan.provision` is set)] -> NewSession (fatal) -> Passthrough (non-fatal)
+/// -> SetEnv x N (non-fatal, one per `plan.env` entry). Shared mode (no
+/// branch): omit Fetch + WorktreeAdd. Provision runs immediately before
+/// NewSession so the file exists before the agent launches, but a write
+/// failure (best-effort, non-fatal) never aborts the spawn. Mirrors the
+/// pre-batch `run_spawn` order.
 fn build_spawn_steps(plan: &SpawnPlan) -> Vec<Step> {
     let mut steps = Vec::new();
     if plan.branch.is_some() {
@@ -1768,6 +1789,13 @@ fn build_spawn_steps(plan: &SpawnPlan) -> Vec<Step> {
             id: StepId::WorktreeAdd,
             cmd: worktree_add_cmd(plan),
             fatal: true,
+        });
+    }
+    if let Some(p) = &plan.provision {
+        steps.push(Step {
+            id: StepId::Provision,
+            cmd: provision_cmd(p),
+            fatal: false, // best-effort; never aborts the spawn (like Passthrough)
         });
     }
     steps.push(Step {
@@ -4867,6 +4895,163 @@ pub(crate) mod tests {
                 batch::StepId::SetEnv,
             ]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // provision step tests (#196, Task 4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn provision_cmd_writes_base64_and_chmod_before_newsession() {
+        let f = crate::config::ProvisionFile {
+            path: "~/.remora/hooks/claude-notify.sh".into(),
+            content: "#!/bin/sh\necho hi\n".into(),
+            mode: Some(0o755),
+        };
+        let cmd = provision_cmd(&f);
+        // $HOME-resolved path, base64 pipeline, chmod in octal, mkdir parent.
+        assert!(cmd.contains("\"$HOME\"/.remora/hooks/claude-notify.sh"));
+        assert!(cmd.contains("base64 -d"));
+        assert!(cmd.contains("chmod 755"));
+        assert!(cmd.contains("mkdir -p"));
+    }
+
+    #[test]
+    fn provision_cmd_omits_chmod_when_mode_is_none() {
+        let f = crate::config::ProvisionFile {
+            path: "~/.remora/hooks/claude-notify.sh".into(),
+            content: "x".into(),
+            mode: None,
+        };
+        let cmd = provision_cmd(&f);
+        assert!(!cmd.contains("chmod"), "no mode ⇒ no chmod: {cmd}");
+    }
+
+    #[test]
+    fn provision_step_is_non_fatal_and_precedes_new_session() {
+        let mut plan = worktree_plan();
+        plan.provision = Some(crate::config::ProvisionFile {
+            path: "~/.remora/hooks/claude-notify.sh".into(),
+            content: "x".into(),
+            mode: Some(0o755),
+        });
+        let steps = build_spawn_steps(&plan);
+        let prov = steps
+            .iter()
+            .position(|s| matches!(s.id, batch::StepId::Provision))
+            .expect("provision step");
+        let new = steps
+            .iter()
+            .position(|s| matches!(s.id, batch::StepId::NewSession))
+            .expect("new_session");
+        assert!(prov < new, "provision must precede new_session");
+        assert!(
+            !steps[prov].fatal,
+            "provision must be non-fatal (best-effort)"
+        );
+    }
+
+    #[test]
+    fn no_provision_means_no_provision_step() {
+        let steps = build_spawn_steps(&worktree_plan()); // worktree_plan sets provision: None
+        assert!(!steps
+            .iter()
+            .any(|s| matches!(s.id, batch::StepId::Provision)));
+    }
+
+    /// Integration (D2/D4): runs the REAL generated `provision_cmd` through a
+    /// real `sh` with a fake `$HOME`, proving the base64 pipeline writes the
+    /// contrib notify script byte-for-byte at the `$HOME`-resolved path with
+    /// the requested mode. If `bash`+`jq` are available (mirroring
+    /// `activity::marker::tests::script_output_matches_wire_contract`), it
+    /// goes further and actually executes the written script and asserts
+    /// `MarkerScanner` parses exactly one `Awaiting` marker carrying the
+    /// preview message — proving the provisioned file is not just present on
+    /// disk but a working hook end to end.
+    #[test]
+    fn provision_write_then_exec_emits_a_parseable_marker() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let script = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contrib/agent-hooks/claude-code/remora-notify.sh"
+        ))
+        .expect("read contrib script");
+        let f = crate::config::ProvisionFile {
+            path: "~/.remora/hooks/claude-notify.sh".into(),
+            content: script.clone(),
+            mode: Some(0o755),
+        };
+        let tmp = std::env::temp_dir().join(format!(
+            "remora-prov-{}-{}",
+            std::process::id(),
+            "provision_write_then_exec"
+        ));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+
+        // Run: HOME=<tmp> sh -c "<provision_cmd>"
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(provision_cmd(&f))
+            .env("HOME", &tmp)
+            .status()
+            .expect("run provision");
+        assert!(status.success(), "provision cmd runs");
+
+        let written = tmp.join(".remora/hooks/claude-notify.sh");
+        assert!(written.exists(), "script written to $HOME-resolved path");
+        let written_bytes = std::fs::read(&written).expect("read written script");
+        assert_eq!(
+            written_bytes,
+            script.as_bytes(),
+            "base64 round-trip through the shell must be byte-identical to the source script"
+        );
+
+        let mode = std::fs::metadata(&written)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755, "chmod applied the requested mode");
+
+        // Stronger assertion, gated on tooling availability like the marker.rs
+        // precedent: actually execute the written script and scan its output.
+        let has_jq = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("command -v jq")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if has_jq {
+            use std::io::Write as _;
+            let marker_out = tmp.join("marker.out");
+            let mut child = std::process::Command::new("bash")
+                .arg(&written)
+                .env("REMORA_MARKER_OUT", &marker_out)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("bash should spawn");
+            let stdin_json = serde_json::json!({ "message": "Approve running tests?" }).to_string();
+            child
+                .stdin
+                .take()
+                .expect("stdin piped")
+                .write_all(format!("{stdin_json}\n").as_bytes())
+                .expect("write stdin");
+            let exec_status = child.wait().expect("script exits");
+            assert!(exec_status.success(), "hook script exits 0");
+
+            let marker_bytes = std::fs::read(&marker_out).expect("read marker output");
+            let mut scanner = crate::activity::MarkerScanner::new();
+            let hits = scanner.feed(&marker_bytes);
+            assert_eq!(hits.len(), 1, "exactly one marker parsed: {hits:?}");
+            assert_eq!(hits[0].status, remora_protocol::SessionStatus::Awaiting);
+            let preview = hits[0].preview.as_ref().expect("preview present");
+            assert_eq!(preview.as_str(), "Approve running tests?");
+        } else {
+            eprintln!("skip: jq not found — skipping executed-hook marker assertion");
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // -----------------------------------------------------------------------
