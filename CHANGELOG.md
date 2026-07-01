@@ -496,6 +496,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Clicking a session in the sidebar now revives it when the local tab is
+  dead but the session is reachable** (#189, inverse of #178). Two dropped-intent
+  gaps: the live-attach path short-circuited on `key === activeKey` alone, so
+  re-clicking a `stopped`/`disconnected` *active* tab focused an empty pane and
+  returned without reconnecting; and "reopen" skipped the respawn for a
+  `reconnecting` tab whose retry loop was doomed once discovery reported the
+  server session gone. The store now revives any non-live sidebar dedupe — the
+  live-attach path re-attaches in place (new `reconnectTab`, guarded so it can't
+  orphan an in-flight respawn), the respawn path respawns a `reconnecting` tab —
+  and the click's focus-intent gate is liveness-aware. A revive that terminally
+  fails now clears the armed focus flag so it can't steal focus onto the next
+  tab.
 - **Removing a session no longer resurrects it as an orphaned worktree row.**
   Opening a discovered *live* session whose local tab was gone (e.g. after an
   app restart or reconnect — the common persistent-session flow) went through
