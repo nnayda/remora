@@ -418,6 +418,19 @@ fn agent_item(a: &Agent) -> Item {
         arr.push(arg.as_str());
     }
     t["command"] = value(arr);
+    if let Some(p) = &a.provision {
+        let mut pt = Table::new();
+        pt["path"] = value(p.path.as_str());
+        // toml_edit's serializer escapes backslashes/quotes/newlines, so a
+        // basic string round-trips the script correctly (the `\033`-breaks-TOML
+        // hazard is a hand-authoring hazard, not a serializer one). Proven by
+        // the round-trip test.
+        pt["content"] = value(p.content.as_str());
+        if let Some(mode) = p.mode {
+            pt["mode"] = value(i64::from(mode));
+        }
+        t["provision"] = Item::Table(pt);
+    }
     Item::Table(t)
 }
 
@@ -450,6 +463,7 @@ mod tests {
     fn claude_agent() -> Agent {
         Agent {
             command: vec!["claude".into()],
+            provision: None,
         }
     }
 
@@ -888,8 +902,14 @@ mod tests {
     #[test]
     fn empty_command_agent_round_trips() {
         let mut doc = ConfigDocument::parse("").expect("empty doc parses");
-        doc.insert_agent(&aid("shell"), &Agent { command: vec![] })
-            .expect("inserting a plain-shell agent is valid");
+        doc.insert_agent(
+            &aid("shell"),
+            &Agent {
+                command: vec![],
+                provision: None,
+            },
+        )
+        .expect("inserting a plain-shell agent is valid");
         let out = doc.to_toml();
         assert!(out.contains("command = []"), "writes an empty array: {out}");
         let reparsed = ConfigDocument::parse(&out).expect("re-parses");
@@ -925,6 +945,36 @@ mod tests {
         assert!(
             !doc.to_toml().contains("base ="),
             "cleared base must be omitted"
+        );
+    }
+
+    #[test]
+    fn agent_provision_round_trips_with_script_bytes() {
+        // Backslashes + single quotes: printf '\033Ptmux;...' — the exact hazard.
+        let script = "#!/usr/bin/env bash\nset -e\nprintf '\\033Ptmux;\\033\\033]7366;remora;1;state;%s\\007\\033\\\\' \"$x\" > \"$out\"\n";
+        let toml = format!(
+            "[agents.claude]\ncommand = [\"claude\"]\n\n[agents.claude.provision]\npath = \"~/.remora/hooks/claude-notify.sh\"\ncontent = {content}\nmode = 493\n",
+            content = toml_edit::Value::from(script), // serializer-escaped basic string
+        );
+        let doc = ConfigDocument::parse(&toml).expect("parses");
+        let cfg = doc.config().expect("valid");
+        let got = cfg.agents[&aid("claude")]
+            .provision
+            .as_ref()
+            .expect("provision");
+        assert_eq!(got.content, script, "content survives parse");
+        // Re-serialize the model and re-parse: content must still be byte-identical.
+        let mut doc2 = ConfigDocument::parse("").expect("empty");
+        doc2.insert_agent(&aid("claude"), &cfg.agents[&aid("claude")])
+            .expect("insert");
+        let cfg2 = doc2.config().expect("valid");
+        assert_eq!(
+            cfg2.agents[&aid("claude")]
+                .provision
+                .as_ref()
+                .expect("p")
+                .content,
+            script
         );
     }
 }

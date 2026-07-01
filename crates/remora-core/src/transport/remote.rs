@@ -937,25 +937,10 @@ pub(crate) fn run_respawn(
             Err(SourceError::Transport(probe.stderr))
         };
     }
-    // Batched stamp tail: new-session (the atomic lock) + passthrough + set-env,
-    // one script. No worktree-add / fetch / cascade (the worktree survives).
-    let mut steps = vec![Step {
-        id: StepId::NewSession,
-        cmd: join_cmd(&new_session_tokens(effective)),
-        fatal: true,
-    }];
-    steps.push(Step {
-        id: StepId::Passthrough,
-        cmd: join_cmd(&set_passthrough_tokens(&effective.tmux_name)),
-        fatal: false,
-    });
-    for (key, value) in &effective.env {
-        steps.push(Step {
-            id: StepId::SetEnv,
-            cmd: join_cmd(&set_environment_tokens(&effective.tmux_name, key, value)),
-            fatal: false,
-        });
-    }
+    // Batched stamp tail: [provision] + new-session (the atomic lock) +
+    // passthrough + set-env, one script. No worktree-add / fetch / cascade
+    // (the worktree survives a respawn).
+    let steps = build_respawn_steps(effective);
     let out = exec.run(&batch::build(&steps, batch::BatchMode::StopOnError))?;
     let records = batch::parse_records(&out.stdout)?;
     if records.is_empty() {
@@ -1743,6 +1728,27 @@ fn worktree_add_cmd(plan: &SpawnPlan) -> String {
     format!("git -C {project} worktree add -b {branch} {dir} {start_point}")
 }
 
+/// Shell command for a `StepId::Provision` step: create the parent dir, write
+/// the file's bytes (base64-decoded, so arbitrary content — control bytes,
+/// quotes, newlines — survives exactly), and chmod when a mode is set. The
+/// path is `$HOME`-resolved via `quote_remote_path`, matching how the hook
+/// command in the inline `--settings` JSON reads it. Best-effort: emitted as a
+/// non-fatal step so a write failure degrades to no-marker, never aborts spawn.
+fn provision_cmd(f: &crate::config::ProvisionFile) -> String {
+    use base64::Engine as _;
+    let qpath = quote_remote_path(&f.path);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(f.content.as_bytes());
+    // `--` at each path-consuming utility so a relative path like `-hook.sh`
+    // is treated as an operand, not an option (`> {qpath}` needs none — a
+    // redirect target is never option-parsed).
+    let mut cmd =
+        format!("mkdir -p -- \"$(dirname -- {qpath})\" && printf %s '{b64}' | base64 -d > {qpath}");
+    if let Some(mode) = f.mode {
+        cmd.push_str(&format!(" && chmod {:o} -- {qpath}", mode));
+    }
+    cmd
+}
+
 /// Joins already-quoted logical tokens into one shell command for a step.
 /// Tokens are pre-quoted by their builders (e.g. `set_environment_tokens`,
 /// `new_session_tokens`); `batch::build` quotes the whole script once, so this
@@ -1752,10 +1758,13 @@ fn join_cmd(tokens: &[String]) -> String {
 }
 
 /// The ordered batched-spawn step list. Worktree mode: Fetch (non-fatal) ->
-/// WorktreeAdd (fatal, with cascade) -> NewSession (fatal) -> Passthrough
-/// (non-fatal) -> SetEnv x N (non-fatal, one per `plan.env` entry). Shared
-/// mode (no branch): omit Fetch + WorktreeAdd. Mirrors the pre-batch `run_spawn`
-/// order.
+/// WorktreeAdd (fatal, with cascade) -> [Provision (non-fatal, only when
+/// `plan.provision` is set)] -> NewSession (fatal) -> Passthrough (non-fatal)
+/// -> SetEnv x N (non-fatal, one per `plan.env` entry). Shared mode (no
+/// branch): omit Fetch + WorktreeAdd. Provision runs immediately before
+/// NewSession so the file exists before the agent launches, but a write
+/// failure (best-effort, non-fatal) never aborts the spawn. Mirrors the
+/// pre-batch `run_spawn` order.
 fn build_spawn_steps(plan: &SpawnPlan) -> Vec<Step> {
     let mut steps = Vec::new();
     if plan.branch.is_some() {
@@ -1768,6 +1777,50 @@ fn build_spawn_steps(plan: &SpawnPlan) -> Vec<Step> {
             id: StepId::WorktreeAdd,
             cmd: worktree_add_cmd(plan),
             fatal: true,
+        });
+    }
+    if let Some(p) = &plan.provision {
+        steps.push(Step {
+            id: StepId::Provision,
+            cmd: provision_cmd(p),
+            fatal: false, // best-effort; never aborts the spawn (like Passthrough)
+        });
+    }
+    steps.push(Step {
+        id: StepId::NewSession,
+        cmd: join_cmd(&new_session_tokens(plan)),
+        fatal: true,
+    });
+    steps.push(Step {
+        id: StepId::Passthrough,
+        cmd: join_cmd(&set_passthrough_tokens(&plan.tmux_name)),
+        fatal: false,
+    });
+    for (key, value) in &plan.env {
+        steps.push(Step {
+            id: StepId::SetEnv,
+            cmd: join_cmd(&set_environment_tokens(&plan.tmux_name, key, value)),
+            fatal: false,
+        });
+    }
+    steps
+}
+
+/// The ordered batched-respawn step list: [Provision (non-fatal, only when
+/// `plan.provision` is set)] -> NewSession (fatal) -> Passthrough (non-fatal)
+/// -> SetEnv x N (non-fatal, one per `plan.env` entry). No worktree-add /
+/// fetch / cascade (the worktree survives a respawn). Provision mirrors
+/// `build_spawn_steps` so a respawn re-writes the hook script exactly like a
+/// spawn does (ADR-0020) — otherwise a provisioned file that goes missing
+/// while the worktree survives (e.g. node recycled in k8s) stays missing
+/// forever and activity markers silently die.
+fn build_respawn_steps(plan: &SpawnPlan) -> Vec<Step> {
+    let mut steps = Vec::new();
+    if let Some(p) = &plan.provision {
+        steps.push(Step {
+            id: StepId::Provision,
+            cmd: provision_cmd(p),
+            fatal: false, // best-effort; never aborts the respawn (like spawn)
         });
     }
     steps.push(Step {
@@ -1819,6 +1872,7 @@ pub(crate) mod tests {
                 ("REMORA_CREATED_AT".into(), "1700000000".into()),
             ],
             agent_argv: vec!["claude".into(), "--continue".into()],
+            provision: None,
         }
     }
 
@@ -4345,6 +4399,7 @@ pub(crate) mod tests {
                 ("REMORA_CREATED_AT".into(), "1700000000".into()),
             ],
             agent_argv: vec!["claude".into(), "--continue".into()],
+            provision: None,
         };
         let porcelain = "worktree /home/dev/api\n\
                          HEAD abc\n\
@@ -4796,6 +4851,60 @@ pub(crate) mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // build_respawn_steps provision tests (#196) — respawn must re-provision
+    // the hook exactly like spawn does (ADR-0020), so a hook file that goes
+    // missing while the worktree survives gets re-written on the next respawn.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn respawn_steps_include_provision_before_new_session_when_present() {
+        let mut plan = respawn_plan();
+        plan.provision = Some(crate::config::ProvisionFile {
+            path: "~/.remora/hooks/claude-notify.sh".into(),
+            content: "x".into(),
+            mode: Some(0o755),
+        });
+        let steps = build_respawn_steps(&plan);
+        let prov = steps
+            .iter()
+            .position(|s| matches!(s.id, batch::StepId::Provision))
+            .expect("provision step present");
+        let new = steps
+            .iter()
+            .position(|s| matches!(s.id, batch::StepId::NewSession))
+            .expect("new_session step present");
+        assert!(prov < new, "provision must precede new_session");
+        assert!(
+            !steps[prov].fatal,
+            "provision must be non-fatal (best-effort), like spawn"
+        );
+    }
+
+    #[test]
+    fn respawn_steps_omit_provision_when_absent() {
+        let plan = respawn_plan(); // provision: None (from worktree_plan())
+        let steps = build_respawn_steps(&plan);
+        assert!(
+            !steps
+                .iter()
+                .any(|s| matches!(s.id, batch::StepId::Provision)),
+            "no provision file ⇒ no Provision step"
+        );
+        let ids: Vec<_> = steps.iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                batch::StepId::NewSession,
+                batch::StepId::Passthrough,
+                batch::StepId::SetEnv,
+                batch::StepId::SetEnv,
+                batch::StepId::SetEnv,
+            ],
+            "unchanged order/fatality for the non-provision case"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // build_spawn_steps + worktree_add_cmd tests (#182, Task 3)
     // -----------------------------------------------------------------------
 
@@ -4865,6 +4974,143 @@ pub(crate) mod tests {
                 batch::StepId::SetEnv,
             ]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // provision step tests (#196, Task 4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn provision_cmd_writes_base64_and_chmod_before_newsession() {
+        let f = crate::config::ProvisionFile {
+            path: "~/.remora/hooks/claude-notify.sh".into(),
+            content: "#!/bin/sh\necho hi\n".into(),
+            mode: Some(0o755),
+        };
+        let cmd = provision_cmd(&f);
+        // $HOME-resolved path, base64 pipeline, chmod in octal, mkdir parent.
+        assert!(cmd.contains("\"$HOME\"/.remora/hooks/claude-notify.sh"));
+        assert!(cmd.contains("base64 -d"));
+        assert!(cmd.contains("chmod 755"));
+        assert!(cmd.contains("mkdir -p"));
+        // `--` guards so a leading-dash path can't be parsed as an option.
+        assert!(cmd.contains("mkdir -p --"), "mkdir needs `--`: {cmd}");
+        assert!(cmd.contains("dirname --"), "dirname needs `--`: {cmd}");
+        assert!(cmd.contains("chmod 755 --"), "chmod needs `--`: {cmd}");
+    }
+
+    #[test]
+    fn provision_cmd_omits_chmod_when_mode_is_none() {
+        let f = crate::config::ProvisionFile {
+            path: "~/.remora/hooks/claude-notify.sh".into(),
+            content: "x".into(),
+            mode: None,
+        };
+        let cmd = provision_cmd(&f);
+        assert!(!cmd.contains("chmod"), "no mode ⇒ no chmod: {cmd}");
+    }
+
+    #[test]
+    fn provision_step_is_non_fatal_and_precedes_new_session() {
+        let mut plan = worktree_plan();
+        plan.provision = Some(crate::config::ProvisionFile {
+            path: "~/.remora/hooks/claude-notify.sh".into(),
+            content: "x".into(),
+            mode: Some(0o755),
+        });
+        let steps = build_spawn_steps(&plan);
+        let prov = steps
+            .iter()
+            .position(|s| matches!(s.id, batch::StepId::Provision))
+            .expect("provision step");
+        let new = steps
+            .iter()
+            .position(|s| matches!(s.id, batch::StepId::NewSession))
+            .expect("new_session");
+        assert!(prov < new, "provision must precede new_session");
+        assert!(
+            !steps[prov].fatal,
+            "provision must be non-fatal (best-effort)"
+        );
+    }
+
+    #[test]
+    fn no_provision_means_no_provision_step() {
+        let steps = build_spawn_steps(&worktree_plan()); // worktree_plan sets provision: None
+        assert!(!steps
+            .iter()
+            .any(|s| matches!(s.id, batch::StepId::Provision)));
+    }
+
+    /// Integration (D2/D4): runs the REAL generated `provision_cmd` through a
+    /// real `sh` with a fake `$HOME`, proving the base64 pipeline writes an
+    /// arbitrary script byte-for-byte at the `$HOME`-resolved path with the
+    /// requested mode, and that the written file is a working executable.
+    ///
+    /// Uses a GENERIC, agent-neutral script (not the Claude recipe) so
+    /// `remora-core` stays agent-agnostic — the Claude notify script's marker
+    /// wire contract is covered where it belongs (`activity::marker` executes
+    /// the real recipe, and the frontend drift guard pins the template to it).
+    /// This test owns only the transport concern: `provision_cmd` writes the
+    /// exact bytes as an executable file.
+    #[test]
+    fn provision_write_then_exec_runs_the_written_script() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Exercises the exact-byte hazards provisioning must preserve through
+        // base64 + the shell: single quotes and backslashes. The script writes
+        // a sentinel so we can prove it actually executed.
+        let script = "#!/bin/sh\nprintf 'ok \\047\\\\ done' > \"$SENTINEL\"\n";
+        let f = crate::config::ProvisionFile {
+            path: "~/.remora/hooks/provisioned.sh".into(),
+            content: script.to_string(),
+            mode: Some(0o755),
+        };
+        let tmp = std::env::temp_dir().join(format!("remora-prov-exec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("tmp");
+
+        // Write via the real provision_cmd through sh with a fake $HOME.
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(provision_cmd(&f))
+            .env("HOME", &tmp)
+            .status()
+            .expect("run provision");
+        assert!(status.success(), "provision cmd runs");
+
+        let written = tmp.join(".remora/hooks/provisioned.sh");
+        assert!(written.exists(), "script written to $HOME-resolved path");
+        assert_eq!(
+            std::fs::read(&written).expect("read written script"),
+            script.as_bytes(),
+            "base64 round-trip through the shell must be byte-identical to the source"
+        );
+        assert_eq!(
+            std::fs::metadata(&written)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "chmod applied the requested mode"
+        );
+
+        // The written file is a working executable: run it and check its effect.
+        let sentinel = tmp.join("sentinel");
+        let run = std::process::Command::new("sh")
+            .arg(&written)
+            .env("SENTINEL", &sentinel)
+            .status()
+            .expect("run written script");
+        assert!(run.success(), "provisioned script executes");
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).expect("sentinel written"),
+            "ok '\\ done",
+            "the provisioned script ran and produced its exact output (quotes + backslash survived)"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // -----------------------------------------------------------------------
@@ -4974,6 +5220,7 @@ pub(crate) mod tests {
             base: None,
             env: vec![],
             agent_argv: vec![],
+            provision: None,
         }
     }
 

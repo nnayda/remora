@@ -192,7 +192,12 @@ export type AgentDto = { id: string }
 /**
  * Form payload for create/edit of an agent.
  */
-export type AgentInputDto = { command: string[] }
+export type AgentInputDto = { command: string[]; 
+/**
+ * Preserved across the editor round-trip so that a TOML-set `provision`
+ * file is not silently dropped when the user edits an unrelated field.
+ */
+provision?: ProvisionFileDto | null }
 export type BridgeError = { kind: "sessionExists"; message: string } | { kind: "sessionNotFound"; message: string } | { kind: "channelClosed" } | { kind: "transport"; message: string } | { kind: "plan"; message: string } | { kind: "invalidId"; message: string } | { kind: "unknownHandle" } | { kind: "invalidSize"; message: string } | 
 /**
  * The config file exists but could not be read or parsed. A *missing*
@@ -257,7 +262,7 @@ export type EditableConfigDto = { config: EditorConfigDto | null; issues: string
 /**
  * An agent with its full launch argv (the display `AgentDto` carries only id).
  */
-export type EditorAgentDto = { id: string; command: string[] }
+export type EditorAgentDto = { id: string; command: string[]; provision: ProvisionFileDto | null }
 /**
  * The whole per-device config, projected **un-redacted** for the editor forms.
  */
@@ -326,6 +331,12 @@ export type ProjectInputDto = { name: string | null; hostId: string; path: strin
  * path does not destroy it.
  */
 worktreeRoot?: string | null }
+/**
+ * A single provisioned file (ADR-0003 data, #196): the editor's counterpart
+ * to core's `ProvisionFile`. Shared by the read projection and the write
+ * inputs so the form round-trips exactly what is on disk.
+ */
+export type ProvisionFileDto = { path: string; content: string; mode: number | null }
 /**
  * Result of a discovery poll: one bucket per host attempted this poll, in
  * config order. Sessions are sorted by (project_id, session_id) within each

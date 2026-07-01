@@ -185,6 +185,26 @@ pub struct Agent {
     /// Launch command as an argv array — never joined into a shell string
     /// (ADR-0004).
     pub command: Vec<String>,
+    /// One optional file Remora writes to the sandbox before launch (ADR-0003
+    /// data). Opaque to core — contents are never parsed. Single file by design
+    /// (see #196 spec / plan-eng-review D7).
+    #[serde(default)]
+    pub provision: Option<ProvisionFile>,
+}
+
+/// A file Remora materializes on the sandbox at spawn. Agent-agnostic: core
+/// writes the bytes verbatim and never interprets them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisionFile {
+    /// Destination on the sandbox. `~`/`~/…` are resolved to `$HOME` at write
+    /// time by the transport (`quote_remote_path`), matching the session dir.
+    pub path: String,
+    /// Verbatim file contents. Written byte-for-byte; never parsed.
+    pub content: String,
+    /// Optional unix mode (TOML octal literal, e.g. `0o755`).
+    #[serde(default)]
+    pub mode: Option<u32>,
 }
 
 /// Why a config failed to load.
@@ -273,6 +293,11 @@ pub enum ValidationIssue {
     },
     #[error("agent `{agent}`: `command` {reason}")]
     InvalidAgentCommand {
+        agent: AgentId,
+        reason: &'static str,
+    },
+    #[error("agent `{agent}`: `provision.path` {reason}")]
+    InvalidProvision {
         agent: AgentId,
         reason: &'static str,
     },
@@ -821,6 +846,32 @@ impl Config {
                     agent: id.clone(),
                     reason,
                 });
+            }
+
+            // `command` already permits arbitrary execution, so `provision`
+            // adds no trust boundary — no prefix restriction here by design
+            // (see spec non-goals / outside-voice #6).
+            if let Some(p) = &agent.provision {
+                let preason = if p.path.trim().is_empty() {
+                    Some("must not be empty")
+                } else if p.path != "~" && p.path.starts_with('~') && !p.path.starts_with("~/") {
+                    // Transport tilde resolution (quote_remote_path) only handles
+                    // `~` and `~/…`; a `~user` path would silently fall through to
+                    // a literal write. Fail closed, like project paths do.
+                    Some("must use `~` or `~/`; `~user` paths are not supported")
+                } else if p.path.split('/').any(|seg| seg == "..") {
+                    Some("must not contain a `..` path component")
+                } else if p.path.chars().any(char::is_control) {
+                    Some("must not contain control characters")
+                } else {
+                    None
+                };
+                if let Some(reason) = preason {
+                    issues.push(ValidationIssue::InvalidProvision {
+                        agent: id.clone(),
+                        reason,
+                    });
+                }
             }
         }
 
@@ -1767,5 +1818,66 @@ mod tests {
             .expect("valid");
         let devbox = &cfg.hosts[&host_id("devbox")];
         assert_eq!(devbox.worktree_root, None);
+    }
+
+    #[test]
+    fn agent_without_provision_parses_and_defaults_none() {
+        let cfg =
+            Config::from_toml_str("[agents.claude]\ncommand = [\"claude\"]\n").expect("valid");
+        let a = &cfg.agents[&AgentId::new("claude").expect("slug")];
+        assert_eq!(a.provision, None);
+    }
+
+    #[test]
+    fn agent_with_provision_parses() {
+        let toml = "[agents.claude]\ncommand = [\"claude\"]\n\n[agents.claude.provision]\npath = \"~/.remora/hooks/claude-notify.sh\"\ncontent = \"#!/bin/sh\\necho hi\\n\"\nmode = 0o755\n";
+        let cfg = Config::from_toml_str(toml).expect("valid");
+        let p = cfg.agents[&AgentId::new("claude").expect("slug")]
+            .provision
+            .as_ref()
+            .expect("provision");
+        assert_eq!(p.path, "~/.remora/hooks/claude-notify.sh");
+        assert_eq!(p.mode, Some(0o755));
+        assert!(p.content.contains("echo hi"));
+    }
+
+    #[test]
+    fn provision_rejects_empty_path() {
+        let toml = "[agents.claude]\ncommand=[\"claude\"]\n[agents.claude.provision]\npath=\"\"\ncontent=\"x\"\n";
+        assert!(issues_of(toml)
+            .iter()
+            .any(|i| matches!(i, ValidationIssue::InvalidProvision { .. })));
+    }
+
+    #[test]
+    fn provision_rejects_parent_traversal() {
+        let toml = "[agents.claude]\ncommand=[\"claude\"]\n[agents.claude.provision]\npath=\"~/../etc/x\"\ncontent=\"x\"\n";
+        assert!(issues_of(toml)
+            .iter()
+            .any(|i| matches!(i, ValidationIssue::InvalidProvision { .. })));
+    }
+
+    #[test]
+    fn provision_rejects_tilde_user_path() {
+        // `~user` is unsupported: transport tilde resolution only handles `~`/`~/…`.
+        let toml = "[agents.claude]\ncommand=[\"claude\"]\n[agents.claude.provision]\npath=\"~root/x\"\ncontent=\"x\"\n";
+        assert!(issues_of(toml)
+            .iter()
+            .any(|i| matches!(i, ValidationIssue::InvalidProvision { .. })));
+    }
+
+    #[test]
+    fn provision_accepts_plain_tilde_paths() {
+        // `~` and `~/…` are the supported forms — a config using them is valid
+        // (no issues at all, so `issues_of`'s expect_err would be wrong here).
+        for path in ["~", "~/.remora/hooks/x.sh"] {
+            let toml = format!(
+                "[agents.claude]\ncommand=[\"claude\"]\n[agents.claude.provision]\npath=\"{path}\"\ncontent=\"x\"\n"
+            );
+            assert!(
+                Config::from_toml_str(&toml).is_ok(),
+                "path {path} must be accepted"
+            );
+        }
     }
 }

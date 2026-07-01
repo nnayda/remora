@@ -7,7 +7,9 @@ import type {
 import {
   addArg,
   agentFormFromDto,
+  applyClaudeTemplate,
   buildSettingsModel,
+  claudeMarkerTemplate,
   emptyAgentForm,
   emptyHostForm,
   emptyProjectForm,
@@ -392,7 +394,11 @@ describe("agent form", () => {
   });
 
   it("prefills argv from a dto", () => {
-    const form = agentFormFromDto({ id: "claude", command: ["claude", "-r"] });
+    const form = agentFormFromDto({
+      id: "claude",
+      command: ["claude", "-r"],
+      provision: null,
+    });
     expect(form.id).toBe("claude");
     expect(form.command).toEqual(["claude", "-r"]);
   });
@@ -412,7 +418,12 @@ describe("agent form", () => {
   });
 
   it("rejects an all-blank command", () => {
-    const blank = { id: "ok", command: ["", "  "], plainShell: false };
+    const blank = {
+      id: "ok",
+      command: ["", "  "],
+      plainShell: false,
+      provision: null,
+    };
     expect(validateAgentForm(blank, "create")).toMatch(/command/i);
   });
 
@@ -421,6 +432,7 @@ describe("agent form", () => {
       id: "ok",
       command: [" claude ", "", "-r"],
       plainShell: false,
+      provision: null,
     };
     expect(validateAgentForm(form, "create")).toBeNull();
     expect(toAgentInput(form)).toEqual({ command: ["claude", "-r"] });
@@ -434,6 +446,7 @@ describe("agent form", () => {
         id: "claude",
         command: ["claude", `${dash}dangerously`],
         plainShell: false,
+        provision: null,
       };
       expect(validateAgentForm(form, "create")).toMatch(/dash/i);
     }
@@ -444,30 +457,46 @@ describe("agent form", () => {
           id: "claude",
           command: ["claude", "--dangerously", "-r"],
           plainShell: false,
+          provision: null,
         },
         "create",
       ),
     ).toBeNull();
     expect(
       validateAgentForm(
-        { id: "claude", command: ["claude", "a—b"], plainShell: false },
+        {
+          id: "claude",
+          command: ["claude", "a—b"],
+          plainShell: false,
+          provision: null,
+        },
         "create",
       ),
     ).toBeNull();
   });
 
   it("seeds plainShell from an empty dto command", () => {
-    const shell = agentFormFromDto({ id: "shell", command: [] });
+    const shell = agentFormFromDto({
+      id: "shell",
+      command: [],
+      provision: null,
+    });
     expect(shell.plainShell).toBe(true);
     // One editable row is restored so unchecking the toggle has something to show.
     expect(shell.command).toEqual([""]);
     expect(
-      agentFormFromDto({ id: "claude", command: ["claude"] }).plainShell,
+      agentFormFromDto({ id: "claude", command: ["claude"], provision: null })
+        .plainShell,
     ).toBe(false);
   });
 
   it("plain shell is valid with an empty command and saves []", () => {
-    const form = { id: "shell", command: ["claude"], plainShell: true };
+    const form = {
+      id: "shell",
+      command: ["claude"],
+      plainShell: true,
+      provision: null,
+    };
     expect(validateAgentForm(form, "create")).toBeNull();
     expect(toAgentInput(form)).toEqual({ command: [] });
   });
@@ -475,8 +504,73 @@ describe("agent form", () => {
   it("accepts all-blank rows when plain shell and saves []", () => {
     // The same rows that are rejected above are fine once the toggle is on —
     // they collapse to an empty command instead of failing validation.
-    const form = { id: "ok", command: ["", "  "], plainShell: true };
+    const form = {
+      id: "ok",
+      command: ["", "  "],
+      plainShell: true,
+      provision: null,
+    };
     expect(validateAgentForm(form, "create")).toBeNull();
     expect(toAgentInput(form)).toEqual({ command: [] });
+  });
+
+  it("round-trips provision through the form", () => {
+    const dto = {
+      id: "claude",
+      command: ["claude"],
+      provision: {
+        path: "~/.remora/hooks/claude-notify.sh",
+        content: "x",
+        mode: 493,
+      },
+    };
+    const form = agentFormFromDto(dto);
+    expect(toAgentInput(form).provision).toEqual(dto.provision);
+  });
+
+  it("claude template fills command with --settings and provision", () => {
+    const t = claudeMarkerTemplate();
+    expect(t.command).toContain("--settings");
+    expect(t.provision.path).toBe("~/.remora/hooks/claude-notify.sh");
+    expect(t.provision.content).toContain("7366;remora"); // wire marker
+  });
+
+  describe("applyClaudeTemplate", () => {
+    it("fills a blank command with the template outright", () => {
+      const form = emptyAgentForm();
+      const result = applyClaudeTemplate(form);
+      const t = claudeMarkerTemplate();
+      expect(result.command).toEqual(t.command);
+      expect(result.command).toContain("--settings");
+      expect(result.provision).toEqual(t.provision);
+      expect(result.plainShell).toBe(false);
+    });
+
+    it("preserves existing flags and appends --settings", () => {
+      const form = {
+        ...emptyAgentForm(),
+        command: ["claude", "--continue"],
+      };
+      const result = applyClaudeTemplate(form);
+      const t = claudeMarkerTemplate();
+      const settingsJson = t.command[t.command.indexOf("--settings") + 1];
+      expect(result.command).toEqual([
+        "claude",
+        "--continue",
+        "--settings",
+        settingsJson,
+      ]);
+      expect(result.provision).toEqual(t.provision);
+    });
+
+    it("does not double --settings when already present", () => {
+      const form = {
+        ...emptyAgentForm(),
+        command: ["claude", "--settings", "{}"],
+      };
+      const result = applyClaudeTemplate(form);
+      expect(result.command).toEqual(["claude", "--settings", "{}"]);
+      expect(result.command.filter((a) => a === "--settings")).toHaveLength(1);
+    });
   });
 });

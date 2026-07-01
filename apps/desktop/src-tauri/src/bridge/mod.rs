@@ -1352,6 +1352,7 @@ mod tests {
     fn agent_input() -> AgentInputDto {
         AgentInputDto {
             command: vec!["claude".into(), "--flag".into()],
+            provision: None,
         }
     }
     /// A bridge over a guaranteed-absent temp config file (fresh-device start).
@@ -1405,6 +1406,7 @@ mod tests {
             "claude".into(),
             AgentInputDto {
                 command: vec!["claude".into(), "--resume".into()],
+                provision: None,
             },
         )
         .await
