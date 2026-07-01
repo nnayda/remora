@@ -1235,6 +1235,100 @@ describe("SessionStore openViaRespawn", () => {
   });
 });
 
+// ─── openViaAttach tests ──────────────────────────────────────────────────────
+
+describe("SessionStore openViaAttach", () => {
+  it("opens a NEW live tab via the attach opener — never spawns (no worktree add)", async () => {
+    // Opening a discovered LIVE session must ATTACH to the running tmux, not
+    // spawn-first. Spawn-first back-compat-creates a duplicate worktree/branch
+    // that leaks when tmux-new-session collides — the orphaned-session bug.
+    const attachConn = fakeConn();
+    const openers: StoreOpeners = {
+      spawn: vi.fn(async () => ({ connection: makeConn(), attached: false })),
+      attach: vi.fn(async () => attachConn.conn),
+      respawn: vi.fn(async () => makeConn()),
+      schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
+    };
+    const store = new SessionStore(openers);
+    const result = await store.openViaAttach(spec("p", "s"));
+    expect(openers.spawn).not.toHaveBeenCalled();
+    expect(openers.respawn).not.toHaveBeenCalled();
+    expect(openers.attach).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ ok: true, attached: true, opened: true });
+    const snap = store.getSnapshot();
+    expect(snap.tabs).toHaveLength(1);
+    expect(snap.tabs[0].status).toBe("live");
+    expect(snap.tabs[0].connection).toBe(attachConn.conn);
+    expect(snap.activeKey).toBe("p/s");
+  });
+
+  it("focuses an already-open tab without re-attaching", async () => {
+    const openers: StoreOpeners = {
+      spawn: vi.fn(async () => ({ connection: makeConn(), attached: false })),
+      attach: vi.fn(async () => makeConn()),
+      respawn: vi.fn(async () => makeConn()),
+      schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
+    };
+    const store = new SessionStore(openers);
+    await store.openViaAttach(spec("p", "s"));
+    await store.openSession(spec("p", "other"));
+    expect(store.getSnapshot().activeKey).toBe("p/other");
+    const result = await store.openViaAttach(spec("p", "s"));
+    expect(result).toEqual({ ok: true, attached: true, opened: false });
+    expect(openers.attach).toHaveBeenCalledTimes(1);
+    expect(store.getSnapshot().activeKey).toBe("p/s");
+  });
+
+  it("falls back to respawn when attach reports sessionNotFound (died since poll)", async () => {
+    // A live session can die between the discovery poll and the click; attach
+    // then fails sessionNotFound. Rather than error, re-create it in the
+    // surviving worktree via the respawn opener (never spawn — no worktree add).
+    const respawnConn = fakeConn();
+    const openers: StoreOpeners = {
+      spawn: vi.fn(async () => ({ connection: makeConn(), attached: false })),
+      attach: vi.fn(() =>
+        Promise.reject({ kind: "sessionNotFound", message: "gone" }),
+      ),
+      respawn: vi.fn(async () => respawnConn.conn),
+      schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
+    };
+    const store = new SessionStore(openers);
+    const result = await store.openViaAttach(spec("p", "s"));
+    expect(openers.spawn).not.toHaveBeenCalled();
+    expect(openers.respawn).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ ok: true, attached: false, opened: true });
+    const snap = store.getSnapshot();
+    expect(snap.tabs).toHaveLength(1);
+    expect(snap.tabs[0].status).toBe("live");
+    expect(snap.tabs[0].connection).toBe(respawnConn.conn);
+  });
+
+  it("surfaces a non-not-found attach failure as {ok:false} without respawning", async () => {
+    const openers: StoreOpeners = {
+      spawn: vi.fn(async () => ({ connection: makeConn(), attached: false })),
+      attach: vi.fn(() =>
+        Promise.reject({ kind: "transport", message: "refused" }),
+      ),
+      respawn: vi.fn(async () => makeConn()),
+      schedule: vi.fn(),
+      stop: vi.fn(async () => {}),
+      remove: vi.fn(async () => {}),
+    };
+    const store = new SessionStore(openers);
+    const result = await store.openViaAttach(spec("p", "s"));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatchObject({ kind: "transport" });
+    expect(openers.respawn).not.toHaveBeenCalled();
+    expect(store.getSnapshot().tabs).toHaveLength(0);
+  });
+});
+
 // ─── Fix D: additional coverage gaps ─────────────────────────────────────────
 
 describe("SessionStore Fix D coverage", () => {

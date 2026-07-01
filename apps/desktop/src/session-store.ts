@@ -1,6 +1,6 @@
 import type { DirtyReasonDto, WorkspaceModeDto } from "./bindings";
 import type { SessionConnection } from "./connection";
-import { errorMessage, reconnectFate } from "./connection";
+import { errorMessage, isSessionNotFound, reconnectFate } from "./connection";
 
 export type TeardownResult = { ok: true } | { ok: false; error?: unknown };
 export type RemoveResult =
@@ -502,6 +502,43 @@ export class SessionStore {
         .respawn(p, s, a)
         .then((connection) => ({ connection, attached: false })),
     );
+  };
+
+  /**
+   * Open a session that discovery reports as LIVE by ATTACHING to the running
+   * tmux — never the spawn-first path. Spawn-first runs `git worktree add` before
+   * it learns the session already exists, and when the session was created with
+   * an explicit branch, that add lands at a *different* (convention) path and
+   * succeeds, leaking a duplicate worktree/branch that resurfaces on remove
+   * (the orphaned-session bug). Attaching creates nothing.
+   *
+   * An already-open tab just gets focused. If the live session died between the
+   * discovery poll and this click, attach fails `sessionNotFound`; we fall back
+   * to respawn (re-create tmux in the surviving worktree) rather than error.
+   */
+  openViaAttach = async (input: SpawnInput): Promise<OpenResult> => {
+    if (this.disposed) {
+      return { ok: false, error: OPEN_CANCELLED };
+    }
+    const key = tabKey(input.projectId, input.sessionId);
+    const existing = this.tabs.find((t) => t.key === key);
+    if (existing) {
+      this.activeKey = key;
+      this.commit();
+      return { ok: true, attached: existing.attached, opened: false };
+    }
+
+    const result = await this.openTab(input, (p, s) =>
+      this.openers.attach(p, s).then((connection) => ({
+        connection,
+        attached: true,
+      })),
+    );
+    // Died between poll and click → re-create in the surviving worktree.
+    if (!result.ok && "error" in result && isSessionNotFound(result.error)) {
+      return this.openViaRespawn(input);
+    }
+    return result;
   };
 
   respawnTab = async (key: string): Promise<void> => {
