@@ -7,6 +7,7 @@ import type {
   HostInputDto,
   PresentEntitiesDto,
   ProjectInputDto,
+  ProvisionFileDto,
   WorkspaceModeDto,
 } from "./bindings";
 import { isValidSlug } from "./spawn-input";
@@ -253,10 +254,14 @@ export interface AgentFormState {
    * argv editor is disabled but its rows are preserved so unchecking restores
    * them; only `[]` is sent on save. */
   plainShell: boolean;
+  /** Optional file to write and chmod before the agent's first launch (#196),
+   * e.g. the Claude notification-hook script. Round-tripped untouched through
+   * edit — the form has no UI for it yet. */
+  provision: ProvisionFileDto | null;
 }
 
 export function emptyAgentForm(): AgentFormState {
-  return { id: "", command: [""], plainShell: false };
+  return { id: "", command: [""], plainShell: false, provision: null };
 }
 
 export function agentFormFromDto(dto: EditorAgentDto): AgentFormState {
@@ -264,6 +269,7 @@ export function agentFormFromDto(dto: EditorAgentDto): AgentFormState {
     id: dto.id,
     command: dto.command.length > 0 ? [...dto.command] : [""],
     plainShell: dto.command.length === 0,
+    provision: dto.provision ?? null, // round-trip: preserve on edit (D5)
   };
 }
 
@@ -329,11 +335,84 @@ export function validateAgentForm(
 }
 
 export function toAgentInput(form: AgentFormState): AgentInputDto {
+  const provision = form.provision ?? undefined;
   if (form.plainShell) {
-    return { command: [] };
+    return { command: [], provision };
   }
   return {
     command: form.command.map((arg) => arg.trim()).filter((arg) => arg !== ""),
+    provision,
+  };
+}
+
+// ---- Claude notification-hook template ----
+
+const CLAUDE_NOTIFY_PATH = "~/.remora/hooks/claude-notify.sh";
+
+// Byte-identical to contrib/agent-hooks/claude-code/remora-notify.sh — a
+// drift-guard test (claude-template.drift.test.ts) enforces this, so this
+// string must never be hand-edited independently of that file.
+const CLAUDE_NOTIFY_SCRIPT = `#!/usr/bin/env bash
+# Remora activity marker (OSC-7366, ADR-0010). Claude Code "Notification" hook:
+# emit awaiting_input + the agent's message as a preview so Remora can show what
+# the agent is waiting for.
+#
+# Two non-obvious, load-bearing requirements:
+#   1. The marker MUST be tmux-passthrough WRAPPED. Remora runs the agent in its
+#      own tmux session with allow-passthrough; tmux silently consumes a bare OSC.
+#   2. It MUST go to the terminal, not stdout. Claude Code captures a hook's
+#      stdout (shown only in Ctrl-R), so stdout never reaches the PTY byte stream
+#      Remora reads. Default to /dev/tty; REMORA_MARKER_OUT overrides (tests).
+#
+# The payload is UNTRUSTED by design; Remora core sanitizes + length-caps it.
+# This printf MUST stay byte-for-byte in sync with the wire contract asserted by
+# remora_notify_recipe_round_trip in crates/remora-core/src/activity/marker.rs.
+set -euo pipefail
+
+out="\${REMORA_MARKER_OUT:-/dev/tty}"
+msg="$(jq -r '.message // empty' 2>/dev/null || true)"
+[ -n "$msg" ] || exit 0
+
+enc="$(printf '%s' "$msg" | base64 | tr -d '\\n')"
+state="YXdhaXRpbmdfaW5wdXQ="   # base64("awaiting_input")
+
+# on-wire (tmux passthrough envelope, inner ESC doubled):
+#   ESC P tmux ; ESC ESC ] 7366 ; remora ; 1 ; state ; <state> ; <msg> BEL ESC \\
+printf '\\033Ptmux;\\033\\033]7366;remora;1;state;%s;%s\\007\\033\\\\' "$state" "$enc" > "$out" 2>/dev/null || exit 0
+`;
+
+// Inline settings: a Notification hook running the script via $HOME (claude
+// runs hook commands through sh -c, which expands $HOME — tilde is not
+// guaranteed to expand there).
+const CLAUDE_SETTINGS_JSON = JSON.stringify({
+  hooks: {
+    Notification: [
+      {
+        hooks: [
+          {
+            type: "command",
+            command: "$HOME/.remora/hooks/claude-notify.sh",
+          },
+        ],
+      },
+    ],
+  },
+});
+
+/** The stock "wire Claude's Notification hook to Remora's activity marker"
+ * template (#196): a `--settings` flag carrying the hook config, plus the
+ * provision file the hook script needs on disk before first launch. */
+export function claudeMarkerTemplate(): {
+  command: string[];
+  provision: ProvisionFileDto;
+} {
+  return {
+    command: ["claude", "--settings", CLAUDE_SETTINGS_JSON],
+    provision: {
+      path: CLAUDE_NOTIFY_PATH,
+      content: CLAUDE_NOTIFY_SCRIPT,
+      mode: 0o755,
+    },
   };
 }
 
