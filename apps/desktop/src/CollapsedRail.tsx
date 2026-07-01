@@ -78,11 +78,11 @@ export function CollapsedRail({
             "rk-railmini__session",
             entry.active ? "is-active" : "",
             entry.reconnecting ? "is-reconnecting" : "",
-            entry.firstOfProject ? "is-project-start" : "",
+            entry.dividerBefore ? "is-project-start" : "",
           ]
             .filter(Boolean)
             .join(" ");
-          const activity =
+          const activityLabel =
             entry.connected || entry.connecting
               ? `, ${entry.connecting ? "connecting" : activityPhrase(entry.status)}`
               : "";
@@ -96,7 +96,7 @@ export function CollapsedRail({
                 type="button"
                 className={cls}
                 aria-current={entry.active ? "page" : undefined}
-                aria-label={`${entry.branchLabel}, ${entry.hostLabel}${activity}`}
+                aria-label={`${entry.branchLabel}, ${entry.hostLabel}${activityLabel}`}
                 onClick={() => onOpenSession(entry.session)}
               >
                 <span className="rk-railmini__glyph">

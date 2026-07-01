@@ -817,8 +817,11 @@
   opacity: 0.55;
 }
 /* Hairline project divider: the non-color grouping channel. Applied to the
-   first session of each project except the very first row. */
-.rk-railmini__session.is-project-start:not(:first-child) {
+   first session of each project after the first (dividerBefore, computed in
+   rail-glyph.ts — this can't be a positional :first-child selector because
+   Tooltip wraps every session button, so each is always its wrapper's only
+   child). */
+.rk-railmini__session.is-project-start {
   margin-top: var(--space-2);
   padding-top: var(--space-2);
   border-top: 1px solid var(--border-hairline);
@@ -828,7 +831,6 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--accent);
 }
 /* Mono branch-initial: DESIGN.md's machine-value signal, distinguishes
    same-project sessions. Bottom-left so it never collides with the status dot
@@ -845,6 +847,9 @@
   padding: 0 1px;
   border-radius: 2px;
   pointer-events: none;
+}
+.rk-railmini__session.is-active .rk-railmini__initial {
+  background: transparent;
 }
 .rk-railmini__dot {
   position: absolute;

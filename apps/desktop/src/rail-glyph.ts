@@ -59,7 +59,9 @@ export interface RailEntry {
   reconnecting: boolean;
   hostLabel: string;
   branchLabel: string;
-  firstOfProject: boolean;
+  /** True only for the first session of each project after the first
+   * non-empty project — marks a project boundary that needs a top divider. */
+  dividerBefore: boolean;
 }
 
 /**
@@ -79,9 +81,10 @@ export function railEntries(
   let projectIndex = 0;
   for (const project of tree) {
     if (project.sessions.length === 0) continue;
-    const Icon = projectIcon(projectIndex);
+    const idx = projectIndex;
+    const Icon = projectIcon(idx);
     projectIndex++;
-    let firstOfProject = true;
+    let isFirstOfProject = true;
     for (const session of project.sessions) {
       entries.push({
         key: session.key,
@@ -95,9 +98,9 @@ export function railEntries(
         reconnecting: session.reconnecting,
         hostLabel: project.hostLabel,
         branchLabel: session.branch ?? session.sessionId,
-        firstOfProject,
+        dividerBefore: isFirstOfProject && idx > 0,
       });
-      firstOfProject = false;
+      isFirstOfProject = false;
     }
   }
   return entries;

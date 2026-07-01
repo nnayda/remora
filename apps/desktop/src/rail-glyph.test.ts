@@ -108,7 +108,7 @@ describe("railEntries", () => {
     expect(out[0].Icon).not.toBe(out[2].Icon); // different project
   });
 
-  it("flags exactly the active key and sets firstOfProject per project", () => {
+  it("flags exactly the active key and marks dividerBefore per project", () => {
     const tree = [
       projectNode("p1", [sessionNode("p1", "a"), sessionNode("p1", "b")]),
       projectNode("p2", [sessionNode("p2", "c")]),
@@ -116,7 +116,17 @@ describe("railEntries", () => {
     const activeKey = "p1 b";
     const out = railEntries(tree, activeKey, empty, noActivity, empty);
     expect(out.map((e) => e.active)).toEqual([false, true, false]);
-    expect(out.map((e) => e.firstOfProject)).toEqual([true, false, true]);
+    expect(out.map((e) => e.dividerBefore)).toEqual([false, false, true]);
+  });
+
+  it("marks dividerBefore only on the first session of each project after the first", () => {
+    const tree = [
+      projectNode("p1", [sessionNode("p1", "a")]),
+      projectNode("empty", []),
+      projectNode("p2", [sessionNode("p2", "b")]),
+    ];
+    const out = railEntries(tree, null, empty, noActivity, empty);
+    expect(out.map((e) => e.dividerBefore)).toEqual([false, true]);
   });
 
   it("propagates connected, connecting, reconnecting and labels", () => {
