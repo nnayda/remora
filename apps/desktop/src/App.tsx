@@ -446,7 +446,9 @@ function App() {
             tree={tree}
             activeKey={activeKey}
             openKeys={openKeys}
+            connectingKeys={connectingKeys}
             activity={activity}
+            onOpenSession={openFromSidebar}
             onExpand={toggleCollapsed}
             onOpenSettings={openSettings}
           />
