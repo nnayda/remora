@@ -7,81 +7,48 @@ import {
 /**
  * Whether a sidebar open must disarm the `focusOnSelect` intent flag.
  *
- * The flag is armed before `openSession` is called so the focus effect grabs
- * the terminal once it's live. But the effect only consumes the flag when the
- * active tab is `live` — so any open that doesn't leave a live terminal to
- * focus must disarm the flag itself, or it survives to steal focus on the next
- * unrelated `activeKey`/`activeStatus`/`focusRequest` change (e.g. a background
- * reconnect or respawn going live).
- *
- * Keep the arm only when the click lands on something live to focus:
- *  - a fresh spawn (`opened`), which commits a live tab, or
- *  - a dedupe to an already-open **live** tab (explicit re-selection → focus).
- *
- * Disarm otherwise:
+ * The flag is armed before the opener runs so the focus effect grabs the
+ * terminal once the active tab is `live`. Both sidebar openers now lead every
+ * existing tab to a live terminal — a `live` dedupe is focused directly, and a
+ * non-live dedupe is revived in place (`openViaAttach` → `reconnectTab`,
+ * `openViaRespawn` → `respawnTab`), a controlled path to `live`. So keep the arm
+ * for any successful open, and rely on the focus effect to clear it if a revive
+ * terminally fails (App.tsx §2b). Disarm only when there is nothing a live
+ * terminal can arrive for:
  *  - a real failure (a no-op open never flips `activeKey`), but NOT a cancel
- *    (store closed/disposed mid-connect — not a real open attempt); and
- *  - a dedupe to ANY **non-live** existing tab (`disconnected`/`reconnecting`/
- *    `stopped`) — the stale-discovery window where discovery reports `live` but
- *    the local tab isn't. `openSession` focuses that tab without reconnecting,
- *    so the effect's `activeStatus === "live"` guard never consumes the flag
- *    (#136, the sidebar twin of the dialog leak fixed in #133). We disarm even a
- *    `reconnecting` tab that may later recover on its own: letting that deferred
- *    recovery grab focus after the user has looked elsewhere is the very steal
- *    this guards against — the conservative choice is to never carry the arm
- *    across a state change we don't control.
+ *    (store closed/disposed mid-connect — not a real open attempt); or
+ *  - a vanished tab (`preStatus === null` on a dedupe). `preStatus` is sampled
+ *    before the call, so a dedupe (`opened === false`) always had a tab: this
+ *    case is unreachable via `openFromSidebar` and kept only as a defensive belt.
  *
- * @param existingStatus status of the deduped existing tab, or null if the open
- *   committed a fresh tab / no matching tab is open.
+ * @param preStatus the matching tab's status sampled BEFORE the opener ran
+ *   (openers flip status synchronously), or null if no matching tab was open.
  */
 export function shouldDisarmAfterSidebarOpen(
-  result: OpenResult,
-  existingStatus: TabStatus | null,
-): boolean {
-  if (!result.ok) return result.error !== OPEN_CANCELLED;
-  if (result.opened) return false; // fresh live tab — keep armed to focus it
-  return existingStatus !== "live"; // deduped: disarm unless the tab is live
-}
-
-/**
- * Whether a sidebar **respawn-branch** open (the clicked node was discovered
- * `stopped`) must disarm `focusOnSelect`, given the matching tab's local status
- * *before* the open ran (`null` = no tab was open yet).
- *
- * This is the respawn-path twin of {@link shouldDisarmAfterSidebarOpen}, and it
- * differs in one load-bearing way: `openViaRespawn` actively respawns a
- * `stopped`/`disconnected` existing tab — a controlled path to `live` that the
- * focus effect will consume — so the arm is **kept** for those, whereas the
- * live-attach path (which never respawns) disarms them. Keep the arm only when
- * a live terminal will predictably arrive to consume it:
- *  - a fresh spawn (`opened`) commits a live tab;
- *  - a dedupe to an already-`live` tab (clicking it flips `activeKey` to a live
- *    tab, so the effect focuses it — the active-live re-click is short-circuited
- *    before the open, so a `live` status here is a background tab); or
- *  - a `stopped`/`disconnected` tab that `openViaRespawn` will respawn.
- *
- * Disarm otherwise:
- *  - a real failure (a no-op open never flips `activeKey`), but NOT a cancel;
- *  - a dedupe to a `reconnecting` tab — `openViaRespawn` does NOT respawn it, so
- *    its only path to `live` is a self-recovery we don't control (#136 policy:
- *    never carry the arm across a state change we don't own); and
- *  - a vanished tab (`null`) — nothing to focus.
- *
- * Decide from the status captured *before* the call: `respawnTab` flips
- * `stopped`/`disconnected` to `reconnecting` synchronously, so a post-call read
- * would misclassify a tab that is legitimately respawning.
- *
- * @param preStatus the matching tab's status sampled before `openViaRespawn`,
- *   or null if no matching tab was open.
- */
-export function shouldDisarmAfterSidebarRespawn(
   result: OpenResult,
   preStatus: TabStatus | null,
 ): boolean {
   if (!result.ok) return result.error !== OPEN_CANCELLED;
   if (result.opened) return false; // fresh live tab — keep armed to focus it
-  // Deduped to an existing tab: keep only where a controlled path to live
-  // follows (live now, or stopped/disconnected → respawn). Reconnecting and
-  // vanished have no path we control, so disarm.
-  return preStatus === "reconnecting" || preStatus === null;
+  return preStatus === null; // deduped: keep the arm; disarm only if vanished
+}
+
+/**
+ * Whether a sidebar re-click of the *active* tab should focus its terminal in
+ * place instead of routing to an opener.
+ *
+ * Re-clicking the active, locally-`live` tab changes no store state — an opener
+ * would dedupe to the current `activeKey`, so the activeKey-gated focus effect
+ * never fires to consume `focusOnSelect`; focusing directly (and disarming) is
+ * the only way to land focus and avoid leaking the armed flag onto the next
+ * unrelated change. A non-live active tab must NOT short-circuit: it has to fall
+ * through to a revive path (#189 Bug A) — the old code focused a placeholder
+ * (no terminal handle) and returned without reconnecting.
+ */
+export function shouldFocusActiveTabInPlace(
+  activeKey: string | null,
+  key: string,
+  preStatus: TabStatus | null,
+): boolean {
+  return key === activeKey && preStatus === "live";
 }
