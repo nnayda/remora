@@ -16,8 +16,8 @@ use super::pty_process::spawn_pty_channel;
 use crate::config::Config;
 use crate::discovery;
 use crate::naming::{
-    derive_session_id, parse_tmux_session_name, tmux_session_name, ENV_AGENT, ENV_CREATED_AT,
-    ENV_PREFIX, ENV_WORKSPACE,
+    branch_name, derive_session_id, parse_tmux_session_name, tmux_session_name, ENV_AGENT,
+    ENV_CREATED_AT, ENV_PREFIX, ENV_WORKSPACE,
 };
 use crate::spawn_plan::{PlanError, SpawnPlan};
 use crate::{DirtyReason, SessionChannel, SourceError};
@@ -1558,24 +1558,49 @@ fn resolve_worktree(
     session_id: &SessionId,
     home: &str,
 ) -> Result<Option<(String, String)>, SourceError> {
+    // First match wins (respawn only needs one worktree to reuse). Shares the
+    // listing + derive-match + fail-closed policy with `resolve_worktrees` so the
+    // two can't drift; the Vec alloc is negligible on this rare (respawn) path.
+    Ok(resolve_worktrees(exec, project_path, session_id, home)?
+        .into_iter()
+        .next())
+}
+
+/// Like [`resolve_worktree`] but returns EVERY worktree whose branch derives to
+/// `session_id`, not just the first. A session can accumulate more than one such
+/// worktree — e.g. a B2 session created with a raw branch (`issues`, worktree at
+/// `.../issues`) that was later re-opened through the spawn-first path, which
+/// back-compat-spawned a second worktree at the convention path
+/// (`.../issues-<hash>`, branch `remora/issues-<hash>`). Both derive to the same
+/// `session_id`, so `run_remove` must destroy all of them or the survivor
+/// re-surfaces in discovery as a "new" stopped row (the leaked-orphan bug).
+///
+/// Same fail-closed policy as `resolve_worktree`: a listing failure with
+/// non-empty stderr is `Err(Transport)` so an ambiguous probe never reads as
+/// "no worktrees" and silently orphans a live worktree + branch.
+fn resolve_worktrees(
+    exec: &dyn RemoteExec,
+    project_path: &str,
+    session_id: &SessionId,
+    home: &str,
+) -> Result<Vec<(String, String)>, SourceError> {
     let out = exec.run(&worktree_list_tokens(project_path))?;
     if !out.success {
-        // Non-empty stderr → transport/auth/git error; fail closed.
-        // Empty stderr → no worktrees or empty output; treat as not found.
         if !out.stderr.trim().is_empty() {
             return Err(SourceError::Transport(out.stderr));
         }
-        return Ok(None);
+        return Ok(Vec::new());
     }
+    let mut matches = Vec::new();
     for wt in discovery::parse_worktree_porcelain(&out.stdout) {
         if let Some(branch) = wt.branch {
             if derive_session_id(Some(&branch)) == Some(session_id.clone()) {
                 let canonical = discovery::canonicalize_remote_path(&wt.path, home);
-                return Ok(Some((canonical, branch)));
+                matches.push((canonical, branch));
             }
         }
     }
-    Ok(None)
+    Ok(matches)
 }
 
 /// Ends a session for good. Mode is determined from REAL remote git state (not
@@ -1625,29 +1650,44 @@ pub(crate) fn run_remove(
         .unwrap_or_else(|| "~".to_string());
 
     // Determine mode from git's authoritative listing (ADR-0015, #124): find
-    // the worktree whose branch derives to this session_id. A convention-path
+    // EVERY worktree whose branch derives to this session_id. A convention-path
     // recompute (the old approach) breaks when the session was spawned with a
-    // custom worktree_root or branch.
-    let resolved = resolve_worktree(exec, &paths.project_path, session_id, &home)?;
+    // custom worktree_root or branch; matching on ALL derived worktrees (not just
+    // the first) also destroys any leaked-orphan twin that shares the session_id.
+    let resolved = resolve_worktrees(exec, &paths.project_path, session_id, &home)?;
 
-    match resolved {
-        None => {
-            // No discoverable worktree: shared session or worktree already gone.
-            // Kill tmux only (idempotent — absent session is tolerated).
-            kill_session(exec, &paths.tmux_name)
-        }
-        Some((real_dir, real_branch)) => {
-            // A2' (ADR-0015): the worktree at `project.path` is the PRIMARY
-            // checkout. Never `worktree remove` or `branch -D` it — killing
-            // tmux is all teardown should do here.
-            let primary_path = discovery::canonicalize_remote_path(&paths.project_path, &home);
-            if real_dir == primary_path {
-                return kill_session(exec, &paths.tmux_name);
-            }
+    // Split off the primary checkout (A2', ADR-0015): the worktree at
+    // `project.path` is never `worktree remove`d or `branch -D`d — killing tmux
+    // is all teardown should do for it. Any other matches are removable worktrees.
+    let primary_path = discovery::canonicalize_remote_path(&paths.project_path, &home);
+    let removable: Vec<(String, String)> = resolved
+        .into_iter()
+        .filter(|(dir, _)| dir != &primary_path)
+        .collect();
 
-            // Non-primary worktree: dirty gate (unless force), kill, remove, delete.
-            if !force {
-                if let Some(reason) = worktree_has_work(exec, &real_dir)? {
+    // Dirty gate (unless force): refuse-and-change-nothing means checking ALL
+    // removable worktrees BEFORE killing tmux or removing anything, so a dirty
+    // worktree leaves the session fully intact (tmux still alive).
+    //
+    // Exception: a back-compat orphan twin — a DUPLICATE worktree on the
+    // `remora/<session_id>` branch left behind by the old spawn-first path — was
+    // never used, so its `NotOnRemote` count is base commits inherited from its
+    // start-point, not user work; ignoring it stops a phantom twin from soft-
+    // locking removal of an otherwise-clean session. Its uncommitted FILES are
+    // still genuine work and block. A legit standalone
+    // `remora/<x>` session is never a duplicate (`removable.len() == 1`), so it
+    // keeps the full gate.
+    if !force {
+        let orphan_twin_branch = branch_name(session_id);
+        let has_duplicates = removable.len() > 1;
+        for (dir, branch) in &removable {
+            if let Some(reason) = worktree_has_work(exec, dir)? {
+                let is_orphan_twin = has_duplicates && branch == &orphan_twin_branch;
+                let blocks = match reason {
+                    DirtyReason::Uncommitted | DirtyReason::Both => true,
+                    DirtyReason::NotOnRemote => !is_orphan_twin,
+                };
+                if blocks {
                     return Err(SourceError::WorkspaceDirty {
                         project_id: project_id.clone(),
                         session_id: session_id.clone(),
@@ -1655,18 +1695,23 @@ pub(crate) fn run_remove(
                     });
                 }
             }
-            kill_session(exec, &paths.tmux_name)?;
-            let rm = exec.run(&worktree_remove_tokens(&paths.project_path, &real_dir))?;
-            if !rm.success && !stderr_signals_worktree_absent(&rm.stderr) {
-                return Err(SourceError::Transport(rm.stderr));
-            }
-            let del = exec.run(&branch_delete_tokens(&paths.project_path, &real_branch))?;
-            if !del.success && !stderr_signals_branch_absent(&del.stderr) {
-                return Err(SourceError::Transport(del.stderr));
-            }
-            Ok(())
         }
     }
+
+    // Kill tmux once (idempotent — absent session is tolerated), then remove each
+    // non-primary worktree + its branch (both idempotent — already-gone tolerated).
+    kill_session(exec, &paths.tmux_name)?;
+    for (dir, branch) in &removable {
+        let rm = exec.run(&worktree_remove_tokens(&paths.project_path, dir))?;
+        if !rm.success && !stderr_signals_worktree_absent(&rm.stderr) {
+            return Err(SourceError::Transport(rm.stderr.clone()));
+        }
+        let del = exec.run(&branch_delete_tokens(&paths.project_path, branch))?;
+        if !del.success && !stderr_signals_branch_absent(&del.stderr) {
+            return Err(SourceError::Transport(del.stderr.clone()));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4138,6 +4183,126 @@ pub(crate) mod tests {
             "must not branch -D on not-found"
         );
         assert_eq!(fake.calls.lock().expect("lock").len(), 3);
+    }
+
+    /// Builds the porcelain listing for a B2 session `issues` plus its
+    /// back-compat orphan twin (`remora/issues-<hash>`), both deriving to the
+    /// same session_id. Returns `(session_id, porcelain)`.
+    fn two_worktree_porcelain() -> (SessionId, String) {
+        let session_id = derive_session_id(Some("issues")).expect("slug");
+        let orphan_branch = format!("remora/{}", session_id.as_str());
+        let porcelain = format!(
+            "worktree /home/dev/.remora/worktrees/api/issues\n\
+             HEAD abc\n\
+             branch refs/heads/issues\n\
+             \n\
+             worktree /home/dev/.remora/worktrees/api/{sid}\n\
+             HEAD def\n\
+             branch refs/heads/{orphan}\n",
+            sid = session_id.as_str(),
+            orphan = orphan_branch,
+        );
+        (session_id, porcelain)
+    }
+
+    #[test]
+    fn run_remove_orphan_twin_unpushed_base_does_not_block_a_clean_session() {
+        // The back-compat orphan twin sits on its base commit; if that base is
+        // not on any remote, `git rev-list --count HEAD --not --remotes` > 0 and
+        // the twin reads `NotOnRemote`. That is inherited base state, not user
+        // work (the twin was never used — spawn-first created it and the tmux
+        // collision abandoned it). It must NOT refuse removal of an otherwise-
+        // clean session without force. The real worktree here is clean.
+        let (session_id, porcelain) = two_worktree_porcelain();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out(&porcelain)),  // git worktree list: real + orphan twin
+            Ok(FakeExec::out("")),          // worktree 1 (issues): status clean
+            Ok(FakeExec::out("0\n")),       // worktree 1: 0 not-on-remote
+            Ok(FakeExec::out("")),          // worktree 2 (orphan): status clean (no files)
+            Ok(FakeExec::out("3\n")),       // worktree 2: 3 unpushed (inherited base) → NotOnRemote
+                                            // kill-session + per-worktree remove/-D default to Ok(ok()).
+        ]);
+        // force=false: the dirty gate runs, but the orphan twin's NotOnRemote is
+        // noise, so removal proceeds and both worktrees are torn down.
+        assert!(
+            run_remove(&fake, &test_config(), &pid("api"), &session_id, false).is_ok(),
+            "orphan twin's inherited unpushed commits must not block a clean session"
+        );
+        assert_eq!(fake.count_calls_with("kill-session"), 1);
+        assert_eq!(fake.count_calls_with("remove"), 2, "both worktrees removed");
+        assert_eq!(fake.count_calls_with("-D"), 2, "both branches deleted");
+    }
+
+    #[test]
+    fn run_remove_orphan_twin_with_uncommitted_files_still_blocks() {
+        // The relaxation is narrow: only the orphan twin's NotOnRemote is ignored.
+        // Actual uncommitted FILES in the twin are genuine work and still refuse
+        // (fail-safe: touch nothing) without force.
+        let (session_id, porcelain) = two_worktree_porcelain();
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("/home/dev")),     // printf $HOME
+            Ok(FakeExec::out(&porcelain)),      // git worktree list
+            Ok(FakeExec::out("")),              // worktree 1 (issues): status clean
+            Ok(FakeExec::out("0\n")),           // worktree 1: 0 not-on-remote
+            Ok(FakeExec::out(" M src/x.rs\n")), // worktree 2 (orphan): UNCOMMITTED files
+            Ok(FakeExec::out("0\n")),           // worktree 2: 0 not-on-remote
+        ]);
+        let err = run_remove(&fake, &test_config(), &pid("api"), &session_id, false)
+            .expect_err("uncommitted files in the twin must still block");
+        assert!(matches!(err, SourceError::WorkspaceDirty { .. }), "{err}");
+        assert_eq!(fake.count_calls_with("kill-session"), 0, "touch nothing");
+        assert_eq!(fake.count_calls_with("remove"), 0);
+    }
+
+    #[test]
+    fn run_remove_deletes_every_worktree_deriving_to_the_session_id() {
+        // A session can end up with MORE THAN ONE worktree whose branch derives
+        // to the same session_id: e.g. a B2 session created with the raw branch
+        // `issues` (worktree `.../issues`) that was later re-opened via the
+        // spawn-first path, which back-compat-spawned a second worktree at the
+        // convention path `.../issues-<hash>` with branch `remora/issues-<hash>`.
+        // Both branches derive to `derive_session_id("issues")`. Removing the
+        // session must destroy BOTH worktrees + branches; deleting only the first
+        // leaves an orphan that discovery re-surfaces as a "new" stopped row.
+        let session_id = derive_session_id(Some("issues")).expect("slug");
+        let orphan_branch = format!("remora/{}", session_id.as_str());
+        let porcelain = format!(
+            "worktree /home/dev/.remora/worktrees/api/issues\n\
+             HEAD abc\n\
+             branch refs/heads/issues\n\
+             \n\
+             worktree /home/dev/.remora/worktrees/api/{sid}\n\
+             HEAD def\n\
+             branch refs/heads/{orphan}\n",
+            sid = session_id.as_str(),
+            orphan = orphan_branch,
+        );
+        let fake = FakeExec::new(vec![
+            Ok(FakeExec::out("/home/dev")), // printf $HOME
+            Ok(FakeExec::out(&porcelain)),  // git worktree list: TWO matching worktrees
+                                            // force=true skips the dirty probe; kill-session, then per-worktree
+                                            // remove + branch -D all default to Ok(ok()).
+        ]);
+        assert!(
+            run_remove(&fake, &test_config(), &pid("api"), &session_id, true).is_ok(),
+            "removing a session with two derived worktrees must succeed"
+        );
+        assert_eq!(
+            fake.count_calls_with("kill-session"),
+            1,
+            "tmux is killed once (single session name)"
+        );
+        assert_eq!(
+            fake.count_calls_with("remove"),
+            2,
+            "BOTH worktrees must be removed, not just the first"
+        );
+        assert_eq!(
+            fake.count_calls_with("-D"),
+            2,
+            "BOTH branches must be deleted, not just the first"
+        );
     }
 
     // -----------------------------------------------------------------------
