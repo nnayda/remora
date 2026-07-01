@@ -16,6 +16,10 @@ use remora_protocol::SessionStatus;
 pub enum DetectorEvent {
     Status(SessionStatus),
     Preview(SanitizedText),
+    /// First well-formed marker of any kind seen this attach (#198). One-shot:
+    /// emitted once on the false→true edge of the `marker_seen` latch. Proves
+    /// the agent's hook pipeline is wired, independent of activity state.
+    MarkerSeen,
 }
 
 /// Clock-free per-session activity state machine. The settle timing lives in the
@@ -24,6 +28,7 @@ pub enum DetectorEvent {
 pub struct Detector {
     state: SessionStatus,
     scanner: MarkerScanner,
+    marker_seen: bool,
 }
 
 impl Detector {
@@ -31,6 +36,7 @@ impl Detector {
         Self {
             state: SessionStatus::Unknown,
             scanner: MarkerScanner::new(),
+            marker_seen: false,
         }
     }
 
@@ -51,19 +57,25 @@ impl Detector {
             return out;
         }
 
-        // Markers present: replay them in arrival order, each emitting its
-        // status transition (if changed) immediately followed by its own
-        // preview. PTY read boundaries are arbitrary, so two markers
-        // (working+preview, then awaiting+preview) can coalesce into one chunk;
-        // ordering per hit keeps each preview attached to its own state rather
-        // than collapsing to the last status with all previews trailing.
+        // Markers present: replay them in arrival order. The first marker of any
+        // kind (this attach) also latches `marker_seen` and emits a one-shot
+        // MarkerSeen, ordered ahead of that hit's own events.
         for h in hits {
-            if self.state != h.status {
-                self.state = h.status;
-                out.push(DetectorEvent::Status(h.status));
+            if !self.marker_seen {
+                self.marker_seen = true;
+                out.push(DetectorEvent::MarkerSeen);
             }
-            if let Some(preview) = h.preview {
-                out.push(DetectorEvent::Preview(preview));
+            match h {
+                MarkerHit::State { status, preview } => {
+                    if self.state != status {
+                        self.state = status;
+                        out.push(DetectorEvent::Status(status));
+                    }
+                    if let Some(preview) = preview {
+                        out.push(DetectorEvent::Preview(preview));
+                    }
+                }
+                MarkerHit::Liveness => {} // latch only; no status/preview
             }
         }
         out
@@ -98,8 +110,15 @@ mod detector_tests {
             .filter_map(|e| match e {
                 DetectorEvent::Status(s) => Some(s),
                 DetectorEvent::Preview(_) => None,
+                DetectorEvent::MarkerSeen => None,
             })
             .collect()
+    }
+
+    fn marker_seen_count(evs: &[DetectorEvent]) -> usize {
+        evs.iter()
+            .filter(|e| matches!(e, DetectorEvent::MarkerSeen))
+            .count()
     }
 
     #[test]
@@ -155,7 +174,7 @@ mod detector_tests {
             .iter()
             .filter_map(|e| match e {
                 DetectorEvent::Preview(t) => Some(t.as_str().to_string()),
-                _ => None,
+                DetectorEvent::Status(_) | DetectorEvent::MarkerSeen => None,
             })
             .collect();
         assert_eq!(previews, vec!["Run tests?".to_string()]);
@@ -166,19 +185,61 @@ mod detector_tests {
         // Two complete markers coalesced into one chunk:
         //   working + preview "A"  (b64 "A" = "QQ==")
         //   idle    + preview "B"  (b64 "B" = "Qg==")
-        // must stay ordered: Status(Working), Preview(A), Status(Idle), Preview(B)
-        // — not Status(Idle) then both previews.
+        // must stay ordered: MarkerSeen, Status(Working), Preview(A), Status(Idle), Preview(B)
+        // — not Status(Idle) then both previews. MarkerSeen latches once, ahead
+        // of the first hit's own events (#198).
         let mut d = Detector::new();
         let chunk = b"\x1b]7366;remora;1;state;d29ya2luZw==;QQ==\x07\
 \x1b]7366;remora;1;state;aWRsZQ==;Qg==\x07";
         let evs = d.on_bytes(chunk);
-        assert_eq!(evs.len(), 4, "got {evs:?}");
+        assert_eq!(evs.len(), 5, "got {evs:?}");
+        assert!(matches!(evs[0], DetectorEvent::MarkerSeen));
         assert!(matches!(
-            evs[0],
+            evs[1],
             DetectorEvent::Status(SessionStatus::Working)
         ));
-        assert!(matches!(&evs[1], DetectorEvent::Preview(t) if t.as_str() == "A"));
-        assert!(matches!(evs[2], DetectorEvent::Status(SessionStatus::Idle)));
-        assert!(matches!(&evs[3], DetectorEvent::Preview(t) if t.as_str() == "B"));
+        assert!(matches!(&evs[2], DetectorEvent::Preview(t) if t.as_str() == "A"));
+        assert!(matches!(evs[3], DetectorEvent::Status(SessionStatus::Idle)));
+        assert!(matches!(&evs[4], DetectorEvent::Preview(t) if t.as_str() == "B"));
+    }
+
+    #[test]
+    fn lone_ping_latches_marker_seen_without_status() {
+        // base64-free ping marker, alone in a chunk.
+        let mut d = Detector::new();
+        let evs = d.on_bytes(b"\x1b]7366;remora;1;ping\x07");
+        assert_eq!(marker_seen_count(&evs), 1);
+        assert!(
+            evs.iter()
+                .all(|e| !matches!(e, DetectorEvent::Status(_) | DetectorEvent::Preview(_))),
+            "ping must not drive status or preview, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn awaiting_marker_also_latches_marker_seen() {
+        let mut d = Detector::new();
+        // "awaiting_input" state marker.
+        let evs = d.on_bytes(b"\x1b]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\x07");
+        assert_eq!(marker_seen_count(&evs), 1);
+        assert_eq!(statuses(evs), vec![SessionStatus::Awaiting]);
+    }
+
+    #[test]
+    fn marker_seen_latch_is_idempotent() {
+        let mut d = Detector::new();
+        let first = d.on_bytes(b"\x1b]7366;remora;1;ping\x07");
+        assert_eq!(marker_seen_count(&first), 1);
+        // A later awaiting marker must NOT re-emit MarkerSeen.
+        let second = d.on_bytes(b"\x1b]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\x07");
+        assert_eq!(marker_seen_count(&second), 0);
+    }
+
+    #[test]
+    fn byte_firehose_never_latches_marker_seen() {
+        let mut d = Detector::new();
+        assert_eq!(marker_seen_count(&d.on_bytes(b"lots of output")), 0);
+        assert_eq!(marker_seen_count(&d.on_tick()), 0);
+        assert_eq!(marker_seen_count(&d.on_bytes(b"more")), 0);
     }
 }

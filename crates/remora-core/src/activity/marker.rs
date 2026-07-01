@@ -224,7 +224,11 @@ mod tests {
         let inner = strip_tmux_passthrough(&wrapped);
         let mut s = MarkerScanner::new();
         let hits = s.feed(inner.as_bytes());
-        assert_eq!(hits, vec![MarkerHit::Liveness], "exactly one liveness marker");
+        assert_eq!(
+            hits,
+            vec![MarkerHit::Liveness],
+            "exactly one liveness marker"
+        );
     }
 
     #[test]
