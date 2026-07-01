@@ -3,6 +3,7 @@ import type { AgentInputDto, EditorAgentDto } from "./bindings";
 import {
   addArg,
   agentFormFromDto,
+  applyClaudeTemplate,
   emptyAgentForm,
   type FormMode,
   moveArg,
@@ -86,6 +87,18 @@ export function AgentForm({
         checked={form.plainShell}
         onChange={(checked) => setForm((f) => ({ ...f, plainShell: checked }))}
       />
+      {mode === "create" && (
+        <div>
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            onClick={() => setForm(applyClaudeTemplate)}
+          >
+            Claude Code (activity markers)
+          </Button>
+        </div>
+      )}
       <span className="settings-form__fieldlabel">Command</span>
       <ul className="settings-argv" aria-disabled={form.plainShell}>
         {form.command.map((arg, i) => (

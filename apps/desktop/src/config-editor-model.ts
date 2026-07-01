@@ -416,6 +416,24 @@ export function claudeMarkerTemplate(): {
   };
 }
 
+/** Apply the Claude activity-markers template (#196) to a form: set the
+ * provision file and ensure the launch command carries `--settings`, WITHOUT
+ * clobbering the user's existing flags (e.g. `--continue`). A blank command
+ * uses the template command outright. Shaped as `(prev) => next` so callers
+ * can pass it straight to `setForm`. */
+export function applyClaudeTemplate(form: AgentFormState): AgentFormState {
+  const t = claudeMarkerTemplate();
+  const base = form.command.filter((arg) => arg.trim() !== "");
+  const settingsJson = t.command[t.command.indexOf("--settings") + 1];
+  const command =
+    base.length === 0
+      ? t.command
+      : base.includes("--settings")
+        ? base
+        : [...base, "--settings", settingsJson];
+  return { ...form, command, provision: t.provision, plainShell: false };
+}
+
 // ---- shared helpers ----
 
 /** Create checks the slug shape; edit locks the id (an immutable join key). */

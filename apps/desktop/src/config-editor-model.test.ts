@@ -7,6 +7,7 @@ import type {
 import {
   addArg,
   agentFormFromDto,
+  applyClaudeTemplate,
   buildSettingsModel,
   claudeMarkerTemplate,
   emptyAgentForm,
@@ -532,5 +533,44 @@ describe("agent form", () => {
     expect(t.command).toContain("--settings");
     expect(t.provision.path).toBe("~/.remora/hooks/claude-notify.sh");
     expect(t.provision.content).toContain("7366;remora"); // wire marker
+  });
+
+  describe("applyClaudeTemplate", () => {
+    it("fills a blank command with the template outright", () => {
+      const form = emptyAgentForm();
+      const result = applyClaudeTemplate(form);
+      const t = claudeMarkerTemplate();
+      expect(result.command).toEqual(t.command);
+      expect(result.command).toContain("--settings");
+      expect(result.provision).toEqual(t.provision);
+      expect(result.plainShell).toBe(false);
+    });
+
+    it("preserves existing flags and appends --settings", () => {
+      const form = {
+        ...emptyAgentForm(),
+        command: ["claude", "--continue"],
+      };
+      const result = applyClaudeTemplate(form);
+      const t = claudeMarkerTemplate();
+      const settingsJson = t.command[t.command.indexOf("--settings") + 1];
+      expect(result.command).toEqual([
+        "claude",
+        "--continue",
+        "--settings",
+        settingsJson,
+      ]);
+      expect(result.provision).toEqual(t.provision);
+    });
+
+    it("does not double --settings when already present", () => {
+      const form = {
+        ...emptyAgentForm(),
+        command: ["claude", "--settings", "{}"],
+      };
+      const result = applyClaudeTemplate(form);
+      expect(result.command).toEqual(["claude", "--settings", "{}"]);
+      expect(result.command.filter((a) => a === "--settings")).toHaveLength(1);
+    });
   });
 });
