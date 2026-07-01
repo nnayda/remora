@@ -107,4 +107,35 @@ describe("ActivityStore (passive recorder)", () => {
     expect(store.getPreviewSnapshot().has("k")).toBe(false);
     expect(store.getPreview("k")).toBeUndefined();
   });
+
+  it("records markerSeen per key and snapshots it", () => {
+    const s = new ActivityStore();
+    expect(s.getMarkerSeenSnapshot().has("p/a")).toBe(false);
+    s.noteMarkerSeen("p/a");
+    expect(s.getMarkerSeenSnapshot().has("p/a")).toBe(true);
+  });
+
+  it("markerSeen notifies once, then not on repeat", () => {
+    const s = new ActivityStore();
+    const cb = vi.fn();
+    s.subscribe(cb);
+    s.noteMarkerSeen("p/a");
+    expect(cb).toHaveBeenCalledTimes(1);
+    s.noteMarkerSeen("p/a"); // already set → no notification
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it("clear() drops markerSeen so a reattach re-earns it", () => {
+    const s = new ActivityStore();
+    s.noteMarkerSeen("p/a");
+    s.clear("p/a");
+    expect(s.getMarkerSeenSnapshot().has("p/a")).toBe(false);
+  });
+
+  it("markerSeen snapshot does not churn the status snapshot", () => {
+    const s = new ActivityStore();
+    const before = s.getSnapshot();
+    s.noteMarkerSeen("p/a");
+    expect(s.getSnapshot()).toBe(before); // status snapshot identity unchanged
+  });
 });
