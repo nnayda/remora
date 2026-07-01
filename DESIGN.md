@@ -428,8 +428,8 @@ The ladder: `shadow-xs` (1px, controls) → `shadow-sm` (rows, raised chips) →
 - `glow-accent` — the focus ring (a 3px accent halo). Every focusable control
   gets it; nothing else does.
 - `glow-pulse` — the activity pulse's halo. **Canonical color is marine**
-  (`pulse` / `#6ea4ff`). See Do's and Don'ts: the CSS still carries a legacy
-  lavender glow that is being retired toward this marine value.
+  (`pulse` / `#6ea4ff`): a single hue runs end-to-end from the pulse core
+  through the halo and the `remora-pulse-glow` keyframe.
 
 Radii reinforce depth: tighter corners sit closer to the surface, looser corners
 float higher — see Shapes.
@@ -550,20 +550,17 @@ in every active state — keep it that way.
   (3px chips → 14px dialogs).
 - **Don't add a competing animation.** A second looping motion next to the pulse
   destroys the one signature moment.
-
-**Known drift — activity-pulse glow color.** The token CSS currently carries a
-**legacy lavender** glow (`--glow-pulse` and the `remora-pulse-glow` keyframe use
-`rgba(169, 156, 255, …)` dark / `rgba(124, 108, 240, …)` light) while the pulse
-*core* color and `--marine-pulse` are marine `#6ea4ff`. The canonical color is
-**marine** (recorded above). The lavender values are slated for retirement so the
-signature moment is a single hue end to end — tracked in #180; do not add new
-uses of the lavender glow.
+- **Don't reintroduce the lavender glow.** The activity-pulse halo is **marine**
+  end to end — `--glow-pulse` and the `remora-pulse-glow` keyframe derive from
+  `--marine-pulse` (`#6ea4ff`, deepening to `--marine-500` `#1e6ff5` in light).
+  The old `rgba(169, 156, 255, …)` / `rgba(124, 108, 240, …)` lavender values are
+  retired (#180); a single hue is what makes the signature moment read.
 
 ## Decisions Log
 
 | Date | Decision | Rationale |
 |------|----------|-----------|
 | 2026-06-29 | Formalize the shipped token system as DESIGN.md in the Google `design.md` format | Token CSS held the values but the *decisions* had no home (issue #150). Front matter mirrors `styles/tokens/*.css`; prose captures the calls surfaced during the session-row review. |
-| 2026-06-29 | Canonical activity-pulse color is marine `#6ea4ff` | The pulse is the one signature moment; a single hue end-to-end is stronger than the blue-core / lavender-glow split currently in the CSS. Lavender glow flagged for retirement. |
+| 2026-06-29 | Canonical activity-pulse color is marine `#6ea4ff` | The pulse is the one signature moment and reads strongest as a single hue end to end. The lavender glow was never a chosen split — it was an inconsistency where the halo drifted off the marine core. Marine is canonical; the lavender values are corrected, not "retired" (fixed in #180). |
 | 2026-06-29 | Document Inter as the shipped chrome face | Re-fonting a shipped app is a product decision, not a docs task; Inter's legibility at 11–14px and tabular figures justify keeping it. Recorded so the choice is intentional. |
 | 2026-06-29 | Host as a bare muted label; Tag for machine values, Badge for status | Resolves the chip-vs-bare-label question from the session-row review — chips are for values the user acts on, not ambient context. |

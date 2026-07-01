@@ -462,6 +462,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Activity-pulse glow unified on marine** (#180): the pulse halo now uses the
+  signature marine accent end to end instead of a legacy lavender. `--glow-pulse`
+  (dark + light) and the `remora-pulse-glow` keyframe derive from `--marine-pulse`
+  (`#6ea4ff`, deepening to `--marine-500` `#1e6ff5` in light), matching the pulse
+  core so the one signature moment reads as a single hue. The old
+  `rgba(169, 156, 255, …)` / `rgba(124, 108, 240, …)` values are gone; DESIGN.md
+  records marine as canonical and its Do's-and-Don'ts guard against reintroducing
+  the lavender. Token-only change; no logic, transport, or component changes.
+
 - **Quieter, more honest sidebar chrome**: dropped the per-session "open in a
   tab" indicator dot and the session-count badges on host and project rows —
   visual noise that didn't carry enough signal. The sidebar now reads as host →
