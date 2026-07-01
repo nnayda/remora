@@ -47,6 +47,31 @@ export interface Tab {
   error: string | null;
 }
 
+/**
+ * Pure drag-to-reorder move: return a copy of `tabs` with `key` moved to
+ * `targetKey`'s position. The moved tab lands on the side the drag came from —
+ * after the target when moving rightward, before it when moving leftward — so a
+ * tab dropped on a neighbour swaps with it. No-op (returns the same array) for a
+ * self-move or an unknown key. Shared by the store's committed `reorderTab` and
+ * the tab bar's live drag preview so the previewed order and the order that
+ * lands on drop can never diverge.
+ */
+export function reorderTabs(
+  tabs: Tab[],
+  key: string,
+  targetKey: string,
+): Tab[] {
+  if (key === targetKey) return tabs;
+  const from = tabs.findIndex((t) => t.key === key);
+  const to = tabs.findIndex((t) => t.key === targetKey);
+  if (from === -1 || to === -1) return tabs;
+  const next = [...tabs];
+  const [moved] = next.splice(from, 1);
+  const target = next.findIndex((t) => t.key === targetKey);
+  next.splice(from < to ? target + 1 : target, 0, moved);
+  return next;
+}
+
 export interface Snapshot {
   tabs: Tab[];
   activeKey: string | null;
@@ -425,14 +450,8 @@ export class SessionStore {
    * change which session is focused).
    */
   reorderTab = (key: string, targetKey: string): void => {
-    if (key === targetKey) return;
-    const from = this.tabs.findIndex((t) => t.key === key);
-    const to = this.tabs.findIndex((t) => t.key === targetKey);
-    if (from === -1 || to === -1) return;
-    const next = [...this.tabs];
-    const [moved] = next.splice(from, 1);
-    const target = next.findIndex((t) => t.key === targetKey);
-    next.splice(from < to ? target + 1 : target, 0, moved);
+    const next = reorderTabs(this.tabs, key, targetKey);
+    if (next === this.tabs) return; // no-op: self-move or unknown key
     this.tabs = next;
     this.commit();
   };

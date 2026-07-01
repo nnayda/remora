@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import type { SessionConnection } from "./connection";
-import type { StoreOpeners } from "./session-store";
+import type { StoreOpeners, Tab } from "./session-store";
 import {
   canRespawn,
   OPEN_CANCELLED,
   removeErrorMessage,
+  reorderTabs,
   SessionStore,
   tabKey,
 } from "./session-store";
@@ -370,6 +371,75 @@ describe("SessionStore", () => {
     expect(result).toEqual({ ok: false, error: OPEN_CANCELLED });
     expect(openers.spawn).not.toHaveBeenCalled();
     expect(store.getSnapshot().tabs).toHaveLength(0);
+  });
+});
+
+// ─── reorderTabs (pure drag-to-reorder / live-preview helper) ────────────────
+
+describe("reorderTabs", () => {
+  // Minimal Tab stand-ins: reorderTabs only touches `key`.
+  const tabs = (...keys: string[]) => keys.map((key) => ({ key }) as Tab);
+  const keys = (ts: Tab[]) => ts.map((t) => t.key);
+
+  it("moving a tab right drops it after the target", () => {
+    expect(keys(reorderTabs(tabs("a", "b", "c", "d"), "a", "c"))).toEqual([
+      "b",
+      "c",
+      "a",
+      "d",
+    ]);
+  });
+
+  it("moving a tab left drops it before the target", () => {
+    expect(keys(reorderTabs(tabs("a", "b", "c", "d"), "d", "b"))).toEqual([
+      "a",
+      "d",
+      "b",
+      "c",
+    ]);
+  });
+
+  it("dropping onto an adjacent tab swaps the two", () => {
+    expect(keys(reorderTabs(tabs("a", "b", "c"), "a", "b"))).toEqual([
+      "b",
+      "a",
+      "c",
+    ]);
+  });
+
+  it("moves the head tab to the last slot", () => {
+    expect(keys(reorderTabs(tabs("a", "b", "c", "d"), "a", "d"))).toEqual([
+      "b",
+      "c",
+      "d",
+      "a",
+    ]);
+  });
+
+  it("moves the tail tab to the first slot", () => {
+    expect(keys(reorderTabs(tabs("a", "b", "c", "d"), "d", "a"))).toEqual([
+      "d",
+      "a",
+      "b",
+      "c",
+    ]);
+  });
+
+  it("returns the same array reference for a self-move (no-op)", () => {
+    const input = tabs("a", "b");
+    expect(reorderTabs(input, "a", "a")).toBe(input);
+  });
+
+  it("returns the same array reference for an unknown key (no-op)", () => {
+    const input = tabs("a", "b");
+    expect(reorderTabs(input, "ghost", "b")).toBe(input);
+    expect(reorderTabs(input, "a", "ghost")).toBe(input);
+  });
+
+  it("does not mutate the input array", () => {
+    const input = tabs("a", "b", "c");
+    reorderTabs(input, "a", "c");
+    expect(keys(input)).toEqual(["a", "b", "c"]);
   });
 });
 

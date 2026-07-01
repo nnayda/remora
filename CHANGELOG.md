@@ -462,6 +462,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Tabs reflow live while dragging to reorder** (#185): dragging a tab now
+  shuffles the other tabs out of the way in real time and slides the dragged
+  tab (dimmed) into its prospective slot, instead of showing a static drop
+  indicator that only committed on release. The previewed order and the order
+  that lands on drop are computed by one shared `reorderTabs` helper, so they
+  can never diverge, and the whole strip accepts the drag so the native cursor
+  reads "move" rather than the stray "+" copy glyph. Midpoint hysteresis to
+  damp boundary flicker is a follow-up (#209).
 - **Dropped the "Remora" window title-bar text** (#186): the native OS window
   title is now empty (`app.windows[0].title` in `tauri.conf.json`) instead of
   duplicating the wordmark logo the app already renders in its own chrome. The
