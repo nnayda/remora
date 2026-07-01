@@ -534,8 +534,10 @@ describe("TerminalController", () => {
     );
     conn.emit({ event: "statusChange", status: "working" });
     conn.emit({ event: "previewUpdate", preview: "run tests?" });
+    conn.emit({ event: "markerSeen" });
     expect(sink.setStatus).toHaveBeenCalledWith("p/a", "working");
     expect(sink.setPreview).toHaveBeenCalledWith("p/a", "run tests?");
+    expect(sink.noteMarkerSeen).toHaveBeenCalledWith("p/a");
   });
 
   it("clears the sink on a closed event", () => {

@@ -1,7 +1,8 @@
 //! Core-side agent-activity detection (ADR-0013): a pure, clock-free state
-//! machine that turns the PTY byte stream into `SessionStatus` transitions and
-//! sanitized previews. The settle clock lives in the bridge thread that drives
-//! it (`transport::pty_process`), not here.
+//! machine that turns the PTY byte stream into `SessionStatus` transitions,
+//! sanitized previews, and a one-shot `MarkerSeen` liveness signal (#198,
+//! ADR-0019) on the first marker of any kind. The settle clock lives in the
+//! bridge thread that drives it (`transport::pty_process`), not here.
 
 mod marker;
 mod sanitize;

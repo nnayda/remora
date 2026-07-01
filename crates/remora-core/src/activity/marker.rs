@@ -4,7 +4,8 @@
 //! OSC reassembly and bounds its own buffers (the untrusted-input DoS cap).
 //!
 //! Grammar (inner, after tmux passthrough unwraps it):
-//!   ESC ] 7366 ; remora ; <ver> ; <type> ; <state-b64> [ ; <msg-b64> ] BEL
+//!   state:  ESC ] 7366 ; remora ; <ver> ; state ; <state-b64> [ ; <msg-b64> ] BEL
+//!   ping:   ESC ] 7366 ; remora ; <ver> ; ping BEL   (payload-free liveness marker, #198/ADR-0019)
 //! vte splits the OSC string on ';' and hands us the segments (the `7366` code
 //! is the first segment).
 
@@ -206,6 +207,18 @@ mod tests {
         let mut s = MarkerScanner::new();
         let hits = s.feed(&ping_marker());
         assert_eq!(hits, vec![MarkerHit::Liveness]);
+    }
+
+    #[test]
+    fn reassembles_ping_split_across_feeds() {
+        // The ping shares the vte reassembly path with state markers; guard it
+        // with its own regression test so a split read boundary still yields one
+        // Liveness hit (parity with reassembles_marker_split_across_feeds).
+        let bytes = ping_marker();
+        let (a, b) = bytes.split_at(10);
+        let mut s = MarkerScanner::new();
+        assert!(s.feed(a).is_empty()); // incomplete: vte buffers internally
+        assert_eq!(s.feed(b), vec![MarkerHit::Liveness]);
     }
 
     #[test]
