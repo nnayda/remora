@@ -31,6 +31,7 @@ export function useSessions() {
     connecting: snapshot.connecting,
     openSession: sessionStore.openSession,
     openViaRespawn: sessionStore.openViaRespawn,
+    openViaAttach: sessionStore.openViaAttach,
     closeTab: sessionStore.closeTab,
     focusTab: sessionStore.focusTab,
     reorderTab: sessionStore.reorderTab,

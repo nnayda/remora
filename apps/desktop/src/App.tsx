@@ -50,6 +50,7 @@ function App() {
     connecting,
     openSession,
     openViaRespawn,
+    openViaAttach,
     closeTab,
     focusTab,
     reorderTab,
@@ -240,7 +241,7 @@ function App() {
       return;
     }
     // Live-attach path. A re-click of the session that is already the active tab
-    // hits openSession's dedupe, which sets activeKey to its current value — no
+    // hits openViaAttach's dedupe, which sets activeKey to its current value — no
     // change — so the activeKey-gated focus effect never fires. It would neither
     // focus the terminal nor consume focusOnSelect, leaking the armed flag onto
     // the next unrelated activeStatus change (#133/#136 focus-steal class).
@@ -251,10 +252,11 @@ function App() {
       terminals.current.get(key)?.focus();
       return;
     }
-    // openSession resolves (never rejects) with {ok:false} on failure — e.g. a
-    // session that died between the poll and the click. Surface that instead of
-    // dropping it silently; the .catch is a belt-and-braces guard.
-    openSession({
+    // Attach to the live tmux (never spawn-first): spawn-first back-compat-adds
+    // a duplicate worktree that leaks and resurfaces on remove. openViaAttach
+    // resolves (never rejects) with {ok:false} on failure, and if the session
+    // died between the poll and the click it falls back to respawn internally.
+    openViaAttach({
       projectId: node.projectId,
       sessionId: node.sessionId,
       agent: node.agent,
