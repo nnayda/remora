@@ -323,6 +323,65 @@ mod tests {
         );
     }
 
+    /// Regression guard: executes the remora-ping.sh script and asserts its
+    /// stdout bytes match the wire contract. A no-op in minimal environments
+    /// (no bash), but is the live guard where tooling is present.
+    ///
+    /// This test ties the SCRIPT to the wire contract — editing the script
+    /// back to a bare OSC or stdout would fail here. The manual hermes
+    /// dogfood (/dev/tty + real tmux) remains the true e2e gate.
+    #[test]
+    fn ping_script_output_matches_wire_contract() {
+        use std::process::{Command, Stdio};
+
+        let script_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contrib/agent-hooks/claude-code/remora-ping.sh"
+        );
+        if !std::path::Path::new(script_path).exists() {
+            eprintln!("skip: script not found at {script_path}");
+            return;
+        }
+        let has_bash = Command::new("bash")
+            .arg("-c")
+            .arg("true")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !has_bash {
+            eprintln!("skip: bash not found");
+            return;
+        }
+
+        let output = Command::new("bash")
+            .arg(script_path)
+            .env("REMORA_MARKER_OUT", "/dev/stdout")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("bash should spawn")
+            .wait_with_output()
+            .expect("script should exit");
+        assert!(
+            output.status.success(),
+            "script exited non-zero: {:?}",
+            output.status
+        );
+
+        let stdout = String::from_utf8(output.stdout).expect("utf-8");
+        let stdout = stdout.trim_end_matches('\n');
+        assert_eq!(
+            stdout,
+            make_wrapped_ping(),
+            "ping script output does not match wire contract"
+        );
+
+        // Tie script output to the scanner: it must parse to Liveness.
+        let inner = strip_tmux_passthrough(&make_wrapped_ping());
+        let mut s = MarkerScanner::new();
+        assert_eq!(s.feed(inner.as_bytes()), vec![MarkerHit::Liveness]);
+    }
+
     /// Regression guard: executes the actual shell script and asserts its
     /// stdout bytes match the wire contract. A no-op in minimal environments
     /// (no bash/jq), but is the live guard where tooling is present.
