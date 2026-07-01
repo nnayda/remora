@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opaque-bytes-to-a-path capability on `Agent` — core stays agent-agnostic;
   the Claude recipe lives in the frontend, drift-guarded against
   `contrib/agent-hooks/claude-code/remora-notify.sh`. See `docs/agent-hooks.md`
-  and ADR-0019. The misconfig/"did a marker arrive" diagnostic and a richer
+  and ADR-0020. The misconfig/"did a marker arrive" diagnostic and a richer
   per-file provision editor are follow-ups.
 - **Agent prompt preview** (#61): when an agent is waiting on you, the sidebar
   session row now shows what it asked ("the session says: …") on hover. A

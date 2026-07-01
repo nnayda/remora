@@ -1808,7 +1808,7 @@ fn build_spawn_steps(plan: &SpawnPlan) -> Vec<Step> {
 /// -> SetEnv x N (non-fatal, one per `plan.env` entry). No worktree-add /
 /// fetch / cascade (the worktree survives a respawn). Provision mirrors
 /// `build_spawn_steps` so a respawn re-writes the hook script exactly like a
-/// spawn does (ADR-0019) — otherwise a provisioned file that goes missing
+/// spawn does (ADR-0020) — otherwise a provisioned file that goes missing
 /// while the worktree survives (e.g. node recycled in k8s) stays missing
 /// forever and activity markers silently die.
 fn build_respawn_steps(plan: &SpawnPlan) -> Vec<Step> {
@@ -4849,7 +4849,7 @@ pub(crate) mod tests {
 
     // -----------------------------------------------------------------------
     // build_respawn_steps provision tests (#196) — respawn must re-provision
-    // the hook exactly like spawn does (ADR-0019), so a hook file that goes
+    // the hook exactly like spawn does (ADR-0020), so a hook file that goes
     // missing while the worktree survives gets re-written on the next respawn.
     // -----------------------------------------------------------------------
 

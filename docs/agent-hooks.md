@@ -7,7 +7,7 @@ a hook just `printf`s a string Remora defined.
 ## Claude Code: zero-setup via the desktop template
 
 Creating a Claude Code agent from the desktop's **"Claude Code (activity
-markers)"** template (new-agent form, #196/ADR-0019) is the primary path —
+markers)"** template (new-agent form, #196/ADR-0020) is the primary path —
 markers work with no manual sandbox setup:
 
 1. In the new-agent form, click **Claude Code (activity markers)**. It fills
@@ -27,7 +27,7 @@ Both fields are plain, editable `Agent` config (`command` / `provision`) — you
 can hand-edit them in TOML the same way, or clear/replace them after applying
 the template.
 
-**Caveat (D6, ADR-0019):** Remora launches the agent with
+**Caveat (D6, ADR-0020):** Remora launches the agent with
 `claude --settings '{…}'` carrying a Notification hook. `--settings` layers on
 top of the user's `~/.claude/settings.json` (model/permissions/MCP survive),
 but whether a `--settings` `hooks` object shadows a user's OWN Notification
@@ -79,7 +79,7 @@ through `provision`, install it directly:
   the template (no more silent "did the hook even get configured" gap for the
   common case). A "did a marker ever arrive" diagnostic — for hand-configured
   agents, or a provisioned script that fails to land (best-effort write) — is
-  still a follow-up; its trigger signal needs its own design (see ADR-0019).
+  still a follow-up; its trigger signal needs its own design (see ADR-0020).
 
 ## Security
 

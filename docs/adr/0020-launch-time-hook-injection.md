@@ -1,4 +1,4 @@
-# 0019. Launch-time hook injection: `Agent.provision` + inline `--settings`
+# 0020. Launch-time hook injection: `Agent.provision` + inline `--settings`
 
 - **Status:** Accepted
 - **Date:** 2026-07-01
