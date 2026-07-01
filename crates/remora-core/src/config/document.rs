@@ -450,6 +450,7 @@ mod tests {
     fn claude_agent() -> Agent {
         Agent {
             command: vec!["claude".into()],
+            provision: None,
         }
     }
 
@@ -888,8 +889,14 @@ mod tests {
     #[test]
     fn empty_command_agent_round_trips() {
         let mut doc = ConfigDocument::parse("").expect("empty doc parses");
-        doc.insert_agent(&aid("shell"), &Agent { command: vec![] })
-            .expect("inserting a plain-shell agent is valid");
+        doc.insert_agent(
+            &aid("shell"),
+            &Agent {
+                command: vec![],
+                provision: None,
+            },
+        )
+        .expect("inserting a plain-shell agent is valid");
         let out = doc.to_toml();
         assert!(out.contains("command = []"), "writes an empty array: {out}");
         let reparsed = ConfigDocument::parse(&out).expect("re-parses");
