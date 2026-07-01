@@ -1738,10 +1738,13 @@ fn provision_cmd(f: &crate::config::ProvisionFile) -> String {
     use base64::Engine as _;
     let qpath = quote_remote_path(&f.path);
     let b64 = base64::engine::general_purpose::STANDARD.encode(f.content.as_bytes());
+    // `--` at each path-consuming utility so a relative path like `-hook.sh`
+    // is treated as an operand, not an option (`> {qpath}` needs none — a
+    // redirect target is never option-parsed).
     let mut cmd =
-        format!("mkdir -p \"$(dirname {qpath})\" && printf %s '{b64}' | base64 -d > {qpath}");
+        format!("mkdir -p -- \"$(dirname -- {qpath})\" && printf %s '{b64}' | base64 -d > {qpath}");
     if let Some(mode) = f.mode {
-        cmd.push_str(&format!(" && chmod {:o} {qpath}", mode));
+        cmd.push_str(&format!(" && chmod {:o} -- {qpath}", mode));
     }
     cmd
 }
@@ -4990,6 +4993,10 @@ pub(crate) mod tests {
         assert!(cmd.contains("base64 -d"));
         assert!(cmd.contains("chmod 755"));
         assert!(cmd.contains("mkdir -p"));
+        // `--` guards so a leading-dash path can't be parsed as an option.
+        assert!(cmd.contains("mkdir -p --"), "mkdir needs `--`: {cmd}");
+        assert!(cmd.contains("dirname --"), "dirname needs `--`: {cmd}");
+        assert!(cmd.contains("chmod 755 --"), "chmod needs `--`: {cmd}");
     }
 
     #[test]
@@ -5036,36 +5043,34 @@ pub(crate) mod tests {
     }
 
     /// Integration (D2/D4): runs the REAL generated `provision_cmd` through a
-    /// real `sh` with a fake `$HOME`, proving the base64 pipeline writes the
-    /// contrib notify script byte-for-byte at the `$HOME`-resolved path with
-    /// the requested mode. If `bash`+`jq` are available (mirroring
-    /// `activity::marker::tests::script_output_matches_wire_contract`), it
-    /// goes further and actually executes the written script and asserts
-    /// `MarkerScanner` parses exactly one `Awaiting` marker carrying the
-    /// preview message — proving the provisioned file is not just present on
-    /// disk but a working hook end to end.
+    /// real `sh` with a fake `$HOME`, proving the base64 pipeline writes an
+    /// arbitrary script byte-for-byte at the `$HOME`-resolved path with the
+    /// requested mode, and that the written file is a working executable.
+    ///
+    /// Uses a GENERIC, agent-neutral script (not the Claude recipe) so
+    /// `remora-core` stays agent-agnostic — the Claude notify script's marker
+    /// wire contract is covered where it belongs (`activity::marker` executes
+    /// the real recipe, and the frontend drift guard pins the template to it).
+    /// This test owns only the transport concern: `provision_cmd` writes the
+    /// exact bytes as an executable file.
     #[test]
-    fn provision_write_then_exec_emits_a_parseable_marker() {
+    fn provision_write_then_exec_runs_the_written_script() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let script = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../contrib/agent-hooks/claude-code/remora-notify.sh"
-        ))
-        .expect("read contrib script");
+        // Exercises the exact-byte hazards provisioning must preserve through
+        // base64 + the shell: single quotes and backslashes. The script writes
+        // a sentinel so we can prove it actually executed.
+        let script = "#!/bin/sh\nprintf 'ok \\047\\\\ done' > \"$SENTINEL\"\n";
         let f = crate::config::ProvisionFile {
-            path: "~/.remora/hooks/claude-notify.sh".into(),
-            content: script.clone(),
+            path: "~/.remora/hooks/provisioned.sh".into(),
+            content: script.to_string(),
             mode: Some(0o755),
         };
-        let tmp = std::env::temp_dir().join(format!(
-            "remora-prov-{}-{}",
-            std::process::id(),
-            "provision_write_then_exec"
-        ));
+        let tmp = std::env::temp_dir().join(format!("remora-prov-exec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("tmp");
 
-        // Run: HOME=<tmp> sh -c "<provision_cmd>"
+        // Write via the real provision_cmd through sh with a fake $HOME.
         let status = std::process::Command::new("sh")
             .arg("-c")
             .arg(provision_cmd(&f))
@@ -5074,63 +5079,36 @@ pub(crate) mod tests {
             .expect("run provision");
         assert!(status.success(), "provision cmd runs");
 
-        let written = tmp.join(".remora/hooks/claude-notify.sh");
+        let written = tmp.join(".remora/hooks/provisioned.sh");
         assert!(written.exists(), "script written to $HOME-resolved path");
-        let written_bytes = std::fs::read(&written).expect("read written script");
         assert_eq!(
-            written_bytes,
+            std::fs::read(&written).expect("read written script"),
             script.as_bytes(),
-            "base64 round-trip through the shell must be byte-identical to the source script"
+            "base64 round-trip through the shell must be byte-identical to the source"
+        );
+        assert_eq!(
+            std::fs::metadata(&written)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "chmod applied the requested mode"
         );
 
-        let mode = std::fs::metadata(&written)
-            .expect("metadata")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o755, "chmod applied the requested mode");
-
-        // Stronger assertion, gated on tooling availability like the marker.rs
-        // precedent: actually execute the written script and scan its output.
-        let has_jq = std::process::Command::new("bash")
-            .arg("-c")
-            .arg("command -v jq")
+        // The written file is a working executable: run it and check its effect.
+        let sentinel = tmp.join("sentinel");
+        let run = std::process::Command::new("sh")
+            .arg(&written)
+            .env("SENTINEL", &sentinel)
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if has_jq {
-            use std::io::Write as _;
-            let marker_out = tmp.join("marker.out");
-            let mut child = std::process::Command::new("bash")
-                .arg(&written)
-                .env("REMORA_MARKER_OUT", &marker_out)
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-                .expect("bash should spawn");
-            let stdin_json = serde_json::json!({ "message": "Approve running tests?" }).to_string();
-            child
-                .stdin
-                .take()
-                .expect("stdin piped")
-                .write_all(format!("{stdin_json}\n").as_bytes())
-                .expect("write stdin");
-            let exec_status = child.wait().expect("script exits");
-            assert!(exec_status.success(), "hook script exits 0");
-
-            let marker_bytes = std::fs::read(&marker_out).expect("read marker output");
-            let mut scanner = crate::activity::MarkerScanner::new();
-            let hits = scanner.feed(&marker_bytes);
-            assert_eq!(hits.len(), 1, "exactly one marker parsed: {hits:?}");
-            // The Notification hook emits an `awaiting_input` State marker
-            // (post-#198 MarkerHit is an enum: State { .. } | Liveness).
-            let crate::activity::MarkerHit::State { status, preview } = &hits[0] else {
-                panic!("expected a State marker, got {:?}", hits[0]);
-            };
-            assert_eq!(*status, remora_protocol::SessionStatus::Awaiting);
-            let preview = preview.as_ref().expect("preview present");
-            assert_eq!(preview.as_str(), "Approve running tests?");
-        } else {
-            eprintln!("skip: jq not found — skipping executed-hook marker assertion");
-        }
+            .expect("run written script");
+        assert!(run.success(), "provisioned script executes");
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).expect("sentinel written"),
+            "ok '\\ done",
+            "the provisioned script ran and produced its exact output (quotes + backslash survived)"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

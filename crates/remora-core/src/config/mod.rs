@@ -854,6 +854,11 @@ impl Config {
             if let Some(p) = &agent.provision {
                 let preason = if p.path.trim().is_empty() {
                     Some("must not be empty")
+                } else if p.path != "~" && p.path.starts_with('~') && !p.path.starts_with("~/") {
+                    // Transport tilde resolution (quote_remote_path) only handles
+                    // `~` and `~/…`; a `~user` path would silently fall through to
+                    // a literal write. Fail closed, like project paths do.
+                    Some("must use `~` or `~/`; `~user` paths are not supported")
                 } else if p.path.split('/').any(|seg| seg == "..") {
                     Some("must not contain a `..` path component")
                 } else if p.path.chars().any(char::is_control) {
@@ -1850,5 +1855,29 @@ mod tests {
         assert!(issues_of(toml)
             .iter()
             .any(|i| matches!(i, ValidationIssue::InvalidProvision { .. })));
+    }
+
+    #[test]
+    fn provision_rejects_tilde_user_path() {
+        // `~user` is unsupported: transport tilde resolution only handles `~`/`~/…`.
+        let toml = "[agents.claude]\ncommand=[\"claude\"]\n[agents.claude.provision]\npath=\"~root/x\"\ncontent=\"x\"\n";
+        assert!(issues_of(toml)
+            .iter()
+            .any(|i| matches!(i, ValidationIssue::InvalidProvision { .. })));
+    }
+
+    #[test]
+    fn provision_accepts_plain_tilde_paths() {
+        // `~` and `~/…` are the supported forms — a config using them is valid
+        // (no issues at all, so `issues_of`'s expect_err would be wrong here).
+        for path in ["~", "~/.remora/hooks/x.sh"] {
+            let toml = format!(
+                "[agents.claude]\ncommand=[\"claude\"]\n[agents.claude.provision]\npath=\"{path}\"\ncontent=\"x\"\n"
+            );
+            assert!(
+                Config::from_toml_str(&toml).is_ok(),
+                "path {path} must be accepted"
+            );
+        }
     }
 }
