@@ -731,3 +731,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   class — a 28×28 bordered, rounded hit area with a larger gear and a hover
   state, wired into the existing focus-visible outline. Visual-only; the button
   kept its `aria-label`/`title="Settings"`, so accessibility is unchanged.
+
+### Security
+
+- **Bound combining marks in the activity-preview sanitizer** (#197): a sandbox
+  payload could stack Unicode combining marks (Zalgo) on a base glyph to garble
+  the preview tooltip — the marks pass `char::is_control()` and survived the
+  earlier control/bidi/zero-width scrub (#193). The sanitizer now caps stacking
+  marks (Mn/Me) to four per grapheme cluster and drops orphan marks with no
+  base. Bounding per grapheme cluster (not a per-char run) means interleaved
+  spacing marks or other extenders can't reset the budget to smuggle an
+  unbounded stack back in, while legitimate decomposed accents (e.g. NFD `é`) and
+  3–4-mark scripts like Biblical Hebrew stay intact.
