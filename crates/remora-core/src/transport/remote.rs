@@ -1819,6 +1819,7 @@ pub(crate) mod tests {
                 ("REMORA_CREATED_AT".into(), "1700000000".into()),
             ],
             agent_argv: vec!["claude".into(), "--continue".into()],
+            provision: None,
         }
     }
 
@@ -4345,6 +4346,7 @@ pub(crate) mod tests {
                 ("REMORA_CREATED_AT".into(), "1700000000".into()),
             ],
             agent_argv: vec!["claude".into(), "--continue".into()],
+            provision: None,
         };
         let porcelain = "worktree /home/dev/api\n\
                          HEAD abc\n\
@@ -4974,6 +4976,7 @@ pub(crate) mod tests {
             base: None,
             env: vec![],
             agent_argv: vec![],
+            provision: None,
         }
     }
 
