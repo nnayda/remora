@@ -550,6 +550,11 @@ async fn forward(
                         break;
                     }
                 }
+                Some(ChannelOutput::MarkerSeen) => {
+                    if sink.send(BridgeOutput::MarkerSeen).is_err() {
+                        break;
+                    }
+                }
                 Some(_) => {} // ChannelOutput is #[non_exhaustive]
                 None => break, // transport death
             }
