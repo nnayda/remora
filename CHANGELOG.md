@@ -462,6 +462,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Dropped the "Remora" window title-bar text** (#186): the native OS window
+  title is now empty (`app.windows[0].title` in `tauri.conf.json`) instead of
+  duplicating the wordmark logo the app already renders in its own chrome. The
+  traffic-light controls and window dragging are unaffected — only the redundant
+  title text is gone.
+
 - **Activity-pulse glow unified on marine** (#180): the pulse halo now uses the
   signature marine accent end to end instead of a legacy lavender. `--glow-pulse`
   (dark + light) and the `remora-pulse-glow` keyframe derive from `--marine-pulse`
