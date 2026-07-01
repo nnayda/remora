@@ -5120,8 +5120,13 @@ pub(crate) mod tests {
             let mut scanner = crate::activity::MarkerScanner::new();
             let hits = scanner.feed(&marker_bytes);
             assert_eq!(hits.len(), 1, "exactly one marker parsed: {hits:?}");
-            assert_eq!(hits[0].status, remora_protocol::SessionStatus::Awaiting);
-            let preview = hits[0].preview.as_ref().expect("preview present");
+            // The Notification hook emits an `awaiting_input` State marker
+            // (post-#198 MarkerHit is an enum: State { .. } | Liveness).
+            let crate::activity::MarkerHit::State { status, preview } = &hits[0] else {
+                panic!("expected a State marker, got {:?}", hits[0]);
+            };
+            assert_eq!(*status, remora_protocol::SessionStatus::Awaiting);
+            let preview = preview.as_ref().expect("preview present");
             assert_eq!(preview.as_str(), "Approve running tests?");
         } else {
             eprintln!("skip: jq not found — skipping executed-hook marker assertion");
