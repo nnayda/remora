@@ -513,6 +513,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tab bar's path: when the clicked session is already the active tab, it focuses
   the terminal directly and disarms the flag. (The symmetric leak on the respawn
   path is tracked separately in #178.)
+- **Sidebar clicks on a stopped-discovered session no longer leak focus on the
+  respawn path** (#178). The symmetric twin of #141: when discovery reported a
+  session `stopped` (server reaped it) but its local tab was still `live`,
+  clicking it routed to `openViaRespawn`, which deduped to the live tab, did no
+  respawn, and left `activeKey`/`activeStatus` unchanged — so the focus effect
+  never fired to consume the armed `focusOnSelect`, which then stole focus on the
+  next unrelated change. `openFromSidebar` now short-circuits the active,
+  locally-live re-click (focus the terminal directly and disarm), gating on
+  liveness so a genuinely-stopped active tab still respawns, and reads the tab's
+  status fresh from the store to close a stale-render window. The remaining
+  respawn-dedupe cases route through a new `shouldDisarmAfterSidebarRespawn`
+  predicate so a `reconnecting`/vanished dedupe also disarms (the reconnecting
+  twin surfaced in the #141 review), while a `stopped`/`disconnected` tab that
+  `openViaRespawn` respawns keeps the arm to focus once it goes live. The
+  predicate is extracted and unit-tested to close the recurring focus-steal
+  class at the root. The inverse revival gaps on the live-attach path are tracked
+  in #189.
 - **Attach fingerprints the session instead of trusting the tmux name alone**
   (#105). Attach was name-only: `tmux has-session -t remora_<project>_<session>`
   then attach. If something else held a session with that name — a tmux server
