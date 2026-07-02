@@ -17,6 +17,7 @@
 mod bridge;
 mod identity;
 mod noise;
+mod pairing_client;
 mod remote_source;
 mod wire_error;
 
@@ -29,5 +30,6 @@ pub use noise::{
     chunk_bytes, prologue, Handshake, HandshakeKind, NoiseError, Transport, MAX_NOISE_PLAINTEXT,
     NOISE_PATTERN, PTY_CHUNK_BYTES,
 };
+pub use pairing_client::{run_pairing, PairingError, PairingProgress};
 pub use remote_source::RemoteSource;
 pub use wire_error::{map_source_error, map_wire_error};
