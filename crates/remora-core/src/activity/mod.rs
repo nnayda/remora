@@ -10,7 +10,7 @@
 //!            bytes (no marker)              marker: state S
 //! Unknown ──────────────────▶ Working ◀──────────────────▶ S (any state)
 //!                               │  ▲
-//!                    tick       │  │ bytes / user input
+//!                    tick       │  │ bytes
 //!                               ▼  │
 //!                             Idle ┘
 //!
