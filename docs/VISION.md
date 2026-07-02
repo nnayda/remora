@@ -46,9 +46,15 @@ process.
 
 The competitive gap, concretely: several tools do "multiple agents in
 worktrees" (claude-squad, Crystal, Conductor) and separate tools do
-"persistent / roaming remote terminal" (tmux, mosh, vibetunnel, ttyd).
-Nobody has fused them into a remote-sandbox-first, cross-platform, open GUI
-with reconnect as the headline.
+"persistent / roaming remote terminal" (tmux, mosh, vibetunnel, ttyd). A
+newer category does "drive your coding agent from your phone" over an
+end-to-end-encrypted relay — but their bridge is the machine *running the
+agent*, so the agent and your credentials still share a computer. E2EE
+relays are table stakes in that category now; Remora's surviving edge is the
+sandbox-first inversion: the bridge holds only transport creds while the
+agent stays in a disposable remote sandbox
+([ADR-0021](adr/0021-blind-relay-bridge-trust-model.md)) — fused with
+cross-platform reconnect as the headline.
 
 ## Constraints
 
@@ -107,13 +113,15 @@ with reconnect as the headline.
    start an agent (`claude`) under tmux in a worktree, detach, re-attach,
    stream to a local xterm.js window. Prove reconnect-after-sleep end to end.
 2. **Define `SessionSource` + the wire protocol** so direct mode and the
-   future relay are the same shape.
+   future relay mode (bridge + blind relay, ADR-0021) are the same shape.
 3. **Tauri desktop shell:** tabs, embedded terminal, session spawn and
    list/reconnect — direct mode, `ssh` + `kubectl` adapters.
 4. **Read-only panels:** file browser, git diff viewer, then PR review.
 5. **Desktop CI:** signed/notarized macOS + Windows builds, auto-update on
    tag.
-6. **Relay (opt-in):** host `SessionSource` behind a WebSocket; document the
+6. **Relay mode (opt-in):** blind relay + user-side bridge hosting
+   `SessionSource` behind a WebSocket
+   ([ADR-0021](adr/0021-blind-relay-bridge-trust-model.md)); document the
    Tailscale no-relay path.
 7. **Mobile client + push notifications:** Tauri mobile build; relay fires
    "agent needs you"; phone answers on the same live session.
@@ -131,7 +139,9 @@ project from day one:
 - **Mobile:** iOS (TestFlight → App Store) and Android (APK/Play) from the
   same codebase, gated on the relay/Tailscale path being ready.
 - **Relay:** a small container image with a `docker run`/compose example and
-  a Helm chart.
+  a Helm chart; later a second small image for the headless bridge, plus a
+  minimal Remora-operated push gateway so self-hosted relays can wake the
+  official mobile apps ([ADR-0021](adr/0021-blind-relay-bridge-trust-model.md)).
 - **CI/CD:** a GitHub Actions matrix building all targets on tag, publishing
   to GitHub Releases and the stores, pushing the relay image to a registry.
 
@@ -142,21 +152,25 @@ project from day one:
   actions) instead of a full TUI on a small screen?
 - **Mobile prompt ergonomics:** quick-action buttons (approve / deny / common
   replies) over the raw terminal?
-- **Notification signal:** how does the relay detect "agent is waiting for
-  you" — parse the PTY stream for prompt patterns, a tmux hook, or a status
-  signal from the agent itself? Whatever the mechanism, the heuristics are
-  per-agent adapter data, not core code
-  ([ADR-0003](adr/0003-agent-agnostic-sessions.md)).
+- **Notification signal:** how does the *bridge* detect "agent is waiting
+  for you"? (Never the relay — it routes ciphertext only and must not parse
+  a PTY stream, [ADR-0021](adr/0021-blind-relay-bridge-trust-model.md).)
+  The building blocks exist bridge-side: the core-side activity detector
+  ([ADR-0013](adr/0013-core-side-activity-detector.md)) and the injected
+  activity hooks ([ADR-0020](adr/0020-launch-time-hook-injection.md));
+  whatever the mechanism, the heuristics are per-agent adapter data, not
+  core code ([ADR-0003](adr/0003-agent-agnostic-sessions.md)).
 - **Worktree/branch hygiene:** naming and cleanup of stale worktrees and
   tmux sessions. (The pod-restart half is decided: surviving worktrees
   surface as *stopped* with one-click respawn —
   [ADR-0004](adr/0004-local-config-live-session-discovery.md).)
-- **Relay auth:** simplest secure pairing for desktop ⇄ phone ⇄ relay —
-  pairing code, OIDC, or shared token?
-- **Relay configuration source:** host/project config is per-device
-  ([ADR-0004](adr/0004-local-config-live-session-discovery.md)) and the
-  phone never holds a sandbox key — so where does the relay's copy of host
-  config and credentials come from, and how is it authorized?
+- ~~**Relay auth**~~ — answered: QR split-secret pairing (relay-visible
+  rendezvous token + relay-blind PSK in the Noise handshake); see
+  [ADR-0021](adr/0021-blind-relay-bridge-trust-model.md).
+- ~~**Relay configuration source**~~ — answered: the relay has no copy.
+  Host config and credentials stay on the user-side bridge (the desktop
+  app or a self-run headless container); the relay routes ciphertext only
+  ([ADR-0021](adr/0021-blind-relay-bridge-trust-model.md)).
 - **Session display names:** sessions are never stored client-side and
   sandbox-side metadata is untrusted — where could a user-assigned session
   label durably live?

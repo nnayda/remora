@@ -6,6 +6,7 @@ import {
   OPEN_CANCELLED,
   removeErrorMessage,
   reorderTabs,
+  routeRemoveResult,
   SessionStore,
   tabKey,
 } from "./session-store";
@@ -563,6 +564,38 @@ describe("removeErrorMessage", () => {
     expect(removeErrorMessage({ ok: false })).toBe(
       "Could not remove the session.",
     );
+  });
+});
+
+describe("routeRemoveResult", () => {
+  it("routes success to done", () => {
+    expect(routeRemoveResult({ ok: true }, false)).toEqual({ kind: "done" });
+  });
+
+  it("routes a dirty first attempt to the force re-prompt", () => {
+    expect(
+      routeRemoveResult({ ok: false, dirty: "uncommitted" }, false),
+    ).toEqual({ kind: "confirm-force", reason: "uncommitted" });
+  });
+
+  it("never re-prompts after a force attempt, even if dirty (no loop)", () => {
+    const r = routeRemoveResult({ ok: false, dirty: "uncommitted" }, true);
+    expect(r.kind).not.toBe("confirm-force");
+  });
+
+  it("routes a backend error to a notice with its message", () => {
+    expect(
+      routeRemoveResult(
+        { ok: false, error: new Error("kill tmux: nope") },
+        false,
+      ),
+    ).toEqual({ kind: "error", message: "kill tmux: nope" });
+  });
+
+  it("routes a bare {ok:false} (busy-guard/disposed) to ignored — not a false failure notice", () => {
+    expect(routeRemoveResult({ ok: false }, false)).toEqual({
+      kind: "ignored",
+    });
   });
 });
 
@@ -1955,6 +1988,124 @@ describe("SessionStore Fix D coverage", () => {
     resolve();
     await first;
     expect(remove).toHaveBeenCalledTimes(1);
+  });
+
+  // Background removal (#0 non-blocking delete): the snapshot publishes which
+  // keys have a remove in flight so the sidebar can spin their rows.
+
+  it("remove publishes the key in snapshot.removing while in flight and clears it on success", async () => {
+    let resolveRemove!: () => void;
+    const remove = vi.fn(
+      () =>
+        new Promise<void>((r) => {
+          resolveRemove = r;
+        }),
+    );
+    const { store } = makeStore({ remove });
+    const p = store.remove("api", "x", false);
+    expect(store.getSnapshot().removing).toEqual(["api/x"]);
+    resolveRemove();
+    await p;
+    expect(store.getSnapshot().removing).toEqual([]);
+  });
+
+  it("remove clears snapshot.removing when the backend fails", async () => {
+    let rejectRemove!: (e: unknown) => void;
+    const remove = vi.fn(
+      () =>
+        new Promise<void>((_r, rej) => {
+          rejectRemove = rej;
+        }),
+    );
+    const { store } = makeStore({ remove });
+    const p = store.remove("api", "x", false);
+    expect(store.getSnapshot().removing).toEqual(["api/x"]);
+    rejectRemove(new Error("boom"));
+    const r = await p;
+    expect(r.ok).toBe(false);
+    expect(store.getSnapshot().removing).toEqual([]);
+  });
+
+  it("remove clears snapshot.removing on a WorkspaceDirty rejection", async () => {
+    const dirty = {
+      kind: "workspaceDirty",
+      message: "x",
+      reason: "uncommitted",
+    };
+    const { store } = makeStore({ remove: vi.fn().mockRejectedValue(dirty) });
+    const r = await store.remove("api", "x", false);
+    expect(r).toEqual({ ok: false, dirty: "uncommitted" });
+    expect(store.getSnapshot().removing).toEqual([]);
+  });
+
+  // A disposed store short-circuits remove() the same way it short-circuits
+  // openSession (see the analogous test above): terminal, so no new backend
+  // side effect (tmux kill / worktree delete) may fire post-teardown.
+  it("remove on a disposed store returns {ok:false} without invoking the opener", async () => {
+    const remove = vi.fn().mockResolvedValue(undefined);
+    const { store } = makeStore({ remove });
+    store.dispose();
+    const r = await store.remove("api", "x", false);
+    expect(r).toEqual({ ok: false });
+    expect(remove).not.toHaveBeenCalled();
+    expect(store.getSnapshot().removing).toEqual([]);
+  });
+
+  // The store only closes the tab on a *successful* remove (see `remove`'s
+  // success branch). A failed backgrounded remove must leave the tab exactly
+  // as it was — the session may still be alive server-side, and the row stays
+  // available to retry (App keeps the confirm dialog closed but never
+  // silently drops the tab on failure).
+  it("remove leaves the tab open when the backend fails (no tab is dropped on failure)", async () => {
+    const { store } = makeStore({
+      remove: vi.fn().mockRejectedValue(new Error("kill tmux: nope")),
+    });
+    await store.openSession({
+      projectId: "api",
+      sessionId: "x",
+      agent: null,
+      base: null,
+      workspace: "worktree" as const,
+    });
+    const r = await store.remove("api", "x", false);
+    expect(r.ok).toBe(false);
+    expect(store.getSnapshot().tabs.map((t) => t.key)).toEqual(["api/x"]);
+  });
+
+  it("stop does NOT appear in snapshot.removing (it is remove-only)", async () => {
+    let resolveStop!: () => void;
+    const stop = vi.fn(
+      () =>
+        new Promise<void>((r) => {
+          resolveStop = r;
+        }),
+    );
+    const { store } = makeStore({ stop });
+    const p = store.stop("api", "x");
+    expect(store.getSnapshot().removing).toEqual([]);
+    resolveStop();
+    await p;
+  });
+
+  // App gates its optimistic tab close on snapshot.removing: remove() marks
+  // the key SYNCHRONOUSLY (before its first await) when it accepts the call,
+  // and never marks it on a busy-guard refusal. Without this, a remove
+  // refused mid-stop would still destroy the tab while the removal never ran.
+  it("remove refused by the busy-guard never appears in snapshot.removing", async () => {
+    let resolveStop!: () => void;
+    const stop = vi.fn(
+      () =>
+        new Promise<void>((r) => {
+          resolveStop = r;
+        }),
+    );
+    const { store } = makeStore({ stop });
+    const stopP = store.stop("api", "x"); // key is now busy (teardownPending)
+    const r = await store.remove("api", "x", false);
+    expect(r).toEqual({ ok: false });
+    expect(store.getSnapshot().removing).toEqual([]);
+    resolveStop();
+    await stopP;
   });
 
   // CROSS-RACE: open (respawn) vs teardown (remove). The bug: `pending`

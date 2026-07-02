@@ -30,6 +30,7 @@ specta-typescript = "=0.0.9"
 tokio = { workspace = true, features = ["sync", "macros", "rt", "time"] }
 notify = "8"
 notify-debouncer-full = "0.5"
+futures-util = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

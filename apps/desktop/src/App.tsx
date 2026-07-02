@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   commands,
   type DetectedTerminalDto,
+  type DirtyReasonDto,
   type WorkspaceModeDto,
 } from "./bindings";
 import { CollapsedRail } from "./CollapsedRail";
@@ -16,7 +17,12 @@ import {
 import { NewSessionDialog } from "./NewSessionDialog";
 import { SettingsDialog, type View as SettingsView } from "./SettingsDialog";
 import { Sidebar } from "./Sidebar";
-import { canRespawn, OPEN_CANCELLED, tabKey } from "./session-store";
+import {
+  canRespawn,
+  OPEN_CANCELLED,
+  routeRemoveResult,
+  tabKey,
+} from "./session-store";
 import { buildTree, type SessionNode } from "./session-tree";
 import {
   shouldDisarmAfterSidebarOpen,
@@ -79,6 +85,7 @@ function App() {
     tabs,
     activeKey,
     connecting,
+    removing,
     openSession,
     openViaRespawn,
     openViaAttach,
@@ -156,7 +163,13 @@ function App() {
     projectId: string;
     sessionId: string;
     workspace: WorkspaceModeDto | null;
+    /** Set when re-opened at the force stage after a background dirty result. */
+    forceReason?: DirtyReasonDto;
   } | null>(null);
+  // Render-time mirror of removeTarget for the backgrounded remove's settle
+  // callback, whose closure captured the value from a long-gone render.
+  const removeTargetRef = useRef(removeTarget);
+  removeTargetRef.current = removeTarget;
   const newButtonRef = useRef<HTMLButtonElement>(null);
   // Live focus handles for the mounted terminal panes, keyed by tab key.
   const terminals = useRef(new Map<string, TerminalHandle>());
@@ -199,6 +212,9 @@ function App() {
   // Sessions whose open is in flight — the sidebar spins their rows until the
   // open resolves to a live tab, fails, or is cancelled (#170).
   const connectingKeys = useMemo(() => new Set(connecting), [connecting]);
+  // Sessions with a background remove in flight — their sidebar row spins
+  // "Removing…" until the teardown settles and the row vanishes or recovers.
+  const removingKeys = useMemo(() => new Set(removing), [removing]);
 
   // Status of the active tab, so the focus effect re-fires when a freshly opened
   // or respawned session goes live (a stopped/reconnecting tab renders a
@@ -416,9 +432,14 @@ function App() {
       .catch(() => setNotice("Could not copy the command."));
   }
 
-  /** Open the remove confirm dialog for any session. */
+  /** Open the remove confirm dialog for any session. A session whose removal
+   * is already running in the background gets no dialog — confirming it would
+   * only hit the store's busy-guard, and the row's spinner already says the
+   * removal is underway. */
   function onRemove(node: SessionNode) {
     setNotice(null);
+    const key = tabKey(node.projectId, node.sessionId);
+    if (removingKeys.has(key)) return;
     setRemoveTarget({
       projectId: node.projectId,
       sessionId: node.sessionId,
@@ -429,6 +450,7 @@ function App() {
   /** Open the remove confirm dialog from a tab (stopped/disconnected pane). */
   function onRemoveTab(projectId: string, sessionId: string) {
     setNotice(null);
+    if (removingKeys.has(tabKey(projectId, sessionId))) return;
     // Find the workspace from the tree if available.
     const node = tree
       .flatMap((p) => p.sessions)
@@ -438,6 +460,62 @@ function App() {
       sessionId,
       workspace: node?.workspace ?? null,
     });
+  }
+
+  /** Confirm callback for the remove dialog. Removal is backgrounded: the tab
+   * and dialog close immediately (the user moves on to other sessions) and the
+   * settled result is routed async — success needs nothing (the row vanishes
+   * on the discovery refresh), WorkspaceDirty re-opens the dialog at the force
+   * stage, and a real failure lands in the notice bar. The sidebar row spins
+   * via snapshot.removing for the whole teardown. */
+  function handleRemoveConfirm(force: boolean) {
+    if (!removeTarget) return;
+    const target = removeTarget;
+    setRemoveTarget(null);
+    const key = tabKey(target.projectId, target.sessionId);
+    const promise = removeSession(target.projectId, target.sessionId, force);
+    // Optimistic close: intent to remove was just confirmed, and mid-teardown
+    // the terminal would only die visibly. On failure the sidebar row remains
+    // and the session can be reopened. Gated on the store having ACCEPTED the
+    // remove — remove() publishes snapshot.removing synchronously before its
+    // first await, so a busy-guard refusal (a stop/respawn/open already in
+    // flight for this key) is visible here. Closing unconditionally would
+    // destroy the tab for a remove that never ran.
+    if (sessionStore.getSnapshot().removing.includes(key)) {
+      closeTab(key);
+    }
+    void promise
+      .then((result) => {
+        // Even a failed remove may have torn down partial server state (e.g.
+        // tmux killed, worktree removal failed), so re-list on every outcome.
+        void discoveryStore.refreshAfterOpen();
+        const followUp = routeRemoveResult(result, force);
+        if (followUp.kind === "confirm-force") {
+          // If the user has meanwhile opened a remove dialog for a DIFFERENT
+          // session, don't clobber it with this session's force re-prompt —
+          // park the dirty result in the notice bar instead, so neither the
+          // open dialog nor this result is silently lost. Removing the dirty
+          // session again re-prompts. (The ref, not the closure, carries the
+          // current dialog state — this callback's render is long gone.)
+          const open = removeTargetRef.current;
+          if (open && tabKey(open.projectId, open.sessionId) !== key) {
+            setNotice(
+              `${target.projectId}/${target.sessionId} has uncommitted work — choose Remove again to confirm.`,
+            );
+          } else {
+            setRemoveTarget({ ...target, forceReason: followUp.reason });
+          }
+        } else if (followUp.kind === "error") {
+          setNotice(
+            `Could not remove ${target.projectId}/${target.sessionId}: ${followUp.message}`,
+          );
+        }
+      })
+      // The store action resolves rather than rejects, but guard anyway so an
+      // unexpected throw can't become an unhandled rejection.
+      .catch(() => {
+        setNotice(`Could not remove ${target.projectId}/${target.sessionId}.`);
+      });
   }
 
   /** Dialog success callback: close it, note an attach-vs-spawn outcome, route
@@ -549,6 +627,7 @@ function App() {
             activeKey={activeKey}
             openKeys={openKeys}
             connectingKeys={connectingKeys}
+            removingKeys={removingKeys}
             onOpenSession={openFromSidebar}
             configError={configError}
             discoveryUnavailable={discoveryUnavailable}
@@ -739,16 +818,15 @@ function App() {
       )}
       {removeTarget && (
         <ConfirmRemoveDialog
+          // Remount (fresh focus + state) if the dialog ever retargets to a
+          // different session while open, rather than morphing in place.
+          key={tabKey(removeTarget.projectId, removeTarget.sessionId)}
           projectId={removeTarget.projectId}
           sessionId={removeTarget.sessionId}
           workspace={removeTarget.workspace}
-          onConfirm={(force) =>
-            removeSession(removeTarget.projectId, removeTarget.sessionId, force)
-          }
-          onClose={() => {
-            setRemoveTarget(null);
-            void discoveryStore.refreshAfterOpen();
-          }}
+          forceReason={removeTarget.forceReason ?? null}
+          onConfirm={handleRemoveConfirm}
+          onClose={() => setRemoveTarget(null)}
         />
       )}
       {settingsOpen && (

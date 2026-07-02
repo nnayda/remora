@@ -17,8 +17,12 @@ DIRECT MODE (default, zero infra)
   App ──ssh / kubectl exec──► sandbox (tmux: one session per worktree)
 
 RELAY MODE (opt-in, enables phone-from-anywhere + push notifications)
-  App   ──WS──► relay ──ssh / kubectl exec──► sandbox (tmux)
-  Phone ──WS──┘
+  Phone ──WS/TLS──► relay (blind) ──WS/TLS──► bridge ──ssh / kubectl exec──► sandbox (tmux)
+  App  ──┘         routes ciphertext         holds creds; = the desktop app
+                   only, holds no creds      or a headless container, always
+                                             on user hardware (ADR-0021)
+  (one Noise session runs END-TO-END phone⇄bridge, through the relay — the
+   per-hop WS/TLS is transport framing, never where encryption terminates)
 ```
 
 Persistence is borrowed, not invented: tmux already solves "process survives
@@ -70,8 +74,13 @@ a type or code path in core
 | `apps/desktop/src-tauri` | Tauri 2 shell: owns the `SessionSource` instance(s) and an open-channel registry; exposes `session_*` Tauri commands (spawn/attach/list/write/resize/respawn/close) that stream PTY output to the frontend over `ipc::Channel`. The channel also carries typed activity events — a status value and a sanitized preview — produced by the core-side detector ([ADR-0013](adr/0013-core-side-activity-detector.md)) and consumed by the UI, which renders them and performs no detection of its own. The UI talks only to this layer. | `remora-core` |
 | `apps/desktop/src` | React UI: tabs, embedded terminal, file/diff/PR panels. Talks only to the Tauri layer. | `@tauri-apps/api` |
 
-A future `relay` binary will host `remora-core` behind a WebSocket and speak
-`remora-protocol` to clients — same seam, no UI changes.
+Relay mode splits into two future binaries
+([ADR-0021](adr/0021-blind-relay-bridge-trust-model.md)): a **bridge** that
+hosts `remora-core` behind a WebSocket (the desktop app by default, or a
+headless container — always on user hardware, since it holds transport
+creds) and a **blind relay** that routes end-to-end-encrypted
+`remora-protocol` frames between paired devices without being able to read
+them — same seam, no UI changes.
 
 ## Security invariants
 
@@ -82,13 +91,23 @@ A future `relay` binary will host `remora-core` behind a WebSocket and speak
   including the agent — can forge it. Discovered state informs display and
   the config join only; spawn and respawn build commands exclusively from
   local configuration ([ADR-0004](adr/0004-local-config-live-session-discovery.md)).
-- Clients hold no long-lived secrets beyond what the user already uses to
-  reach their sandbox (kubeconfig / SSH). In relay mode the phone
-  authenticates to the relay and never holds a key to the sandbox.
+- Clients hold no *sandbox-reaching* secrets beyond what the user already
+  uses (kubeconfig / SSH); on-device end-to-end identity keys (per-device
+  Noise statics, ADR-0021) are the deliberate carve-out — generated on the
+  device, never leaving it, never able to reach a sandbox. In relay mode the
+  phone authenticates **end-to-end to the bridge** (PSK-paired, pinned
+  statics); it presents only a routing credential to the relay, and never
+  holds a key to the sandbox.
 - Sandboxes need no public ingress. Direct mode rides the user's existing
-  reachability (VPN / bastion / kubeconfig); in relay mode the relay is the
-  only thing that reaches them; with a mesh VPN (e.g. Tailscale), the mesh is
-  the boundary.
+  reachability (VPN / bastion / kubeconfig); in relay mode only the
+  user-side bridge reaches them — the relay reaches nothing and routes only
+  ciphertext; with a mesh VPN (e.g. Tailscale), the mesh is the boundary.
+- The relay stores no plaintext session content and no sandbox credentials,
+  ever ([ADR-0021](adr/0021-blind-relay-bridge-trust-model.md)). E2E keys
+  are generated on-device and never leave it. A fully compromised relay
+  yields metadata and denial of service — no session *plaintext*, no code,
+  no sandbox access; timing/size side channels over the interactive stream
+  remain and are named as an accepted risk in ADR-0021.
 - Sandbox hardening is recommended and documented, not enforced: resource
   limits, network egress policy, no host cloud credentials, and
   ephemeral/disposable pods.

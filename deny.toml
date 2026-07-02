@@ -10,6 +10,15 @@ yanked = "deny"
 # safe upgrade; that is upstream's to fix, and this heals automatically when
 # tauri moves off them.
 unmaintained = "workspace"
+# quick-xml 0.39.4 advisories, fixed only in >= 0.41.0, which nothing in the
+# Tauri Linux stack accepts yet (plist ^1 pins 0.39; no 0.39.x patch exists).
+# The affected parsers only see local plist/wayland data here, not untrusted
+# XML. Temporary — remove once `cargo update` reaches quick-xml >= 0.41
+# through upstream; see #243.
+ignore = [
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+]
 
 [licenses]
 version = 2

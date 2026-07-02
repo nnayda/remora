@@ -104,7 +104,7 @@ Environment variables:
 | --- | --- |
 | `apps/desktop` | Tauri 2 desktop app — React + TypeScript frontend in `src/`, Rust shell in `src-tauri/` |
 | `crates/remora-core` | Session model and the `SessionSource` transport seam |
-| `crates/remora-protocol` | Wire protocol types shared by clients and the future relay |
+| `crates/remora-protocol` | Wire protocol types shared by clients, the future bridge, and the relay envelope ([ADR-0021](adr/0021-blind-relay-bridge-trust-model.md)) |
 | `docs/` | [VISION.md](VISION.md), [ARCHITECTURE.md](ARCHITECTURE.md), [ADRs](adr/) |
 
 ## CI

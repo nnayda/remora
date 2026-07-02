@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **macOS line-editing chords in the terminal**: Cmd+Delete (kill line
+  backward), Cmd+Left / Cmd+Right (jump to line start/end), and
+  Option+Delete (delete word) now work in the embedded terminal. xterm.js
+  deliberately leaves meta chords to the app — meta+arrow sent nothing and
+  Cmd+Delete deleted a single character — so the terminal controller now
+  translates them to the conventional readline bytes (`^U`, `^A`, `^E`,
+  `ESC DEL`), matching iTerm2's "Natural Text Editing" and VS Code's
+  terminal defaults.
+
 ### Added
 
 - **Open a session in an external terminal — UI half**: session menu gains
@@ -25,6 +36,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shape errors). Session-menu/Settings UI ships in the companion UI change.
   Note: the app's own reconnects still evict external clients (documented
   sequential-handoff semantics).
+- **Background session removal**: confirming "Remove session" no longer locks
+  the app behind the dialog for the whole remote teardown. The dialog and the
+  session's tab close immediately, the teardown (tmux kill + worktree/branch
+  delete) runs in the background, and the sidebar row shows a "Removing…"
+  spinner until it completes. If the workspace has uncommitted work, the
+  dialog re-opens at the "Remove anyway?" stage once the background check
+  reports it; other failures surface in the notice bar with the reason, and
+  the session stays available to retry. Because results now arrive
+  asynchronously, the force re-prompt names its session, never replaces a
+  remove dialog you have open for a different session (it parks in the notice
+  bar instead), and a session already mid-removal can't be asked to remove
+  again — its tab is only closed once the store has actually accepted the
+  removal.
+- **ADR-0021: relay trust model — blind relay + user-side bridge** (#68):
+  settles the relay architecture before any relay code exists. Relay mode
+  splits into a self-hostable (or Remora-hosted, paid) **blind relay** that
+  routes only end-to-end-encrypted frames — no sandbox credentials, no
+  plaintext; blindness guaranteed by cryptography, with an audit mode as a
+  regression guard against accidental metadata leakage — and a **bridge**
+  holding host config + transport creds that runs only on user hardware
+  (the desktop app by default; a headless container later for
+  laptop-asleep phone access). Devices pair by QR with a split secret
+  (relay-visible rendezvous token + relay-blind PSK mixed into an
+  IKpsk-family Noise handshake), so even a malicious relay cannot enroll
+  itself as a device; per-bridge rosters, revocation as first-class UX.
+  Corrects ARCHITECTURE.md's old relay-drives-ssh sketch and resolves two
+  VISION.md open questions (relay auth; relay configuration source). Docs
+  only — build work is sequenced in follow-up issues starting with relay
+  slice 1 (envelope + relay MVP + one E2E PTY stream, #231; then pairing
+  #232, push #233, headless bridge #234; SECURITY page #235 and
+  PROTOCOL.md #236).
 - **Per-session collapsed rail** (#184): the collapsed left sidebar now shows one
   navigable glyph per session instead of one avatar per host. Clicking a glyph
   focuses/opens that session (it used to only expand the rail). Sessions are
@@ -109,6 +151,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RS/US delimiter bytes from each step's captured output, so an attacker-set
   tmux `#{E:}` value can never forge a record boundary — making the framing
   unforgeable by construction (this also retroactively hardens the spawn path).
+- **Cross-host discovery fan-out** (#101): `Bridge::list()` now awaits every
+  configured host's `SessionSource::list()` concurrently instead of one at a
+  time, so a host that *errors* (or connects within ssh's 10s handshake
+  timeout and then responds) no longer serializes discovery of the rest —
+  latency now tracks the slowest finite host rather than their sum. A host
+  that hangs *after* connecting still blocks the whole call, since neither
+  transport bounds the execution phase yet (tracked separately in #99); this
+  change doesn't regress that case, it was equally unbounded before. When
+  *every* host is down, the resulting error aggregates each host's cause
+  instead of surfacing only the last one visited.
 - **Design system documented in `DESIGN.md`** (#150): the shipped token system
   (`apps/desktop/src/styles/tokens/*.css`) now has a written home in the
   [Google design.md](https://github.com/google-labs-code/design.md) format —
@@ -559,6 +611,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Awaiting status no longer stomped by cosmetic terminal output** (#224):
+  once an agent asserts `awaiting_input`, the red pulse and its prompt
+  preview now survive tmux status-line clock repaints and TUI spinner
+  frames. `awaiting` exits only on a real signal: another state marker,
+  typing into the session through Remora, or closing the session (ADR-0022).
+  Known residual: answering out-of-band (e.g. directly in tmux on the host)
+  doesn't emit any of those signals yet — tracked in #239, which adds
+  working/idle exit markers to the hook recipe.
+
+- **The activity pulse now catches AskUserQuestion menus.** A session sitting
+  at Claude Code's interactive multiple-choice prompt showed a gray idle dot
+  with no tooltip, because the marker recipe wired only the `Notification`
+  hook — and AskUserQuestion fires no immediate Notification (empirically,
+  Claude Code 2.1.198 sends only a delayed, generic `permission_prompt` nag
+  ~6s later, whose text is "Claude needs your permission", not the question).
+  The launch template's `--settings` and `remora-notify.sh` now also wire
+  `PreToolUse` with matcher `AskUserQuestion`, which fires as the menu
+  displays; the script pulls the real question text from
+  `.tool_input.questions[0].question` as the preview, so the row shows the
+  awaiting pulse and "the session says: <question>" on hover. Scoped to that
+  one tool so every other tool call stays silent, and all script failure
+  paths exit 0/1 (never 2, which would block the tool). Wire contract pinned
+  by a new script round-trip test; existing template-created agents need the
+  refresh path in #214 to pick this up. See `docs/agent-hooks.md`.
+- **Collapsed-rail branch initial no longer drops combining marks** (#220,
+  follow-up to #184). The per-session badge derived its letter from the first
+  *code point* of the branch name, which splits a grapheme cluster: a base
+  letter followed by a combining mark (e.g. "e" + U+0301, the decomposed form
+  of "é") rendered as a bare "E" instead of the composed "É". It now segments
+  by grapheme cluster via `Intl.Segmenter`, falling back to the first code
+  point where that API is unavailable (still surrogate-pair safe).
 - **Clicking a session in the sidebar now revives it when the local tab is
   dead but the session is reachable** (#189, inverse of #178). Two dropped-intent
   gaps: the live-attach path short-circuited on `key === activeKey` alone, so

@@ -11,6 +11,29 @@ import { activityStore } from "./useActivity";
 
 const encoder = new TextEncoder();
 
+/** Bytes for the macOS line-editing chords xterm won't produce on its own:
+ * it drops meta+arrow outright and treats Cmd+Backspace as a one-char delete,
+ * because on macOS meta chords are conventionally the app's to map. Native
+ * terminals translate them in the emulator layer (iTerm's "Natural Text
+ * Editing", VS Code's terminal keybindings), so we do the same, to the same
+ * readline control bytes. Option+Backspace is included even though xterm can
+ * emit it, so the chord stays deterministic regardless of the webview's
+ * option-key (third-level-shift) handling. Returns undefined for anything
+ * that isn't exactly one of these chords. */
+function editingChordBytes(event: KeyboardEvent): string | undefined {
+  if (event.type !== "keydown" || event.ctrlKey || event.shiftKey)
+    return undefined;
+  if (event.metaKey && !event.altKey) {
+    if (event.key === "Backspace") return "\x15"; // Cmd+Delete → kill line backward (^U)
+    if (event.key === "ArrowLeft") return "\x01"; // Cmd+Left → beginning of line (^A)
+    if (event.key === "ArrowRight") return "\x05"; // Cmd+Right → end of line (^E)
+  }
+  if (event.altKey && !event.metaKey && event.key === "Backspace") {
+    return "\x1b\x7f"; // Option+Delete → backward-kill-word (ESC DEL)
+  }
+  return undefined;
+}
+
 // Literal hex from notes/design-system/tokens/colors.css (xterm can't read CSS vars).
 const XTERM_THEME = {
   background: "#08090C", // --ink-1000 / --term-bg
@@ -124,7 +147,7 @@ export class TerminalController {
   }
 
   /**
-   * Custom key handling layered over xterm. Two interceptions, both returning
+   * Custom key handling layered over xterm. Three interceptions, all returning
    * `false` to suppress xterm's default for that key; every other key returns
    * `true` and falls through unchanged.
    *
@@ -135,9 +158,12 @@ export class TerminalController {
    * 2. The copy chord — Cmd+C (macOS) or Ctrl+Shift+C (Linux/Windows) — copies
    *    the current selection to the host clipboard and swallows the key so it is
    *    not sent to the PTY.
+   * 3. macOS line-editing chords (Cmd+Delete/Left/Right, Option+Delete) →
+   *    their conventional readline bytes; see editingChordBytes.
    *
-   * A bare Ctrl-C matches neither branch, so it stays SIGINT. Other modifiers
-   * (Ctrl/Alt/Meta+Enter) are left alone so their own bindings reach the agent.
+   * A bare Ctrl-C matches none of the branches, so it stays SIGINT. Other
+   * modifiers (Ctrl/Alt/Meta+Enter) are left alone so their own bindings reach
+   * the agent.
    */
   private handleKeyEvent(event: KeyboardEvent): boolean {
     if (
@@ -180,6 +206,19 @@ export class TerminalController {
         );
       }
       return false; // consume the chord; never forward to the PTY
+    }
+
+    const editingBytes = editingChordBytes(event);
+    if (editingBytes !== undefined) {
+      // Same reasoning as Shift+Enter: stop the webview acting on the chord
+      // (e.g. Cmd+Left is "history back" in WebKit) on top of suppressing xterm.
+      event.preventDefault();
+      if (!this.closed) {
+        void this.connection
+          .write(encoder.encode(editingBytes))
+          .catch((e) => this.logTransportError("write", e));
+      }
+      return false;
     }
 
     return true;

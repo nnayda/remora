@@ -485,4 +485,96 @@ mod tests {
             "Approve running tests?"
         );
     }
+
+    /// Same regression guard, for the PreToolUse(AskUserQuestion) input shape:
+    /// the hook input carries the question at `.tool_input.questions[0].question`
+    /// instead of `.message`. Claude Code's AskUserQuestion menu fires no
+    /// immediate Notification (only a delayed generic permission_prompt nag),
+    /// so PreToolUse is the recipe's only prompt-time signal for it.
+    #[test]
+    fn script_output_matches_wire_contract_for_askuserquestion() {
+        use base64::Engine as _;
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let script_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contrib/agent-hooks/claude-code/remora-notify.sh"
+        );
+        if !std::path::Path::new(script_path).exists() {
+            eprintln!("skip: script not found at {script_path}");
+            return;
+        }
+        let has_jq = Command::new("bash")
+            .arg("-c")
+            .arg("command -v jq")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !has_jq {
+            eprintln!("skip: jq not found — skipping script round-trip test");
+            return;
+        }
+
+        let mut child = Command::new("bash")
+            .arg(script_path)
+            .env("REMORA_MARKER_OUT", "/dev/stdout")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("bash should spawn");
+
+        let question = "Which option would you prefer?";
+        // The captured shape of a real PreToolUse hook input for AskUserQuestion
+        // (verified against Claude Code 2.1.198), minus irrelevant fields.
+        let stdin_json = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_input": {
+                "questions": [{
+                    "question": question,
+                    "header": "Choice",
+                    "options": [
+                        { "label": "Option A", "description": "first" },
+                        { "label": "Option B", "description": "second" }
+                    ],
+                    "multiSelect": false
+                }]
+            }
+        })
+        .to_string();
+        child
+            .stdin
+            .take()
+            .expect("stdin piped")
+            .write_all(format!("{stdin_json}\n").as_bytes())
+            .expect("write stdin");
+
+        let output = child.wait_with_output().expect("script should exit");
+        assert!(
+            output.status.success(),
+            "script exited non-zero: {:?}",
+            output.status
+        );
+
+        let enc = base64::engine::general_purpose::STANDARD.encode(question);
+        let expected = make_wrapped(AWAITING_INPUT_B64, &enc);
+
+        let stdout = String::from_utf8(output.stdout).expect("script output is utf-8");
+        let stdout = stdout.trim_end_matches('\n');
+        assert_eq!(
+            stdout, expected,
+            "script output does not match wire contract for AskUserQuestion input"
+        );
+
+        let inner = strip_tmux_passthrough(&expected);
+        let mut s = MarkerScanner::new();
+        let hits = s.feed(inner.as_bytes());
+        assert_eq!(hits.len(), 1, "exactly one marker from script output");
+        let MarkerHit::State { status, preview } = &hits[0] else {
+            panic!("expected State, got {:?}", hits[0]);
+        };
+        assert_eq!(*status, SessionStatus::Awaiting);
+        assert_eq!(preview.as_ref().expect("preview").as_str(), question);
+    }
 }
