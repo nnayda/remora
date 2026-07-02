@@ -125,6 +125,26 @@ fn ssh_base_argv(host: &SshHost, interactive: bool) -> Vec<String> {
     argv
 }
 
+/// The VS Code Remote-SSH authority for this host: `[user@]host[:port]`.
+/// `host` may be a `~/.ssh/config` alias — VS Code reads ssh config too, so an
+/// alias resolves its own `HostName`/`ProxyJump`/`IdentityFile`. An explicit
+/// `port` is emitted best-effort; older VS Code may ignore `:port` inside the
+/// `ssh-remote+` authority, in which case the port must live in a ssh-config
+/// alias (verify on real hardware — see #256).
+fn ssh_remote_authority(host: &SshHost) -> String {
+    let mut authority = String::new();
+    if let Some(user) = &host.user {
+        authority.push_str(user);
+        authority.push('@');
+    }
+    authority.push_str(&host.host);
+    if let Some(port) = host.port {
+        authority.push(':');
+        authority.push_str(&port.to_string());
+    }
+    authority
+}
+
 #[async_trait]
 impl SessionSource for SshSource {
     /// Resolves the spawn plan from config, then runs the full spawn
@@ -166,6 +186,18 @@ impl SessionSource for SshSource {
             true,
             &attach_tokens_coexist(&tmux_name),
         ))
+    }
+
+    async fn remote_workspace(
+        &self,
+        _project_id: &ProjectId,
+        _session_id: &SessionId,
+        workspace_path: &str,
+    ) -> Result<crate::RemoteWorkspace, SourceError> {
+        Ok(crate::RemoteWorkspace::Ssh {
+            authority: ssh_remote_authority(&self.host),
+            path: workspace_path.to_string(),
+        })
     }
 
     /// Discovers sessions on the host and joins them to local config.
@@ -321,6 +353,56 @@ mod tests {
             agent_argv: vec!["claude".into(), "--continue".into()],
             provision: None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // remote_workspace / ssh_remote_authority tests (#79)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ssh_remote_authority_covers_all_variants() {
+        assert_eq!(ssh_remote_authority(&host("devbox", None, None)), "devbox");
+        assert_eq!(
+            ssh_remote_authority(&host("devbox", Some("nathan"), None)),
+            "nathan@devbox"
+        );
+        assert_eq!(
+            ssh_remote_authority(&host("devbox", None, Some(2222))),
+            "devbox:2222"
+        );
+        assert_eq!(
+            ssh_remote_authority(&host("devbox", Some("nathan"), Some(2222))),
+            "nathan@devbox:2222"
+        );
+        // A `~/.ssh/config` alias flows through verbatim (VS Code reads ssh config).
+        assert_eq!(ssh_remote_authority(&host("hermes", None, None)), "hermes");
+    }
+
+    #[tokio::test]
+    async fn remote_workspace_wraps_authority_and_path() {
+        let source = SshSource::new(
+            SshHost {
+                host: "hermes".into(),
+                user: Some("nathan".into()),
+                port: Some(2222),
+            },
+            Arc::new(Config::default()),
+        );
+        let target = source
+            .remote_workspace(
+                &ProjectId::new("api").expect("slug"),
+                &SessionId::new("fix-login").expect("slug"),
+                "/home/nathan/.remora/worktrees/api/fix-login",
+            )
+            .await
+            .expect("locator");
+        assert_eq!(
+            target,
+            crate::RemoteWorkspace::Ssh {
+                authority: "nathan@hermes:2222".into(),
+                path: "/home/nathan/.remora/worktrees/api/fix-login".into(),
+            }
+        );
     }
 
     // -----------------------------------------------------------------------

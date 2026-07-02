@@ -254,6 +254,17 @@ impl SessionSource for ResolvingSource {
             .await
     }
 
+    async fn remote_workspace(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        workspace_path: &str,
+    ) -> Result<remora_core::RemoteWorkspace, SourceError> {
+        self.for_project(project_id)?
+            .remote_workspace(project_id, session_id, workspace_path)
+            .await
+    }
+
     async fn respawn(
         &self,
         project_id: &ProjectId,

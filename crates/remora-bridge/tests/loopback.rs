@@ -358,6 +358,15 @@ impl SessionSource for ScriptedSource {
         Err(scripted_unsupported())
     }
 
+    async fn remote_workspace(
+        &self,
+        _project_id: &ProjectId,
+        _session_id: &SessionId,
+        _workspace_path: &str,
+    ) -> Result<remora_core::RemoteWorkspace, remora_core::SourceError> {
+        Err(scripted_unsupported())
+    }
+
     async fn list(&self) -> Result<Vec<SessionMeta>, remora_core::SourceError> {
         Ok(self.sessions.clone())
     }

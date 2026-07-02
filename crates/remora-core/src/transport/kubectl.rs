@@ -297,6 +297,15 @@ impl SessionSource for KubectlSource {
         .map_err(|e| SourceError::Transport(format!("external attach task: {e}")))?
     }
 
+    async fn remote_workspace(
+        &self,
+        _project_id: &ProjectId,
+        _session_id: &SessionId,
+        _workspace_path: &str,
+    ) -> Result<crate::RemoteWorkspace, SourceError> {
+        Err(crate::unsupported_remote_workspace())
+    }
+
     async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
         let host = self.host.clone();
         let runner = Arc::clone(&self.runner);
@@ -564,6 +573,33 @@ mod tests {
                 "-c",
                 "export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=xterm-256color; tmux attach-session",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_workspace_is_unsupported_for_kubectl() {
+        // Literal-field KubectlHost resolves without running commands (same
+        // construction as external_attach_command_wraps_coexist_attach_in_pod_shell).
+        let source = KubectlSource::new(
+            KubectlHost {
+                pod: KubectlField::Literal("p".into()),
+                namespace: None,
+                context: None,
+                container: None,
+            },
+            Arc::new(Config::default()),
+        );
+        let err = source
+            .remote_workspace(
+                &ProjectId::new("api").expect("slug"),
+                &SessionId::new("fix-login").expect("slug"),
+                "/work/api/fix-login",
+            )
+            .await
+            .expect_err("kubectl has no local-editor target");
+        assert!(
+            matches!(err, SourceError::Transport(ref m) if m.contains("SSH")),
+            "unexpected error: {err:?}"
         );
     }
 

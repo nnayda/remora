@@ -1049,6 +1049,14 @@ mod tests {
         ) -> Result<Vec<String>, SourceError> {
             unreachable!()
         }
+        async fn remote_workspace(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+            _: &str,
+        ) -> Result<remora_core::RemoteWorkspace, SourceError> {
+            unreachable!()
+        }
         async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
             Ok(vec![
                 SessionMeta {
@@ -1270,6 +1278,14 @@ mod tests {
         ) -> Result<Vec<String>, SourceError> {
             self.inner.external_attach_command(p, s).await
         }
+        async fn remote_workspace(
+            &self,
+            p: &ProjectId,
+            s: &SessionId,
+            path: &str,
+        ) -> Result<remora_core::RemoteWorkspace, SourceError> {
+            self.inner.remote_workspace(p, s, path).await
+        }
         async fn list(&self) -> Result<Vec<remora_protocol::SessionMeta>, SourceError> {
             self.inner.list().await
         }
@@ -1363,6 +1379,14 @@ mod tests {
             _: &ProjectId,
             _: &SessionId,
         ) -> Result<Vec<String>, SourceError> {
+            unreachable!()
+        }
+        async fn remote_workspace(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+            _: &str,
+        ) -> Result<remora_core::RemoteWorkspace, SourceError> {
             unreachable!()
         }
         async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
@@ -1555,6 +1579,14 @@ mod tests {
             _: &ProjectId,
             _: &SessionId,
         ) -> Result<Vec<String>, SourceError> {
+            unreachable!()
+        }
+        async fn remote_workspace(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+            _: &str,
+        ) -> Result<remora_core::RemoteWorkspace, SourceError> {
             unreachable!()
         }
         async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
@@ -2223,6 +2255,14 @@ mod tests {
         ) -> Result<Vec<String>, SourceError> {
             log_push(&self.log, "external_attach_command");
             Ok(Vec::new())
+        }
+        async fn remote_workspace(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+            _: &str,
+        ) -> Result<remora_core::RemoteWorkspace, SourceError> {
+            unreachable!()
         }
         async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
             Ok(Vec::new())

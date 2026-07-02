@@ -220,6 +220,19 @@ impl SessionSource for FakeSessionSource {
         ])
     }
 
+    async fn remote_workspace(
+        &self,
+        _project_id: &ProjectId,
+        _session_id: &SessionId,
+        workspace_path: &str,
+    ) -> Result<crate::RemoteWorkspace, SourceError> {
+        // Deterministic fake locator so bridge tests can assert pass-through.
+        Ok(crate::RemoteWorkspace::Ssh {
+            authority: "fake-host".into(),
+            path: workspace_path.to_string(),
+        })
+    }
+
     async fn respawn(
         &self,
         project_id: &ProjectId,
