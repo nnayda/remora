@@ -8,6 +8,18 @@
 use crate::bridge::editor_dto::WorkspaceModeDto;
 use remora_core::config::{Config, Host, Project, Transport};
 
+/// The user's external-terminal preference, projected as-is. NOT a connection
+/// secret: the registry id is a label; the custom argv is the user's own
+/// LOCAL launcher command (same trust class as an agent launch argv, but —
+/// unlike `AgentDto` — the UI needs the value itself to render the read-only
+/// "Custom (config file)" state and the menu label).
+#[derive(Clone, Debug, serde::Serialize, specta::Type)]
+#[serde(untagged)]
+pub enum TerminalPreferenceDto {
+    Registry(String),
+    Custom(Vec<String>),
+}
+
 /// The whole per-device config, projected for the sidebar. `Default` is the
 /// empty config a fresh device (no file yet) renders.
 #[derive(Clone, Debug, Default, serde::Serialize, specta::Type)]
@@ -16,6 +28,7 @@ pub struct ConfigDto {
     pub hosts: Vec<HostDto>,
     pub projects: Vec<ProjectDto>,
     pub agents: Vec<AgentDto>,
+    pub terminal: Option<TerminalPreferenceDto>,
 }
 
 /// A configured host, label-only. The `transport` discriminant is all the UI
@@ -59,9 +72,24 @@ pub struct AgentDto {
     pub id: String,
 }
 
+impl From<remora_core::config::TerminalPreference> for TerminalPreferenceDto {
+    fn from(p: remora_core::config::TerminalPreference) -> Self {
+        match p {
+            remora_core::config::TerminalPreference::Registry(id) => {
+                TerminalPreferenceDto::Registry(id)
+            }
+            remora_core::config::TerminalPreference::Custom(argv) => {
+                TerminalPreferenceDto::Custom(argv)
+            }
+        }
+    }
+}
+
 impl From<Config> for ConfigDto {
     fn from(config: Config) -> Self {
         // BTreeMap iteration is sorted, so the sidebar render order is stable.
+        // Take terminal before field-by-field into_iter() calls consume config.
+        let terminal = config.terminal.map(Into::into);
         ConfigDto {
             hosts: config
                 .hosts
@@ -80,6 +108,7 @@ impl From<Config> for ConfigDto {
                     id: id.as_str().to_owned(),
                 })
                 .collect(),
+            terminal,
         }
     }
 }
@@ -243,6 +272,27 @@ mod tests {
             dto.projects[0].workspace,
             WorkspaceModeDto::Shared
         ));
+    }
+
+    #[test]
+    fn config_dto_carries_terminal_preference_both_shapes() {
+        let mut config = Config::default();
+        config.terminal = Some(remora_core::config::TerminalPreference::Registry(
+            "ghostty".into(),
+        ));
+        let json = serde_json::to_string(&ConfigDto::from(config)).expect("serialize");
+        assert!(json.contains(r#""terminal":"ghostty""#), "{json}");
+
+        let mut config = Config::default();
+        config.terminal = Some(remora_core::config::TerminalPreference::Custom(vec![
+            "my-term".into(),
+            "-e".into(),
+        ]));
+        let json = serde_json::to_string(&ConfigDto::from(config)).expect("serialize");
+        assert!(json.contains(r#""terminal":["my-term","-e"]"#), "{json}");
+
+        let json = serde_json::to_string(&ConfigDto::from(Config::default())).expect("serialize");
+        assert!(json.contains(r#""terminal":null"#), "{json}");
     }
 
     #[test]

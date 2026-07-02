@@ -245,7 +245,7 @@ export type ConfigChanged = null
  * The whole per-device config, projected for the sidebar. `Default` is the
  * empty config a fresh device (no file yet) renders.
  */
-export type ConfigDto = { hosts: HostDto[]; projects: ProjectDto[]; agents: AgentDto[] }
+export type ConfigDto = { hosts: HostDto[]; projects: ProjectDto[]; agents: AgentDto[]; terminal: TerminalPreferenceDto | null }
 export type DirtyReasonDto = "uncommitted" | "notOnRemote" | "both"
 /**
  * The editable config plus its validation state (ADR-0006 degraded mode).
@@ -373,6 +373,14 @@ export type SessionStateDto = "live" | "stopped"
  * frontend `ActivityState` tokens ("working" | "idle" | "awaiting" | "unknown").
  */
 export type SessionStatusDto = "working" | "idle" | "awaiting" | "unknown"
+/**
+ * The user's external-terminal preference, projected as-is. NOT a connection
+ * secret: the registry id is a label; the custom argv is the user's own
+ * LOCAL launcher command (same trust class as an agent launch argv, but —
+ * unlike `AgentDto` — the UI needs the value itself to render the read-only
+ * "Custom (config file)" state and the menu label).
+ */
+export type TerminalPreferenceDto = string | string[]
 /**
  * Transport + connection details, shared by the read projection and the write
  * inputs (it round-trips: what the form shows is what it submits). Internally

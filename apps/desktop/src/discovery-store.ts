@@ -41,7 +41,12 @@ export interface DiscoverySnapshot {
   reconnectingKeys: string[];
 }
 
-const EMPTY_CONFIG: ConfigDto = { hosts: [], projects: [], agents: [] };
+const EMPTY_CONFIG: ConfigDto = {
+  hosts: [],
+  projects: [],
+  agents: [],
+  terminal: null,
+};
 
 /** Best-effort human message from an unknown thrown config-load error. */
 function errorMessage(e: unknown): string {
