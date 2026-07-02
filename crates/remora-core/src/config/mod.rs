@@ -101,6 +101,7 @@ pub struct Config {
     pub hosts: BTreeMap<HostId, Host>,
     pub projects: BTreeMap<ProjectId, Project>,
     pub agents: BTreeMap<AgentId, Agent>,
+    pub terminal: Option<TerminalPreference>,
 }
 
 /// A configured host: a transport plus its connection details (ADR-0004).
@@ -129,6 +130,17 @@ pub struct SshHost {
     pub host: String,
     pub user: Option<String>,
     pub port: Option<u16>,
+}
+
+/// The user's external-terminal preference (spec 2026-07-02): a registry id
+/// (`terminal = "ghostty"`, written by the Settings dropdown, portable across
+/// machines) or a custom argv prefix (`terminal = ["my-term", "-e"]`,
+/// config-file-only, machine-specific). Core validates SHAPE only — the
+/// desktop shell owns the registry and rejects unknown ids at resolve time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalPreference {
+    Registry(String),
+    Custom(Vec<String>),
 }
 
 /// A kubectl connection field: either a literal value used verbatim as one
@@ -416,6 +428,66 @@ impl<'de> Deserialize<'de> for RawKubectlField {
     }
 }
 
+/// Raw `terminal` key as authored in TOML: a bare string (registry id) or an
+/// array of strings (custom argv prefix). Hand-written `Deserialize` for the
+/// same reason as [`RawKubectlField`]: `#[serde(untagged)]` buffers into
+/// `Content` and reports shape errors as an unusable "did not match any
+/// variant", where a hand-edited config needs the expected shapes named.
+/// Emptiness is validated HERE (not post-parse) so the error carries TOML
+/// line/column like every other shape error.
+#[derive(Debug)]
+struct RawTerminalPreference(TerminalPreference);
+
+impl<'de> Deserialize<'de> for RawTerminalPreference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, SeqAccess, Visitor};
+        use std::fmt;
+
+        struct PrefVisitor;
+
+        const EXPECTED: &str =
+            "a string (registry id) or an array of non-empty strings (custom argv prefix)";
+
+        impl<'de> Visitor<'de> for PrefVisitor {
+            type Value = RawTerminalPreference;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(EXPECTED)
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                if v.trim().is_empty() {
+                    return Err(de::Error::custom("`terminal` must not be empty"));
+                }
+                Ok(RawTerminalPreference(TerminalPreference::Registry(
+                    v.to_owned(),
+                )))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut argv: Vec<String> = Vec::new();
+                while let Some(token) = seq.next_element::<String>()? {
+                    if token.trim().is_empty() {
+                        return Err(de::Error::custom(
+                            "`terminal` argv tokens must not be empty",
+                        ));
+                    }
+                    argv.push(token);
+                }
+                if argv.is_empty() {
+                    return Err(de::Error::custom("`terminal` array must not be empty"));
+                }
+                Ok(RawTerminalPreference(TerminalPreference::Custom(argv)))
+            }
+        }
+
+        deserializer.deserialize_any(PrefVisitor)
+    }
+}
+
 /// Deserialization shape for one `[hosts.<id>]` table.
 ///
 /// Carries the *union* of every transport's fields because serde cannot
@@ -450,6 +522,8 @@ struct RawConfig {
     projects: BTreeMap<ProjectId, Project>,
     #[serde(default)]
     agents: BTreeMap<AgentId, Agent>,
+    #[serde(default)]
+    terminal: Option<RawTerminalPreference>,
 }
 
 /// The guard for a value used verbatim as one argv token (literal fields AND
@@ -879,6 +953,7 @@ impl Config {
             hosts,
             projects: raw.projects,
             agents: raw.agents,
+            terminal: raw.terminal.map(|r| r.0),
         };
         if issues.is_empty() {
             Ok(config)
@@ -1877,6 +1952,51 @@ mod tests {
             assert!(
                 Config::from_toml_str(&toml).is_ok(),
                 "path {path} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_key_parses_both_shapes_and_defaults_to_none() {
+        let none = Config::from_toml_str("").expect("empty config valid");
+        assert_eq!(none.terminal, None);
+
+        let registry = Config::from_toml_str(r#"terminal = "ghostty""#).expect("registry form");
+        assert_eq!(
+            registry.terminal,
+            Some(TerminalPreference::Registry("ghostty".into()))
+        );
+
+        let custom = Config::from_toml_str(r#"terminal = ["my-term", "-e"]"#).expect("custom form");
+        assert_eq!(
+            custom.terminal,
+            Some(TerminalPreference::Custom(vec![
+                "my-term".into(),
+                "-e".into()
+            ]))
+        );
+    }
+
+    #[test]
+    fn terminal_key_rejects_wrong_shapes_with_a_loud_message() {
+        // The whole reason for the custom Visitor (untagged enums answer
+        // "data did not match any variant" — useless for a hand-edited file).
+        for (input, must_mention) in [
+            (r#"terminal = 42"#, "a string (registry id) or an array"),
+            // The seq visitor delegates each element to `next_element::<String>()`,
+            // so a non-string element surfaces serde's own type-mismatch message
+            // (which still names the expected shape: a string) rather than the
+            // top-level `expecting()` text.
+            (r#"terminal = ["ok", 3]"#, "expected a string"),
+            (r#"terminal = []"#, "must not be empty"),
+            (r#"terminal = [""]"#, "must not be empty"),
+            (r#"terminal = """#, "must not be empty"),
+        ] {
+            let err = Config::from_toml_str(input).expect_err(input);
+            let msg = err.to_string();
+            assert!(
+                msg.contains(must_mention),
+                "for `{input}`, expected message containing `{must_mention}`, got: {msg}"
             );
         }
     }
