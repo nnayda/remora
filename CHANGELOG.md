@@ -24,7 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Corrects ARCHITECTURE.md's old relay-drives-ssh sketch and resolves two
   VISION.md open questions (relay auth; relay configuration source). Docs
   only — build work is sequenced in follow-up issues starting with relay
-  slice 1 (envelope + relay MVP + one E2E PTY stream).
+  slice 1 (envelope + relay MVP + one E2E PTY stream, #231; then pairing
+  #232, push #233, headless bridge #234; SECURITY page #235 and
+  PROTOCOL.md #236).
 - **Per-session collapsed rail** (#184): the collapsed left sidebar now shows one
   navigable glyph per session instead of one avatar per host. Clicking a glyph
   focuses/opens that session (it used to only expand the rail). Sessions are

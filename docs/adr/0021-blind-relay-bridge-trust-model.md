@@ -356,14 +356,14 @@ What becomes harder, and what we are committed to:
   parity — the envelope is a contract.
 
 Follow-ups this decision creates: ARCHITECTURE.md diagram + invariants
-update and VISION.md open-question resolution (same PR); build issues for
-relay slice 1 (envelope + relay MVP + one E2E PTY stream — incl. audit
+update and VISION.md open-question resolution (same PR); build issues —
+relay slice 1 (#231: envelope + relay MVP + one E2E PTY stream, incl. audit
 mode, reproducible-builds requirement, loopback test, cross-device mutual
 exclusion below the seam, multi-client resize policy, bounded
 per-connection buffers, padding/coalescing consideration), pairing flow
-(QR split-secret + PSK handshake, enrollment confirmation, no-camera
+(#232: QR split-secret + PSK handshake, enrollment confirmation, no-camera
 fallback, mesh-mode pairing, remote revocation, bridge
-unpinning/deregistration), push pipeline (incl. authenticated rate-limited
-gateway), headless bridge, SECURITY page, and PROTOCOL.md — filed with this
-PR and cross-linked from #71 (which also inherits the mailbox
-forward-secrecy and freshness-binding requirements).
+unpinning/deregistration), push pipeline (#233: incl. authenticated
+rate-limited gateway), headless bridge (#234), SECURITY page (#235), and
+PROTOCOL.md (#236) — cross-linked from #71 (which also inherits the
+mailbox forward-secrecy and freshness-binding requirements).
