@@ -45,7 +45,7 @@ unicode-segmentation = "1"
 # bound ADR-0013 relies on); it is vte's default today, but pin it explicitly
 # so a future `default-features = false` can't silently turn osc_raw into an
 # unbounded Vec.
-vte = { version = "0.13", features = ["no_std"] }
+vte = { version = "0.14", features = ["no_std"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
