@@ -543,6 +543,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Collapsed-rail branch initial no longer drops combining marks** (#220,
+  follow-up to #184). The per-session badge derived its letter from the first
+  *code point* of the branch name, which splits a grapheme cluster: a base
+  letter followed by a combining mark (e.g. "e" + U+0301, the decomposed form
+  of "é") rendered as a bare "E" instead of the composed "É". It now segments
+  by grapheme cluster via `Intl.Segmenter`, falling back to the first code
+  point where that API is unavailable (still surrogate-pair safe).
 - **Clicking a session in the sidebar now revives it when the local tab is
   dead but the session is reachable** (#189, inverse of #178). Two dropped-intent
   gaps: the live-attach path short-circuited on `key === activeKey` alone, so
