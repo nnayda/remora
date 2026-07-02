@@ -80,6 +80,11 @@ export interface Snapshot {
    * has no tab to carry a status until it resolves, so this transient set is the
    * only signal the click registered. Mirrors the `pending` open guard. */
   connecting: string[];
+  /** Keys whose remove is in flight. Removal runs in the background (the
+   * confirm dialog closes immediately), so this transient set drives the
+   * sidebar row's "Removing…" spinner until the teardown settles. Remove-only
+   * by design — a `stop` is quick and must not read as a removal. */
+  removing: string[];
 }
 
 export interface StoreOpeners {
@@ -146,8 +151,17 @@ export class SessionStore {
   private reconnectTokens = new Map<string, ReconnectToken>();
   private disposed = false;
   private listeners = new Set<() => void>();
-  private snapshot: Snapshot = { tabs: [], activeKey: null, connecting: [] };
+  private snapshot: Snapshot = {
+    tabs: [],
+    activeKey: null,
+    connecting: [],
+    removing: [],
+  };
   private teardownPending = new Set<string>();
+  // Keys with a remove in flight — the UI-facing subset of `teardownPending`
+  // (which also covers stops and exists only for the busy-guard). Mutations
+  // are followed by commit() so the sidebar spinner tracks the teardown.
+  private removing = new Set<string>();
   // Per-key count of in-flight respawns. A respawn is an "open" for
   // mutual-exclusion purposes but, unlike `openTab`, isn't tracked in `pending`
   // (it cancels via the reconnect token, not the pending token — see
@@ -193,6 +207,7 @@ export class SessionStore {
       // `pending` is exactly the set of in-flight opens (set/cleared only in
       // openTab), so it doubles as the connecting set the UI spins on.
       connecting: [...this.pending.keys()],
+      removing: [...this.removing],
     };
     for (const listener of this.listeners) listener();
   }
@@ -660,9 +675,12 @@ export class SessionStore {
     return { ok: true };
   };
 
-  /** Remove a session for good. On success the local tab is closed (silent;
-   * closeTab also cancels the reconnect token). WorkspaceDirty is surfaced so the
-   * UI can confirm a force-remove (D2/D5). */
+  /** Remove a session for good. Runs in the background from the UI's point of
+   * view: the key is published in `snapshot.removing` for the whole call so
+   * the sidebar row spins while the multi-round-trip teardown runs. On success
+   * the local tab is closed (silent; closeTab also cancels the reconnect
+   * token). WorkspaceDirty is surfaced so the UI can confirm a force-remove
+   * (D2/D5). */
   remove = async (
     projectId: string,
     sessionId: string,
@@ -674,14 +692,20 @@ export class SessionStore {
     // removing a session mid-spawn is the orphaning race.
     if (this.busy(key)) return { ok: false };
     this.teardownPending.add(key);
+    this.removing.add(key);
+    this.commit();
     try {
       await this.openers.remove(projectId, sessionId, force);
     } catch (error) {
       this.teardownPending.delete(key);
+      this.removing.delete(key);
+      this.commit();
       if (isWorkspaceDirty(error)) return { ok: false, dirty: error.reason };
       return { ok: false, error };
     }
     this.teardownPending.delete(key);
+    this.removing.delete(key);
+    this.commit();
     this.closeTab(key); // no-op if not open; else silent close + token cancel
     return { ok: true };
   };

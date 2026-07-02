@@ -1957,6 +1957,69 @@ describe("SessionStore Fix D coverage", () => {
     expect(remove).toHaveBeenCalledTimes(1);
   });
 
+  // Background removal (#0 non-blocking delete): the snapshot publishes which
+  // keys have a remove in flight so the sidebar can spin their rows.
+
+  it("remove publishes the key in snapshot.removing while in flight and clears it on success", async () => {
+    let resolveRemove!: () => void;
+    const remove = vi.fn(
+      () =>
+        new Promise<void>((r) => {
+          resolveRemove = r;
+        }),
+    );
+    const { store } = makeStore({ remove });
+    const p = store.remove("api", "x", false);
+    expect(store.getSnapshot().removing).toEqual(["api/x"]);
+    resolveRemove();
+    await p;
+    expect(store.getSnapshot().removing).toEqual([]);
+  });
+
+  it("remove clears snapshot.removing when the backend fails", async () => {
+    let rejectRemove!: (e: unknown) => void;
+    const remove = vi.fn(
+      () =>
+        new Promise<void>((_r, rej) => {
+          rejectRemove = rej;
+        }),
+    );
+    const { store } = makeStore({ remove });
+    const p = store.remove("api", "x", false);
+    expect(store.getSnapshot().removing).toEqual(["api/x"]);
+    rejectRemove(new Error("boom"));
+    const r = await p;
+    expect(r.ok).toBe(false);
+    expect(store.getSnapshot().removing).toEqual([]);
+  });
+
+  it("remove clears snapshot.removing on a WorkspaceDirty rejection", async () => {
+    const dirty = {
+      kind: "workspaceDirty",
+      message: "x",
+      reason: "uncommitted",
+    };
+    const { store } = makeStore({ remove: vi.fn().mockRejectedValue(dirty) });
+    const r = await store.remove("api", "x", false);
+    expect(r).toEqual({ ok: false, dirty: "uncommitted" });
+    expect(store.getSnapshot().removing).toEqual([]);
+  });
+
+  it("stop does NOT appear in snapshot.removing (it is remove-only)", async () => {
+    let resolveStop!: () => void;
+    const stop = vi.fn(
+      () =>
+        new Promise<void>((r) => {
+          resolveStop = r;
+        }),
+    );
+    const { store } = makeStore({ stop });
+    const p = store.stop("api", "x");
+    expect(store.getSnapshot().removing).toEqual([]);
+    resolveStop();
+    await p;
+  });
+
   // CROSS-RACE: open (respawn) vs teardown (remove). The bug: `pending`
   // guards opens against opens and `teardownPending` guards teardowns against
   // teardowns, but nothing serialized an open against a teardown. A remove that
