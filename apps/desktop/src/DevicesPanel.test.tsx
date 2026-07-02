@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DeviceInfoDto } from "./bindings";
 
@@ -112,7 +113,14 @@ describe("DevicesPanel — per-row revoke", () => {
       kind: "relay",
       message: "roster storage failed",
     });
-    render(<DevicesPanel />);
+    // StrictMode matches the app root (main.tsx) and pins the unmount latch:
+    // the dev double-mount (setup → cleanup → setup) must leave it re-armed,
+    // or this banner is silently swallowed in every dev session.
+    render(
+      <StrictMode>
+        <DevicesPanel />
+      </StrictMode>,
+    );
 
     await screen.findByText("Pixel 7");
     fireEvent.click(

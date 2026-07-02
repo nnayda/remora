@@ -56,14 +56,17 @@ export function DevicesPanel() {
   // A failed revoke surfaces above the list (the load itself has its own state).
   const [revokeError, setRevokeError] = useState<string | null>(null);
   // Unmount latch for `confirmRevoke`, which outlives the mount effect's local
-  // `live` flag: don't set state after the panel is gone.
+  // `live` flag: don't set state after the panel is gone. Re-armed in the
+  // effect body — not just the ref initializer — so StrictMode's dev
+  // double-mount (setup → cleanup → setup) leaves the surviving mount latched
+  // true instead of permanently false.
   const liveRef = useRef(true);
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    liveRef.current = true;
+    return () => {
       liveRef.current = false;
-    },
-    [],
-  );
+    };
+  }, []);
 
   // Fetch fingerprint + roster together; a relayNotConfigured rejection from
   // either is the "no bridge" empty state, anything else is a read error.
