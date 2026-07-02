@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "apps/desktop/src-tauri",
+  "crates/remora-bridge",
   "crates/remora-core",
   "crates/remora-protocol",
   "crates/remora-relay",
@@ -20,16 +21,20 @@ async-trait = "0.1"
 base64 = "0.22"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 portable-pty = "0.9"
+rand = "0.9"
 remora-core = { path = "crates/remora-core" }
 remora-protocol = { path = "crates/remora-protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shlex = "2.0"
+# snow >= 0.9.5 pulls in the GHSA-97f8-h76h-f297 fix; never pin below 0.9.5.
+snow = "0.9.6"
 subtle = "2"
 tempfile = "3.27.0"
 thiserror = "2"
 tokio = { version = "1", default-features = false }
 tokio-tungstenite = "0.29"
+tokio-util = "0.7"
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 toml_edit = "0.25.12"
 unicode-general-category = "1"
