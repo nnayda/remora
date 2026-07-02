@@ -26,6 +26,7 @@ pub(crate) enum StepId {
     Provision,
     NewSession,
     Passthrough,
+    WindowSize,
     SetEnv,
     // list() sections (PR B)
     Names,
@@ -44,6 +45,7 @@ impl StepId {
             StepId::Provision => "provision",
             StepId::NewSession => "new_session",
             StepId::Passthrough => "passthrough",
+            StepId::WindowSize => "window_size",
             StepId::SetEnv => "set_env",
             StepId::Names => "names",
             StepId::Metadata => "metadata",
@@ -59,6 +61,7 @@ impl StepId {
             "provision" => Some(StepId::Provision),
             "new_session" => Some(StepId::NewSession),
             "passthrough" => Some(StepId::Passthrough),
+            "window_size" => Some(StepId::WindowSize),
             "set_env" => Some(StepId::SetEnv),
             "names" => Some(StepId::Names),
             "metadata" => Some(StepId::Metadata),
@@ -503,6 +506,15 @@ mod tests {
             Some(StepId::Provision)
         );
         assert_eq!(StepId::Provision.token(), "provision");
+    }
+
+    #[test]
+    fn window_size_step_id_round_trips() {
+        assert_eq!(
+            StepId::from_token(StepId::WindowSize.token()),
+            Some(StepId::WindowSize)
+        );
+        assert_eq!(StepId::WindowSize.token(), "window_size");
     }
 
     #[test]
