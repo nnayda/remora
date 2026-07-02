@@ -1,9 +1,8 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { WorkspaceModeDto } from "./bindings";
+import type { DirtyReasonDto, WorkspaceModeDto } from "./bindings";
 import { ConfirmRemoveDialog } from "./ConfirmRemoveDialog";
-import type { RemoveResult } from "./session-store";
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -18,14 +17,22 @@ vi.mock("./ui/icons", () => ({
 // Helpers
 // ---------------------------------------------------------------------------
 
-function renderDialog(workspace: WorkspaceModeDto | null) {
+function renderDialog(
+  workspace: WorkspaceModeDto | null,
+  opts: {
+    forceReason?: DirtyReasonDto | null;
+    onConfirm?: (force: boolean) => void;
+    onClose?: () => void;
+  } = {},
+) {
   render(
     <ConfirmRemoveDialog
       projectId="my-project"
       sessionId="my-session"
       workspace={workspace}
-      onConfirm={async () => ({ ok: true }) as RemoveResult}
-      onClose={() => {}}
+      forceReason={opts.forceReason ?? null}
+      onConfirm={opts.onConfirm ?? (() => {})}
+      onClose={opts.onClose ?? (() => {})}
     />,
   );
 }
@@ -81,5 +88,54 @@ describe("ConfirmRemoveDialog — null workspace (unknown mode)", () => {
 
     expect(screen.queryByText("Remove session")).not.toBeNull();
     expect(screen.queryByText("Close session")).toBeNull();
+  });
+});
+
+describe("ConfirmRemoveDialog — fire-and-forget confirm", () => {
+  it("clicking Remove fires onConfirm(false) once and does not call onClose itself", () => {
+    const onConfirm = vi.fn();
+    const onClose = vi.fn();
+    renderDialog("worktree", { onConfirm, onClose });
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+    expect(onConfirm).toHaveBeenCalledWith(false);
+    // App owns closing the dialog (it nulls removeTarget in its confirm
+    // handler); the dialog must not double-close.
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("Cancel calls onClose without firing onConfirm", () => {
+    const onConfirm = vi.fn();
+    const onClose = vi.fn();
+    renderDialog("worktree", { onConfirm, onClose });
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onConfirm).not.toHaveBeenCalled();
+  });
+});
+
+describe("ConfirmRemoveDialog — force stage from forceReason", () => {
+  it("opens directly at the force stage with mapped reason copy", () => {
+    renderDialog("worktree", { forceReason: "uncommitted" });
+
+    expect(screen.queryByText("Remove anyway?")).not.toBeNull();
+    expect(
+      screen.queryByText(/This session has uncommitted changes\./),
+    ).not.toBeNull();
+    expect(screen.queryAllByText("Remove anyway").length).toBeGreaterThan(0);
+  });
+
+  it("confirming the force stage fires onConfirm(true)", () => {
+    const onConfirm = vi.fn();
+    renderDialog("worktree", { forceReason: "notOnRemote", onConfirm });
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove anyway" }));
+
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+    expect(onConfirm).toHaveBeenCalledWith(true);
   });
 });
