@@ -37,7 +37,7 @@ use std::time::Instant;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use remora_protocol::{
-    DeviceId, Envelope, FrameType, RelayHello, ENVELOPE_HEADER_LEN, MAX_ENVELOPE_PAYLOAD,
+    DeviceId, Envelope, FrameType, HelloRole, RelayHello, ENVELOPE_HEADER_LEN, MAX_ENVELOPE_PAYLOAD,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
@@ -350,9 +350,32 @@ async fn run_connection(
 }
 
 /// What the data loop should do after one inbound message.
+#[derive(Debug, PartialEq, Eq)]
 enum DataStep {
     Continue,
     Close(CloseReason),
+}
+
+/// Maps a `PeerUnavailable` route outcome to the *sender's* next step, keyed by
+/// the sender's role — a routing/availability policy, not payload inspection.
+///
+/// - **Device sender**: its only reachable peer is its bridge, so a gone bridge
+///   means the device has nothing to do — close it (4004, `PeerGone`).
+/// - **Bridge sender**: addressing a departed device is *routine*, not a
+///   protocol violation. Under spec D3 a device reconnects with a fresh routing
+///   id, so its old id goes offline on every reconnect, and the blind relay
+///   sends the bridge no departure signal — its orphaned per-peer task keeps
+///   draining that session's PTY and emits one more Output frame to the now-gone
+///   id. Tearing down the bridge's whole relay connection here would cancel
+///   *every other* device's session on that bridge and force a full reconnect
+///   with backoff. So the relay drops the undeliverable frame and the bridge
+///   continues; the bridge's own per-peer task notices the client is gone
+///   through its normal channel-death path.
+fn peer_unavailable_step(sender_role: HelloRole) -> DataStep {
+    match sender_role {
+        HelloRole::Device => DataStep::Close(CloseReason::PeerGone),
+        HelloRole::Bridge => DataStep::Continue,
+    }
 }
 
 /// Handles one post-hello inbound message: routes a `Data` frame, or maps
@@ -388,7 +411,10 @@ fn handle_data_message(
     let (outcome, _victim) = router.route(permit, envelope.src, envelope.dst, bytes.to_vec());
     match outcome {
         RouteOutcome::Delivered => DataStep::Continue,
-        RouteOutcome::PeerUnavailable => DataStep::Close(CloseReason::PeerGone),
+        // A gone peer closes only a *device* sender; a *bridge* addressing a
+        // departed device is routine — drop the frame and continue (see
+        // `peer_unavailable_step`).
+        RouteOutcome::PeerUnavailable => peer_unavailable_step(permit.role()),
         RouteOutcome::NotAllowed => DataStep::Close(CloseReason::Protocol),
         RouteOutcome::Overflow => {
             // dst-kill: wake the slow destination's reader; the sender lives on.
@@ -468,4 +494,25 @@ fn close_frame(reason: CloseReason) -> CloseFrame {
 async fn close_now(ws: &mut WebSocketStream<TcpStream>, reason: CloseReason) {
     let _ = ws.send(Message::Close(Some(close_frame(reason)))).await;
     let _ = ws.close(None).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_unavailable_closes_a_device_sender() {
+        // A device whose only bridge is gone has nothing to do — close it 4004.
+        assert_eq!(
+            peer_unavailable_step(HelloRole::Device),
+            DataStep::Close(CloseReason::PeerGone),
+        );
+    }
+
+    #[test]
+    fn peer_unavailable_drops_and_continues_for_a_bridge_sender() {
+        // A bridge addressing a departed device is routine (D3 fresh routing
+        // ids): drop the undeliverable frame, never tear down the bridge.
+        assert_eq!(peer_unavailable_step(HelloRole::Bridge), DataStep::Continue);
+    }
 }

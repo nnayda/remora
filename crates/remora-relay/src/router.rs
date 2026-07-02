@@ -108,8 +108,12 @@ pub enum HelloOutcome {
 pub enum RouteOutcome {
     /// The frame was enqueued on the destination's outbound queue.
     Delivered,
-    /// The destination is not currently registered. The caller closes the
-    /// **sender** with WebSocket close code 4004.
+    /// The destination is not currently registered. The caller reacts by the
+    /// sender's role (a routing/availability policy, not a payload decision): a
+    /// **device** sender is closed with WebSocket close code 4004 (its only
+    /// bridge is gone), while a **bridge** sender drops the undeliverable frame
+    /// and continues (a departed device is routine under spec D3 — see the WS
+    /// layer's `peer_unavailable_step`).
     PeerUnavailable,
     /// Adjacency violation: the sender may not address this destination (or the
     /// envelope `src` did not match the sender's routing id). The caller closes

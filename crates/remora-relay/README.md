@@ -104,7 +104,7 @@ The relay's WebSocket close code on every teardown is one of:
 | `1000` | normal | Peer closed cleanly, or the socket reached EOF. |
 | `4001` | auth_failure | The hello's token didn't match a configured `bridges`/`devices` entry (or none is configured — closed by default). |
 | `4002` | protocol | A malformed frame, an illegal frame type for the connection's state, or an envelope `src`/`dst` adjacency violation. |
-| `4004` | peer_gone | The envelope's destination device isn't currently registered with the relay. |
+| `4004` | peer_gone | The envelope's destination device isn't currently registered with the relay. Sent only to a **device** sender whose bridge is gone (it has nothing left to do). A **bridge** addressing a departed device is routine — under D3 a device reconnects with a fresh routing id, so its old id goes offline on every reconnect — so the relay drops that undeliverable frame and keeps the bridge connection up rather than tearing down every other device's session on it. |
 | `4008` | buffer_overflow | This connection's outbound buffer exceeded `buffer_bytes`; it was shed as a slow consumer. The frame's *sender* is unaffected — only the slow destination is killed. |
 | `4009` | replaced | A newer connection registered under the same routing id and displaced this one (e.g. the same device reconnected before the old socket was cleaned up). |
 
