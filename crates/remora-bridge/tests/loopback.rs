@@ -34,23 +34,25 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt as _, StreamExt as _};
 use rand::RngCore as _;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
 use remora_bridge::{
-    prologue, serve_bridge, BridgeConfig, BridgeEvent, BridgeIdentity, Handshake, HandshakeKind,
-    PairingCommand, PairingFile, RemoteSource, Roster, RosterEntry, Transport, NOISE_PATTERN,
+    prologue, run_pairing, serve_bridge, BridgeConfig, BridgeEvent, BridgeIdentity, Handshake,
+    HandshakeKind, PairingCommand, PairingError, PairingFile, PairingOutcome, PairingProgress,
+    RemoteSource, Roster, RosterEntry, Transport, NOISE_PATTERN,
 };
 use remora_core::{
     ExclusiveSource, FakeSessionSource, SessionChannel, SessionLocks, SessionSource,
 };
 use remora_protocol::{
     BridgeMessage, ChannelInput, ChannelOutput, ClientMessage, DeviceId, Envelope, FrameType,
-    HelloRole, ProjectId, RelayHello, RemoteOp, RemoteResult, SessionId, SessionMeta, SessionState,
-    SessionStatus, SpawnSpec, PROTOCOL_VERSION,
+    HelloRole, PairingBridgeMsg, PairingClientMsg, PairingCode, PairingRejectReason, ProjectId,
+    RelayHello, RemoteOp, RemoteResult, SessionId, SessionMeta, SessionState, SessionStatus,
+    SpawnSpec, PROTOCOL_VERSION,
 };
 use remora_relay::{serve, AuditSink, BridgeEntry, RelayConfig};
 
@@ -70,6 +72,17 @@ const READY_TIMEOUT: Duration = Duration::from_secs(20);
 /// Per-message-arrival timeout. Once the route is live, a loopback round-trip is
 /// sub-millisecond; two seconds is pure slack against scheduler noise.
 const RECV_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Ceiling for awaiting a single bridge [`BridgeEvent`] driven by the real
+/// pairing ceremony. Generous slack above the sub-second loopback ceremony (and
+/// above the short pairing-window TTLs the tests use for expiry paths).
+const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ceiling for awaiting a [`run_pairing`] task to *complete* the whole ceremony.
+/// Wider than [`EVENT_TIMEOUT`] and above the driver's own 15 s relay-read budget,
+/// so a slow-but-correct completion on a loaded box surfaces the driver's real
+/// outcome rather than tripping the outer bound and flaking.
+const PAIR_JOIN_TIMEOUT: Duration = Duration::from_secs(25);
 
 // ---------------------------------------------------------------------------
 // Relay instance: a killable blind relay on its own runtime/thread.
@@ -1052,6 +1065,727 @@ async fn list_devices_returns_self_with_connect_stamp() {
         }
         other => panic!("expected Response(Devices), got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Real-pairing harness + E2E lifecycle tests (Task 14, ADR-0021 D3/D6).
+//
+// The `Harness` above pre-populates the roster and mints the `PairingFile`
+// inline (Task 6 scaffolding) — the right shape for the PTY/echo/adversarial
+// proofs, which need a *paired* device to exercise the session path and would
+// only be slowed by re-pairing per test. This `PairingHarness` instead starts
+// with an EMPTY roster and drives the *real* ceremony end to end (OpenWindow →
+// run_pairing → Confirm → PairingFile → RemoteSource), so the confirm-gated
+// grant, revoke kick, and abandoned-confirm paths are proven over real sockets
+// and real Noise, not asserted from unit seams.
+// ---------------------------------------------------------------------------
+
+/// A relay + bridge stood up with an empty roster, plus the desktop-side command
+/// sender, event receiver, and a handle on the shared roster — everything a test
+/// needs to drive and observe the pairing ceremony. Dropping it tears the stack
+/// down.
+struct PairingHarness {
+    relay: Relay,
+    /// Shared with the bridge; the confirm path pushes the enrolled entry here.
+    roster: Arc<RwLock<Roster>>,
+    commands_tx: mpsc::Sender<PairingCommand>,
+    events_rx: mpsc::Receiver<BridgeEvent>,
+    shutdown: CancellationToken,
+    bridge_task: JoinHandle<()>,
+    _dir: tempfile::TempDir,
+}
+
+impl PairingHarness {
+    async fn new(source: Arc<dyn SessionSource>) -> PairingHarness {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let identity =
+            BridgeIdentity::load_or_create(&dir.path().join("identity.toml")).expect("identity");
+        let bridge_id = identity.device_id;
+        // Shared roster (empty): the bridge enrols the paired device into *this*
+        // handle, so the test can assert the durable trust boundary directly.
+        let roster = Arc::new(RwLock::new(Roster::default()));
+
+        let bridges = vec![BridgeEntry {
+            token: BRIDGE_TOKEN.to_string(),
+            device_id: bridge_id,
+        }];
+        let config0 = Arc::new(RelayConfig {
+            listen: "127.0.0.1:0".to_string(),
+            bridges,
+            buffer_bytes: 1 << 20,
+            handshake_timeout_secs: 10,
+            max_connections: 1024,
+            audit: None,
+        });
+        let relay = Relay::start(config0);
+        let relay_url = format!("ws://{}", relay.addr);
+
+        let shutdown = CancellationToken::new();
+        let bridge_cfg = BridgeConfig {
+            relay_url: relay_url.clone(),
+            registration_token: BRIDGE_TOKEN.to_string(),
+            identity,
+            roster: roster.clone(),
+            roster_path: dir.path().join("bridge_roster.toml"),
+        };
+        let bridge_source: Arc<dyn SessionSource> = Arc::new(ExclusiveSource::new(
+            source,
+            SessionLocks::new(),
+            "loopback-pairing",
+        ));
+        let (commands_tx, commands_rx) = mpsc::channel::<PairingCommand>(8);
+        let (events_tx, events_rx) = mpsc::channel::<BridgeEvent>(32);
+        let shutdown_c = shutdown.clone();
+        let bridge_task = tokio::spawn(async move {
+            let _ = serve_bridge(
+                bridge_cfg,
+                bridge_source,
+                commands_rx,
+                events_tx,
+                shutdown_c,
+            )
+            .await;
+        });
+
+        PairingHarness {
+            relay,
+            roster,
+            commands_tx,
+            events_rx,
+            shutdown,
+            bridge_task,
+            _dir: dir,
+        }
+    }
+
+    /// Opens (or replaces) the pairing window, returning the minted code. The
+    /// reply resolves once the bridge's connection loop processes the command, so
+    /// this doubles as a "bridge is connected" gate.
+    async fn open_window(&self, ttl_secs: u64) -> PairingCode {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands_tx
+            .send(PairingCommand::OpenWindow {
+                ttl_secs,
+                reply: reply_tx,
+            })
+            .await
+            .expect("send OpenWindow");
+        match tokio::time::timeout(EVENT_TIMEOUT, reply_rx).await {
+            Ok(Ok(Ok(code))) => code,
+            Ok(Ok(Err(e))) => panic!("OpenWindow rejected: {e:?}"),
+            Ok(Err(_)) => panic!("OpenWindow reply channel dropped"),
+            Err(_) => panic!("timed out awaiting OpenWindow reply"),
+        }
+    }
+
+    async fn confirm(&self, device_id: DeviceId) {
+        self.commands_tx
+            .send(PairingCommand::Confirm { device_id })
+            .await
+            .expect("send Confirm");
+    }
+
+    async fn reject(&self, device_id: DeviceId) {
+        self.commands_tx
+            .send(PairingCommand::Reject { device_id })
+            .await
+            .expect("send Reject");
+    }
+
+    async fn revoke(&self, device_id: DeviceId) {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands_tx
+            .send(PairingCommand::Revoke {
+                device_id,
+                reply: reply_tx,
+            })
+            .await
+            .expect("send Revoke");
+        match tokio::time::timeout(EVENT_TIMEOUT, reply_rx).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => panic!("Revoke failed: {e:?}"),
+            Ok(Err(_)) => panic!("Revoke reply channel dropped"),
+            Err(_) => panic!("timed out awaiting Revoke reply"),
+        }
+    }
+
+    /// Awaits the next bridge event, failing on close or timeout.
+    async fn next_event(&mut self) -> BridgeEvent {
+        match tokio::time::timeout(EVENT_TIMEOUT, self.events_rx.recv()).await {
+            Ok(Some(ev)) => ev,
+            Ok(None) => panic!("bridge event channel closed"),
+            Err(_) => panic!("timed out waiting for a bridge event"),
+        }
+    }
+
+    /// The next event within `dur`, or `None` on timeout — for bounded *negative*
+    /// assertions ("no arrival while a handshake is already pending").
+    async fn try_next_event(&mut self, dur: Duration) -> Option<BridgeEvent> {
+        tokio::time::timeout(dur, self.events_rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Reads events until a `PairingDeviceArrived`, returning its `(device_id,
+    /// name, fingerprint)`. Tolerates a leading `PairingWindowOpened`.
+    async fn await_arrival(&mut self) -> (DeviceId, String, String) {
+        loop {
+            match self.next_event().await {
+                BridgeEvent::PairingDeviceArrived {
+                    device_id,
+                    name,
+                    fingerprint,
+                } => return (device_id, name, fingerprint),
+                BridgeEvent::PairingWindowOpened { .. } => continue,
+                other => panic!("expected PairingDeviceArrived, got {other:?}"),
+            }
+        }
+    }
+
+    /// Reads events until a terminal `PairingResult`, returning the outcome.
+    async fn await_result(&mut self) -> PairingOutcome {
+        loop {
+            match self.next_event().await {
+                BridgeEvent::PairingResult(outcome) => return outcome,
+                BridgeEvent::PairingWindowOpened { .. }
+                | BridgeEvent::PairingDeviceArrived { .. }
+                | BridgeEvent::RosterChanged => continue,
+                other => panic!("expected PairingResult, got {other:?}"),
+            }
+        }
+    }
+
+    async fn roster_len(&self) -> usize {
+        self.roster.read().await.entries.len()
+    }
+}
+
+impl Drop for PairingHarness {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        self.bridge_task.abort();
+        self.relay.kill();
+    }
+}
+
+/// Drains a [`run_pairing`] progress stream until `WaitingForConfirmation`,
+/// returning the device's own fingerprint (the value the operator compares).
+async fn await_waiting_fingerprint(progress: &mut mpsc::Receiver<PairingProgress>) -> String {
+    loop {
+        match tokio::time::timeout(EVENT_TIMEOUT, progress.recv()).await {
+            Ok(Some(PairingProgress::WaitingForConfirmation { own_fingerprint })) => {
+                return own_fingerprint
+            }
+            Ok(Some(_)) => continue, // Connecting
+            Ok(None) => panic!("progress channel closed before WaitingForConfirmation"),
+            Err(_) => panic!("timed out waiting for WaitingForConfirmation"),
+        }
+    }
+}
+
+/// Runs one full happy-path pairing on a fresh window and returns the resulting
+/// `PairingFile` (the device's durable trust bundle). Asserts the operator-shown
+/// fingerprint equals the device's own. Used by tests that need a paired device
+/// without re-asserting every intermediate step.
+async fn pair_one_device(h: &mut PairingHarness, device_name: &str) -> PairingFile {
+    let code = h.open_window(30).await;
+    let (progress_tx, mut progress_rx) = mpsc::channel(8);
+    let task = tokio::spawn(run_pairing(code, device_name.to_string(), progress_tx));
+
+    let (device_id, name, fingerprint) = h.await_arrival().await;
+    assert_eq!(
+        name, device_name,
+        "arrival carries the device's declared name"
+    );
+    let own = await_waiting_fingerprint(&mut progress_rx).await;
+    assert_eq!(
+        fingerprint, own,
+        "the fingerprint the bridge shows must equal the device's own"
+    );
+    h.confirm(device_id).await;
+
+    match tokio::time::timeout(PAIR_JOIN_TIMEOUT, task).await {
+        Ok(Ok(Ok(file))) => file,
+        Ok(Ok(Err(e))) => panic!("pairing failed: {e:?}"),
+        Ok(Err(join)) => panic!("pairing task panicked: {join:?}"),
+        Err(_) => panic!("timed out awaiting the pairing file"),
+    }
+}
+
+/// Reads inbound frames until one is a *Pairing* frame addressed to `routing_id`,
+/// returning its payload; `None` on close/EOF/error. The `recv_payload` sibling
+/// filters `Data` frames — the ceremony rides `Pairing` frames.
+async fn recv_pairing_payload(stream: &mut WsStream, routing_id: DeviceId) -> Option<Vec<u8>> {
+    loop {
+        match stream.next().await {
+            Some(Ok(Message::Binary(bytes))) => {
+                let envelope = Envelope::decode(&bytes).ok()?;
+                if envelope.frame_type == FrameType::Pairing && envelope.dst == routing_id {
+                    return Some(envelope.payload);
+                }
+            }
+            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return None,
+            Some(Ok(_)) => {}
+        }
+    }
+}
+
+/// A hand-driven device (initiator) half of the pairing ceremony, built from the
+/// same primitives [`run_pairing`] uses (relay hello + `Handshake::initiator` +
+/// `Pairing` prologue + envelope encode). It stops after `Pending` so a test can
+/// choose to receive the `Grant` and then vanish — the abandoned-confirm case the
+/// safe driver never produces. Mirrors bridge.rs's own initiator test harness.
+struct PairingRawClient {
+    stream: WsStream,
+    transport: Transport,
+    routing_id: DeviceId,
+    device_private: Vec<u8>,
+    device_public: Vec<u8>,
+    // Held so the relay connection stays up until the client is dropped.
+    _sink: WsSink,
+}
+
+impl PairingRawClient {
+    /// Dials the window, completes the handshake, sends the sealed `Hello`, and
+    /// reads `Pending` — leaving the client parked at the confirm gate.
+    async fn connect_through_pending(code: &PairingCode, device_name: &str) -> PairingRawClient {
+        let params: snow::params::NoiseParams = NOISE_PATTERN.parse().expect("valid noise pattern");
+        let device_keypair = snow::Builder::new(params)
+            .generate_keypair()
+            .expect("generate device keypair");
+        let device_id = DeviceId(rand::random());
+        let relay_url = code.relay_url.clone().expect("relay url");
+        let rendezvous = code.rendezvous_token.clone().expect("rendezvous token");
+        let bridge_id = code.bridge_id;
+
+        let (ws, _resp) = connect_async(&relay_url).await.expect("pairing dial");
+        let (mut sink, mut stream) = ws.split();
+        let routing_id = DeviceId(rand::random());
+
+        let hello = RelayHello {
+            role: HelloRole::Device,
+            token: rendezvous,
+            device_id,
+            routing_id,
+            bridge_id,
+        };
+        let hello_payload = serde_json::to_vec(&hello).expect("serialize relay hello");
+        send_frame(
+            &mut sink,
+            FrameType::Hello,
+            routing_id,
+            DeviceId::ZERO,
+            hello_payload,
+        )
+        .await;
+
+        let bound = prologue(HandshakeKind::Pairing, &device_id, &routing_id, &bridge_id);
+        let mut hs =
+            Handshake::initiator(&device_keypair.private, &code.bridge_key, &code.psk, &bound)
+                .expect("build initiator");
+        let msg1 = hs.write_message(&[]).expect("write msg1");
+        let mut first = Vec::with_capacity(32 + msg1.len());
+        first.extend_from_slice(&device_id.0);
+        first.extend_from_slice(&msg1);
+        send_frame(&mut sink, FrameType::Pairing, routing_id, bridge_id, first).await;
+
+        let msg2 = recv_pairing_payload(&mut stream, routing_id)
+            .await
+            .expect("bridge msg2");
+        hs.read_message(&msg2).expect("read msg2");
+        let (mut transport, _bridge_static) = hs.into_transport().expect("into transport");
+
+        // Sealed E2E hello.
+        let ciphertext = transport
+            .seal(&PairingClientMsg::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                device_name: device_name.to_string(),
+            })
+            .expect("seal pairing hello");
+        send_frame(
+            &mut sink,
+            FrameType::Pairing,
+            routing_id,
+            bridge_id,
+            ciphertext,
+        )
+        .await;
+
+        // Read Pending — the arrival is now user-visible on the bridge.
+        let pending = recv_pairing_payload(&mut stream, routing_id)
+            .await
+            .expect("pairing pending");
+        match transport
+            .open::<PairingBridgeMsg>(&pending)
+            .expect("open pending")
+        {
+            PairingBridgeMsg::Pending => {}
+            other => panic!("expected Pending, got {other:?}"),
+        }
+
+        PairingRawClient {
+            stream,
+            transport,
+            routing_id,
+            device_private: device_keypair.private.clone(),
+            device_public: device_keypair.public.clone(),
+            _sink: sink,
+        }
+    }
+
+    /// Reads the bridge's decision after the operator confirms — expects `Grant`,
+    /// returning `(device_token, session_psk_b64)`.
+    async fn recv_grant(&mut self) -> (String, String) {
+        let frame = recv_pairing_payload(&mut self.stream, self.routing_id)
+            .await
+            .expect("grant frame");
+        match self
+            .transport
+            .open::<PairingBridgeMsg>(&frame)
+            .expect("open grant")
+        {
+            PairingBridgeMsg::Grant {
+                device_token,
+                psk,
+                bridge_name: _,
+            } => (device_token, psk),
+            other => panic!("expected Grant, got {other:?}"),
+        }
+    }
+}
+
+/// Dials the pairing window and sends a first frame whose Noise `msg1` is garbage
+/// (a valid 32-byte identity preamble followed by random bytes), so the bridge's
+/// responder `read_message` fails immediately — the pre-confirmation "released
+/// slot" path (Task 11 fix round 1). A corrupt msg1 is the honest probe here: in
+/// IKpsk2 the PSK is mixed only in message 2, so a *valid* msg1 under a wrong PSK
+/// would still be read (and answered) by the responder and would instead park the
+/// slot until the window deadline. Returns after a bounded wait confirms no `msg2`
+/// comes back (the handshake failed), then drops the connection — which also gives
+/// the bridge time to release the slot before the legitimate handshake starts.
+async fn send_garbage_pairing_probe(code: &PairingCode) {
+    let device_id = DeviceId(rand::random());
+    let relay_url = code.relay_url.clone().expect("relay url");
+    let rendezvous = code.rendezvous_token.clone().expect("rendezvous token");
+    let bridge_id = code.bridge_id;
+
+    let (ws, _resp) = connect_async(&relay_url).await.expect("probe dial");
+    let (mut sink, mut stream) = ws.split();
+    let routing_id = DeviceId(rand::random());
+
+    let hello = RelayHello {
+        role: HelloRole::Device,
+        token: rendezvous,
+        device_id,
+        routing_id,
+        bridge_id,
+    };
+    send_frame(
+        &mut sink,
+        FrameType::Hello,
+        routing_id,
+        DeviceId::ZERO,
+        serde_json::to_vec(&hello).expect("serialize relay hello"),
+    )
+    .await;
+
+    // 32-byte preamble (so `split_preamble` succeeds) + 64 random bytes standing in
+    // for msg1: the responder builds fine but `read_message` fails the AEAD, drops
+    // the attempt, and (pre-`Pending`) frees the window for the next handshake.
+    let mut first = Vec::with_capacity(32 + 64);
+    first.extend_from_slice(&device_id.0);
+    first.extend((0..64).map(|_| rand::random::<u8>()));
+    send_frame(&mut sink, FrameType::Pairing, routing_id, bridge_id, first).await;
+
+    // The failed responder never replies; wait (bounded) for a msg2 that will never
+    // come, which also lets the bridge process + release the slot before we return.
+    assert!(
+        tokio::time::timeout(RECV_TIMEOUT, recv_pairing_payload(&mut stream, routing_id))
+            .await
+            .is_err(),
+        "a garbage first frame must draw no handshake response"
+    );
+}
+
+/// The capstone: a device pairs through the real confirm-gated ceremony over the
+/// relay, and the resulting `PairingFile` attaches on its FIRST try — the
+/// assert-before-grant guarantee means no first-connect race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pairing_end_to_end_then_attach() {
+    let fake = Arc::new(FakeSessionSource::new());
+    fake.spawn(spec("api", "one")).await.expect("spawn");
+    let mut h = PairingHarness::new(fake).await;
+
+    let code = h.open_window(30).await;
+    // The window-opened event carries the same code the reply did.
+    match h.next_event().await {
+        BridgeEvent::PairingWindowOpened {
+            code: opened,
+            expires_at,
+        } => {
+            assert_eq!(opened.bridge_id, code.bridge_id);
+            assert!(expires_at >= 1, "expiry is a real unix timestamp");
+        }
+        other => panic!("expected PairingWindowOpened, got {other:?}"),
+    }
+
+    let (progress_tx, mut progress_rx) = mpsc::channel(8);
+    let task = tokio::spawn(run_pairing(code, "phone".to_string(), progress_tx));
+
+    // The bridge surfaces the arrival; its fingerprint equals the device's own.
+    let (device_id, name, fingerprint) = h.await_arrival().await;
+    assert_eq!(name, "phone");
+    let own = await_waiting_fingerprint(&mut progress_rx).await;
+    assert_eq!(
+        fingerprint, own,
+        "operator and device compare the same string"
+    );
+
+    // Empty until the confirm-gated grant persists the entry.
+    assert_eq!(h.roster_len().await, 0, "nothing durable before Confirm");
+    h.confirm(device_id).await;
+
+    // Terminal event is Paired, and the roster now pins exactly this device.
+    match h.await_result().await {
+        PairingOutcome::Paired {
+            device_id: id,
+            name,
+        } => {
+            assert_eq!(id, device_id);
+            assert_eq!(name, "phone");
+        }
+        other => panic!("expected Paired, got {other:?}"),
+    }
+    let pairing_file = match tokio::time::timeout(PAIR_JOIN_TIMEOUT, task).await {
+        Ok(Ok(Ok(file))) => file,
+        other => panic!("pairing did not produce a file: {other:?}"),
+    };
+    assert_eq!(h.roster_len().await, 1, "the paired device is enrolled");
+    assert_eq!(pairing_file.device_id, device_id);
+
+    // FIRST list + attach succeed — no readiness poll, proving assert-before-grant
+    // credentialed the device at the relay before it ever received the file.
+    let remote = RemoteSource::new(pairing_file);
+    let listed = remote.list().await.expect("first list succeeds");
+    assert_eq!(listed.len(), 1);
+    let (project, session) = ids("api", "one");
+    let mut channel = remote
+        .attach(&project, &session)
+        .await
+        .expect("first attach");
+    assert_eq!(recv_bytes(&mut channel).await, b"[fake attach api_one]\r\n");
+    channel.send_bytes(b"hi".to_vec()).await.expect("send hi");
+    assert_eq!(recv_bytes(&mut channel).await, b"hi");
+}
+
+/// A wrong-PSK probe on an open window frees the slot (pre-`Pending`), so a
+/// legitimate device pairs on the SAME window right after. Proves the responder's
+/// `ReleasedSlot` exit does not burn the window (Task 11 fix round 1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn garbage_first_frame_then_real_pairing_succeeds() {
+    let fake = Arc::new(FakeSessionSource::new());
+    let mut h = PairingHarness::new(fake).await;
+
+    let code = h.open_window(30).await;
+    match h.next_event().await {
+        BridgeEvent::PairingWindowOpened { .. } => {}
+        other => panic!("expected PairingWindowOpened, got {other:?}"),
+    }
+
+    // A garbage first frame: the responder drops it and keeps the window open.
+    send_garbage_pairing_probe(&code).await;
+
+    // The same window now completes a real pairing.
+    let (progress_tx, mut progress_rx) = mpsc::channel(8);
+    let task = tokio::spawn(run_pairing(code, "phone".to_string(), progress_tx));
+    let (device_id, _name, fingerprint) = h.await_arrival().await;
+    let own = await_waiting_fingerprint(&mut progress_rx).await;
+    assert_eq!(fingerprint, own);
+    h.confirm(device_id).await;
+    match tokio::time::timeout(PAIR_JOIN_TIMEOUT, task).await {
+        Ok(Ok(Ok(_file))) => {}
+        other => panic!("legit pairing after a probe must succeed: {other:?}"),
+    }
+    assert_eq!(h.roster_len().await, 1, "only the legit device is enrolled");
+}
+
+/// Once a handshake reaches `Pending`, a second handshake on the same window is
+/// refused (never surfaces an arrival); the first completes and consumes the
+/// window, after which a fresh attempt on the spent code cannot pair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raced_second_pairing_is_refused() {
+    let fake = Arc::new(FakeSessionSource::new());
+    let mut h = PairingHarness::new(fake).await;
+
+    let code = h.open_window(30).await;
+    match h.next_event().await {
+        BridgeEvent::PairingWindowOpened { .. } => {}
+        other => panic!("expected PairingWindowOpened, got {other:?}"),
+    }
+
+    // First handshake reaches Pending (arrival surfaced) and parks on Confirm.
+    let (p1_tx, mut p1_rx) = mpsc::channel(8);
+    let first = tokio::spawn(run_pairing(code.clone(), "first".to_string(), p1_tx));
+    let (first_id, _n, first_fp) = h.await_arrival().await;
+    let first_own = await_waiting_fingerprint(&mut p1_rx).await;
+    assert_eq!(first_fp, first_own);
+
+    // Second handshake while the first is pending: its frames are dropped by the
+    // single-in-flight window, so it NEVER surfaces an arrival and NEVER reaches
+    // WaitingForConfirmation. Assert both bounded negatives.
+    let (p2_tx, mut p2_rx) = mpsc::channel(8);
+    let second = tokio::spawn(run_pairing(code.clone(), "second".to_string(), p2_tx));
+    assert!(
+        h.try_next_event(RECV_TIMEOUT).await.is_none(),
+        "no second arrival may surface while the first is pending"
+    );
+    // The second's progress only ever reached Connecting (never WaitingForConfirmation).
+    while let Ok(progress) = p2_rx.try_recv() {
+        assert!(
+            !matches!(progress, PairingProgress::WaitingForConfirmation { .. }),
+            "the refused second handshake must not reach confirmation"
+        );
+    }
+    second.abort();
+
+    // The first completes and consumes the window: exactly one device is enrolled,
+    // and the responder's single-completed-handshake rule (Task 11) means the
+    // window is spent — a subsequent code carries no live routing (its relay
+    // window is cancelled on completion). We assert the durable outcome (roster of
+    // exactly one) rather than dialing a spent window, whose refusal only surfaces
+    // via the client's fixed relay-read timeout.
+    h.confirm(first_id).await;
+    match tokio::time::timeout(PAIR_JOIN_TIMEOUT, first).await {
+        Ok(Ok(Ok(_file))) => {}
+        other => panic!("first pairing must complete: {other:?}"),
+    }
+    assert_eq!(h.roster_len().await, 1, "exactly one device enrolled");
+}
+
+/// A rejected device gets nothing durable: `run_pairing` returns `Rejected`, the
+/// roster stays empty, and the terminal event is `Rejected`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reject_grants_nothing_durable() {
+    let fake = Arc::new(FakeSessionSource::new());
+    let mut h = PairingHarness::new(fake).await;
+
+    let code = h.open_window(30).await;
+    match h.next_event().await {
+        BridgeEvent::PairingWindowOpened { .. } => {}
+        other => panic!("expected PairingWindowOpened, got {other:?}"),
+    }
+
+    let (progress_tx, mut progress_rx) = mpsc::channel(8);
+    let task = tokio::spawn(run_pairing(code, "phone".to_string(), progress_tx));
+    let (device_id, _n, _fp) = h.await_arrival().await;
+    let _ = await_waiting_fingerprint(&mut progress_rx).await;
+
+    h.reject(device_id).await;
+
+    // The device driver reports a user rejection...
+    match tokio::time::timeout(PAIR_JOIN_TIMEOUT, task).await {
+        Ok(Ok(Err(PairingError::Rejected(PairingRejectReason::UserRejected)))) => {}
+        other => panic!("expected Rejected(UserRejected), got {other:?}"),
+    }
+    // ...the terminal event is Rejected, and nothing durable was granted.
+    match h.await_result().await {
+        PairingOutcome::Rejected { device_id: id } => assert_eq!(id, device_id),
+        other => panic!("expected Rejected outcome, got {other:?}"),
+    }
+    assert_eq!(h.roster_len().await, 0, "a reject enrols nothing");
+}
+
+/// Revoking a paired device kills its live attach and refuses its next dial: the
+/// bridge cancels the session bridge-side and re-asserts the shrunken set, which
+/// the relay applies by dropping the device credential (ADR-0021 D6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_kicks_live_device() {
+    let fake = Arc::new(FakeSessionSource::new());
+    fake.spawn(spec("api", "one")).await.expect("spawn");
+    let mut h = PairingHarness::new(fake).await;
+
+    let pairing_file = pair_one_device(&mut h, "phone").await;
+    let device_id = pairing_file.device_id;
+    assert_eq!(h.roster_len().await, 1);
+
+    // Attach: a live peer session for the paired device.
+    let remote = RemoteSource::new(pairing_file.clone());
+    let (project, session) = ids("api", "one");
+    let mut channel = remote.attach(&project, &session).await.expect("attach");
+    assert_eq!(recv_bytes(&mut channel).await, b"[fake attach api_one]\r\n");
+
+    // Revoke it: the roster shrinks and the live session is kicked.
+    h.revoke(device_id).await;
+    assert_eq!(h.roster_len().await, 0, "revoke drops the roster entry");
+
+    // The live attach channel dies structurally.
+    assert!(
+        tokio::time::timeout(EVENT_TIMEOUT, channel.recv())
+            .await
+            .expect("revoked channel should report death promptly")
+            .is_none(),
+        "a revoked device's live channel must die"
+    );
+
+    // A subsequent dial is refused by the relay (credential de-asserted).
+    let outcome = tokio::time::timeout(Duration::from_secs(20), remote.attach(&project, &session))
+        .await
+        .expect("post-revoke attach must return, not hang");
+    match outcome {
+        Err(remora_core::SourceError::Transport(_)) => {}
+        other => panic!("a revoked device must not re-attach, got {other:?}"),
+    }
+}
+
+/// A device that vanishes after `Grant` but before `Confirm` leaves no ghost: the
+/// bridge persists no roster entry and re-asserts roster-only, so the abandoned
+/// window expires to `Expired` and the bridge is healthy enough to pair a fresh
+/// device (which then is the ONLY roster entry).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirm_lost_leaves_no_ghost() {
+    let fake = Arc::new(FakeSessionSource::new());
+    let mut h = PairingHarness::new(fake).await;
+
+    // Short TTL so the bridge's post-Grant confirm-wait (bounded by the window
+    // deadline) expires promptly once the hand-driven client vanishes.
+    let code = h.open_window(3).await;
+    match h.next_event().await {
+        BridgeEvent::PairingWindowOpened { .. } => {}
+        other => panic!("expected PairingWindowOpened, got {other:?}"),
+    }
+
+    // Hand-drive the device up to Grant, then drop it without sending Confirm.
+    let mut client = PairingRawClient::connect_through_pending(&code, "ghost").await;
+    let (device_id, _n, _fp) = h.await_arrival().await;
+    h.confirm(device_id).await;
+    let (_device_token, _psk_b64) = client.recv_grant().await;
+    // Sanity: the client really did mint a static keypair (the identity the bridge
+    // pinned during the handshake) — proves this was a real ceremony, not a stub.
+    assert_eq!(client.device_private.len(), 32);
+    assert_eq!(client.device_public.len(), 32);
+    drop(client);
+
+    // The window expires: the bridge reports Expired and (per the responder) has
+    // re-asserted roster-only. No durable entry was persisted.
+    match h.await_result().await {
+        PairingOutcome::Expired => {}
+        other => panic!("expected Expired after an abandoned confirm, got {other:?}"),
+    }
+    assert_eq!(
+        h.roster_len().await,
+        0,
+        "an abandoned confirm enrols nothing"
+    );
+
+    // The bridge is healthy: a fresh device pairs cleanly and is the ONLY entry —
+    // the abandoned attempt left no trace in the durable trust boundary.
+    let fresh = pair_one_device(&mut h, "real-phone").await;
+    assert_eq!(h.roster_len().await, 1, "only the fresh device is enrolled");
+    assert_ne!(
+        fresh.device_id, device_id,
+        "the fresh device is not the vanished ghost"
+    );
 }
 
 /// Not a correctness test: measures loopback round-trip latency (byte → echo)

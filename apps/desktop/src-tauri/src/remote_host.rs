@@ -22,32 +22,36 @@
 //! `RemoteSource::list` would collapse host identity). See the Bridge's
 //! `session_source_for_attach`.
 //!
-//! Bridge identity + roster persist under the app config dir like real bridge
-//! state; the relay's admission tokens are minted fresh per run (spec D11).
+//! Bridge identity persists under the app config dir like real bridge state; the
+//! relay's bridge-registration token is minted fresh per run (spec D11). The
+//! device roster starts **empty** and is populated by the real pairing ceremony
+//! (ADR-0021 D3): [`start_loopback`] opens a pairing window, runs the device-side
+//! [`run_pairing`] driver over the in-process relay, and auto-confirms the (self)
+//! device — see [`drive_loopback_pairing`] for why the auto-confirm is dev-only.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use base64::Engine as _;
 use rand::RngCore as _;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use remora_bridge::{
-    serve_bridge, BridgeConfig, BridgeIdentity, PairingFile, RemoteSource, Roster, RosterEntry,
-    NOISE_PATTERN,
+    run_pairing, serve_bridge, BridgeConfig, BridgeEvent, BridgeIdentity, PairingCommand,
+    PairingFile, PairingProgress, RemoteSource, Roster,
 };
 use remora_core::config::{Config, ConfigError};
 use remora_core::{SessionChannel, SessionSource, SourceError};
-use remora_protocol::{AgentId, DeviceId, ProjectId, SessionId, SessionMeta, SpawnSpec};
+use remora_protocol::{AgentId, ProjectId, SessionId, SessionMeta, SpawnSpec};
 use remora_relay::{serve, AuditSink, BridgeEntry, RelayConfig};
 
 use crate::bridge::resolve::SourceResolver;
 use crate::bridge::Bridge;
 
-const B64: base64::engine::general_purpose::GeneralPurpose =
-    base64::engine::general_purpose::STANDARD;
+/// Lifetime of the dev-loopback pairing window. The self-device auto-confirms
+/// within milliseconds, so this only bounds a wedged ceremony; kept short.
+const LOOPBACK_PAIRING_TTL_SECS: u64 = 30;
 
 /// `true` only when `REMORA_REMOTE_LOOPBACK` is exactly `"1"`. Any other value
 /// (unset, `"0"`, `"true"`, whitespace) leaves the loopback off.
@@ -106,65 +110,25 @@ impl RemoteHost {
 pub async fn start_loopback(
     bridge: &Bridge,
 ) -> Result<RemoteHost, Box<dyn std::error::Error + Send + Sync>> {
-    // Bridge identity + roster live alongside config.toml (`…/remora/`), so the
-    // bridge id is stable across runs like real bridge state.
+    // Bridge identity lives alongside config.toml (`…/remora/`), so the bridge id
+    // is stable across runs like real bridge state; the roster is per-run (below).
     let config_path = bridge.config_path();
     let state_dir: PathBuf = config_path
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let identity = BridgeIdentity::load_or_create(&state_dir.join("bridge_identity.toml"))?;
-    // Load-or-empty; the per-run device is ephemeral (fresh keypair + per-run
-    // tokens below), so we never persist the roster — a saved entry could never
-    // reconnect through a later run's fresh relay anyway.
-    let mut roster = Roster::load(&state_dir.join("bridge_roster.toml")).unwrap_or_default();
+    // Start from an EMPTY roster: the device this run pairs is enrolled by the
+    // real ceremony below, not seeded inline. We never persist it — a saved entry
+    // could not reconnect through a later run's fresh relay + per-run credentials
+    // anyway. (A stale on-disk roster from an older build is deliberately ignored.)
+    let roster = Roster::default();
 
-    // Fresh admission tokens per run (spec D11): the relay authorizes this run's
-    // bridge + device and nothing else.
+    // Fresh bridge-registration token per run (spec D11): the relay authorizes
+    // this run's bridge and nothing else. The per-device relay credential is
+    // minted by the bridge during the confirm-gated pairing below.
     let registration_token = random_token();
-    let device_relay_token = random_token();
-
-    // Loopback-only scaffolding: mints this run's ephemeral device + pairing
-    // file inline. This replaces the slice-1 `provision_device` helper (deleted
-    // in #232) — it is dev-only dogfood wiring, not the real pairing story; the
-    // out-of-band pairing ceremony (QR display, confirm-gated enrollment)
-    // lands in this branch's later work and replaces this block outright.
     let bridge_id = identity.device_id;
-    let device_keypair = {
-        let params: snow::params::NoiseParams =
-            NOISE_PATTERN.parse().map_err(|e: snow::Error| {
-                Box::<dyn std::error::Error + Send + Sync>::from(e.to_string())
-            })?;
-        snow::Builder::new(params)
-            .generate_keypair()
-            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?
-    };
-    let device_id = DeviceId(rand::random());
-    let mut psk = [0u8; 32];
-    rand::rng().fill_bytes(&mut psk);
-
-    roster.entries.push(RosterEntry {
-        device_id,
-        static_pubkey: device_keypair.public.clone(),
-        psk,
-        relay_token: device_relay_token.clone(),
-        name: "desktop loopback".to_string(),
-        enrolled_at: None,
-        last_connected_at: None,
-    });
-
-    // Provisioned against a placeholder relay URL; the real ws:// URL is
-    // stamped in once the relay's ephemeral port is known.
-    let pairing = PairingFile {
-        relay_url: "ws://placeholder".to_string(),
-        device_token: device_relay_token.clone(),
-        bridge_id,
-        bridge_static_pubkey: B64.encode(&identity.static_keypair.public),
-        psk: B64.encode(psk),
-        device_id,
-        device_private_key: B64.encode(&device_keypair.private),
-        device_public_key: B64.encode(&device_keypair.public),
-    };
 
     let relay_cfg = Arc::new(RelayConfig {
         listen: "127.0.0.1:0".to_string(),
@@ -179,10 +143,7 @@ pub async fn start_loopback(
     });
     let audit = AuditSink::new(&relay_cfg)?;
     let (addr, relay_accept) = serve(relay_cfg, audit).await?;
-
     let relay_url = format!("ws://{addr}");
-    let mut pairing = pairing;
-    pairing.relay_url = relay_url.clone();
 
     // The bridge serves through the *same* wrapping resolver the direct path
     // uses (resolver carries the shared SessionLocks), so both actors serialize
@@ -200,13 +161,12 @@ pub async fn start_loopback(
         roster: Arc::new(tokio::sync::RwLock::new(roster)),
         roster_path: state_dir.join("bridge_roster.toml"),
     };
-    // Task 10 threads the pairing command/event channels through `serve_bridge`.
-    // The loopback dogfood path does not drive pairing yet (Task 14 rewrites this
-    // to run the real ceremony), so the desktop end of each channel is unused for
-    // now: an unfed command receiver and an undrained event sender both degrade
-    // gracefully (the bridge disables its command branch and ignores send errors).
-    let (_commands_tx, commands_rx) = tokio::sync::mpsc::channel(8);
-    let (events_tx, _events_rx) = tokio::sync::mpsc::channel(8);
+    // Thread the pairing command/event channels through `serve_bridge` and drive
+    // the real ceremony over them (below). Once pairing completes we drop both
+    // ends: the bridge keeps serving (a closed command channel just disables the
+    // command branch) — no further commands are issued in loopback mode.
+    let (commands_tx, commands_rx) = tokio::sync::mpsc::channel::<PairingCommand>(8);
+    let (events_tx, events_rx) = tokio::sync::mpsc::channel::<BridgeEvent>(8);
     let shutdown_c = shutdown.clone();
     let bridge_task = tokio::spawn(async move {
         if let Err(e) = serve_bridge(bridge_cfg, source, commands_rx, events_tx, shutdown_c).await {
@@ -214,12 +174,82 @@ pub async fn start_loopback(
         }
     });
 
+    // Run the real pairing ceremony against our own bridge (dev-only auto-confirm)
+    // and take the resulting durable `PairingFile` for the client transport.
+    let pairing = drive_loopback_pairing(commands_tx, events_rx).await?;
+
     Ok(RemoteHost {
         remote: Arc::new(RemoteSource::new(pairing)),
         shutdown,
         bridge_task,
         relay_accept,
     })
+}
+
+/// Drives the ADR-0021 pairing ceremony against this run's freshly-served bridge
+/// and returns the resulting durable [`PairingFile`].
+///
+/// **Dev-only auto-confirm.** This is the `REMORA_REMOTE_LOOPBACK` dogfood path:
+/// the desktop pairs *with its own in-process bridge*, so there is no second
+/// operator to eyeball the fingerprint. It opens a pairing window, runs the real
+/// device-side [`run_pairing`] driver over the in-process relay, and — the moment
+/// the bridge surfaces the arriving (self) device — auto-confirms it. The real
+/// pairing UI (a later PR) confirms only on an explicit human decision; this
+/// shortcut exists solely because the loopback's two ends are the same machine.
+async fn drive_loopback_pairing(
+    commands_tx: tokio::sync::mpsc::Sender<PairingCommand>,
+    mut events_rx: tokio::sync::mpsc::Receiver<BridgeEvent>,
+) -> Result<PairingFile, Box<dyn std::error::Error + Send + Sync>> {
+    // Open this run's single pairing window; the bridge mints the code (relay
+    // endpoint, bridge identity, one-shot PSK) and replies with it.
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    commands_tx
+        .send(PairingCommand::OpenWindow {
+            ttl_secs: LOOPBACK_PAIRING_TTL_SECS,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "loopback bridge stopped before opening a pairing window")?;
+    let code = reply_rx
+        .await
+        .map_err(|_| "loopback bridge dropped the pairing-window reply")?
+        .map_err(|e| format!("open pairing window failed: {e:?}"))?;
+
+    // The device-side driver runs the whole IKpsk2 ceremony over the relay. Its
+    // progress is UI-only; drain it so the driver's best-effort sends never wedge.
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<PairingProgress>(8);
+    tokio::spawn(async move { while progress_rx.recv().await.is_some() {} });
+
+    let pairing = run_pairing(code, "loopback device".to_string(), progress_tx);
+    tokio::pin!(pairing);
+
+    loop {
+        tokio::select! {
+            event = events_rx.recv() => match event {
+                // Auto-confirm the (self) device the instant it arrives — dev-only,
+                // see this function's doc comment.
+                Some(BridgeEvent::PairingDeviceArrived { device_id, .. }) => {
+                    commands_tx
+                        .send(PairingCommand::Confirm { device_id })
+                        .await
+                        .map_err(|_| "loopback bridge stopped before confirm")?;
+                }
+                // Window-opened / result / roster-changed need no action here; the
+                // driver's return value is the source of truth for success.
+                Some(_) => {}
+                None => {
+                    return Err(
+                        "loopback bridge closed its event channel before pairing completed".into(),
+                    )
+                }
+            },
+            result = &mut pairing => {
+                return result.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("loopback pairing failed: {e}").into()
+                });
+            }
+        }
+    }
 }
 
 /// 32 random bytes, hex-encoded — a per-run relay admission token.
