@@ -346,9 +346,14 @@ function App() {
       .catch(() => setNotice("Could not stop the session."));
   }
 
-  /** Open the remove confirm dialog for any session. */
+  /** Open the remove confirm dialog for any session. A session whose removal
+   * is already running in the background gets no dialog — confirming it would
+   * only hit the store's busy-guard, and the row's spinner already says the
+   * removal is underway. */
   function onRemove(node: SessionNode) {
     setNotice(null);
+    const key = tabKey(node.projectId, node.sessionId);
+    if (removingKeys.has(key)) return;
     setRemoveTarget({
       projectId: node.projectId,
       sessionId: node.sessionId,
@@ -359,6 +364,7 @@ function App() {
   /** Open the remove confirm dialog from a tab (stopped/disconnected pane). */
   function onRemoveTab(projectId: string, sessionId: string) {
     setNotice(null);
+    if (removingKeys.has(tabKey(projectId, sessionId))) return;
     // Find the workspace from the tree if available.
     const node = tree
       .flatMap((p) => p.sessions)
