@@ -441,17 +441,65 @@ struct PairingTaskHandle {
     ctl_tx: mpsc::Sender<PairingCtl>,
 }
 
-/// Signals a pairing task's completion (its window generation) to the connection
-/// loop when dropped — firing on *every* exit path so the loop drops the spent
-/// window. Mirrors [`DoneGuard`] for the singular pairing task.
+/// How a pairing task ended, from the connection loop's perspective (ADR-0021
+/// D3). The window is only *consumed* by an attempt that became user-visible;
+/// a garbage frame or failed handshake must not burn the rest of the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairingExit {
+    /// The attempt failed before anything user-visible happened — corrupt first
+    /// frame, handshake failure (e.g. a wrong-PSK probe that reached the
+    /// rendezvous window), a non-`Hello` first message, or a version mismatch.
+    /// The in-flight slot is released so a fresh handshake from the legitimate
+    /// device can start while the window is unexpired.
+    ReleasedSlot,
+    /// The ceremony reached `Pending` (the user saw the arrival): whatever the
+    /// outcome — paired, rejected, expired, post-assert failure — the window is
+    /// consumed. D3's "single completed handshake per window".
+    ConsumedWindow,
+}
+
+/// Signals a pairing task's completion (its window generation + how it ended)
+/// to the connection loop when dropped — firing on *every* exit path. Mirrors
+/// [`DoneGuard`] for the singular pairing task.
+///
+/// Defaults to [`PairingExit::ReleasedSlot`]; [`run_pairing`] flips it to
+/// `ConsumedWindow` the moment `Pending` is on the wire, so every earlier
+/// return frees the slot and every later one consumes the window.
 struct PairingDoneGuard {
-    done: mpsc::UnboundedSender<u64>,
+    done: mpsc::UnboundedSender<(u64, PairingExit)>,
     generation: u64,
+    exit: PairingExit,
+}
+
+impl PairingDoneGuard {
+    /// Marks the window consumed: the attempt became user-visible (`Pending`
+    /// sent), so no further handshake may start on this window.
+    fn consume(&mut self) {
+        self.exit = PairingExit::ConsumedWindow;
+    }
 }
 
 impl Drop for PairingDoneGuard {
     fn drop(&mut self) {
-        let _ = self.done.send(self.generation);
+        let _ = self.done.send((self.generation, self.exit));
+    }
+}
+
+/// Applies a pairing task's done-signal to the loop's window state. Generation-
+/// guarded (a stale signal from a replaced window is a no-op): a consumed window
+/// is dropped entirely; a released slot keeps the window (secret + deadline)
+/// alive with `task = None`, so the next Pairing frame from an unknown `src`
+/// starts a fresh handshake (see [`dispatch_pairing_frame`]).
+fn handle_pairing_done(pairing: &mut Option<PairingWindow>, generation: u64, exit: PairingExit) {
+    let Some(window) = pairing.as_mut() else {
+        return;
+    };
+    if window.generation != generation {
+        return;
+    }
+    match exit {
+        PairingExit::ConsumedWindow => *pairing = None,
+        PairingExit::ReleasedSlot => window.task = None,
     }
 }
 
@@ -627,9 +675,10 @@ async fn run_connection(
     // Monotonic generation stamped into each pairing window, so a completed task's
     // late done-signal can never clear a newer window that replaced it.
     let mut pairing_generation: u64 = 0;
-    // The running pairing task echoes its window generation here on exit so the
-    // loop drops the spent window (mirrors [`DoneGuard`] for peers).
-    let (pairing_done_tx, mut pairing_done_rx) = mpsc::unbounded_channel::<u64>();
+    // The running pairing task echoes its window generation + exit mode here so
+    // the loop drops a consumed window or frees the slot of a pre-`Pending`
+    // failure (mirrors [`DoneGuard`] for peers; see [`handle_pairing_done`]).
+    let (pairing_done_tx, mut pairing_done_rx) = mpsc::unbounded_channel::<(u64, PairingExit)>();
     // Once the command channel closes (the desktop dropped its sender) we stop
     // selecting on it so a closed channel does not spin the loop.
     let mut commands_open = true;
@@ -648,12 +697,11 @@ async fn run_connection(
                 }
             }
             done = pairing_done_rx.recv() => {
-                // Drop the window only if the spent task still owns it (a newer
-                // `OpenWindow` bumps the generation and survives a stale signal).
-                if let Some(generation) = done {
-                    if pairing.as_ref().is_some_and(|w| w.generation == generation) {
-                        pairing = None;
-                    }
+                // Generation-guarded (a newer `OpenWindow` survives a stale
+                // signal): consumed → drop the window; a pre-`Pending` failure
+                // → free the slot so a fresh handshake can start.
+                if let Some((generation, exit)) = done {
+                    handle_pairing_done(&mut pairing, generation, exit);
                 }
             }
             cmd = commands.recv(), if commands_open => match cmd {
@@ -796,7 +844,7 @@ fn dispatch_inbound(
     control_seq: &Arc<AtomicU32>,
     events: &mpsc::Sender<BridgeEvent>,
     done_tx: &mpsc::UnboundedSender<(DeviceId, u64)>,
-    pairing_done_tx: &mpsc::UnboundedSender<u64>,
+    pairing_done_tx: &mpsc::UnboundedSender<(u64, PairingExit)>,
     conn_token: &CancellationToken,
 ) {
     let envelope = match Envelope::decode(bytes) {
@@ -873,12 +921,14 @@ fn dispatch_inbound(
 ///
 /// - No open window, or a window past its deadline → the frame is dropped (and
 ///   an expired window is cleared so a later scan sees "no window").
-/// - Window open, no device yet → spawn [`run_pairing`] bound to this `src`,
-///   handing it this frame as the handshake's first message.
+/// - Window open, no device yet — including a slot freed by a pre-`Pending`
+///   failure (see [`handle_pairing_done`]) → spawn [`run_pairing`] bound to this
+///   `src`, handing it this frame as the handshake's first message.
 /// - Task already running for this `src` → forward the frame (the E2E hello,
 ///   then the final confirm).
-/// - A frame from any *other* `src` while a task runs → dropped: exactly one
-///   pairing handshake completes per window (ADR-0021 D3 single-use).
+/// - A frame from any *other* `src` while a task runs → dropped: at most one
+///   handshake is in flight, and exactly one *completed* (user-visible)
+///   handshake consumes the window (ADR-0021 D3 single-use).
 #[allow(clippy::too_many_arguments)]
 fn dispatch_pairing_frame(
     src: DeviceId,
@@ -889,7 +939,7 @@ fn dispatch_pairing_frame(
     control_seq: &Arc<AtomicU32>,
     control_waiters: &ControlWaiters,
     events: &mpsc::Sender<BridgeEvent>,
-    pairing_done_tx: &mpsc::UnboundedSender<u64>,
+    pairing_done_tx: &mpsc::UnboundedSender<(u64, PairingExit)>,
     conn_token: &CancellationToken,
 ) {
     let Some(window) = pairing.as_mut() else {
@@ -979,14 +1029,18 @@ async fn run_pairing(
     control_seq: Arc<AtomicU32>,
     control_waiters: ControlWaiters,
     events: mpsc::Sender<BridgeEvent>,
-    pairing_done_tx: mpsc::UnboundedSender<u64>,
+    pairing_done_tx: mpsc::UnboundedSender<(u64, PairingExit)>,
     conn_token: CancellationToken,
 ) {
-    // Drop the spent window in the connection loop when this task returns for any
-    // reason (handshake fail, reject, expiry, confirm, teardown).
-    let _done = PairingDoneGuard {
+    // Signal the connection loop when this task returns for any reason. Until
+    // `Pending` is on the wire the exit is `ReleasedSlot` — a garbage frame or
+    // failed handshake (e.g. a wrong-PSK probe) must not burn the window for the
+    // legitimate device; after `Pending` (user-visible arrival) every outcome
+    // consumes the window (D3's single completed handshake per window).
+    let mut done = PairingDoneGuard {
         done: pairing_done_tx,
         generation: params.generation,
+        exit: PairingExit::ReleasedSlot,
     };
 
     // --- Responder handshake. The first frame carries the device's minted
@@ -1075,6 +1129,9 @@ async fn run_pairing(
     {
         return;
     }
+    // The arrival is now user-visible: from here on, every exit consumes the
+    // window — no second handshake may follow a completed one (ADR-0021 D3).
+    done.consume();
 
     // --- Await the user's decision (or window expiry). No pending credential is
     // asserted yet, so reject/expiry here just closes with no relay cleanup. ---
@@ -2459,6 +2516,335 @@ mod tests {
         let p2 = next_session_psk().expect("psk");
         assert_eq!(p1.len(), 32);
         assert_ne!(p1, p2, "each session psk is freshly random");
+    }
+
+    /// Mints a fresh X25519 static keypair the same way the identity layer does.
+    fn test_keypair() -> snow::Keypair {
+        snow::Builder::new(
+            crate::noise::NOISE_PATTERN
+                .parse()
+                .expect("noise params parse"),
+        )
+        .generate_keypair()
+        .expect("generate keypair")
+    }
+
+    /// [`PeerDeps`] with a real bridge keypair, for driving [`run_pairing`].
+    fn pairing_deps(bridge: &snow::Keypair) -> Arc<PeerDeps> {
+        Arc::new(PeerDeps {
+            bridge_id: DeviceId([9u8; 32]),
+            bridge_static_priv: bridge.private.clone(),
+            bridge_static_pub: bridge.public.clone(),
+            relay_url: "ws://test".to_string(),
+            roster: Arc::new(RwLock::new(Roster::default())),
+            roster_path: PathBuf::from("unused-roster.toml"),
+            source: Arc::new(remora_core::FakeSessionSource::new()),
+        })
+    }
+
+    /// The channel bundle a spawned [`run_pairing`] is driven through in tests.
+    struct PairingHarness {
+        outbound_rx: mpsc::Receiver<Message>,
+        events_rx: mpsc::Receiver<BridgeEvent>,
+        frame_tx: mpsc::Sender<Vec<u8>>,
+        ctl_tx: mpsc::Sender<PairingCtl>,
+        done_rx: mpsc::UnboundedReceiver<(u64, PairingExit)>,
+    }
+
+    /// Spawns [`run_pairing`] for `first_frame` under generation 7 and a 60 s
+    /// deadline, returning the harness the test drives it through.
+    fn spawn_pairing(
+        deps: &Arc<PeerDeps>,
+        src: DeviceId,
+        first_frame: Vec<u8>,
+        secret: [u8; 32],
+    ) -> PairingHarness {
+        let (outbound_tx, outbound_rx) = mpsc::channel::<Message>(16);
+        let (events_tx, events_rx) = mpsc::channel::<BridgeEvent>(16);
+        let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (ctl_tx, ctl_rx) = mpsc::channel::<PairingCtl>(4);
+        let (done_tx, done_rx) = mpsc::unbounded_channel::<(u64, PairingExit)>();
+        tokio::spawn(run_pairing(
+            PairingParams {
+                src,
+                first_frame,
+                secret,
+                expires_at: now_secs() + 60,
+                generation: 7,
+            },
+            frame_rx,
+            ctl_rx,
+            deps.clone(),
+            outbound_tx,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(Mutex::new(HashMap::new())),
+            events_tx,
+            done_tx,
+            CancellationToken::new(),
+        ));
+        PairingHarness {
+            outbound_rx,
+            events_rx,
+            frame_tx,
+            ctl_tx,
+            done_rx,
+        }
+    }
+
+    /// Receives the next outbound Pairing envelope's payload, asserting routing.
+    async fn recv_pairing_payload(
+        outbound_rx: &mut mpsc::Receiver<Message>,
+        expect_dst: DeviceId,
+    ) -> Vec<u8> {
+        let msg = outbound_rx.recv().await.expect("an outbound frame");
+        let Message::Binary(bytes) = msg else {
+            panic!("expected a binary frame, got {msg:?}");
+        };
+        let env = Envelope::decode(bytes.as_ref()).expect("decode envelope");
+        assert_eq!(env.frame_type, FrameType::Pairing, "pairing frame type");
+        assert_eq!(env.dst, expect_dst, "addressed to the device's src");
+        env.payload
+    }
+
+    /// Drives the device half of the pairing handshake against a spawned
+    /// [`run_pairing`], returning the device's established transport.
+    async fn complete_device_handshake(
+        init: &mut Option<Handshake>,
+        harness: &mut PairingHarness,
+        src: DeviceId,
+    ) -> Transport {
+        let msg2 = recv_pairing_payload(&mut harness.outbound_rx, src).await;
+        let mut hs = init.take().expect("initiator present");
+        hs.read_message(&msg2).expect("read msg2");
+        let (transport, _) = hs.into_transport().expect("device transport");
+        transport
+    }
+
+    #[test]
+    fn handle_pairing_done_consumed_drops_window_released_frees_slot() {
+        let window = |task: Option<PairingTaskHandle>| PairingWindow {
+            secret: [1; 32],
+            expires_at: now_secs() + 60,
+            generation: 5,
+            task,
+        };
+        let task_handle = || {
+            let (frame_tx, _frame_rx) = mpsc::channel::<Vec<u8>>(1);
+            let (ctl_tx, _ctl_rx) = mpsc::channel::<PairingCtl>(1);
+            PairingTaskHandle {
+                src: DeviceId([2; 32]),
+                frame_tx,
+                ctl_tx,
+            }
+        };
+
+        // Consumed: the whole window is dropped.
+        let mut pairing = Some(window(Some(task_handle())));
+        handle_pairing_done(&mut pairing, 5, PairingExit::ConsumedWindow);
+        assert!(pairing.is_none(), "a consumed window is gone");
+
+        // Released: the window survives with the slot freed for a fresh attempt.
+        let mut pairing = Some(window(Some(task_handle())));
+        handle_pairing_done(&mut pairing, 5, PairingExit::ReleasedSlot);
+        let w = pairing.as_ref().expect("window survives a released slot");
+        assert!(w.task.is_none(), "the in-flight slot is freed");
+
+        // Generation guard: a stale signal (older window) is a no-op either way.
+        let mut pairing = Some(window(Some(task_handle())));
+        handle_pairing_done(&mut pairing, 4, PairingExit::ConsumedWindow);
+        assert!(pairing.is_some(), "stale consumed signal must not drop");
+        handle_pairing_done(&mut pairing, 4, PairingExit::ReleasedSlot);
+        assert!(
+            pairing.as_ref().is_some_and(|w| w.task.is_some()),
+            "stale released signal must not free the live slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn garbage_first_frame_releases_slot_and_admits_a_fresh_handshake() {
+        // Reviewer finding (fix round 1): a corrupted/garbage first frame — or a
+        // wrong-PSK probe that reached the rendezvous window — must NOT burn the
+        // window. The failed task signals ReleasedSlot; the loop frees the slot;
+        // the next Pairing frame from a fresh src starts a new handshake.
+        let bridge = test_keypair();
+        let deps = pairing_deps(&bridge);
+        let psk = [0x42u8; 32];
+        let src_a = DeviceId([0xa0; 32]);
+
+        // 32-byte preamble + garbage msg1: the responder handshake read fails.
+        let mut harness = spawn_pairing(&deps, src_a, vec![0u8; 48], psk);
+        assert_eq!(
+            harness.done_rx.recv().await,
+            Some((7, PairingExit::ReleasedSlot)),
+            "a pre-Pending handshake failure must release the slot"
+        );
+
+        // Apply the signal the way the connection loop does: window survives.
+        let mut pairing = Some(PairingWindow {
+            secret: psk,
+            expires_at: now_secs() + 60,
+            generation: 7,
+            task: None,
+        });
+        handle_pairing_done(&mut pairing, 7, PairingExit::ReleasedSlot);
+        assert!(pairing.is_some(), "the window must survive the failure");
+
+        // A fresh device's first frame is admitted: dispatch spawns a new task.
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<Message>(16);
+        let (events_tx, _events_rx) = mpsc::channel::<BridgeEvent>(16);
+        let (done_tx, _done_rx) = mpsc::unbounded_channel::<(u64, PairingExit)>();
+        let src_b = DeviceId([0xb0; 32]);
+        dispatch_pairing_frame(
+            src_b,
+            vec![0u8; 48],
+            &mut pairing,
+            &deps,
+            &outbound_tx,
+            &Arc::new(AtomicU32::new(0)),
+            &Arc::new(Mutex::new(HashMap::new())),
+            &events_tx,
+            &done_tx,
+            &CancellationToken::new(),
+        );
+        let w = pairing.as_ref().expect("window still open");
+        let task = w.task.as_ref().expect("a fresh handshake was admitted");
+        assert_eq!(task.src, src_b, "the new task binds to the fresh src");
+    }
+
+    #[tokio::test]
+    async fn version_mismatch_rejects_and_releases_the_slot() {
+        // A too-old device gets a wire Rejected{VersionMismatch}, but since the
+        // arrival never became user-visible the slot is released — a mixed fleet
+        // scanning the same QR must not dead-end the window.
+        let bridge = test_keypair();
+        let device = test_keypair();
+        let deps = pairing_deps(&bridge);
+        let psk = [0x42u8; 32];
+        let src = DeviceId([0xd0; 32]);
+        let device_id = DeviceId([0xd1; 32]);
+
+        let pro = prologue(HandshakeKind::Pairing, &device_id, &src, &deps.bridge_id);
+        let mut init = Some(
+            Handshake::initiator(&device.private, &bridge.public, &psk, &pro).expect("initiator"),
+        );
+        let msg1 = init
+            .as_mut()
+            .expect("initiator present")
+            .write_message(&[])
+            .expect("msg1");
+        let mut first = device_id.0.to_vec();
+        first.extend_from_slice(&msg1);
+
+        let mut harness = spawn_pairing(&deps, src, first, psk);
+        let mut transport = complete_device_handshake(&mut init, &mut harness, src).await;
+
+        let hello = transport
+            .seal(&PairingClientMsg::Hello {
+                protocol_version: PROTOCOL_VERSION - 1,
+                device_name: "old phone".to_string(),
+            })
+            .expect("seal hello");
+        harness.frame_tx.send(hello).await.expect("send hello");
+
+        let payload = recv_pairing_payload(&mut harness.outbound_rx, src).await;
+        let reply: PairingBridgeMsg = transport.open(&payload).expect("open reply");
+        assert!(
+            matches!(
+                reply,
+                PairingBridgeMsg::Rejected {
+                    reason: PairingRejectReason::VersionMismatch {
+                        bridge_min: PROTOCOL_VERSION
+                    }
+                }
+            ),
+            "got {reply:?}"
+        );
+        assert_eq!(
+            harness.done_rx.recv().await,
+            Some((7, PairingExit::ReleasedSlot)),
+            "a version-mismatch arrival never became user-visible: release"
+        );
+    }
+
+    #[tokio::test]
+    async fn reject_after_pending_consumes_the_window() {
+        // Once Pending is on the wire the arrival is user-visible: whatever the
+        // outcome (here: user Reject), the window is consumed — D3's single
+        // completed handshake per window.
+        let bridge = test_keypair();
+        let device = test_keypair();
+        let deps = pairing_deps(&bridge);
+        let psk = [0x42u8; 32];
+        let src = DeviceId([0xd0; 32]);
+        let device_id = DeviceId([0xd1; 32]);
+
+        let pro = prologue(HandshakeKind::Pairing, &device_id, &src, &deps.bridge_id);
+        let mut init = Some(
+            Handshake::initiator(&device.private, &bridge.public, &psk, &pro).expect("initiator"),
+        );
+        let msg1 = init
+            .as_mut()
+            .expect("initiator present")
+            .write_message(&[])
+            .expect("msg1");
+        let mut first = device_id.0.to_vec();
+        first.extend_from_slice(&msg1);
+
+        let mut harness = spawn_pairing(&deps, src, first, psk);
+        let mut transport = complete_device_handshake(&mut init, &mut harness, src).await;
+
+        let hello = transport
+            .seal(&PairingClientMsg::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                device_name: "phone".to_string(),
+            })
+            .expect("seal hello");
+        harness.frame_tx.send(hello).await.expect("send hello");
+
+        // The arrival surfaces to the desktop, then Pending reaches the device.
+        match harness.events_rx.recv().await {
+            Some(BridgeEvent::PairingDeviceArrived {
+                device_id: id,
+                name,
+                ..
+            }) => {
+                assert_eq!(id, device_id);
+                assert_eq!(name, "phone");
+            }
+            other => panic!("expected PairingDeviceArrived, got {other:?}"),
+        }
+        let payload = recv_pairing_payload(&mut harness.outbound_rx, src).await;
+        let pending: PairingBridgeMsg = transport.open(&payload).expect("open pending");
+        assert_eq!(pending, PairingBridgeMsg::Pending);
+
+        // The user rejects: wire Rejected{UserRejected}, Rejected event, consumed.
+        harness
+            .ctl_tx
+            .send(PairingCtl::Reject)
+            .await
+            .expect("send reject");
+        let payload = recv_pairing_payload(&mut harness.outbound_rx, src).await;
+        let rejected: PairingBridgeMsg = transport.open(&payload).expect("open rejected");
+        assert!(
+            matches!(
+                rejected,
+                PairingBridgeMsg::Rejected {
+                    reason: PairingRejectReason::UserRejected
+                }
+            ),
+            "got {rejected:?}"
+        );
+        match harness.events_rx.recv().await {
+            Some(BridgeEvent::PairingResult(PairingOutcome::Rejected { device_id: id })) => {
+                assert_eq!(id, device_id);
+            }
+            other => panic!("expected PairingResult(Rejected), got {other:?}"),
+        }
+        assert_eq!(
+            harness.done_rx.recv().await,
+            Some((7, PairingExit::ConsumedWindow)),
+            "a post-Pending outcome must consume the window"
+        );
     }
 
     #[test]
