@@ -123,6 +123,10 @@ function App() {
     /** Set when re-opened at the force stage after a background dirty result. */
     forceReason?: DirtyReasonDto;
   } | null>(null);
+  // Render-time mirror of removeTarget for the backgrounded remove's settle
+  // callback, whose closure captured the value from a long-gone render.
+  const removeTargetRef = useRef(removeTarget);
+  removeTargetRef.current = removeTarget;
   const newButtonRef = useRef<HTMLButtonElement>(null);
   // Live focus handles for the mounted terminal panes, keyed by tab key.
   const terminals = useRef(new Map<string, TerminalHandle>());
@@ -405,9 +409,20 @@ function App() {
         void discoveryStore.refreshAfterOpen();
         const followUp = routeRemoveResult(result, force);
         if (followUp.kind === "confirm-force") {
-          // Latest-wins: if another remove dialog opened meanwhile, the force
-          // re-prompt replaces it rather than being dropped silently.
-          setRemoveTarget({ ...target, forceReason: followUp.reason });
+          // If the user has meanwhile opened a remove dialog for a DIFFERENT
+          // session, don't clobber it with this session's force re-prompt —
+          // park the dirty result in the notice bar instead, so neither the
+          // open dialog nor this result is silently lost. Removing the dirty
+          // session again re-prompts. (The ref, not the closure, carries the
+          // current dialog state — this callback's render is long gone.)
+          const open = removeTargetRef.current;
+          if (open && tabKey(open.projectId, open.sessionId) !== key) {
+            setNotice(
+              `${target.projectId}/${target.sessionId} has uncommitted work — choose Remove again to confirm.`,
+            );
+          } else {
+            setRemoveTarget({ ...target, forceReason: followUp.reason });
+          }
         } else if (followUp.kind === "error") {
           setNotice(
             `Could not remove ${target.projectId}/${target.sessionId}: ${followUp.message}`,
@@ -709,6 +724,9 @@ function App() {
       )}
       {removeTarget && (
         <ConfirmRemoveDialog
+          // Remount (fresh focus + state) if the dialog ever retargets to a
+          // different session while open, rather than morphing in place.
+          key={tabKey(removeTarget.projectId, removeTarget.sessionId)}
           projectId={removeTarget.projectId}
           sessionId={removeTarget.sessionId}
           workspace={removeTarget.workspace}
