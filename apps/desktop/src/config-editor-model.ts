@@ -353,9 +353,13 @@ const CLAUDE_NOTIFY_PATH = "~/.remora/hooks/claude-notify.sh";
 // drift-guard test (claude-template.drift.test.ts) enforces this, so this
 // string must never be hand-edited independently of that file.
 const CLAUDE_NOTIFY_SCRIPT = `#!/usr/bin/env bash
-# Remora activity marker (OSC-7366, ADR-0010). Claude Code "Notification" hook:
-# emit awaiting_input + the agent's message as a preview so Remora can show what
-# the agent is waiting for.
+# Remora activity marker (OSC-7366, ADR-0010). Claude Code hook for BOTH
+# "Notification" and "PreToolUse" (matcher: AskUserQuestion): emit
+# awaiting_input + what the agent is asking as a preview so Remora can show
+# what the agent is waiting for. Notification carries the text in \`.message\`;
+# an AskUserQuestion menu fires no immediate Notification (only a delayed,
+# generic permission_prompt nag), so PreToolUse is its prompt-time signal and
+# the question text rides \`.tool_input.questions[0].question\`.
 #
 # Two non-obvious, load-bearing requirements:
 #   1. The marker MUST be tmux-passthrough WRAPPED. Remora runs the agent in its
@@ -370,7 +374,7 @@ const CLAUDE_NOTIFY_SCRIPT = `#!/usr/bin/env bash
 set -euo pipefail
 
 out="\${REMORA_MARKER_OUT:-/dev/tty}"
-msg="$(jq -r '.message // empty' 2>/dev/null || true)"
+msg="$(jq -r '.message // .tool_input.questions[0].question // empty' 2>/dev/null || true)"
 [ -n "$msg" ] || exit 0
 
 enc="$(printf '%s' "$msg" | base64 | tr -d '\\n')"
@@ -381,21 +385,19 @@ state="YXdhaXRpbmdfaW5wdXQ="   # base64("awaiting_input")
 printf '\\033Ptmux;\\033\\033]7366;remora;1;state;%s;%s\\007\\033\\\\' "$state" "$enc" > "$out" 2>/dev/null || exit 0
 `;
 
-// Inline settings: a Notification hook running the script via $HOME (claude
-// runs hook commands through sh -c, which expands $HOME — tilde is not
-// guaranteed to expand there).
+// Inline settings: Notification + PreToolUse(AskUserQuestion) hooks running
+// the same script via $HOME (claude runs hook commands through sh -c, which
+// expands $HOME — tilde is not guaranteed to expand there). PreToolUse is
+// scoped to AskUserQuestion because that menu fires no immediate Notification;
+// every other tool call must stay silent.
+const CLAUDE_NOTIFY_HOOK = {
+  type: "command",
+  command: "$HOME/.remora/hooks/claude-notify.sh",
+};
 const CLAUDE_SETTINGS_JSON = JSON.stringify({
   hooks: {
-    Notification: [
-      {
-        hooks: [
-          {
-            type: "command",
-            command: "$HOME/.remora/hooks/claude-notify.sh",
-          },
-        ],
-      },
-    ],
+    Notification: [{ hooks: [CLAUDE_NOTIFY_HOOK] }],
+    PreToolUse: [{ matcher: "AskUserQuestion", hooks: [CLAUDE_NOTIFY_HOOK] }],
   },
 });
 
