@@ -919,6 +919,13 @@ mod tests {
         async fn remove(&self, _: &ProjectId, _: &SessionId, _: bool) -> Result<(), SourceError> {
             unreachable!()
         }
+        async fn external_attach_command(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+        ) -> Result<Vec<String>, SourceError> {
+            unreachable!()
+        }
         async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
             Ok(vec![
                 SessionMeta {
@@ -1101,6 +1108,13 @@ mod tests {
         async fn remove(&self, p: &ProjectId, s: &SessionId, f: bool) -> Result<(), SourceError> {
             self.inner.remove(p, s, f).await
         }
+        async fn external_attach_command(
+            &self,
+            p: &ProjectId,
+            s: &SessionId,
+        ) -> Result<Vec<String>, SourceError> {
+            self.inner.external_attach_command(p, s).await
+        }
         async fn list(&self) -> Result<Vec<remora_protocol::SessionMeta>, SourceError> {
             self.inner.list().await
         }
@@ -1186,6 +1200,13 @@ mod tests {
             unreachable!()
         }
         async fn remove(&self, _: &ProjectId, _: &SessionId, _: bool) -> Result<(), SourceError> {
+            unreachable!()
+        }
+        async fn external_attach_command(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+        ) -> Result<Vec<String>, SourceError> {
             unreachable!()
         }
         async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {

@@ -206,6 +206,20 @@ impl SessionSource for FakeSessionSource {
         Ok(channel)
     }
 
+    async fn external_attach_command(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<Vec<String>, SourceError> {
+        // Deterministic, obviously-fake argv so bridge tests can assert
+        // pass-through without a real transport.
+        Ok(vec![
+            "fake-attach".into(),
+            project_id.as_str().into(),
+            session_id.as_str().into(),
+        ])
+    }
+
     async fn respawn(
         &self,
         project_id: &ProjectId,

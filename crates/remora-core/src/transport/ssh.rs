@@ -7,10 +7,11 @@ use async_trait::async_trait;
 use remora_protocol::{ProjectId, SessionId, SessionMeta, SpawnSpec};
 
 use super::remote::{
-    capture, open_pty, run_attach, run_list, run_remove, run_respawn, run_spawn, run_stop,
-    RemoteExec, RemoteOutput,
+    attach_tokens_coexist, capture, open_pty, run_attach, run_list, run_remove, run_respawn,
+    run_spawn, run_stop, RemoteExec, RemoteOutput,
 };
 use crate::config::{Config, SshHost};
+use crate::naming::tmux_session_name;
 use crate::spawn_plan::plan_spawn;
 use crate::{SessionChannel, SessionSource, SourceError};
 
@@ -54,6 +55,8 @@ impl RemoteExec for RealSshExec {
 /// trait doc).
 pub struct SshSource {
     config: Arc<Config>,
+    /// Retained for external_attach_command; the exec closure holds its own copy.
+    host: SshHost,
     exec: Arc<dyn RemoteExec>,
 }
 
@@ -62,13 +65,14 @@ impl SshSource {
     pub fn new(host: SshHost, config: Arc<Config>) -> Self {
         Self {
             config,
+            host: host.clone(),
             exec: Arc::new(RealSshExec { host }),
         }
     }
 
     #[cfg(test)]
-    fn with_exec(_host: SshHost, config: Arc<Config>, exec: Arc<dyn RemoteExec>) -> Self {
-        Self { config, exec }
+    fn with_exec(host: SshHost, config: Arc<Config>, exec: Arc<dyn RemoteExec>) -> Self {
+        Self { config, host, exec }
     }
 }
 
@@ -149,6 +153,19 @@ impl SessionSource for SshSource {
         tokio::task::spawn_blocking(move || run_attach(exec.as_ref(), &project_id, &session_id))
             .await
             .map_err(|e| SourceError::Transport(format!("attach task: {e}")))?
+    }
+
+    async fn external_attach_command(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<Vec<String>, SourceError> {
+        let tmux_name = tmux_session_name(project_id, session_id);
+        Ok(ssh_compose(
+            &self.host,
+            true,
+            &attach_tokens_coexist(&tmux_name),
+        ))
     }
 
     /// Discovers sessions on the host and joins them to local config.
@@ -309,6 +326,39 @@ mod tests {
     // -----------------------------------------------------------------------
     // ssh_compose tests: pin the exact ssh argv shape
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn external_attach_command_composes_full_ssh_argv_without_eviction() {
+        let host = SshHost {
+            host: "hermes".into(),
+            user: Some("nathan".into()),
+            port: Some(2222),
+        };
+        let source = SshSource::new(host, Arc::new(Config::default()));
+        let argv = source
+            .external_attach_command(
+                &ProjectId::new("api").expect("slug"),
+                &SessionId::new("fix-login").expect("slug"),
+            )
+            .await
+            .expect("compose");
+        // Full ssh prefix (interactive: -tt, keepalive, multiplexing), locale
+        // prefix, then the coexist attach — byte-for-byte, mirroring the
+        // ssh_compose fixture style.
+        assert_eq!(argv[0], "ssh");
+        assert!(argv.contains(&"-tt".to_string()));
+        assert!(argv.windows(2).any(|w| w == ["-p", "2222"]));
+        assert!(argv.windows(2).any(|w| w == ["-l", "nathan"]));
+        let tail: Vec<_> = argv.iter().rev().take(4).rev().cloned().collect();
+        assert_eq!(
+            tail,
+            ["tmux", "attach-session", "-t", "remora_api_fix-login"]
+        );
+        assert!(
+            !argv.contains(&"-d".to_string()),
+            "external attach must not evict"
+        );
+    }
 
     #[test]
     fn ssh_compose_attach_minimal_host_has_keepalive_no_dashdash() {

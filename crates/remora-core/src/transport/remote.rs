@@ -183,9 +183,6 @@ pub(crate) fn attach_tokens(tmux_name: &str) -> Vec<String> {
 /// client instead of evicting it (spec decision 1). Used only by
 /// `SessionSource::external_attach_command`. Note the asymmetry is one-way:
 /// the app's own (re)attach still evicts this client (spec decision 2).
-// Temporary until `SessionSource::external_attach_command` (next task) consumes
-// this; that change removes the attribute.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn attach_tokens_coexist(tmux_name: &str) -> Vec<String> {
     attach_tokens_impl(tmux_name, false)
 }

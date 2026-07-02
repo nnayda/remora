@@ -38,6 +38,21 @@ pub trait SessionSource: Send + Sync {
         session_id: &SessionId,
     ) -> Result<SessionChannel, SourceError>;
 
+    /// The full local argv (`ssh …` / `kubectl exec …` + `tmux attach-session
+    /// -t <name>`, no `-d`) that an EXTERNAL terminal can run to attach to
+    /// this session alongside the app's own client. Pure composition — no
+    /// liveness preflight (the UI gates on live state; a dead session shows
+    /// tmux's own error in the external terminal). The first token is the
+    /// transport binary by bare name; the desktop shell resolves it to an
+    /// absolute path before spawning (GUI-launched apps inherit a bare PATH).
+    /// kubectl hosts resolve `{ command }` fields locally first (ADR-0008),
+    /// so this can fail with the same resolution errors as `attach`.
+    async fn external_attach_command(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<Vec<String>, SourceError>;
+
     /// Discovers sessions and their liveness without attaching.
     ///
     /// Never inferred from PTY bytes — listing is a separate control plane
