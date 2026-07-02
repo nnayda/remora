@@ -122,7 +122,13 @@ export function ConfirmRemoveDialog({
       footer={footer}
     >
       {isForce ? (
-        <p>This session has {dirtyCopy}. Remove anyway?</p>
+        <p>
+          Session{" "}
+          <strong style={{ fontFamily: "var(--font-mono)" }}>
+            {projectId}/{sessionId}
+          </strong>{" "}
+          has {dirtyCopy}. Remove anyway?
+        </p>
       ) : isShared ? (
         <p>
           Close session{" "}

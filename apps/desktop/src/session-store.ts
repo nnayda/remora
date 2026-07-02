@@ -751,14 +751,18 @@ export function removeErrorMessage(result: RemoveResult): string {
 
 /** What App should do after a *backgrounded* remove settles. Removal no longer
  * blocks a modal (the confirm dialog closes as soon as it fires), so the
- * result routing — nothing / re-prompt for force / surface an error — happens
- * async in App. Pure so it is testable without rendering App. A dirty result
- * re-prompts only when the attempt was NOT forced: force skips the dirty probe
- * server-side, so honoring `force` here guarantees the prompt cannot loop. */
+ * result routing — nothing / re-prompt for force / surface an error / stay
+ * quiet — happens async in App. Pure so it is testable without rendering App.
+ * A dirty result re-prompts only when the attempt was NOT forced: force skips
+ * the dirty probe server-side, so honoring `force` here guarantees the prompt
+ * cannot loop. A bare `{ok:false}` (no dirty, no error) is the in-flight
+ * busy-guard or a disposed store, never a real failure, so it routes to
+ * `ignored` rather than a false error notice. */
 export type RemoveFollowUp =
   | { kind: "done" }
   | { kind: "confirm-force"; reason: DirtyReasonDto }
-  | { kind: "error"; message: string };
+  | { kind: "error"; message: string }
+  | { kind: "ignored" };
 
 export function routeRemoveResult(
   result: RemoveResult,
@@ -768,5 +772,11 @@ export function routeRemoveResult(
   if (!force && result.dirty) {
     return { kind: "confirm-force", reason: result.dirty };
   }
-  return { kind: "error", message: removeErrorMessage(result) };
+  if ("error" in result && result.error !== undefined) {
+    return { kind: "error", message: removeErrorMessage(result) };
+  }
+  // Bare {ok:false}: the in-flight busy-guard (e.g. a retry while the
+  // removal is already running) or a disposed store — not a real failure,
+  // so stay quiet (matches onStop's convention).
+  return { kind: "ignored" };
 }

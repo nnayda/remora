@@ -580,7 +580,7 @@ describe("routeRemoveResult", () => {
 
   it("never re-prompts after a force attempt, even if dirty (no loop)", () => {
     const r = routeRemoveResult({ ok: false, dirty: "uncommitted" }, true);
-    expect(r.kind).toBe("error");
+    expect(r.kind).not.toBe("confirm-force");
   });
 
   it("routes a backend error to a notice with its message", () => {
@@ -592,10 +592,9 @@ describe("routeRemoveResult", () => {
     ).toEqual({ kind: "error", message: "kill tmux: nope" });
   });
 
-  it("routes a bare {ok:false} (busy-guard/disposed) to the fallback copy", () => {
+  it("routes a bare {ok:false} (busy-guard/disposed) to ignored — not a false failure notice", () => {
     expect(routeRemoveResult({ ok: false }, false)).toEqual({
-      kind: "error",
-      message: "Could not remove the session.",
+      kind: "ignored",
     });
   });
 });

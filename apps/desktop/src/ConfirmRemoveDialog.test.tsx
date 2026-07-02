@@ -123,8 +123,12 @@ describe("ConfirmRemoveDialog — force stage from forceReason", () => {
     renderDialog("worktree", { forceReason: "uncommitted" });
 
     expect(screen.queryByText("Remove anyway?")).not.toBeNull();
+    // The force stage pops up asynchronously and may replace a dialog opened
+    // for a different session, so the body must name the session — not just
+    // describe the dirty reason — to avoid force-deleting the wrong one.
+    expect(screen.queryByText("my-project/my-session")).not.toBeNull();
     expect(
-      screen.queryByText(/This session has uncommitted changes\./),
+      screen.queryByText(/has uncommitted changes\. Remove anyway\?/),
     ).not.toBeNull();
     expect(screen.queryAllByText("Remove anyway").length).toBeGreaterThan(0);
   });
