@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ActivityState } from "./activity-store";
 import { previewWhenAwaiting, rowTitle } from "./agent-claimed";
 import wordmark from "./assets/remora-wordmark.svg";
-import { canOpenExternal } from "./external-terminal";
+import { canOpenExternal, canOpenInVscode } from "./external-terminal";
 import { filterTree } from "./filter-tree";
 import type { HostTransport, ProjectNode, SessionNode } from "./session-tree";
 import { SIDEBAR_COLLAPSE_LABEL } from "./sidebar-labels";
@@ -53,6 +53,8 @@ interface SidebarProps {
   onOpenExternal: (node: SessionNode) => void;
   /** Copy the exact attach command for a live session to the clipboard. */
   onCopyAttach: (node: SessionNode) => void;
+  /** Open this session's remote workspace in local VS Code (Remote-SSH). */
+  onOpenVscode: (node: SessionNode) => void;
   /** Stop a live worktree session (kills tmux, keeps the worktree). */
   onStop: (node: SessionNode) => void;
   /** Open the remove confirm dialog for any session. */
@@ -105,6 +107,7 @@ export function Sidebar({
   externalLabel,
   onOpenExternal,
   onCopyAttach,
+  onOpenVscode,
   onStop,
   onRemove,
   onNewSession,
@@ -222,6 +225,7 @@ export function Sidebar({
               externalLabel={externalLabel}
               onOpenExternal={onOpenExternal}
               onCopyAttach={onCopyAttach}
+              onOpenVscode={onOpenVscode}
               onStop={onStop}
               onRemove={onRemove}
               onNewSession={onNewSession}
@@ -266,6 +270,7 @@ function ProjectGroup({
   externalLabel,
   onOpenExternal,
   onCopyAttach,
+  onOpenVscode,
   onStop,
   onRemove,
   onNewSession,
@@ -284,6 +289,7 @@ function ProjectGroup({
   externalLabel: string;
   onOpenExternal: (node: SessionNode) => void;
   onCopyAttach: (node: SessionNode) => void;
+  onOpenVscode: (node: SessionNode) => void;
   onStop: (node: SessionNode) => void;
   onRemove: (node: SessionNode) => void;
   onNewSession: (projectId: string) => void;
@@ -371,9 +377,11 @@ function ProjectGroup({
                 actions={
                   <SessionMenu
                     session={session}
+                    transport={project.transport}
                     externalLabel={externalLabel}
                     onOpenExternal={onOpenExternal}
                     onCopyAttach={onCopyAttach}
+                    onOpenVscode={onOpenVscode}
                     onStop={onStop}
                     onRemove={onRemove}
                   />
@@ -393,17 +401,22 @@ function ProjectGroup({
  * opening the menu never also opens the session. */
 function SessionMenu({
   session,
+  transport,
   externalLabel,
   onOpenExternal,
   onCopyAttach,
+  onOpenVscode,
   onStop,
   onRemove,
 }: {
   session: SessionNode;
+  /** The session's host transport — gates the VS Code action to ssh only. */
+  transport: HostTransport;
   /** Label from externalTerminalLabel (Task 9), computed once in App. */
   externalLabel: string;
   onOpenExternal: (node: SessionNode) => void;
   onCopyAttach: (node: SessionNode) => void;
+  onOpenVscode: (node: SessionNode) => void;
   onStop: (node: SessionNode) => void;
   onRemove: (node: SessionNode) => void;
 }) {
@@ -469,6 +482,16 @@ function SessionMenu({
                 Copy attach command
               </button>
             </>
+          )}
+          {canOpenInVscode(transport, session.state) && (
+            <button
+              type="button"
+              className="rk-smenu__item"
+              role="menuitem"
+              onClick={pick(onOpenVscode)}
+            >
+              Open in VS Code
+            </button>
           )}
           {canStop && (
             <button
