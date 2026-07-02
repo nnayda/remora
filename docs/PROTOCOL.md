@@ -32,7 +32,7 @@ you reach the session:
    payload it never reads. Present only in **relay mode** (phone/desktop ⇄
    relay ⇄ bridge). Module: [`envelope`](../crates/remora-protocol/src/envelope.rs).
 
-```
+```text
 Direct mode:   client ── SessionSource (in process) ── remora-core ── ssh/kubectl ── sandbox
 Relay mode:    client ── WS/TLS ── relay (blind) ── WS/TLS ── bridge ── ssh/kubectl ── sandbox
                        └────────── one Noise session, end to end ──────────┘
