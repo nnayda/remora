@@ -60,6 +60,13 @@ pub enum BridgeError {
     ConfigEdit {
         message: String,
     },
+    /// External-terminal launch could not resolve a terminal: nothing
+    /// configured (zero or several detected), or the config names an unknown
+    /// or uninstalled registry id. The frontend deep-links Settings on this
+    /// kind (spec §4); launch/exec failures are `Transport` instead.
+    TerminalNotConfigured {
+        message: String,
+    },
     /// A session removal was blocked because the workspace has unsaved state
     /// (uncommitted changes or commits not pushed to any remote). Carry the
     /// reason so the frontend can show a targeted warning and offer `force`.
@@ -243,6 +250,15 @@ mod tests {
         assert!(json.contains(r#""projectId":"api""#));
         assert!(json.contains(r#""state":"stopped""#));
         assert!(json.contains(r#""workspace":"worktree""#));
+    }
+
+    #[test]
+    fn terminal_not_configured_serializes_with_its_kind_tag() {
+        let e = BridgeError::TerminalNotConfigured {
+            message: "no external terminal configured".into(),
+        };
+        let json = serde_json::to_string(&e).expect("serialize");
+        assert!(json.contains(r#""kind":"terminalNotConfigured""#), "{json}");
     }
 
     #[test]

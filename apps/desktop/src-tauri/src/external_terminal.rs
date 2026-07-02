@@ -8,13 +8,6 @@
 //! the same launchd-PATH class for the transport binary is D8, and the
 //! embedded kubectl transport's own copy of this bug is #229).
 
-// Temporary: consumed by the external-terminal commands (next task), which removes this.
-// (Unconditional, not `cfg_attr(not(test), ...)`: `cfg(test)` applies crate-wide during
-// `cargo test`/`clippy --all-targets`, which would re-enable dead-code lints on pub items
-// the inline tests don't happen to touch — e.g. `RealProbe`, `spawn_detached` — and fail
-// the required `-D warnings` gate on this exact commit.)
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 

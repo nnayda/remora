@@ -165,6 +165,38 @@ async configRemoveAgent(id: string) : Promise<Result<null, BridgeError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+async externalTerminals() : Promise<Result<DetectedTerminalDto[], BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("external_terminals") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async openExternalTerminal(projectId: string, sessionId: string, terminalId: string | null) : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("open_external_terminal", { projectId, sessionId, terminalId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async copyAttachCommand(projectId: string, sessionId: string) : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("copy_attach_command", { projectId, sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async configSetTerminal(terminalId: string | null) : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("config_set_terminal", { terminalId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -215,6 +247,13 @@ export type BridgeError = { kind: "sessionExists"; message: string } | { kind: "
  */
 { kind: "configEdit"; message: string } | 
 /**
+ * External-terminal launch could not resolve a terminal: nothing
+ * configured (zero or several detected), or the config names an unknown
+ * or uninstalled registry id. The frontend deep-links Settings on this
+ * kind (spec §4); launch/exec failures are `Transport` instead.
+ */
+{ kind: "terminalNotConfigured"; message: string } | 
+/**
  * A session removal was blocked because the workspace has unsaved state
  * (uncommitted changes or commits not pushed to any remote). Carry the
  * reason so the frontend can show a targeted warning and offer `force`.
@@ -246,6 +285,10 @@ export type ConfigChanged = null
  * empty config a fresh device (no file yet) renders.
  */
 export type ConfigDto = { hosts: HostDto[]; projects: ProjectDto[]; agents: AgentDto[]; terminal: TerminalPreferenceDto | null }
+/**
+ * A detected terminal, id + display name only.
+ */
+export type DetectedTerminalDto = { id: string; name: string }
 export type DirtyReasonDto = "uncommitted" | "notOnRemote" | "both"
 /**
  * The editable config plus its validation state (ADR-0006 degraded mode).

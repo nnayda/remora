@@ -149,6 +149,27 @@ impl Bridge {
         Ok(self.open_channel(channel, sink))
     }
 
+    /// The external-attach argv for a session, composed by core (spec
+    /// decision 5: the shell launches it, never assembles it).
+    pub async fn external_attach_argv(
+        &self,
+        project_id: String,
+        session_id: String,
+    ) -> Result<Vec<String>, BridgeError> {
+        let (p, s) = parse_ids(project_id, session_id)?;
+        let source = self.resolve_for(&p)?;
+        Ok(source.external_attach_command(&p, &s).await?)
+    }
+
+    /// The validated config's `terminal` preference (fresh read — the Bridge
+    /// caches no config by design). A missing file is `None`, matching the
+    /// empty-config convention.
+    pub fn terminal_preference(
+        &self,
+    ) -> Result<Option<remora_core::config::TerminalPreference>, BridgeError> {
+        Ok(self.load_config()?.terminal)
+    }
+
     pub async fn stop(&self, project_id: String, session_id: String) -> Result<(), BridgeError> {
         let (p, s) = parse_ids(project_id, session_id)?;
         self.resolve_for(&p)?.stop(&p, &s).await?;
@@ -415,6 +436,15 @@ impl Bridge {
         self.mutate(|doc| doc.remove_agent(&id)).await
     }
 
+    /// SET or CLEAR the external-terminal registry id (Settings dropdown).
+    pub async fn config_set_terminal(
+        &self,
+        terminal_id: Option<String>,
+    ) -> Result<(), BridgeError> {
+        self.mutate(|doc| doc.set_terminal(terminal_id.as_deref()))
+            .await
+    }
+
     /// The editor critical section: serialize on the mutex, then load → mutate →
     /// save. Reading fresh inside the lock means each mutation sees the prior
     /// one's result (no stale cache). A rejected mutation or a save failure
@@ -650,6 +680,19 @@ mod tests {
             tag,
             std::process::id()
         ))
+    }
+
+    #[tokio::test]
+    async fn external_attach_argv_passes_through_the_source() {
+        let source = Arc::new(FakeSessionSource::default());
+        let bridge = bridge_with_config(source, temp_config_path("ext-attach"));
+        // Ids must parse and resolve like attach — reuse whatever
+        // project/session the module's attach tests use for a resolvable id.
+        let argv = bridge
+            .external_attach_argv("api".into(), "s".into())
+            .await
+            .expect("argv");
+        assert_eq!(argv, ["fake-attach", "api", "s"]);
     }
 
     #[tokio::test]
