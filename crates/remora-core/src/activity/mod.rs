@@ -75,10 +75,7 @@ impl Detector {
         // Exits are a state marker, `on_user_input`, or attach teardown.
         // (Emitted only on transition, so a byte firehose doesn't churn.)
         if hits.is_empty() {
-            if !matches!(
-                self.state,
-                SessionStatus::Working | SessionStatus::Awaiting
-            ) {
+            if !matches!(self.state, SessionStatus::Working | SessionStatus::Awaiting) {
                 self.state = SessionStatus::Working;
                 out.push(DetectorEvent::Status(SessionStatus::Working));
             }
