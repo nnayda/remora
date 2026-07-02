@@ -39,8 +39,19 @@ fn base_config(audit: Option<AuditConfig>) -> Arc<RelayConfig> {
             bridge_id: did(BRIDGE),
         }],
         buffer_bytes: 1_048_576,
+        handshake_timeout_secs: 10,
+        max_connections: 1024,
         audit,
     })
+}
+
+/// `base_config` with the two pre-auth resource bounds overridden, for the
+/// hardening tests (#231).
+fn config_with_bounds(handshake_timeout_secs: u64, max_connections: usize) -> Arc<RelayConfig> {
+    let mut config = (*base_config(None)).clone();
+    config.handshake_timeout_secs = handshake_timeout_secs;
+    config.max_connections = max_connections;
+    Arc::new(config)
 }
 
 fn bridge_hello() -> RelayHello {
@@ -301,4 +312,61 @@ async fn audit_file_written_0600_with_close_records() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o600, "audit file is owner rw only");
+}
+
+/// Slowloris defense (#231): a client that completes the WebSocket upgrade but
+/// never sends a hello is dropped once the handshake deadline elapses, rather
+/// than pinning a task/FD/read-buffer forever.
+#[tokio::test]
+async fn slow_client_that_never_sends_hello_is_dropped() {
+    // 1s handshake window; assert the server-side drop within 2×.
+    let url = start(config_with_bounds(1, 1024)).await;
+    let mut ws = connect(&url).await;
+
+    // Never send a hello. The read must *resolve* (close/EOF/err) within the
+    // deadline window — proving the server dropped us — not hang indefinitely.
+    let outcome = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    let msg =
+        outcome.expect("server dropped the hello-less connection within the handshake window");
+    match msg {
+        None | Some(Ok(Message::Close(_))) | Some(Err(_)) => {}
+        Some(Ok(other)) => panic!("expected close/EOF after handshake timeout, got {other:?}"),
+    }
+}
+
+/// Global connection cap (#231): with `max_connections = N`, the N+1th
+/// connection is refused promptly. Ordering is deterministic — the accept loop
+/// takes a permit before it spawns (and thus before the client's upgrade
+/// completes), so once N clients have connected, N permits are held.
+#[tokio::test]
+async fn connections_beyond_max_are_rejected() {
+    let url = start(config_with_bounds(10, 2)).await;
+
+    // Two long-lived connections that complete hello and hold both permits.
+    let mut bridge = connect(&url).await;
+    send_bin(&mut bridge, hello_frame(&bridge_hello())).await;
+    let mut device = connect(&url).await;
+    send_bin(&mut device, hello_frame(&device_hello())).await;
+
+    // The 3rd is over the cap: the freshly accepted socket is dropped before
+    // the upgrade, so the client's handshake fails (or, if the TCP+upgrade
+    // sneaks through, the next read is an immediate close/EOF).
+    let third = tokio::time::timeout(Duration::from_secs(3), connect_async(&url))
+        .await
+        .expect("3rd connect resolves");
+    match third {
+        Err(_) => {} // upgrade refused at the cap — the common path.
+        Ok((mut ws, _resp)) => {
+            let r = tokio::time::timeout(Duration::from_secs(2), ws.next())
+                .await
+                .expect("over-cap read resolves");
+            assert!(
+                matches!(r, None | Some(Err(_)) | Some(Ok(Message::Close(_)))),
+                "3rd connection past the cap was not dropped: {r:?}",
+            );
+        }
+    }
+
+    drop(bridge);
+    drop(device);
 }

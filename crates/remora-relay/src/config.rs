@@ -27,6 +27,22 @@ pub struct RelayConfig {
     /// connection-granular, not frame-granular).
     #[serde(default = "default_buffer_bytes")]
     pub buffer_bytes: usize,
+    /// Deadline, in seconds, for the pre-authentication handshake — the
+    /// WebSocket upgrade plus the first (hello) frame. A connection that has
+    /// not authenticated within this window is dropped, defeating slowloris
+    /// clients that open a socket and never send a hello (holding a task, an
+    /// FD, and a read buffer indefinitely). Applies only before a successful
+    /// `Router::hello`; authenticated connections are never subject to it.
+    #[serde(default = "default_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
+    /// Global cap on concurrent connections. The accept loop holds a semaphore
+    /// with this many permits; a newly accepted socket that cannot take a
+    /// permit is dropped immediately (before the WebSocket upgrade), bounding
+    /// the relay's total FDs and tasks. This is a **global** cap only —
+    /// per-IP/per-sender fairness is deferred to the rate-limiting follow-up
+    /// and is deliberately out of scope here.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
     /// Opt-in audit log config. `None` = audit mode disabled (the default).
     #[serde(default)]
     pub audit: Option<AuditConfig>,
@@ -34,6 +50,14 @@ pub struct RelayConfig {
 
 fn default_buffer_bytes() -> usize {
     1_048_576
+}
+
+fn default_handshake_timeout_secs() -> u64 {
+    10
+}
+
+fn default_max_connections() -> usize {
+    1024
 }
 
 /// One registered bridge: the token it presents in its `RelayHello` and the
@@ -140,6 +164,8 @@ mod tests {
         assert_eq!(config.devices[0].device_id, device_device_id);
         assert_eq!(config.devices[0].bridge_id, bridge_device_id);
         assert_eq!(config.buffer_bytes, 1_048_576);
+        assert_eq!(config.handshake_timeout_secs, 10);
+        assert_eq!(config.max_connections, 1024);
         assert_eq!(
             config.audit,
             Some(AuditConfig {
@@ -160,6 +186,8 @@ mod tests {
         );
         assert!(config.devices.is_empty());
         assert_eq!(config.buffer_bytes, 1_048_576);
+        assert_eq!(config.handshake_timeout_secs, 10);
+        assert_eq!(config.max_connections, 1024);
         assert_eq!(config.audit, None);
     }
 

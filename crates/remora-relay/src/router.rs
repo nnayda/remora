@@ -472,6 +472,8 @@ mod tests {
                 },
             ],
             buffer_bytes: 1_048_576,
+            handshake_timeout_secs: 10,
+            max_connections: 1024,
             audit: None,
         })
     }

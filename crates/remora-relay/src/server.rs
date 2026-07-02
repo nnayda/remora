@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
@@ -40,7 +40,7 @@ use remora_protocol::{
     DeviceId, Envelope, FrameType, HelloRole, RelayHello, ENVELOPE_HEADER_LEN, MAX_ENVELOPE_PAYLOAD,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
@@ -103,6 +103,11 @@ pub async fn serve(
 
     let router = Router::new(config.clone());
     let registrar = Arc::new(Mutex::new(Registrar::default()));
+    // Global concurrent-connection cap (pre-auth resource bound, #231). Per-IP
+    // fairness is deliberately out of scope here — that belongs to the deferred
+    // per-sender rate-limiting follow-up; this is a global cap only.
+    let conn_limit = Arc::new(Semaphore::new(config.max_connections));
+    let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
 
     let handle = tokio::spawn(async move {
         loop {
@@ -111,12 +116,34 @@ pub async fn serve(
                 // A transient accept error must not kill the whole relay.
                 Err(_) => continue,
             };
+            // Gate on a global permit before spawning. At the cap we drop the
+            // freshly accepted socket immediately (before the WebSocket
+            // upgrade), so an over-limit connection costs no task and no FD
+            // beyond the moment it takes to close.
+            let permit = match conn_limit.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    drop(stream);
+                    continue;
+                }
+            };
             let router = router.clone();
             let registrar = registrar.clone();
             let audit = audit.clone();
             let buffer_bytes = config.buffer_bytes;
             tokio::spawn(async move {
-                handle_connection(stream, router, registrar, audit, buffer_bytes).await;
+                // `permit` is held for the whole connection lifetime and freed
+                // when this task ends, releasing its slot back to the cap.
+                let _permit = permit;
+                handle_connection(
+                    stream,
+                    router,
+                    registrar,
+                    audit,
+                    buffer_bytes,
+                    handshake_timeout,
+                )
+                .await;
             });
         }
     });
@@ -133,18 +160,29 @@ fn ws_config() -> WebSocketConfig {
 
 /// Accepts the WebSocket handshake and runs the connection. A failed handshake
 /// never became a relay connection, so it emits no audit record.
+///
+/// The whole pre-authentication handshake — the WebSocket upgrade here plus the
+/// first (hello) frame read in [`run_connection`] — shares one `handshake_timeout`
+/// deadline. A client that stalls the upgrade or opens the socket and never
+/// sends a hello is dropped once the deadline elapses (slowloris defense, #231),
+/// with no audit record, matching the handshake-failure-emits-no-record
+/// convention.
 async fn handle_connection(
     stream: TcpStream,
     router: Arc<Router>,
     registrar: Arc<Mutex<Registrar>>,
     audit: Arc<AuditSink>,
     buffer_bytes: usize,
+    handshake_timeout: Duration,
 ) {
-    let ws = match accept_async_with_config(stream, Some(ws_config())).await {
-        Ok(ws) => ws,
-        Err(_) => return,
+    let deadline = tokio::time::Instant::now() + handshake_timeout;
+    let accept = accept_async_with_config(stream, Some(ws_config()));
+    let ws = match tokio::time::timeout_at(deadline, accept).await {
+        Ok(Ok(ws)) => ws,
+        // Handshake failed, or the upgrade itself stalled past the deadline.
+        Ok(Err(_)) | Err(_) => return,
     };
-    run_connection(ws, router, registrar, audit, buffer_bytes).await;
+    run_connection(ws, router, registrar, audit, buffer_bytes, deadline).await;
 }
 
 /// Outcome of decoding the first message as a hello (before router auth).
@@ -205,10 +243,20 @@ async fn run_connection(
     registrar: Arc<Mutex<Registrar>>,
     audit: Arc<AuditSink>,
     buffer_bytes: usize,
+    handshake_deadline: tokio::time::Instant,
 ) {
     let started = Instant::now();
 
-    let (hello, mut frames_in, mut bytes_in) = match read_hello(&mut ws).await {
+    // Bound the pre-hello read on the shared handshake deadline: a client that
+    // connected but never sends a hello is dropped when it elapses. It never
+    // authenticated, so — like every other handshake failure — it emits no
+    // audit record.
+    let parsed = match tokio::time::timeout_at(handshake_deadline, read_hello(&mut ws)).await {
+        Ok(parsed) => parsed,
+        Err(_) => return,
+    };
+
+    let (hello, mut frames_in, mut bytes_in) = match parsed {
         HelloParse::Ok { hello, bytes_in } => (hello, 1u64, bytes_in),
         HelloParse::ClosedEarly => {
             audit.record(&AuditRecord::new(

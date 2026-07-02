@@ -47,7 +47,9 @@ no package manager) as the image's unprivileged `nonroot` user. See
 
 ```toml
 listen = "0.0.0.0:9440"
-buffer_bytes = 1048576  # optional; this is the default
+buffer_bytes = 1048576        # optional; this is the default
+handshake_timeout_secs = 10   # optional; this is the default
+max_connections = 1024        # optional; this is the default
 
 [[bridges]]
 token = "<bridge-registration-token>"
@@ -80,6 +82,20 @@ path = "/var/log/remora-relay/audit.log"  # omit this table to disable audit mod
   so shedding is connection-granular. A connection whose outbound queue
   exceeds this budget is killed (close code `4008`) rather than let its
   backlog grow unbounded; the sender that overflowed it is unaffected.
+- **`handshake_timeout_secs`** — deadline for the pre-authentication handshake
+  (default 10s): the WebSocket upgrade plus the first (hello) frame share one
+  window. A client that opens a socket and never sends a hello would otherwise
+  pin a task, an FD, and a read buffer indefinitely (a slowloris); once this
+  deadline elapses the relay drops it. It applies only *before* a successful
+  hello — an authenticated connection is never subject to it.
+- **`max_connections`** — global cap on concurrent connections (default 1024).
+  The accept loop holds a semaphore with this many permits; a newly accepted
+  socket that cannot take one is dropped immediately, before the WebSocket
+  upgrade, bounding total FDs and tasks. This is a **global** cap only —
+  per-IP / per-sender fairness is part of the deferred rate-limiting follow-up
+  and is deliberately out of scope here, so a single source that can open many
+  connections can still consume the whole budget; put the relay behind a proxy
+  or firewall that does per-source limiting if that is a concern.
 - **`audit`** — opt-in; see [Audit mode](#audit-mode) below. Omitting the
   `[audit]` table disables it entirely (the default).
 

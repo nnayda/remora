@@ -196,6 +196,8 @@ impl Harness {
             bridges: bridges.clone(),
             devices: devices.clone(),
             buffer_bytes: opts.buffer_bytes,
+            handshake_timeout_secs: 10,
+            max_connections: 1024,
             audit: None,
         });
         let relay = Relay::start(config0);
@@ -209,6 +211,8 @@ impl Harness {
             bridges,
             devices,
             buffer_bytes: opts.buffer_bytes,
+            handshake_timeout_secs: 10,
+            max_connections: 1024,
             audit: None,
         });
 

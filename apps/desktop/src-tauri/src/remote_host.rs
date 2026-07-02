@@ -142,6 +142,8 @@ pub async fn start_loopback(
             bridge_id,
         }],
         buffer_bytes: 1 << 20,
+        handshake_timeout_secs: 10,
+        max_connections: 1024,
         audit: None,
     });
     let audit = AuditSink::new(&relay_cfg)?;
