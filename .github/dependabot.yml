@@ -26,3 +26,15 @@ updates:
       interval: weekly
     commit-message:
       prefix: ci
+
+  # Keeps the relay image's pinned base-image digests
+  # (crates/remora-relay/Dockerfile: rust:1-bookworm, distroless/cc-debian12)
+  # current as upstream patches them — the digest-refresh cadence for #251's
+  # reproducible build. Bumps the sha256 pin while holding the tag; the weekly
+  # relay-reproducible.yml run re-verifies reproducibility after each bump.
+  - package-ecosystem: docker
+    directory: /crates/remora-relay
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore

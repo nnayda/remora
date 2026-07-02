@@ -162,18 +162,56 @@ takes effect independent of the relay.
 
 ## Reproducible builds
 
-**Baseline, not verified.** The `Dockerfile`'s base images
-(`rust:1-bookworm`, `gcr.io/distroless/cc-debian12`) are pinned by digest,
-and the build uses `cargo build --release --locked`, so the same Dockerfile
-always resolves the same inputs — no floating `latest` tag can silently
-change what gets built. That's the reproducibility *baseline*: pinned
-inputs. It is not yet a verified guarantee that two builds from those same
-inputs produce a byte-identical binary (Rust codegen and Docker layer
-construction both have known sources of non-determinism — embedded build
-paths, timestamps, codegen-unit scheduling). Bit-for-bit build verification,
-plus a process for keeping the pinned digests current as upstream images
-patch, is tracked in
-[#251](https://github.com/nnayda/remora/issues/251).
+**The relay binary is bit-for-bit reproducible.** Two independent builds from
+a clean cache produce a byte-identical `remora-relay` binary (same sha256).
+Three things make that hold, and they're all already in place: the base images
+(`rust:1-bookworm`, `gcr.io/distroless/cc-debian12`) are pinned by digest and
+the build runs `cargo build --release --locked`, so the same `Dockerfile`
+always resolves the same inputs; the workspace's `[profile.release]` sets
+`codegen-units = 1` and `strip = true`, which removes the two biggest sources
+of Rust non-determinism (codegen-unit scheduling and path-bearing debug info);
+and the build runs at a fixed path inside the image (`/src`), so the paths that
+survive stripping (panic-location strings) are identical across machines.
+
+Verify it yourself — this builds the image twice from a clean cache and asserts
+the extracted binaries share one sha256:
+
+```sh
+./scripts/verify-relay-reproducible.sh
+```
+
+CI runs this weekly (`.github/workflows/relay-reproducible.yml`) as a
+regression guard, on the same cadence as the digest bumps below; trigger it by
+hand from the Actions tab after a base-image or release-profile change.
+
+### Reproducing the image *digest*
+
+A plain `docker build` does **not** produce a reproducible image *digest*: the
+final layer records the binary's wall-clock mtime, and the image config records
+a build timestamp, so two builds of the identical binary still get different
+digests. To reproduce the digest as well, build with BuildKit's
+`SOURCE_DATE_EPOCH` + `rewrite-timestamp` through the OCI exporter, which
+normalizes both:
+
+```sh
+SOURCE_DATE_EPOCH=0 docker buildx build --no-cache \
+  --output type=oci,rewrite-timestamp=true,dest=relay.oci.tar \
+  -f crates/remora-relay/Dockerfile .
+```
+
+Two such builds yield an identical OCI manifest digest. (The legacy `docker`
+exporter normalizes the config timestamp but not the copied binary's mtime, so
+use the OCI exporter — the same format a registry stores — when you need a
+reproducible digest.) The binary check above is the guarantee that matters for
+operators verifying what they run; digest reproducibility is for verifying a
+distributed image against a from-source rebuild.
+
+### Keeping the digest pins current
+
+The pinned base-image digests go stale as upstream patches them. Dependabot's
+`docker` ecosystem (see `.github/dependabot.yml`) bumps them weekly — holding
+the `1-bookworm` / `cc-debian12` tags, refreshing the `@sha256:` pin — and the
+weekly reproducibility job re-verifies the build after each bump.
 
 ## Related
 
