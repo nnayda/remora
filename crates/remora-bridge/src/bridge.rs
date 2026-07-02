@@ -92,6 +92,13 @@ const PEER_EVENT_QUEUE: usize = 256;
 /// on expiry the peer task returns and its [`DoneGuard`] reaps the slot (#231).
 const PEER_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long the bridge waits for the relay's `RelayControlAck` to its
+/// connect-time `AssertDevices` before giving up on the connection. The relay is
+/// untrusted (ADR-0021): one that accepts the socket but never acks must not
+/// wedge the bridge in the pre-serve phase forever — on expiry the attempt is
+/// treated like a failed connect (reconnect with growing backoff).
+const CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Static configuration for one [`serve_bridge`] run.
 ///
 /// Not `Debug`/`Clone`: [`BridgeIdentity`] holds a private key.
@@ -505,9 +512,11 @@ async fn run_connection(
         {
             AssertPhase::Acked => None,
             AssertPhase::Shutdown => Some(ConnOutcome::Shutdown),
-            // A relay that refuses our assertion is a config-level problem; grow the
-            // backoff rather than hammer a re-assert that will just re-fail.
-            AssertPhase::Rejected => Some(ConnOutcome::ConnectFailed),
+            // A relay that refuses our assertion is a config-level problem, and
+            // one that never answers is silent/hostile (ADR-0021 untrusted);
+            // both grow the backoff rather than hammer a retry that will just
+            // re-fail — the same path as a failed connect.
+            AssertPhase::Rejected | AssertPhase::TimedOut => Some(ConnOutcome::ConnectFailed),
             AssertPhase::Disconnected => Some(ConnOutcome::Disconnected),
         }
     {
@@ -586,6 +595,7 @@ async fn run_connection(
 }
 
 /// The outcome of the assert-before-serve phase.
+#[derive(Debug, PartialEq, Eq)]
 enum AssertPhase {
     /// The relay acked our `AssertDevices`; proceed to serve.
     Acked,
@@ -593,13 +603,17 @@ enum AssertPhase {
     Rejected,
     /// The connection dropped before the ack arrived.
     Disconnected,
+    /// The relay never answered within [`CONTROL_ACK_TIMEOUT`]: a silent (or
+    /// malicious — ADR-0021 untrusted) relay must not wedge the pre-serve phase.
+    TimedOut,
     /// `shutdown` fired while awaiting the ack.
     Shutdown,
 }
 
 /// Sends `AssertDevices` for the current roster and reads inbound frames until
-/// the matching `RelayControlAck` (or error) arrives. Generic over the stream so
-/// the reply-pump is exercised without a live socket in tests.
+/// the matching `RelayControlAck` (or error) arrives, bounded by
+/// [`CONTROL_ACK_TIMEOUT`]. Generic over the stream so the reply-pump (and the
+/// timeout) are exercised without a live socket in tests.
 async fn assert_roster_and_await_ack<S, E>(
     stream: &mut S,
     deps: &Arc<PeerDeps>,
@@ -621,9 +635,14 @@ where
     {
         return AssertPhase::Disconnected;
     }
+    // One fixed deadline for the whole wait (not per-frame): a relay trickling
+    // unrelated frames cannot keep resetting the clock.
+    let deadline = tokio::time::sleep(CONTROL_ACK_TIMEOUT);
+    tokio::pin!(deadline);
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return AssertPhase::Shutdown,
+            _ = &mut deadline => return AssertPhase::TimedOut,
             inbound = stream.next() => match inbound {
                 None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {
                     return AssertPhase::Disconnected
@@ -1381,6 +1400,59 @@ mod tests {
             }
             other => panic!("expected AssertDevices, got {other:?}"),
         }
+    }
+
+    /// Minimal [`PeerDeps`] for exercising the assert phase without a socket.
+    fn assert_phase_deps() -> Arc<PeerDeps> {
+        Arc::new(PeerDeps {
+            bridge_id: DeviceId([9u8; 32]),
+            bridge_static_priv: vec![0u8; 32],
+            bridge_static_pub: vec![0u8; 32],
+            relay_url: "ws://test".to_string(),
+            roster: Arc::new(RwLock::new(Roster::default())),
+            roster_path: PathBuf::from("unused-roster.toml"),
+            source: Arc::new(remora_core::FakeSessionSource::new()),
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn assert_ack_wait_times_out_on_a_silent_relay() {
+        // ADR-0021: the relay is untrusted. One that accepts the connection and
+        // our AssertDevices but never answers must not wedge the bridge in the
+        // pre-serve phase forever — the bounded wait returns TimedOut, which the
+        // caller maps to the failed-connect path (reconnect with backoff).
+        // Paused time auto-advances past CONTROL_ACK_TIMEOUT, keeping this fast.
+        let deps = assert_phase_deps();
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<Message>(8);
+        let seq = AtomicU32::new(0);
+        let shutdown = CancellationToken::new();
+        let mut silent = futures_util::stream::pending::<Result<Message, ()>>();
+        let phase =
+            assert_roster_and_await_ack(&mut silent, &deps, &outbound_tx, &seq, &shutdown).await;
+        assert_eq!(phase, AssertPhase::TimedOut);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn assert_ack_wait_completes_on_matching_ack() {
+        // The happy path through the same seam: a relay that acks the assert's
+        // correlation id completes the wait as Acked — the deadline must not
+        // fire when the reply is already queued.
+        let deps = assert_phase_deps();
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<Message>(8);
+        let seq = AtomicU32::new(0); // first next_control_id() yields 0
+        let shutdown = CancellationToken::new();
+        let ack_frame = Envelope {
+            frame_type: FrameType::Control,
+            src: DeviceId::ZERO,
+            dst: deps.bridge_id,
+            payload: serde_json::to_vec(&RelayControlAck { id: 0 }).expect("encode ack"),
+        }
+        .encode();
+        let mut replies =
+            futures_util::stream::iter(vec![Ok::<_, ()>(Message::Binary(ack_frame.into()))]);
+        let phase =
+            assert_roster_and_await_ack(&mut replies, &deps, &outbound_tx, &seq, &shutdown).await;
+        assert_eq!(phase, AssertPhase::Acked);
     }
 
     #[test]

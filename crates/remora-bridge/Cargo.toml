@@ -27,6 +27,8 @@ toml = { workspace = true, features = ["display"] }
 [dev-dependencies]
 remora-relay = { path = "../remora-relay" }
 tempfile = { workspace = true }
+# `test-util` enables paused-time tests (`start_paused`) for the timeout seams.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
