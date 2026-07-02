@@ -43,14 +43,16 @@ DIRECT MODE (default, zero infra)
   App ──ssh / kubectl exec──► sandbox (tmux: one session per worktree)
 
 RELAY MODE (opt-in, enables phone-from-anywhere + push notifications)
-  App   ──WS──► relay ──ssh / kubectl exec──► sandbox (tmux)
-  Phone ──WS──┘
+  Phone ──WS/TLS──► relay (blind) ──WS/TLS──► bridge ──ssh / kubectl exec──► sandbox (tmux)
+  App  ──┘          one end-to-end Noise session runs phone⇄bridge THROUGH the
+                    relay, which forwards ciphertext it cannot read (ADR-0021)
 ```
 
 The UI always talks to a `SessionSource` — in direct mode it drives
 `ssh`/`kubectl exec` in-process; in relay mode the same interface is hosted
-behind a WebSocket. Your sandbox only needs `tmux`, `git`, and your agent's
-CLI.
+by a *bridge* on your own hardware, reached end-to-end-encrypted through a
+blind relay ([ADR-0021](docs/adr/0021-blind-relay-bridge-trust-model.md)).
+Your sandbox only needs `tmux`, `git`, and your agent's CLI.
 
 ## Repository layout
 
@@ -58,7 +60,7 @@ CLI.
 | --- | --- |
 | `apps/desktop` | Tauri 2 desktop app (React + TypeScript frontend, Rust shell) |
 | `crates/remora-core` | Session model and the `SessionSource` transport seam |
-| `crates/remora-protocol` | Wire protocol types shared by clients and the future relay |
+| `crates/remora-protocol` | Wire protocol types shared by clients, the future bridge, and the relay envelope (ADR-0021) |
 | `docs/` | Vision, architecture notes, ADRs |
 
 ## Developing
