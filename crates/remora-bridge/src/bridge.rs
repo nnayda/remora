@@ -258,7 +258,6 @@ pub async fn serve_bridge(
         source,
     });
 
-    let mut rng = rand::rng();
     let mut backoff = BACKOFF_MIN;
     loop {
         if shutdown.is_cancelled() {
@@ -274,7 +273,10 @@ pub async fn serve_bridge(
         if shutdown.is_cancelled() {
             return Ok(());
         }
-        let delay = jittered(backoff, &mut rng);
+        // A fresh `ThreadRng` per iteration, never held across an `.await`, so
+        // `serve_bridge`'s future stays `Send` and can be spawned onto a
+        // multi-thread runtime (it is `tokio::spawn`ed by every caller).
+        let delay = jittered(backoff, &mut rand::rng());
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
             _ = tokio::time::sleep(delay) => {}
