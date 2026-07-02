@@ -2087,6 +2087,27 @@ describe("SessionStore Fix D coverage", () => {
     await p;
   });
 
+  // App gates its optimistic tab close on snapshot.removing: remove() marks
+  // the key SYNCHRONOUSLY (before its first await) when it accepts the call,
+  // and never marks it on a busy-guard refusal. Without this, a remove
+  // refused mid-stop would still destroy the tab while the removal never ran.
+  it("remove refused by the busy-guard never appears in snapshot.removing", async () => {
+    let resolveStop!: () => void;
+    const stop = vi.fn(
+      () =>
+        new Promise<void>((r) => {
+          resolveStop = r;
+        }),
+    );
+    const { store } = makeStore({ stop });
+    const stopP = store.stop("api", "x"); // key is now busy (teardownPending)
+    const r = await store.remove("api", "x", false);
+    expect(r).toEqual({ ok: false });
+    expect(store.getSnapshot().removing).toEqual([]);
+    resolveStop();
+    await stopP;
+  });
+
   // CROSS-RACE: open (respawn) vs teardown (remove). The bug: `pending`
   // guards opens against opens and `teardownPending` guards teardowns against
   // teardowns, but nothing serialized an open against a teardown. A remove that

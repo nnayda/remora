@@ -675,6 +675,23 @@ export class SessionStore {
     return { ok: true };
   };
 
+  /** Mark a remove in flight for `key` in BOTH sets (busy-guard + published
+   * spinner signal) and commit, so the two can never drift apart. Runs
+   * synchronously inside `remove()` before its first await — App relies on
+   * that to tell an accepted remove from a busy-guard refusal. */
+  private beginRemove(key: string): void {
+    this.teardownPending.add(key);
+    this.removing.add(key);
+    this.commit();
+  }
+
+  /** Clear the in-flight remove marks for `key` (both settle paths). */
+  private endRemove(key: string): void {
+    this.teardownPending.delete(key);
+    this.removing.delete(key);
+    this.commit();
+  }
+
   /** Remove a session for good. Runs in the background from the UI's point of
    * view: the key is published in `snapshot.removing` for the whole call so
    * the sidebar row spins while the multi-round-trip teardown runs. On success
@@ -691,21 +708,15 @@ export class SessionStore {
     // Refuse if any open/respawn/teardown for this key is already in flight —
     // removing a session mid-spawn is the orphaning race.
     if (this.busy(key)) return { ok: false };
-    this.teardownPending.add(key);
-    this.removing.add(key);
-    this.commit();
+    this.beginRemove(key);
     try {
       await this.openers.remove(projectId, sessionId, force);
     } catch (error) {
-      this.teardownPending.delete(key);
-      this.removing.delete(key);
-      this.commit();
+      this.endRemove(key);
       if (isWorkspaceDirty(error)) return { ok: false, dirty: error.reason };
       return { ok: false, error };
     }
-    this.teardownPending.delete(key);
-    this.removing.delete(key);
-    this.commit();
+    this.endRemove(key);
     this.closeTab(key); // no-op if not open; else silent close + token cancel
     return { ok: true };
   };

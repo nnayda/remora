@@ -380,11 +380,19 @@ function App() {
     if (!removeTarget) return;
     const target = removeTarget;
     setRemoveTarget(null);
+    const key = tabKey(target.projectId, target.sessionId);
+    const promise = removeSession(target.projectId, target.sessionId, force);
     // Optimistic close: intent to remove was just confirmed, and mid-teardown
     // the terminal would only die visibly. On failure the sidebar row remains
-    // and the session can be reopened.
-    closeTab(tabKey(target.projectId, target.sessionId));
-    void removeSession(target.projectId, target.sessionId, force)
+    // and the session can be reopened. Gated on the store having ACCEPTED the
+    // remove — remove() publishes snapshot.removing synchronously before its
+    // first await, so a busy-guard refusal (a stop/respawn/open already in
+    // flight for this key) is visible here. Closing unconditionally would
+    // destroy the tab for a remove that never ran.
+    if (sessionStore.getSnapshot().removing.includes(key)) {
+      closeTab(key);
+    }
+    void promise
       .then((result) => {
         // Even a failed remove may have torn down partial server state (e.g.
         // tmux killed, worktree removal failed), so re-list on every outcome.
