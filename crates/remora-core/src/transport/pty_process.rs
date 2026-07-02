@@ -117,10 +117,13 @@ fn spawn_pty_channel_inner(
     let (raw_tx, raw_rx) = sync_channel::<Vec<u8>>(DETECT_QUEUE);
 
     // #224: "user typed since the detector's last wake". Writer sets it after
-    // a successful write; detector swap-consumes it each wake. SeqCst is free
-    // at keystroke rate; a missed flag self-heals at the next wake (≤1 settle
-    // window). NOT a second output_tx sender and NOT a raw_tx clone — both
-    // were rejected to preserve ADR-0013's ordering + teardown invariants.
+    // a successful non-empty write (keystroke rate); detector swap-consumes it
+    // once per wake (chunk rate — one atomic RMW, noise next to the chunk's
+    // vte parse). Correctness never depends on the ordering: the flag is
+    // level-triggered, so a missed pairing is observed at the next wake
+    // (≤1 settle window). NOT a second output_tx sender and NOT a raw_tx
+    // clone — both were rejected to preserve ADR-0013's ordering + teardown
+    // invariants.
     let user_input = Arc::new(AtomicBool::new(false));
     let user_input_writer = Arc::clone(&user_input);
 
@@ -220,9 +223,13 @@ fn spawn_pty_channel_inner(
                     let _ = writer.flush();
                     // #224: signal AFTER the successful write — a failed or
                     // torn-down write must not read as "the user responded".
+                    // An empty write carries no user intent (empty paste,
+                    // programmatic flush), so it must not exit awaiting.
                     // Resize below deliberately does NOT set this: a resize
                     // causes repaints but is not the user answering.
-                    user_input_writer.store(true, Ordering::SeqCst);
+                    if !bytes.is_empty() {
+                        user_input_writer.store(true, Ordering::SeqCst);
+                    }
                     // Re-check death signal after each write so we don't spin
                     // sending to a dead PTY on platforms that swallow writes.
                     if death_rx.try_recv().is_ok() {
@@ -252,29 +259,38 @@ fn spawn_pty_channel_inner(
     Ok((channel, pid))
 }
 
-/// One detector-thread wake: dispatch the consumed user-input flag and the
-/// received bytes (if any) to the detector, in order. Pure so the wake
-/// semantics are unit-testable without threads.
+/// One detector-thread wake: dispatch the received bytes (if any), then the
+/// consumed user-input flag, to the detector. Pure so the wake semantics are
+/// unit-testable without threads.
 ///
-/// The subtle rule lives in the `None` arm: a silent wake WITH user input
-/// calls `on_user_input` INSTEAD of `on_tick`. Typing counts as activity —
-/// settling in the same wake would churn a sticky `Awaiting` through
-/// `Working` straight to `Idle` when the keystroke produced no output
-/// (echo-off TUIs), and would decay a live `Working` under a quietly
-/// typing user.
+/// Two subtle rules:
+///
+/// - **Bytes before input.** A keystroke and an `awaiting` marker can land in
+///   the same wake (type-ahead: the user answers just before the marker
+///   arrives). Input-first would consume the keystroke as a no-op and then
+///   apply the marker — a sticky `Awaiting` that nothing self-heals, the
+///   false-hold direction the ADR names as worst. Bytes-first lets the
+///   keystroke exit whatever `Awaiting` stands at the end of the wake; at
+///   worst that's a fail-soft false exit, corrected by the next marker.
+///
+/// - **The `None` arm:** a silent wake WITH user input calls `on_user_input`
+///   INSTEAD of `on_tick`. Typing counts as activity — settling in the same
+///   wake would churn a sticky `Awaiting` through `Working` straight to
+///   `Idle` when the keystroke produced no output (echo-off TUIs), and would
+///   decay a live `Working` under a quietly typing user.
 fn wake_events(
     detector: &mut Detector,
     user_input: bool,
     bytes: Option<&[u8]>,
 ) -> Vec<DetectorEvent> {
     let mut events = Vec::new();
-    if user_input {
-        events.extend(detector.on_user_input());
-    }
     match bytes {
         Some(chunk) => events.extend(detector.on_bytes(chunk)),
         None if !user_input => events.extend(detector.on_tick()),
         None => {} // user input counts as activity; skip this wake's settle
+    }
+    if user_input {
+        events.extend(detector.on_user_input());
     }
     events
 }
@@ -319,8 +335,8 @@ mod wake_tests {
 
     #[test]
     fn user_input_with_bytes_emits_working_exactly_once() {
-        // The echo path: on_user_input flips to Working first, then on_bytes
-        // sees Working and dedups — one Status(Working), not two.
+        // The echo path: on_bytes runs first (sticky no-op while Awaiting),
+        // then on_user_input exits — one Status(Working), not two.
         let mut d = awaiting_detector();
         assert_eq!(
             statuses(wake_events(&mut d, true, Some(b"echoed keystroke"))),
@@ -353,14 +369,30 @@ mod wake_tests {
     }
 
     #[test]
-    fn marker_in_the_wake_chunk_still_wins_over_user_input() {
-        // Input flag + a chunk carrying an awaiting marker: the marker is the
-        // agent re-asserting, and markers always win. on_user_input fires
-        // first (Awaiting→Working), then the marker re-enters Awaiting.
+    fn user_input_exits_a_marker_asserted_in_the_same_wake() {
+        // Type-ahead: keystroke and awaiting marker land in one wake. Bytes
+        // dispatch first (marker re-asserts Awaiting — no churn from the
+        // already-Awaiting state), then the input exits it. Preferring the
+        // exit is the fail-soft direction: a swallowed answer would leave a
+        // stuck-red Awaiting nothing self-heals, while a premature exit is
+        // corrected by the agent's next marker.
         let mut d = awaiting_detector();
         assert_eq!(
             statuses(wake_events(&mut d, true, Some(AWAITING_MARKER))),
-            vec![SessionStatus::Working, SessionStatus::Awaiting]
+            vec![SessionStatus::Working]
+        );
+    }
+
+    #[test]
+    fn terminal_marker_in_the_wake_still_wins_over_user_input() {
+        // A chunk carrying an idle marker + the input flag: the marker's exit
+        // stands (input is a no-op outside Awaiting) — input never overrides
+        // an agent-asserted terminal state.
+        let mut d = awaiting_detector();
+        let idle_marker: &[u8] = b"\x1b]7366;remora;1;state;aWRsZQ==\x07";
+        assert_eq!(
+            statuses(wake_events(&mut d, true, Some(idle_marker))),
+            vec![SessionStatus::Idle]
         );
     }
 }
@@ -688,20 +720,27 @@ mod tests {
         assert_eq!(bytes_total, TOTAL, "lost output under backpressure");
     }
 
+    /// Shared setup for the #224 sticky-awaiting tests: a `sh` child that
+    /// fires the awaiting marker (wire twin of the module-level
+    /// `AWAITING_MARKER` scanner input), then runs `rest`; 100ms settle.
+    fn spawn_after_awaiting_marker(rest: &str) -> SessionChannel {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg(format!(
+            "printf '\\033]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\\007'; {rest}"
+        ));
+        spawn_pty_channel_with_settle(cmd, Duration::from_millis(100)).expect("spawn")
+    }
+
     /// Child fires an awaiting marker, then keeps printing cosmetic noise
     /// across several settle windows, then exits. After `Awaiting` no
     /// Working/Idle may follow (#224 sticky) — pre-fix, the noise chunks
     /// flipped Working and the settle decayed to Idle.
     #[tokio::test]
     async fn awaiting_survives_marker_less_output() {
-        let mut cmd = CommandBuilder::new("sh");
-        cmd.arg("-c");
-        cmd.arg(
-            "printf '\\033]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\\007'; \
-             sleep 0.3; printf 'clock repaint'; sleep 0.3; printf 'spinner'",
+        let mut channel = spawn_after_awaiting_marker(
+            "sleep 0.3; printf 'clock repaint'; sleep 0.3; printf 'spinner'",
         );
-        let mut channel =
-            spawn_pty_channel_with_settle(cmd, Duration::from_millis(100)).expect("spawn");
 
         let mut saw_awaiting = false;
         let mut after_awaiting = Vec::new();
@@ -730,11 +769,7 @@ mod tests {
     /// channel is "the user is responding": Working must follow (#224).
     #[tokio::test]
     async fn user_input_exits_awaiting() {
-        let mut cmd = CommandBuilder::new("sh");
-        cmd.arg("-c");
-        cmd.arg("printf '\\033]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\\007'; cat");
-        let mut channel =
-            spawn_pty_channel_with_settle(cmd, Duration::from_millis(100)).expect("spawn");
+        let mut channel = spawn_after_awaiting_marker("cat");
 
         recv_status(&mut channel, remora_protocol::SessionStatus::Awaiting).await;
         channel.send_bytes(b"y\n".to_vec()).await.expect("send");
@@ -746,14 +781,7 @@ mod tests {
     /// resize nor output arriving after it may exit `Awaiting` (#224).
     #[tokio::test]
     async fn resize_does_not_exit_awaiting() {
-        let mut cmd = CommandBuilder::new("sh");
-        cmd.arg("-c");
-        cmd.arg(
-            "printf '\\033]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\\007'; \
-             sleep 0.5; printf 'post-resize repaint'",
-        );
-        let mut channel =
-            spawn_pty_channel_with_settle(cmd, Duration::from_millis(100)).expect("spawn");
+        let mut channel = spawn_after_awaiting_marker("sleep 0.5; printf 'post-resize repaint'");
 
         recv_status(&mut channel, remora_protocol::SessionStatus::Awaiting).await;
         let size = TerminalSize::new(40, 120).expect("nonzero");

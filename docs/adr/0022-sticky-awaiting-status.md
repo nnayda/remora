@@ -48,18 +48,26 @@ The detector stays clock-free, agent-agnostic, and still never *infers*
 ### Bridge wiring: an atomic flag, not a new sender
 
 The PTY bridge's writer thread sets one shared `AtomicBool` after each
-**successful** input write (a failed/torn-down write must not read as "the
-user responded"); the detector thread swap-consumes it at every wake and
-dispatches through a pure `wake_events(detector, user_input, bytes)` helper.
-On a silent wake with input, `on_user_input` runs INSTEAD of the settle
-tick — typing counts as activity; settling in the same wake would churn
-`Awaiting → Working → Idle` when a keystroke produces no output (echo-off
-TUIs). `Resize` deliberately does not set the flag: it causes repaints but
-is not the user answering.
+**successful, non-empty** input write (a failed/torn-down write must not
+read as "the user responded", and an empty write carries no user intent);
+the detector thread swap-consumes it at every wake and dispatches through a
+pure `wake_events(detector, user_input, bytes)` helper. Within a bytes wake,
+the chunk dispatches **before** the input flag: a keystroke and an
+`awaiting` marker can share one wake (type-ahead — the user answers just
+before the marker arrives), and input-first would swallow the answer into a
+stuck-red `Awaiting` nothing self-heals (a false hold, the worst direction
+below); bytes-first lets the input exit whatever `Awaiting` stands at the
+end of the wake, which at worst is a fail-soft false exit corrected by the
+agent's next marker. On a silent wake with input, `on_user_input` runs
+INSTEAD of the settle tick — typing counts as activity; settling in the
+same wake would churn `Awaiting → Working → Idle` when a keystroke produces
+no output (echo-off TUIs). `Resize` deliberately does not set the flag: it
+causes repaints but is not the user answering.
 
-`SeqCst` is used because it is free at keystroke rate; correctness does not
-depend on it — the flag is level-triggered and any later wake (including a
-settle tick) observes it, so a missed pairing self-heals within one settle
+`SeqCst` costs nothing that matters here (the store is keystroke-rate; the
+swap is one RMW per wake, noise next to the chunk parse); correctness does
+not depend on it — the flag is level-triggered and any later wake (including
+a settle tick) observes it, so a missed pairing self-heals within one settle
 window.
 
 ### Accepted approximation: the write path over-approximates "user input"

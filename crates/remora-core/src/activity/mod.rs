@@ -145,6 +145,9 @@ mod detector_tests {
     use super::*;
     use remora_protocol::SessionStatus;
 
+    /// base64("awaiting_input") state marker — the #224 sticky-awaiting entry.
+    const AWAITING_MARKER: &[u8] = b"\x1b]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\x07";
+
     fn statuses(evs: Vec<DetectorEvent>) -> Vec<SessionStatus> {
         evs.into_iter()
             .filter_map(|e| match e {
@@ -211,7 +214,7 @@ mod detector_tests {
         // keeps arriving while the agent is blocked on the user. It must not
         // exit `Awaiting`.
         let mut d = Detector::new();
-        d.on_bytes(b"\x1b]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\x07");
+        d.on_bytes(AWAITING_MARKER);
         assert_eq!(statuses(d.on_bytes(b"12:00 clock repaint")), vec![]);
         assert_eq!(statuses(d.on_bytes(b"spinner frame")), vec![]);
     }
@@ -220,7 +223,7 @@ mod detector_tests {
     fn awaiting_still_exits_via_state_marker() {
         // Markers always win: an idle/working marker is a real exit (#224).
         let mut d = Detector::new();
-        d.on_bytes(b"\x1b]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\x07");
+        d.on_bytes(AWAITING_MARKER);
         assert_eq!(
             statuses(d.on_bytes(b"\x1b]7366;remora;1;state;aWRsZQ==\x07")),
             vec![SessionStatus::Idle]
@@ -249,7 +252,7 @@ mod detector_tests {
     fn tick_leaves_awaiting_untouched() {
         // The settle clock never exits `Awaiting` (it is not Working decay).
         let mut d = Detector::new();
-        d.on_bytes(b"\x1b]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\x07");
+        d.on_bytes(AWAITING_MARKER);
         for _ in 0..3 {
             assert_eq!(statuses(d.on_tick()), vec![]);
         }
@@ -310,7 +313,7 @@ mod detector_tests {
     fn awaiting_marker_also_latches_marker_seen() {
         let mut d = Detector::new();
         // "awaiting_input" state marker.
-        let evs = d.on_bytes(b"\x1b]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\x07");
+        let evs = d.on_bytes(AWAITING_MARKER);
         assert_eq!(marker_seen_count(&evs), 1);
         assert_eq!(statuses(evs), vec![SessionStatus::Awaiting]);
     }
@@ -321,7 +324,7 @@ mod detector_tests {
         let first = d.on_bytes(b"\x1b]7366;remora;1;ping\x07");
         assert_eq!(marker_seen_count(&first), 1);
         // A later awaiting marker must NOT re-emit MarkerSeen.
-        let second = d.on_bytes(b"\x1b]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\x07");
+        let second = d.on_bytes(AWAITING_MARKER);
         assert_eq!(marker_seen_count(&second), 0);
     }
 
@@ -338,7 +341,7 @@ mod detector_tests {
         // #224: keystrokes through Remora's write path are the unambiguous
         // "the user is responding" signal. Working then decays normally.
         let mut d = Detector::new();
-        d.on_bytes(b"\x1b]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\x07");
+        d.on_bytes(AWAITING_MARKER);
         assert_eq!(statuses(d.on_user_input()), vec![SessionStatus::Working]);
         assert_eq!(statuses(d.on_tick()), vec![SessionStatus::Idle]);
     }
