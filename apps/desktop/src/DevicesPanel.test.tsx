@@ -14,14 +14,30 @@ const b = vi.hoisted(() => ({
   revokeDevice: vi.fn(),
   getBridgeFingerprint: vi.fn(),
   subscribeRosterChanged: vi.fn(),
+  // Pairing-dialog seam (only exercised by the "Pair new device" test).
+  openPairingWindow: vi.fn(),
+  confirmPairing: vi.fn(),
+  rejectPairing: vi.fn(),
+  cancelPairing: vi.fn(),
+  subscribePairingWindowOpened: vi.fn(() => Promise.resolve(() => {})),
+  subscribePairingDeviceArrived: vi.fn(() => Promise.resolve(() => {})),
+  subscribePairingResult: vi.fn(() => Promise.resolve(() => {})),
 }));
 
 vi.mock("./bridge", () => b);
+vi.mock("./clipboard", () => ({ writeClipboard: vi.fn() }));
+vi.mock("qrcode", () => ({
+  toDataURL: vi.fn(() => Promise.resolve("data:image/png;base64,ZZ")),
+  default: {
+    toDataURL: vi.fn(() => Promise.resolve("data:image/png;base64,ZZ")),
+  },
+}));
 
 vi.mock("./ui/icons", () => ({
   Smartphone: () => null,
   Trash: () => null,
   AlertTriangle: () => null,
+  Plus: () => null,
   X: () => null,
 }));
 
@@ -55,6 +71,11 @@ beforeEach(() => {
   // Default: a valid, subscribable roster.
   b.getBridgeFingerprint.mockResolvedValue("1111-2222-3333");
   b.subscribeRosterChanged.mockResolvedValue(() => {});
+  b.openPairingWindow.mockResolvedValue({
+    code: "remora-pair:1:XyZ",
+    expiresAt: Math.floor(Date.now() / 1000) + 120,
+    ttlSecs: 120,
+  });
 });
 
 afterEach(() => {
@@ -148,6 +169,38 @@ describe("DevicesPanel — per-row revoke", () => {
     fireEvent.click(screen.getByRole("button", { name: /^Cancel$/ }));
 
     expect(b.revokeDevice).not.toHaveBeenCalled();
+  });
+});
+
+describe("DevicesPanel — pair new device", () => {
+  it("opens the pairing dialog from the header button", async () => {
+    b.listDevices.mockResolvedValue([PIXEL]);
+    render(<DevicesPanel />);
+
+    await screen.findByText("Pixel 7");
+    // The header exposes a "Pair new device" affordance.
+    fireEvent.click(screen.getByRole("button", { name: /pair new device/i }));
+
+    // The ceremony dialog opens and requests a pairing window.
+    expect(await screen.findByText(/remora-pair:1:XyZ/)).not.toBeNull();
+    expect(b.openPairingWindow).toHaveBeenCalledOnce();
+  });
+
+  it("hides the pair button when the relay is not configured", async () => {
+    b.getBridgeFingerprint.mockRejectedValue({
+      kind: "relayNotConfigured",
+      message: "no relay",
+    });
+    b.listDevices.mockRejectedValue({
+      kind: "relayNotConfigured",
+      message: "no relay",
+    });
+    render(<DevicesPanel />);
+
+    await screen.findByText(/Relay not configured/i);
+    expect(
+      screen.queryByRole("button", { name: /pair new device/i }),
+    ).toBeNull();
   });
 });
 

@@ -7,8 +7,9 @@ import {
   subscribeRosterChanged,
 } from "./bridge";
 import { formErrorMessage } from "./form-error";
+import { PairingDialog } from "./PairingDialog";
 import { Button, Dialog, IconButton } from "./ui";
-import { AlertTriangle, Smartphone, Trash } from "./ui/icons";
+import { AlertTriangle, Plus, Smartphone, Trash } from "./ui/icons";
 
 /** True when a thrown bridge value is the "this device hosts no relay" error
  * (ADR-0021) — the panel shows a friendly empty state rather than a roster. */
@@ -55,6 +56,8 @@ export function DevicesPanel() {
   const [revokeTarget, setRevokeTarget] = useState<DeviceInfoDto | null>(null);
   // A failed revoke surfaces above the list (the load itself has its own state).
   const [revokeError, setRevokeError] = useState<string | null>(null);
+  // Whether the pairing-ceremony dialog is open.
+  const [pairing, setPairing] = useState(false);
   // Unmount latch for `confirmRevoke`, which outlives the mount effect's local
   // `live` flag: don't set state after the panel is gone. Re-armed in the
   // effect body — not just the ref initializer — so StrictMode's dev
@@ -136,6 +139,16 @@ export function DevicesPanel() {
           <Smartphone size={14} />
           Devices
         </span>
+        {phase.kind === "ready" && (
+          <Button
+            size="sm"
+            variant="secondary"
+            icon={<Plus size={14} />}
+            onClick={() => setPairing(true)}
+          >
+            Pair new device
+          </Button>
+        )}
       </div>
 
       {phase.kind === "loading" ? (
@@ -188,6 +201,8 @@ export function DevicesPanel() {
           onClose={() => setRevokeTarget(null)}
         />
       )}
+
+      {pairing && <PairingDialog onClose={() => setPairing(false)} />}
     </section>
   );
 }
