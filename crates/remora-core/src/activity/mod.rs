@@ -3,6 +3,25 @@
 //! sanitized previews, and a one-shot `MarkerSeen` liveness signal (#198,
 //! ADR-0019) on the first marker of any kind. The settle clock lives in the
 //! bridge thread that drives it (`transport::pty_process`), not here.
+//!
+//! State machine (#224 made `Awaiting` sticky — see the ADR):
+//!
+//! ```text
+//!            bytes (no marker)              marker: state S
+//! Unknown ──────────────────▶ Working ◀──────────────────▶ S (any state)
+//!                               │  ▲
+//!                    tick       │  │ bytes / user input
+//!                               ▼  │
+//!                             Idle ┘
+//!
+//! Awaiting ── bytes (no marker) ──▶ Awaiting   (sticky — no event)
+//!          ── user input ─────────▶ Working
+//!          ── marker: state S ────▶ S
+//!          ── tick ───────────────▶ Awaiting   (unchanged)
+//! ```
+//!
+//! `Awaiting` is marker-only on entry (never inferred) and sticky on exit:
+//! only a state marker, `on_user_input`, or attach teardown leaves it.
 
 mod marker;
 mod sanitize;
@@ -97,6 +116,21 @@ impl Detector {
         if self.state == SessionStatus::Working {
             self.state = SessionStatus::Idle;
             vec![DetectorEvent::Status(SessionStatus::Idle)]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The user sent input through Remora's own write path — the one signal
+    /// that unambiguously means "the user is responding" (#224). Exits
+    /// `Awaiting` to `Working` (which then decays via the normal settle
+    /// tick); a no-op in every other state, where bytes already drive
+    /// `Working`. The *when* of calling this lives in the bridge, exactly
+    /// like the settle clock does.
+    pub fn on_user_input(&mut self) -> Vec<DetectorEvent> {
+        if self.state == SessionStatus::Awaiting {
+            self.state = SessionStatus::Working;
+            vec![DetectorEvent::Status(SessionStatus::Working)]
         } else {
             Vec::new()
         }
@@ -300,5 +334,27 @@ mod detector_tests {
         assert_eq!(marker_seen_count(&d.on_bytes(b"lots of output")), 0);
         assert_eq!(marker_seen_count(&d.on_tick()), 0);
         assert_eq!(marker_seen_count(&d.on_bytes(b"more")), 0);
+    }
+
+    #[test]
+    fn user_input_exits_awaiting_to_working_then_settles() {
+        // #224: keystrokes through Remora's write path are the unambiguous
+        // "the user is responding" signal. Working then decays normally.
+        let mut d = Detector::new();
+        d.on_bytes(b"\x1b]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\x07");
+        assert_eq!(statuses(d.on_user_input()), vec![SessionStatus::Working]);
+        assert_eq!(statuses(d.on_tick()), vec![SessionStatus::Idle]);
+    }
+
+    #[test]
+    fn user_input_is_noop_outside_awaiting() {
+        // Bytes already drive Working in every other state; typing must not
+        // churn (Unknown), re-emit (Working), or revive (Idle) a status.
+        let mut d = Detector::new();
+        assert_eq!(statuses(d.on_user_input()), vec![]); // Unknown
+        d.on_bytes(b"output");
+        assert_eq!(statuses(d.on_user_input()), vec![]); // Working
+        d.on_tick();
+        assert_eq!(statuses(d.on_user_input()), vec![]); // Idle
     }
 }
