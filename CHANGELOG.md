@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Open a session in an external terminal — core/config/shell half**: core
+  composes a coexisting (no `-d`) attach command via
+  `SessionSource::external_attach_command`; the desktop shell detects installed
+  terminals (Ghostty, kitty, Alacritty, WezTerm, foot) via absolute candidate
+  paths (GUI-launched apps inherit launchd's bare PATH) and launches the chosen
+  one detached, resolving the transport binary the same way. New optional
+  top-level `terminal` config key (`"ghostty"` or a custom argv array, loud
+  shape errors). Session-menu/Settings UI lands in the follow-up PR. Note: the
+  app's own reconnects still evict external clients (documented
+  sequential-handoff semantics).
 - **Background session removal**: confirming "Remove session" no longer locks
   the app behind the dialog for the whole remote teardown. The dialog and the
   session's tab close immediately, the teardown (tmux kill + worktree/branch

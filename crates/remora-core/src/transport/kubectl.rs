@@ -12,10 +12,12 @@ use async_trait::async_trait;
 use remora_protocol::{ProjectId, SessionId, SessionMeta, SpawnSpec};
 
 use super::remote::{
-    capture, open_pty, resolve_local_command, run_attach, run_list, run_remove, run_respawn,
-    run_spawn, run_stop, LocalRunner, RemoteExec, RemoteOutput, ShellRunner,
+    attach_tokens_coexist, capture, open_pty, resolve_local_command, run_attach, run_list,
+    run_remove, run_respawn, run_spawn, run_stop, LocalRunner, RemoteExec, RemoteOutput,
+    ShellRunner,
 };
 use crate::config::{Config, KubectlField, KubectlHost};
+use crate::naming::tmux_session_name;
 use crate::spawn_plan::plan_spawn;
 use crate::{SessionChannel, SessionSource, SourceError};
 
@@ -274,6 +276,27 @@ impl SessionSource for KubectlSource {
         .map_err(|e| SourceError::Transport(format!("attach task: {e}")))?
     }
 
+    async fn external_attach_command(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<Vec<String>, SourceError> {
+        let host = self.host.clone();
+        let runner = Arc::clone(&self.runner);
+        let tmux_name = tmux_session_name(project_id, session_id);
+        tokio::task::spawn_blocking(move || {
+            // `{ command }` fields resolve locally, once, same as every other
+            // method (ADR-0008) — the external client must target the same pod.
+            let resolved = resolve_host(&host, runner.as_ref())?;
+            Ok(kubectl_channel_argv(
+                &resolved,
+                &attach_tokens_coexist(&tmux_name),
+            ))
+        })
+        .await
+        .map_err(|e| SourceError::Transport(format!("external attach task: {e}")))?
+    }
+
     async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
         let host = self.host.clone();
         let runner = Arc::clone(&self.runner);
@@ -362,7 +385,7 @@ mod tests {
 
     use super::super::remote::tests::rec;
     use super::*;
-    use crate::config::{Config, KubectlHost, WorkspaceMode};
+    use crate::config::{Config, KubectlField, KubectlHost, WorkspaceMode};
     use crate::transport::batch;
 
     struct FakeExec {
@@ -540,6 +563,43 @@ mod tests {
                 "sh",
                 "-c",
                 "export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=xterm-256color; tmux attach-session",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn external_attach_command_wraps_coexist_attach_in_pod_shell() {
+        // `host(...)` (above) builds a `ResolvedKubectlHost`, not the
+        // `KubectlHost` `KubectlSource::new` takes — construct a literal-field
+        // `KubectlHost` directly; literal fields resolve without running
+        // commands, so `KubectlSource::new` works directly.
+        let kh = KubectlHost {
+            pod: KubectlField::Literal("p".into()),
+            namespace: None,
+            context: None,
+            container: None,
+        };
+        let source = KubectlSource::new(kh, Arc::new(Config::default()));
+        let argv = source
+            .external_attach_command(
+                &ProjectId::new("api").expect("slug"),
+                &SessionId::new("s").expect("slug"),
+            )
+            .await
+            .expect("compose");
+        assert_eq!(
+            argv,
+            vec![
+                "kubectl",
+                "exec",
+                "-i",
+                "-t",
+                "p",
+                "--",
+                "sh",
+                "-c",
+                "export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=xterm-256color; \
+                 tmux attach-session -t remora_api_s",
             ]
         );
     }

@@ -1,5 +1,6 @@
 pub mod bridge;
 pub mod config_watch;
+mod external_terminal;
 
 use std::sync::Arc;
 use std::time::Duration;

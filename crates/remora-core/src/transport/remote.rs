@@ -159,16 +159,32 @@ pub(crate) fn wrap_with_shell_fallback(agent_command: &str) -> String {
 // Remote-command token builders (transport-neutral; no connection prefix)
 // ---------------------------------------------------------------------------
 
-/// Tokens for attaching to `tmux_name`. `-d` evicts every other client on
-/// attach (sequential-handoff model).
+/// Tokens for attaching to `tmux_name`. `evict` adds `-d`, which kicks every
+/// other client off on attach. One impl so the token list cannot drift
+/// between the two public forms; named wrappers so call sites read as intent
+/// instead of a naked boolean.
+fn attach_tokens_impl(tmux_name: &str, evict: bool) -> Vec<String> {
+    let mut tokens: Vec<String> = vec!["tmux".into(), "attach-session".into()];
+    if evict {
+        tokens.push("-d".into());
+    }
+    tokens.push("-t".into());
+    tokens.push(tmux_name.into());
+    tokens
+}
+
+/// The app's own attach: `-d` evicts every other client (sequential-handoff
+/// model; also clears zombie clients from other devices — spine spike).
 pub(crate) fn attach_tokens(tmux_name: &str) -> Vec<String> {
-    vec![
-        "tmux".into(),
-        "attach-session".into(),
-        "-d".into(),
-        "-t".into(),
-        tmux_name.into(),
-    ]
+    attach_tokens_impl(tmux_name, true)
+}
+
+/// The external-terminal attach: NO `-d`, so it coexists with the app's
+/// client instead of evicting it (spec decision 1). Used only by
+/// `SessionSource::external_attach_command`. Note the asymmetry is one-way:
+/// the app's own (re)attach still evicts this client (spec decision 2).
+pub(crate) fn attach_tokens_coexist(tmux_name: &str) -> Vec<String> {
+    attach_tokens_impl(tmux_name, false)
 }
 
 /// Tokens for `git -C <project> worktree add -b <branch> <worktree> [<start>]`.
@@ -2047,6 +2063,20 @@ pub(crate) mod tests {
         let tokens = attach_tokens("remora_api_fix-login");
         assert_eq!(
             tokens,
+            vec!["tmux", "attach-session", "-d", "-t", "remora_api_fix-login"]
+        );
+    }
+
+    #[test]
+    fn attach_tokens_coexist_omits_the_eviction_flag() {
+        // The external-terminal client must NOT evict the app's client (coexist
+        // contract, spec decision 1). Only `-d` distinguishes the two forms.
+        assert_eq!(
+            attach_tokens_coexist("remora_api_fix-login"),
+            vec!["tmux", "attach-session", "-t", "remora_api_fix-login"]
+        );
+        assert_eq!(
+            attach_tokens("remora_api_fix-login"),
             vec!["tmux", "attach-session", "-d", "-t", "remora_api_fix-login"]
         );
     }

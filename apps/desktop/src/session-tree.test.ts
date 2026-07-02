@@ -45,7 +45,7 @@ const session = (
 const cfg = (
   hosts: ConfigDto["hosts"],
   projects: ConfigDto["projects"],
-): ConfigDto => ({ hosts, projects, agents: [] });
+): ConfigDto => ({ hosts, projects, agents: [], terminal: null });
 
 describe("buildTree", () => {
   it("stamps host label + transport onto a configured project", () => {

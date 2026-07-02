@@ -184,6 +184,24 @@ impl ConfigDocument {
         self.commit(|doc| remove_entry(doc, "agents", id.as_str(), "agent"))
     }
 
+    /// SET or CLEAR the top-level `terminal` key (registry-id form only — the
+    /// Settings dropdown's write path; the custom-argv form is hand-edited in
+    /// the file and never written here). `commit` re-validates the whole
+    /// document, so an id that violates the key's shape rules is rejected.
+    pub fn set_terminal(&mut self, registry_id: Option<&str>) -> Result<(), ConfigError> {
+        self.commit(|doc| {
+            match registry_id {
+                Some(id) => {
+                    doc.insert("terminal", value(id));
+                }
+                None => {
+                    doc.remove("terminal");
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Applies `edit` to a clone, re-validates the serialized result through
     /// the single existing validation path, and commits only if valid. A
     /// rejected edit leaves the live document untouched.
@@ -437,7 +455,9 @@ fn agent_item(a: &Agent) -> Item {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Agent, Host, KubectlHost, Project, SshHost, Transport, WorkspaceMode};
+    use crate::config::{
+        Agent, Host, KubectlHost, Project, SshHost, TerminalPreference, Transport, WorkspaceMode,
+    };
     use remora_protocol::{AgentId, ProjectId};
 
     fn hid(s: &str) -> super::super::HostId {
@@ -976,5 +996,36 @@ mod tests {
                 .content,
             script
         );
+    }
+
+    #[test]
+    fn set_terminal_writes_top_level_key_before_tables_and_preserves_format() {
+        // The regression this pins: a top-level key appended to a document whose
+        // first construct is a [hosts.*] table must serialize at the ROOT, not
+        // inside the last table. commit() re-validates via from_toml_str, so an
+        // invalid placement fails here loudly.
+        let input = "# my config\n[hosts.hermes]\ntransport = \"ssh\"\nhost = \"hermes.local\"\n";
+        let mut doc = ConfigDocument::parse(input).expect("valid base");
+        doc.set_terminal(Some("ghostty")).expect("set");
+        let out = doc.to_toml();
+        assert!(out.contains("# my config"), "comment preserved: {out}");
+        let config = doc.config().expect("still valid");
+        assert_eq!(
+            config.terminal,
+            Some(TerminalPreference::Registry("ghostty".into()))
+        );
+    }
+
+    #[test]
+    fn set_terminal_overwrites_and_clears() {
+        let mut doc = ConfigDocument::parse("terminal = \"kitty\"\n").expect("valid base");
+        doc.set_terminal(Some("ghostty")).expect("overwrite");
+        assert_eq!(
+            doc.config().expect("valid").terminal,
+            Some(TerminalPreference::Registry("ghostty".into()))
+        );
+        doc.set_terminal(None).expect("clear");
+        assert_eq!(doc.config().expect("valid").terminal, None);
+        assert!(!doc.to_toml().contains("terminal"), "key removed");
     }
 }

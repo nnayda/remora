@@ -238,6 +238,129 @@ async fn config_remove_agent(
     bridge.config_remove_agent(id).await
 }
 
+// ---- External terminal (spec 2026-07-02) ----
+
+use crate::external_terminal::{
+    assemble_launch, detect_terminals, resolve_terminal, shell_quote_command, spawn_detached,
+    RealProbe, ResolveError,
+};
+
+/// A detected terminal, id + display name only.
+#[derive(Clone, Debug, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectedTerminalDto {
+    pub id: String,
+    pub name: String,
+}
+
+impl From<ResolveError> for BridgeError {
+    fn from(e: ResolveError) -> Self {
+        match e {
+            ResolveError::NotConfigured(message) => BridgeError::TerminalNotConfigured { message },
+            ResolveError::UnknownId(message) | ResolveError::NotDetected(message) => {
+                BridgeError::TerminalNotConfigured { message }
+            }
+        }
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn external_terminals(
+    _bridge: tauri::State<'_, Bridge>,
+) -> Result<Vec<DetectedTerminalDto>, BridgeError> {
+    // Fresh probe per call (stat-cheap): no cache, no staleness when a
+    // terminal is installed/uninstalled mid-session.
+    Ok(detect_terminals(&RealProbe)
+        .into_iter()
+        .map(|t| DetectedTerminalDto {
+            id: t.id.to_string(),
+            name: t.name.to_string(),
+        })
+        .collect())
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn open_external_terminal(
+    bridge: tauri::State<'_, Bridge>,
+    project_id: String,
+    session_id: String,
+    terminal_id: Option<String>,
+) -> Result<(), BridgeError> {
+    // Resolve the terminal preference first: it's a cheap in-memory lookup,
+    // and if it fails (unconfigured/unknown/uninstalled) we should surface
+    // that -> Settings deep-link before paying for `external_attach_argv`,
+    // which for kubectl sessions can shell out to resolve `{ command }`
+    // fields.
+    let pref = bridge.terminal_preference()?;
+    let detected = detect_terminals(&RealProbe);
+    let plan = resolve_terminal(terminal_id.as_deref(), pref.as_ref(), &detected)?;
+    let attach = bridge.external_attach_argv(project_id, session_id).await?;
+    let argv = assemble_launch(&plan, &attach, &RealProbe).map_err(|e| match e {
+        // A missing transport binary is a launch-environment error, not a
+        // Settings-fixable preference: surface the message (notice), don't
+        // deep-link (spec flow: binary resolution -> error, not Settings).
+        ResolveError::NotDetected(message) => BridgeError::Transport { message },
+        other => other.into(),
+    })?;
+    let terminal_name = argv.first().cloned().unwrap_or_default();
+    let mut child = spawn_detached(&argv).map_err(|e| BridgeError::Transport {
+        message: format!("could not launch `{terminal_name}`: {e}"),
+    })?;
+    // Early-exit check (review D9): a terminal that dies within ~1s (bad
+    // flag, broken install) becomes a real error instead of a flash-closed
+    // window. A CLEAN exit is tolerated — forking launchers (`wezterm
+    // start`) may return 0 immediately by design. >1s failures show in the
+    // terminal itself; Copy attach command is the diagnostic.
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    if let Ok(Some(status)) = child.try_wait() {
+        if !status.success() {
+            return Err(BridgeError::Transport {
+                message: format!("`{terminal_name}` exited immediately ({status})"),
+            });
+        }
+    }
+    // Reap the child when it eventually exits (an unreaped exited child is a
+    // zombie until Remora dies); the blocking slot parks until the terminal
+    // exits, one per launch. The early-exit error path above already reaped
+    // via try_wait.
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn copy_attach_command(
+    app: tauri::AppHandle,
+    bridge: tauri::State<'_, Bridge>,
+    project_id: String,
+    session_id: String,
+) -> Result<(), BridgeError> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    // Written to the clipboard RUST-SIDE: the string carries the hostname,
+    // and connection details never cross to the frontend (the ConfigDto
+    // redaction boundary, dto.rs). The frontend only triggers the copy.
+    let attach = bridge.external_attach_argv(project_id, session_id).await?;
+    let command = shell_quote_command(&attach);
+    app.clipboard()
+        .write_text(command)
+        .map_err(|e| BridgeError::Transport {
+            message: format!("could not write clipboard: {e}"),
+        })
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn config_set_terminal(
+    bridge: tauri::State<'_, Bridge>,
+    terminal_id: Option<String>,
+) -> Result<(), BridgeError> {
+    bridge.config_set_terminal(terminal_id).await
+}
+
 /// Shared by `run()` and the bindings export test, so the command list lives once.
 pub fn builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new()
@@ -261,7 +384,11 @@ pub fn builder() -> Builder<tauri::Wry> {
             config_remove_project,
             config_insert_agent,
             config_update_agent,
-            config_remove_agent
+            config_remove_agent,
+            external_terminals,
+            open_external_terminal,
+            copy_attach_command,
+            config_set_terminal
         ])
         .events(collect_events![ConfigChanged])
 }
