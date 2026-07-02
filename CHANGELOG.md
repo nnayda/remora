@@ -553,6 +553,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The activity pulse now catches AskUserQuestion menus.** A session sitting
+  at Claude Code's interactive multiple-choice prompt showed a gray idle dot
+  with no tooltip, because the marker recipe wired only the `Notification`
+  hook — and AskUserQuestion fires no immediate Notification (empirically,
+  Claude Code 2.1.198 sends only a delayed, generic `permission_prompt` nag
+  ~6s later, whose text is "Claude needs your permission", not the question).
+  The launch template's `--settings` and `remora-notify.sh` now also wire
+  `PreToolUse` with matcher `AskUserQuestion`, which fires as the menu
+  displays; the script pulls the real question text from
+  `.tool_input.questions[0].question` as the preview, so the row shows the
+  awaiting pulse and "the session says: <question>" on hover. Scoped to that
+  one tool so every other tool call stays silent, and all script failure
+  paths exit 0/1 (never 2, which would block the tool). Wire contract pinned
+  by a new script round-trip test; existing template-created agents need the
+  refresh path in #214 to pick this up. See `docs/agent-hooks.md`.
 - **Collapsed-rail branch initial no longer drops combining marks** (#220,
   follow-up to #184). The per-session badge derived its letter from the first
   *code point* of the branch name, which splits a grapheme cluster: a base
