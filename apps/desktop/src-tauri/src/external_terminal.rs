@@ -1,4 +1,5 @@
-//! External-terminal launch: registry, detection, resolution, spawn.
+//! External-terminal registry, detection, and resolution (spawning the
+//! resolved argv lives in `launch.rs`).
 //!
 //! Lives in the desktop shell by design (spec decision 5): core never learns
 //! about local GUI apps, the frontend never sees an argv. Everything here is
@@ -18,7 +19,8 @@ use crate::launch::{resolve_binary_with, PathProbe, SearchEnv};
 struct TerminalSpec {
     id: &'static str,
     name: &'static str,
-    /// Binary base name, probed inside [`BIN_DIRS`] and on `PATH`.
+    /// Binary base name, probed inside the shared launch-dir list and on
+    /// `PATH`.
     bin: &'static str,
     /// Args between the binary and the attach argv (`-e`, `start --`, or
     /// nothing for positional-command terminals).

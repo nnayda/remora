@@ -21,7 +21,7 @@ pub enum RemoteWorkspace {
 /// from [`SessionSource::remote_workspace`]. SSH-only in v1; kubectl is a
 /// follow-up (VS Code Remote-Tunnels over `kubectl exec`).
 pub fn unsupported_remote_workspace() -> SourceError {
-    SourceError::Transport("Open in VS Code is only supported for SSH sessions".into())
+    SourceError::Transport("no local-editor target for this transport — SSH sessions only".into())
 }
 
 /// One instance = one configured host (ssh, kubectl exec, or the

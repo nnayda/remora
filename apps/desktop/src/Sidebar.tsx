@@ -396,7 +396,8 @@ function ProjectGroup({
 }
 
 /** Hover-revealed per-session menu: Open in external terminal / Copy attach
- * command (live only) / Stop (worktree live only) / Remove session.
+ * command (live only) / Open in VS Code (ssh only, live+stopped) / Stop
+ * (worktree live only) / Remove session.
  * Outside-click closes it (mousedown listener); the trigger stops propagation so
  * opening the menu never also opens the session. */
 function SessionMenu({
