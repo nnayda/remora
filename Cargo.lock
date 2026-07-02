@@ -3294,6 +3294,7 @@ dependencies = [
  "rand",
  "remora-core",
  "remora-protocol",
+ "remora-relay",
  "serde",
  "serde_json",
  "snow",
