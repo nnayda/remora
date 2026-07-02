@@ -143,3 +143,59 @@ describe("ConfirmRemoveDialog — force stage from forceReason", () => {
     expect(onConfirm).toHaveBeenCalledWith(true);
   });
 });
+
+describe("ConfirmRemoveDialog — Escape closes without confirming", () => {
+  // With the busy/in-flight state removed (removal is now fire-and-forget and
+  // backgrounded by App), Esc must unconditionally close the dialog — there is
+  // no longer a `requestClose` guard that could refuse to close while "busy".
+  it("Escape on the confirm stage calls onClose and never onConfirm", () => {
+    const onConfirm = vi.fn();
+    const onClose = vi.fn();
+    renderDialog("worktree", { onConfirm, onClose });
+
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onConfirm).not.toHaveBeenCalled();
+  });
+
+  it("Escape on the force stage calls onClose and never onConfirm", () => {
+    const onConfirm = vi.fn();
+    const onClose = vi.fn();
+    renderDialog("worktree", {
+      forceReason: "uncommitted",
+      onConfirm,
+      onClose,
+    });
+
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onConfirm).not.toHaveBeenCalled();
+  });
+});
+
+describe("ConfirmRemoveDialog — shared workspace confirm fires onConfirm", () => {
+  // The confirm-stage footer button label varies ("Close" vs "Remove") but
+  // both wire the same onClick={() => onConfirm(isForce)} — cover the shared
+  // (non-destructive) label explicitly since only its copy was asserted above.
+  it("clicking Close (shared workspace) fires onConfirm(false) once", () => {
+    const onConfirm = vi.fn();
+    const onClose = vi.fn();
+    renderDialog("shared", { onConfirm, onClose });
+
+    // Both the dialog's header "X" and the footer action share the
+    // accessible name "Close" — the footer action is the primary <button>
+    // (not the icon-only header dismiss), so target it specifically.
+    const closeButtons = screen.getAllByRole("button", { name: "Close" });
+    const footerClose = closeButtons.find((b) =>
+      b.className.includes("rmra-btn--primary"),
+    );
+    if (!footerClose) throw new Error("footer Close button not found");
+    fireEvent.click(footerClose);
+
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+    expect(onConfirm).toHaveBeenCalledWith(false);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+});

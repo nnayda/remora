@@ -2038,6 +2038,40 @@ describe("SessionStore Fix D coverage", () => {
     expect(store.getSnapshot().removing).toEqual([]);
   });
 
+  // A disposed store short-circuits remove() the same way it short-circuits
+  // openSession (see the analogous test above): terminal, so no new backend
+  // side effect (tmux kill / worktree delete) may fire post-teardown.
+  it("remove on a disposed store returns {ok:false} without invoking the opener", async () => {
+    const remove = vi.fn().mockResolvedValue(undefined);
+    const { store } = makeStore({ remove });
+    store.dispose();
+    const r = await store.remove("api", "x", false);
+    expect(r).toEqual({ ok: false });
+    expect(remove).not.toHaveBeenCalled();
+    expect(store.getSnapshot().removing).toEqual([]);
+  });
+
+  // The store only closes the tab on a *successful* remove (see `remove`'s
+  // success branch). A failed backgrounded remove must leave the tab exactly
+  // as it was — the session may still be alive server-side, and the row stays
+  // available to retry (App keeps the confirm dialog closed but never
+  // silently drops the tab on failure).
+  it("remove leaves the tab open when the backend fails (no tab is dropped on failure)", async () => {
+    const { store } = makeStore({
+      remove: vi.fn().mockRejectedValue(new Error("kill tmux: nope")),
+    });
+    await store.openSession({
+      projectId: "api",
+      sessionId: "x",
+      agent: null,
+      base: null,
+      workspace: "worktree" as const,
+    });
+    const r = await store.remove("api", "x", false);
+    expect(r.ok).toBe(false);
+    expect(store.getSnapshot().tabs.map((t) => t.key)).toEqual(["api/x"]);
+  });
+
   it("stop does NOT appear in snapshot.removing (it is remove-only)", async () => {
     let resolveStop!: () => void;
     const stop = vi.fn(
