@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use futures_util::future::join_all;
 use remora_core::config::{Config, ConfigDocument, ConfigError, HostId};
-use remora_core::{SessionChannel, SessionSource};
+use remora_core::{SessionChannel, SessionLocks, SessionSource};
 
 use remora_protocol::{
     AgentId, ChannelInput, ChannelOutput, ProjectId, SessionId, SpawnSpec, TerminalSize,
@@ -52,14 +52,29 @@ pub struct Bridge {
     /// Read paths don't take it — `save` is atomic (temp + rename), so a reader
     /// always sees a whole file. Cross-process is out of scope until the relay.
     config_mutex: tokio::sync::Mutex<()>,
+    /// The one-per-process session-lock registry (ADR-0021). The production
+    /// resolver wraps every source it hands out against this same registry, so
+    /// concurrent actors serialize their mutating ops per session. Held here so
+    /// a sibling below the seam — the future remote-host loopback — can share
+    /// it rather than mint a second, non-serializing registry.
+    session_locks: Arc<SessionLocks>,
 }
 
 impl Bridge {
     /// Production: forward tasks run on Tauri's async runtime.
-    pub fn new(resolver: Arc<dyn SourceResolver>, config_path: PathBuf) -> Self {
+    ///
+    /// `session_locks` is the one-per-process registry the caller also cloned
+    /// into the production `ConfigResolver`, so the resolver's wrappers and any
+    /// future in-process actor serialize against the *same* registry.
+    pub fn new(
+        resolver: Arc<dyn SourceResolver>,
+        config_path: PathBuf,
+        session_locks: Arc<SessionLocks>,
+    ) -> Self {
         Self::with_spawner(
             resolver,
             config_path,
+            session_locks,
             Arc::new(|fut| {
                 tauri::async_runtime::spawn(fut);
             }),
@@ -69,6 +84,7 @@ impl Bridge {
     fn with_spawner(
         resolver: Arc<dyn SourceResolver>,
         config_path: PathBuf,
+        session_locks: Arc<SessionLocks>,
         spawn_task: Spawner,
     ) -> Self {
         Self {
@@ -78,7 +94,16 @@ impl Bridge {
             spawn_task,
             config_path,
             config_mutex: tokio::sync::Mutex::new(()),
+            session_locks,
         }
+    }
+
+    /// The shared session-lock registry (ADR-0021). Exposed for a sibling
+    /// actor below the `SessionSource` seam — the future remote-host loopback —
+    /// that must serialize against the same registry the resolver uses.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn session_locks(&self) -> Arc<SessionLocks> {
+        Arc::clone(&self.session_locks)
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<u64, OpenChannel>> {
@@ -648,6 +673,7 @@ mod tests {
         Bridge::with_spawner(
             Arc::new(FixedResolver(source)),
             config_path,
+            SessionLocks::new(),
             Arc::new(|fut| {
                 tokio::spawn(fut);
             }),
@@ -1051,6 +1077,7 @@ mod tests {
                 source: Arc::new(FakeSessionSource::new()),
             }),
             temp_config_path("routing"),
+            SessionLocks::new(),
             Arc::new(|fut| {
                 tokio::spawn(fut);
             }),
@@ -1231,6 +1258,7 @@ mod tests {
         let b = Bridge::with_spawner(
             Arc::new(TwoHostResolver),
             temp_config_path("twohost"),
+            SessionLocks::new(),
             Arc::new(|fut| {
                 tokio::spawn(fut);
             }),
@@ -1284,6 +1312,7 @@ mod tests {
         let b = Bridge::with_spawner(
             Arc::new(AllDownResolver),
             temp_config_path("alldown"),
+            SessionLocks::new(),
             Arc::new(|fut| {
                 tokio::spawn(fut);
             }),
@@ -1328,6 +1357,7 @@ mod tests {
         let b = Bridge::with_spawner(
             Arc::new(TwoDistinctErrorsResolver),
             temp_config_path("alldown-distinct"),
+            SessionLocks::new(),
             Arc::new(|fut| {
                 tokio::spawn(fut);
             }),
@@ -1429,6 +1459,7 @@ mod tests {
                 host_count,
             }),
             temp_config_path("concurrency-probe"),
+            SessionLocks::new(),
             Arc::new(|fut| {
                 tokio::spawn(fut);
             }),
@@ -1462,6 +1493,7 @@ mod tests {
         let b = Bridge::with_spawner(
             Arc::new(NoHostsResolver),
             temp_config_path("no-hosts"),
+            SessionLocks::new(),
             Arc::new(|fut| {
                 tokio::spawn(fut);
             }),
@@ -1952,8 +1984,9 @@ mod tests {
         )
         .expect("write");
         let b = Bridge::with_spawner(
-            Arc::new(super::resolve::ConfigResolver),
+            Arc::new(super::resolve::ConfigResolver::new(SessionLocks::new())),
             path.clone(),
+            SessionLocks::new(),
             Arc::new(|fut| {
                 tokio::spawn(fut);
             }),
@@ -1964,5 +1997,128 @@ mod tests {
             .await;
         std::fs::remove_file(&path).ok();
         assert!(matches!(result, Err(BridgeError::Config { .. })));
+    }
+
+    // ---- Shared session-lock registry (Task 5, ADR-0021) ----
+
+    /// The Bridge keeps a handle to the same registry its resolver wraps with,
+    /// so a future in-process actor can serialize against it. `with_spawner`
+    /// stores exactly the `Arc` it was handed (proven by pointer identity).
+    #[tokio::test]
+    async fn bridge_keeps_the_shared_lock_registry_handle() {
+        let locks = remora_core::SessionLocks::new();
+        let b = Bridge::with_spawner(
+            Arc::new(FixedResolver(Arc::new(FakeSessionSource::new()))),
+            temp_config_path("locks-handle"),
+            Arc::clone(&locks),
+            Arc::new(|fut| {
+                tokio::spawn(fut);
+            }),
+        );
+        assert!(
+            Arc::ptr_eq(&locks, &b.session_locks()),
+            "Bridge must retain the very registry it was constructed with"
+        );
+    }
+
+    /// Test double that parks in `stop` until released, recording op order —
+    /// the seam a wrapped source presents to the Bridge (mirrors the Blocking
+    /// double in `remora-core`'s `exclusive.rs`).
+    struct BlockingSource {
+        log: Arc<Mutex<Vec<String>>>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    fn dead_channel() -> SessionChannel {
+        let (channel, _input_rx, _output_tx) = SessionChannel::pair();
+        channel
+    }
+    fn log_push(log: &Arc<Mutex<Vec<String>>>, entry: &str) {
+        log.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(entry.to_string());
+    }
+    #[async_trait]
+    impl SessionSource for BlockingSource {
+        async fn spawn(&self, _: SpawnSpec) -> Result<SessionChannel, SourceError> {
+            log_push(&self.log, "spawn");
+            Ok(dead_channel())
+        }
+        async fn attach(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+        ) -> Result<SessionChannel, SourceError> {
+            log_push(&self.log, "attach");
+            Ok(dead_channel())
+        }
+        async fn respawn(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+            _: Option<AgentId>,
+        ) -> Result<SessionChannel, SourceError> {
+            log_push(&self.log, "respawn");
+            Ok(dead_channel())
+        }
+        async fn stop(&self, _: &ProjectId, _: &SessionId) -> Result<(), SourceError> {
+            log_push(&self.log, "stop:start");
+            self.started.notify_one();
+            self.release.notified().await;
+            log_push(&self.log, "stop:end");
+            Ok(())
+        }
+        async fn remove(&self, _: &ProjectId, _: &SessionId, _: bool) -> Result<(), SourceError> {
+            unreachable!()
+        }
+        async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// End-to-end proof that the resolver's exclusion actually serializes two
+    /// concurrent Bridge calls on one session: an attach must wait for an
+    /// in-flight stop. The resolver returns one `ExclusiveSource` (shared
+    /// registry) for both, so the lock — not luck — orders them.
+    #[tokio::test]
+    async fn bridge_serializes_stop_and_attach_on_the_same_session() {
+        use remora_core::{ExclusiveSource, SessionLocks};
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let double = Arc::new(BlockingSource {
+            log: Arc::clone(&log),
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        });
+        let wrapped: Arc<dyn SessionSource> =
+            Arc::new(ExclusiveSource::new(double, SessionLocks::new(), "h"));
+        // FixedResolver hands the same wrapped source (one registry) to every
+        // call, exactly as the production resolver shares one registry.
+        let b = Arc::new(bridge(wrapped));
+
+        let b_stop = Arc::clone(&b);
+        let stop_task = tokio::spawn(async move { b_stop.stop("api".into(), "fix".into()).await });
+        // Wait until the parked stop holds the per-session lock.
+        started.notified().await;
+
+        let (s, _rx) = sink();
+        let b_attach = Arc::clone(&b);
+        let attach_task =
+            tokio::spawn(async move { b_attach.attach("api".into(), "fix".into(), s).await });
+        // Let the attach task reach and block on the lock.
+        tokio::task::yield_now().await;
+
+        release.notify_one();
+        stop_task.await.expect("join stop").expect("stop");
+        attach_task.await.expect("join attach").expect("attach");
+
+        // attach ran strictly after stop finished — it did not interleave.
+        assert_eq!(
+            log.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_slice(),
+            &["stop:start", "stop:end", "attach"]
+        );
     }
 }

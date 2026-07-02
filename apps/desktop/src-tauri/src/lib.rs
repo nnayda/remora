@@ -8,6 +8,7 @@ use bridge::commands::ConfigChanged;
 use bridge::resolve::ConfigResolver;
 use bridge::Bridge;
 use remora_core::config::config_file_path;
+use remora_core::SessionLocks;
 use tauri::Manager;
 use tauri_specta::Event;
 
@@ -30,7 +31,15 @@ pub fn run() {
             // config dir; remora-core owns the `remora/config.toml` suffix.
             let base = app.path().config_dir()?;
             let config_path = config_file_path(base);
-            app.manage(Bridge::new(Arc::new(ConfigResolver), config_path.clone()));
+            // One session-lock registry per process, shared between the
+            // resolver's `ExclusiveSource` wrappers and the Bridge's handle
+            // (ADR-0021).
+            let session_locks = SessionLocks::new();
+            app.manage(Bridge::new(
+                Arc::new(ConfigResolver::new(Arc::clone(&session_locks))),
+                config_path.clone(),
+                session_locks,
+            ));
 
             // Live-reload the sidebar when the config file changes on disk.
             // Non-fatal: on failure the app still runs with manual refresh.
