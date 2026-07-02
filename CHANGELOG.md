@@ -20,6 +20,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Device pairing over the relay** (#232, ADR-0021): the bridge now enrolls
+  phones through a real split-secret pairing ceremony instead of the slice-1
+  file-based provisioning stub, and the relay drops its static `devices` config
+  for bridge-asserted credentials. Pairing a device scans (or types) the
+  bridge's one-time code — a relay-visible rendezvous token plus a relay-blind
+  PSK — which drives an `IKpsk2` Noise handshake through the relay; the device's
+  fingerprint surfaces on the desktop and enrollment is gated on the user
+  confirming it, so even a malicious relay can never enroll itself. On confirm
+  the bridge mints the device's durable per-pair relay token and session PSK,
+  asserts the credential to the relay before granting it, and persists the
+  roster entry. Revoking a device removes it from the roster, re-asserts the
+  shrunken set to the relay, and cancels its live sessions. Per-bridge rosters,
+  a single in-flight pairing window, and confirm-gated enrollment are all first
+  class. Push notifications (#233) and the standalone headless bridge (#234)
+  remain later slices.
 - **Open a session in an external terminal — UI half**: session menu gains
   "Open in <terminal>" (launches the configured external terminal attached to
   the session, coexisting with the embedded one) and "Copy attach command"

@@ -296,6 +296,30 @@ async fn device_control_frame_is_closed_4002() {
 }
 
 #[tokio::test]
+async fn hello_or_push_trigger_after_hello_closed_4002() {
+    let url = start(base_config(None)).await;
+
+    // A bridge completes its hello, then sends a second Hello on the same
+    // connection — a post-hello Hello is a protocol violation, closed 4002.
+    let mut bridge = connect(&url).await;
+    send_bin(&mut bridge, hello_frame(&bridge_hello())).await;
+    send_bin(&mut bridge, hello_frame(&bridge_hello())).await;
+    expect_close(&mut bridge, 4002).await;
+
+    // An admitted device then sends a PushTrigger frame — reserved and never
+    // valid device→relay post-hello — also closed 4002.
+    let mut _bridge = bridge_with_asserted_device(&url).await;
+    let mut device = connect(&url).await;
+    send_bin(&mut device, hello_frame(&device_hello())).await;
+    send_bin(
+        &mut device,
+        frame(FrameType::PushTrigger, DEV_ROUTING, BRIDGE),
+    )
+    .await;
+    expect_close(&mut device, 4002).await;
+}
+
+#[tokio::test]
 async fn data_to_offline_dst_closes_sender_4004() {
     let url = start(base_config(None)).await;
 

@@ -119,9 +119,11 @@ pub async fn start_loopback(
         .unwrap_or_else(|| PathBuf::from("."));
     let identity = BridgeIdentity::load_or_create(&state_dir.join("bridge_identity.toml"))?;
     // Start from an EMPTY roster: the device this run pairs is enrolled by the
-    // real ceremony below, not seeded inline. We never persist it — a saved entry
-    // could not reconnect through a later run's fresh relay + per-run credentials
-    // anyway. (A stale on-disk roster from an older build is deliberately ignored.)
+    // real ceremony below, not seeded inline. The confirm path does persist the
+    // enrolled entry to `bridge_roster.toml`, but it is overwritten each run and
+    // never loaded back — a saved entry could not reconnect through a later run's
+    // fresh relay + per-run credentials anyway, so the on-disk copy is harmless
+    // and any stale roster from an older build is deliberately ignored.
     let roster = Roster::default();
 
     // Fresh bridge-registration token per run (spec D11): the relay authorizes

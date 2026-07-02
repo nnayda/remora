@@ -480,10 +480,14 @@ impl Drop for DoneGuard {
 /// single `recv` covers "user decided" and "window gone" uniformly.
 #[derive(Debug)]
 enum PairingCtl {
-    /// The user approved the arrived device's fingerprint.
-    Confirm,
-    /// The user rejected the arrived device.
-    Reject,
+    /// The user approved the fingerprint of the device identified by `device_id`
+    /// (the id the desktop was shown in `PairingDeviceArrived`). The responder
+    /// task drops a decision whose `device_id` does not match the device that
+    /// actually arrived, so a stale queued decision cannot cross-confirm a
+    /// different device after a window replacement.
+    Confirm { device_id: DeviceId },
+    /// The user rejected the device identified by `device_id` (see `Confirm`).
+    Reject { device_id: DeviceId },
 }
 
 /// The bridge's single in-flight pairing window (ADR-0021 D3).
@@ -1215,7 +1219,8 @@ async fn run_pairing(
 
     // --- Await the user's decision (or window expiry). No pending credential is
     // asserted yet, so reject/expiry here just closes with no relay cleanup. ---
-    let decision = await_pairing_decision(&mut ctl_rx, params.expires_at, &conn_token).await;
+    let decision =
+        await_pairing_decision(&mut ctl_rx, &device_id, params.expires_at, &conn_token).await;
     match decision {
         PairingDecision::Confirm => {}
         PairingDecision::Reject => {
@@ -1425,24 +1430,42 @@ enum PairingDecision {
     Closed,
 }
 
-/// Awaits the user's confirm/reject decision, bounded by the window deadline and
-/// the connection token. A closed control channel (the desktop cancelled or a
-/// new window replaced this one) or the deadline both resolve to `Closed`.
+/// Awaits the user's confirm/reject decision for the device that actually
+/// arrived (`arrived`), bounded by the window deadline and the connection token.
+/// A closed control channel (the desktop cancelled or a new window replaced this
+/// one) or the deadline both resolve to `Closed`.
+///
+/// A decision naming a *different* device — e.g. a stale `Confirm` still queued
+/// on the control channel (cap 4) from a window that was replaced before this
+/// device arrived — is dropped, and the await keeps waiting. This binds the
+/// decision to the arrived device so a queued approval can never enroll the
+/// wrong one after a window replacement.
 async fn await_pairing_decision(
     ctl_rx: &mut mpsc::Receiver<PairingCtl>,
+    arrived: &DeviceId,
     expires_at: u64,
     conn_token: &CancellationToken,
 ) -> PairingDecision {
     let sleep = tokio::time::sleep(deadline_from_now(expires_at));
     tokio::pin!(sleep);
-    tokio::select! {
-        _ = conn_token.cancelled() => PairingDecision::Closed,
-        _ = &mut sleep => PairingDecision::Closed,
-        ctl = ctl_rx.recv() => match ctl {
-            Some(PairingCtl::Confirm) => PairingDecision::Confirm,
-            Some(PairingCtl::Reject) => PairingDecision::Reject,
-            None => PairingDecision::Closed,
-        },
+    loop {
+        tokio::select! {
+            _ = conn_token.cancelled() => return PairingDecision::Closed,
+            _ = &mut sleep => return PairingDecision::Closed,
+            ctl = ctl_rx.recv() => match ctl {
+                Some(PairingCtl::Confirm { device_id }) if &device_id == arrived => {
+                    return PairingDecision::Confirm;
+                }
+                Some(PairingCtl::Reject { device_id }) if &device_id == arrived => {
+                    return PairingDecision::Reject;
+                }
+                // A decision for a stale/different device: ignore it and keep
+                // waiting for one that matches the arrived device (or the window
+                // to close).
+                Some(_) => continue,
+                None => return PairingDecision::Closed,
+            },
+        }
     }
 }
 
@@ -1809,7 +1832,7 @@ async fn serve_peer(
                             &mut revoke_target,
                         )
                         .await;
-                        if send_msg(
+                        let send_ok = send_msg(
                             &mut transport,
                             &outbound_tx,
                             bridge_id,
@@ -1817,19 +1840,23 @@ async fn serve_peer(
                             &BridgeMessage::Response { id, result },
                         )
                         .await
-                        .is_err()
-                        {
-                            return;
-                        }
+                        .is_ok();
                         // Response-first, kick-after (ADR-0021 D6): the roster is
                         // already shrunken; now sever the target's live
                         // session(s) bridge-side and re-assert the shrunken set to
-                        // the relay. For a self-revoke this cancels *this* peer —
-                        // the loop returns on its next iteration — but the
-                        // `Revoked` above is already on the outbound queue ahead of
-                        // the re-assert, so the requester still gets its answer.
+                        // the relay. On the success path the `Revoked` response is
+                        // already on the outbound queue ahead of the re-assert, so
+                        // the requester still gets its answer. The kick runs
+                        // *regardless* of the response-send outcome: a per-peer
+                        // seal failure must not leave a revoked device asserted at
+                        // the relay with its live sessions uncancelled until the
+                        // next roster change. For a self-revoke this cancels *this*
+                        // peer — the loop returns on its next iteration.
                         if let Some(target) = revoke_target.take() {
                             assert_and_kick(&target, &deps, &outbound_tx, &control_seq).await;
+                        }
+                        if !send_ok {
+                            return;
                         }
                     }
                     ClientMessage::Input(input) => {
@@ -2267,10 +2294,10 @@ async fn handle_command(
             .await;
         }
         PairingCommand::Confirm { device_id } => {
-            route_pairing_decision(pairing, &device_id, PairingCtl::Confirm).await;
+            route_pairing_decision(pairing, PairingCtl::Confirm { device_id }).await;
         }
         PairingCommand::Reject { device_id } => {
-            route_pairing_decision(pairing, &device_id, PairingCtl::Reject).await;
+            route_pairing_decision(pairing, PairingCtl::Reject { device_id }).await;
         }
         PairingCommand::Revoke { device_id, reply } => {
             let result = revoke_device(&device_id, deps, outbound_tx, control_seq.as_ref()).await;
@@ -2282,21 +2309,16 @@ async fn handle_command(
     }
 }
 
-/// Routes a confirm/reject decision into the running pairing task, but only when
-/// it targets the device that actually arrived (the `device_id` the desktop saw
-/// in `PairingDeviceArrived`). A decision naming a stale device — e.g. a click
-/// after the window already advanced — is ignored rather than misapplied.
+/// Forwards a confirm/reject decision to the running pairing task, if any.
 ///
-/// The task's arrived device id equals the identity preamble on its first frame,
-/// which is not known to the connection loop; so we forward to whatever task is
-/// running and let the task be the single arbiter. The `device_id` is validated
-/// against the arrival the desktop was shown by the desktop layer, and the task
-/// binds to exactly one device, so a mismatched id cannot cross-confirm another.
-async fn route_pairing_decision(
-    pairing: &mut Option<PairingWindow>,
-    _device_id: &DeviceId,
-    ctl: PairingCtl,
-) {
+/// The connection loop does not know which device a running task is bound to
+/// (the arrived device id is the identity preamble on the task's first frame),
+/// so it forwards to whatever task is running and lets the task be the single
+/// arbiter: the decision carries its target `device_id` inside the [`PairingCtl`],
+/// and [`await_pairing_decision`] drops any decision whose id does not match the
+/// arrived device. A stale queued decision therefore cannot cross-confirm a
+/// different device after a window replacement.
+async fn route_pairing_decision(pairing: &mut Option<PairingWindow>, ctl: PairingCtl) {
     if let Some(task) = pairing.as_ref().and_then(|w| w.task.as_ref()) {
         let _ = task.ctl_tx.send(ctl).await;
     }
@@ -3164,7 +3186,7 @@ mod tests {
         // The user rejects: wire Rejected{UserRejected}, Rejected event, consumed.
         harness
             .ctl_tx
-            .send(PairingCtl::Reject)
+            .send(PairingCtl::Reject { device_id })
             .await
             .expect("send reject");
         let payload = recv_pairing_payload(&mut harness.outbound_rx, src).await;
@@ -3189,6 +3211,101 @@ mod tests {
             Some((7, PairingExit::ConsumedWindow)),
             "a post-Pending outcome must consume the window"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_confirm_for_a_different_device_is_ignored() {
+        // Reviewer finding: a decision must bind to the device that actually
+        // arrived. A `Confirm` naming a DIFFERENT device (a stale approval still
+        // queued on the ctl channel from a replaced window) must be dropped — it
+        // must NOT enroll the device that arrived. Only the matching `Confirm`
+        // advances the ceremony.
+        let bridge = test_keypair();
+        let device = test_keypair();
+        let deps = pairing_deps(&bridge);
+        let psk = [0x42u8; 32];
+        let src = DeviceId([0xd0; 32]);
+        let device_id = DeviceId([0xd1; 32]);
+
+        let pro = prologue(HandshakeKind::Pairing, &device_id, &src, &deps.bridge_id);
+        let mut init = Some(
+            Handshake::initiator(&device.private, &bridge.public, &psk, &pro).expect("initiator"),
+        );
+        let msg1 = init
+            .as_mut()
+            .expect("initiator present")
+            .write_message(&[])
+            .expect("msg1");
+        let mut first = device_id.0.to_vec();
+        first.extend_from_slice(&msg1);
+
+        let mut harness = spawn_pairing(&deps, src, first, psk);
+        let mut transport = complete_device_handshake(&mut init, &mut harness, src).await;
+
+        let hello = transport
+            .seal(&PairingClientMsg::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                device_name: "phone".to_string(),
+            })
+            .expect("seal hello");
+        harness.frame_tx.send(hello).await.expect("send hello");
+
+        // Drain the arrival event and the Pending frame: the task is now awaiting.
+        assert!(matches!(
+            harness.events_rx.recv().await,
+            Some(BridgeEvent::PairingDeviceArrived { .. })
+        ));
+        let payload = recv_pairing_payload(&mut harness.outbound_rx, src).await;
+        let pending: PairingBridgeMsg = transport.open(&payload).expect("open pending");
+        assert_eq!(pending, PairingBridgeMsg::Pending);
+
+        // A stale Confirm for a DIFFERENT device is dropped: the task keeps
+        // awaiting, so nothing is sent and the task does not finish.
+        let other = DeviceId([0xee; 32]);
+        harness
+            .ctl_tx
+            .send(PairingCtl::Confirm { device_id: other })
+            .await
+            .expect("send stale confirm");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), harness.outbound_rx.recv())
+                .await
+                .is_err(),
+            "a stale confirm for a different device must not advance the ceremony"
+        );
+        assert!(
+            harness.done_rx.try_recv().is_err(),
+            "the task must still be pending after a mismatched confirm"
+        );
+
+        // The matching Confirm advances the ceremony: the task asserts the pending
+        // credential to the relay (the first outbound Control frame after Confirm).
+        harness
+            .ctl_tx
+            .send(PairingCtl::Confirm { device_id })
+            .await
+            .expect("send matching confirm");
+        let msg = harness.outbound_rx.recv().await.expect("an outbound frame");
+        let Message::Binary(bytes) = msg else {
+            panic!("expected a binary frame, got {msg:?}");
+        };
+        let env = Envelope::decode(bytes.as_ref()).expect("decode envelope");
+        assert_eq!(
+            env.frame_type,
+            FrameType::Control,
+            "the matching confirm drives the assert-before-grant control frame"
+        );
+        let control: RelayControl =
+            serde_json::from_slice(&env.payload).expect("decode relay control");
+        match control {
+            RelayControl::AssertDevices { devices, .. } => {
+                assert!(
+                    devices.iter().any(|d| d.device_id == device_id),
+                    "the arrived device is asserted as the pending credential"
+                );
+            }
+            other => panic!("expected AssertDevices, got {other:?}"),
+        }
     }
 
     #[test]
