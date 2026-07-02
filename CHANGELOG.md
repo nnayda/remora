@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **macOS line-editing chords in the terminal**: Cmd+Delete (kill line
+  backward), Cmd+Left / Cmd+Right (jump to line start/end), and
+  Option+Delete (delete word) now work in the embedded terminal. xterm.js
+  deliberately leaves meta chords to the app — meta+arrow sent nothing and
+  Cmd+Delete deleted a single character — so the terminal controller now
+  translates them to the conventional readline bytes (`^U`, `^A`, `^E`,
+  `ESC DEL`), matching iTerm2's "Natural Text Editing" and VS Code's
+  terminal defaults.
+
 ### Added
 
 - **Per-session collapsed rail** (#184): the collapsed left sidebar now shows one
