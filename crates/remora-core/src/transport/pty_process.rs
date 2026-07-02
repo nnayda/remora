@@ -20,7 +20,7 @@
 //! prompt idle-reap is ever required.
 //!
 //! The writer and detector threads share one `AtomicBool` (#224): the writer
-//! sets it after each successful input write, and the detector thread
+//! sets it after each successful, non-empty input write, and the detector thread
 //! swap-consumes it at every wake to exit a sticky `Awaiting` (see
 //! `wake_events`). It is a flag, not a channel: it adds no `output_tx`
 //! sender and cannot stall the `recv()→None` teardown.
