@@ -67,6 +67,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   slice 1 (envelope + relay MVP + one E2E PTY stream, #231; then pairing
   #232, push #233, headless bridge #234; SECURITY page #235 and
   PROTOCOL.md #236).
+- **Relay slice 1: envelope protocol, blind relay, desktop-hosted bridge**
+  (#231, ADR-0021): the first build slice of the relay trust model settled in
+  ADR-0021. New `remora-protocol` envelope frame types (routing header +
+  opaque payload, `DeviceId`) and typed wire errors; a new `remora-relay`
+  crate — a standalone binary that forwards envelope frames between paired
+  WebSocket connections without ever depending on crypto or session-content
+  crates, so blindness is structural, not just policy; and a new
+  `remora-bridge` crate — a library holding the bridge's Noise identity and a
+  `RemoteSource` (a `SessionSource` implementation that drives `remora-core`
+  end-to-end over Noise, through the relay) — hosted in-process by the
+  desktop app rather than shipped as its own binary yet. Below the
+  `SessionSource` seam, `remora-core` gains per-session keyed locks
+  (`ExclusiveSource`/`SessionLocks`) so a phone acting through the bridge and
+  the desktop's own UI can no longer race an attach against a teardown or a
+  respawn against a close, and a latest-writer-wins tmux window-size policy
+  resolves multi-client resize arbitration on spawn/respawn. The desktop can
+  dogfood the remote path today by attaching through its own bridge over a
+  loopback connection, gated behind `REMORA_REMOTE_LOOPBACK=1` (off by
+  default, no UI). This is slice 1 only: one E2E PTY stream covering attach
+  and list, dev-grade file-based provisioning, no QR pairing UX (#232), no
+  push notifications (#233), and no standalone headless bridge binary (#234)
+  — those follow in later slices.
 - **Per-session collapsed rail** (#184): the collapsed left sidebar now shows one
   navigable glyph per session instead of one avatar per host. Clicking a glyph
   focuses/opens that session (it used to only expand the rail). Sessions are

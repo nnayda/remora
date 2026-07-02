@@ -71,16 +71,25 @@ a type or code path in core
 | --- | --- | --- |
 | `crates/remora-protocol` | Wire types every client speaks (session ids, messages). Deliberately dependency-light — it is the contract third-party clients build against. | `serde` only |
 | `crates/remora-core` | Session model, the `SessionSource` trait, and its direct-mode implementations (ssh, kubectl exec). | `remora-protocol`, `tokio`, `async-trait` |
+| `crates/remora-relay` | Blind envelope-frame relay binary (ADR-0021): routes opaque frames between authenticated WebSocket connections; never depends on crypto or session-content crates. | `remora-protocol`, `tokio-tungstenite` |
+| `crates/remora-bridge` | User-side bridge (ADR-0021): holds the bridge static identity, the paired-device roster, and a `RemoteSource` (`SessionSource` impl driven end-to-end over Noise, through the relay or loopback). Library only — hosted in-process by the desktop today; a headless binary is future work (#234). | `remora-core`, `remora-protocol`, `snow`, `tokio-tungstenite` |
 | `apps/desktop/src-tauri` | Tauri 2 shell: owns the `SessionSource` instance(s) and an open-channel registry; exposes `session_*` Tauri commands (spawn/attach/list/write/resize/respawn/close) that stream PTY output to the frontend over `ipc::Channel`. The channel also carries typed activity events — a status value and a sanitized preview — produced by the core-side detector ([ADR-0013](adr/0013-core-side-activity-detector.md)) and consumed by the UI, which renders them and performs no detection of its own. The UI talks only to this layer. | `remora-core` |
 | `apps/desktop/src` | React UI: tabs, embedded terminal, file/diff/PR panels. Talks only to the Tauri layer. | `@tauri-apps/api` |
 
-Relay mode splits into two future binaries
-([ADR-0021](adr/0021-blind-relay-bridge-trust-model.md)): a **bridge** that
-hosts `remora-core` behind a WebSocket (the desktop app by default, or a
-headless container — always on user hardware, since it holds transport
-creds) and a **blind relay** that routes end-to-end-encrypted
+Relay mode splits along the trust line
+([ADR-0021](adr/0021-blind-relay-bridge-trust-model.md)): the **blind
+relay** (`remora-relay`, a standalone binary) routes end-to-end-encrypted
 `remora-protocol` frames between paired devices without being able to read
-them — same seam, no UI changes.
+them, and the **bridge** (`remora-bridge`, a library) hosts a `RemoteSource`
+that drives `remora-core` end-to-end over Noise — same seam, no UI changes.
+The bridge is only ever hosted on user hardware: today it runs in-process
+inside the desktop app (dev-only loopback dogfood behind
+`REMORA_REMOTE_LOOPBACK=1`, no pairing UX yet — #232); a standalone headless
+`remora-bridge` binary for laptop-asleep access is still future work (#234).
+This is relay **slice 1**: envelope protocol + one E2E PTY stream (attach,
+list) and per-session mutual exclusion below the `SessionSource` seam, with
+dev-grade file-based provisioning — no QR pairing (#232), no push (#233), no
+headless bridge binary (#234).
 
 ## Security invariants
 

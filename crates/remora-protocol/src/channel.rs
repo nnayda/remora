@@ -38,8 +38,12 @@ impl std::error::Error for InvalidTerminalSizeError {}
 /// divide-by-zero and rendering bugs, so it is rejected at every
 /// construction and deserialization path.
 ///
-/// Note: tmux sizes its window to the smallest attached client and reserves
-/// a status line, so the geometry the agent sees may differ from the
+/// Note: Remora-spawned sessions set `window-size latest` (tmux >= 3.1), so
+/// the window follows the latest client to write — the geometry the agent sees
+/// tracks the most recently active client rather than being clamped to the
+/// smallest one. On tmux < 3.1 the option is absent and tmux falls back to
+/// sizing the window to the smallest attached client. Either way tmux reserves
+/// a status line, so the geometry the agent sees may still differ from the
 /// requested size (e.g. request 30 rows, get 29). The protocol carries the
 /// requested size; compensation, if any, is a client concern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

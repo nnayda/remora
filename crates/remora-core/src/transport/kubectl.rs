@@ -746,6 +746,13 @@ mod tests {
             calls[1][2].contains("remora_api_fix-login"),
             "batched script must carry the planned tmux name"
         );
+        // spec D8: the batched script also carries the tolerated `window-size
+        // latest` set-option step (latest-writer-wins sizing, tmux >= 3.1).
+        assert!(
+            calls[1][2].contains("window-size"),
+            "batched script must contain the window-size step: {:?}",
+            &calls[1][2][..calls[1][2].len().min(400)]
+        );
     }
 
     #[tokio::test]

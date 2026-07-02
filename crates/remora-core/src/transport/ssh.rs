@@ -737,13 +737,14 @@ mod tests {
     #[tokio::test]
     async fn spawn_through_fake_exec_attaches() {
         // ssh spawn issues ONE batched script (no probe). The script encodes
-        // fetch → worktree-add → new-session → passthrough → set-env×3.
+        // fetch → worktree-add → new-session → passthrough → window-size → set-env×3.
         let config = test_config();
         let batch_stdout = [
             rec(batch::StepId::Fetch, "", 0),
             rec(batch::StepId::WorktreeAdd, "", 0),
             rec(batch::StepId::NewSession, "", 0),
             rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::WindowSize, "", 0),
             rec(batch::StepId::SetEnv, "", 0),
             rec(batch::StepId::SetEnv, "", 0),
             rec(batch::StepId::SetEnv, "", 0),
@@ -767,6 +768,12 @@ mod tests {
         assert!(
             calls[0][2].contains("new-session") && calls[0][2].contains("remora_api_fix-login"),
             "batched script must carry the planned tmux name"
+        );
+        // spec D8: the batched script also carries the tolerated `window-size
+        // latest` set-option step (latest-writer-wins sizing, tmux >= 3.1).
+        assert!(
+            calls[0][2].contains("window-size"),
+            "batched script must contain the window-size step"
         );
         assert!(
             calls[0][2].contains("REMORA_AGENT"),

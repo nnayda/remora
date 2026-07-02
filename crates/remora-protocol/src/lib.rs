@@ -6,11 +6,18 @@
 //! it is the contract third-party clients build against.
 
 mod channel;
+mod envelope;
 mod id;
+mod remote;
 mod session;
 
 pub use channel::{ChannelInput, ChannelOutput, InvalidTerminalSizeError, TerminalSize};
+pub use envelope::{
+    DeviceId, Envelope, EnvelopeError, FrameType, HelloRole, InvalidDeviceIdError, RelayHello,
+    ENVELOPE_HEADER_LEN, ENVELOPE_VERSION, MAX_ENVELOPE_PAYLOAD,
+};
 pub use id::{AgentId, InvalidIdError, ProjectId, SessionId, MAX_ID_LEN};
+pub use remote::{BridgeMessage, ClientMessage, RemoteOp, RemoteResult, WireError};
 pub use session::{SessionMeta, SessionState, SessionStatus, SpawnSpec, WorkspaceMode};
 
 /// Version of the wire format defined by this crate.

@@ -395,6 +395,26 @@ pub(crate) fn set_passthrough_tokens(tmux_name: &str) -> Vec<String> {
     ]
 }
 
+/// Tokens for `tmux set-option -t <name> window-size latest` (spec D8). Applied
+/// as its own step after the new-session step succeeds — NEVER chained into the
+/// new-session invocation (a mid-chain `set-option` failure would abort the
+/// later options in that invocation) and NEVER fatal: tmux < 3.1 lacks the
+/// `window-size` option and must degrade to the default smallest-client clamp
+/// without failing the spawn. On tmux >= 3.1 this gives Remora-spawned sessions
+/// latest-writer-wins sizing, so a second attached client no longer clamps the
+/// window to the smaller geometry. Called by `run_spawn` and `run_respawn` with
+/// its result tolerated (ignored).
+pub(crate) fn set_window_size_tokens(tmux_name: &str) -> Vec<String> {
+    vec![
+        "tmux".into(),
+        "set-option".into(),
+        "-t".into(),
+        tmux_name.into(),
+        "window-size".into(),
+        "latest".into(),
+    ]
+}
+
 /// Tokens for `tmux set-environment -t <name> <key> <value>`. The value is
 /// the logical metadata string, single-quoted as a literal (no tilde
 /// expansion — the stored value must round-trip via the inline `#{E:VAR}`
@@ -1776,7 +1796,8 @@ fn join_cmd(tokens: &[String]) -> String {
 /// The ordered batched-spawn step list. Worktree mode: Fetch (non-fatal) ->
 /// WorktreeAdd (fatal, with cascade) -> [Provision (non-fatal, only when
 /// `plan.provision` is set)] -> NewSession (fatal) -> Passthrough (non-fatal)
-/// -> SetEnv x N (non-fatal, one per `plan.env` entry). Shared mode (no
+/// -> WindowSize (non-fatal) -> SetEnv x N (non-fatal, one per `plan.env`
+/// entry). Shared mode (no
 /// branch): omit Fetch + WorktreeAdd. Provision runs immediately before
 /// NewSession so the file exists before the agent launches, but a write
 /// failure (best-effort, non-fatal) never aborts the spawn. Mirrors the
@@ -1812,6 +1833,11 @@ fn build_spawn_steps(plan: &SpawnPlan) -> Vec<Step> {
         cmd: join_cmd(&set_passthrough_tokens(&plan.tmux_name)),
         fatal: false,
     });
+    steps.push(Step {
+        id: StepId::WindowSize,
+        cmd: join_cmd(&set_window_size_tokens(&plan.tmux_name)),
+        fatal: false, // spec D8; tmux < 3.1 lacks window-size, must not abort spawn
+    });
     for (key, value) in &plan.env {
         steps.push(Step {
             id: StepId::SetEnv,
@@ -1824,7 +1850,8 @@ fn build_spawn_steps(plan: &SpawnPlan) -> Vec<Step> {
 
 /// The ordered batched-respawn step list: [Provision (non-fatal, only when
 /// `plan.provision` is set)] -> NewSession (fatal) -> Passthrough (non-fatal)
-/// -> SetEnv x N (non-fatal, one per `plan.env` entry). No worktree-add /
+/// -> WindowSize (non-fatal) -> SetEnv x N (non-fatal, one per `plan.env`
+/// entry). No worktree-add /
 /// fetch / cascade (the worktree survives a respawn). Provision mirrors
 /// `build_spawn_steps` so a respawn re-writes the hook script exactly like a
 /// spawn does (ADR-0020) — otherwise a provisioned file that goes missing
@@ -1848,6 +1875,11 @@ fn build_respawn_steps(plan: &SpawnPlan) -> Vec<Step> {
         id: StepId::Passthrough,
         cmd: join_cmd(&set_passthrough_tokens(&plan.tmux_name)),
         fatal: false,
+    });
+    steps.push(Step {
+        id: StepId::WindowSize,
+        cmd: join_cmd(&set_window_size_tokens(&plan.tmux_name)),
+        fatal: false, // spec D8; tmux < 3.1 lacks window-size, must not abort spawn
     });
     for (key, value) in &plan.env {
         steps.push(Step {
@@ -2167,6 +2199,69 @@ pub(crate) mod tests {
         assert_eq!(tokens[3], "remora_api_fix-login");
         assert_eq!(tokens[4], "allow-passthrough");
         assert_eq!(tokens[5], "on");
+    }
+
+    #[test]
+    fn set_window_size_tokens_shape() {
+        // 6 tokens: tmux set-option -t <name> window-size latest
+        let tokens = set_window_size_tokens("remora_api_fix-login");
+        assert_eq!(tokens.len(), 6);
+        assert_eq!(tokens[0], "tmux");
+        assert_eq!(tokens[1], "set-option");
+        assert_eq!(tokens[2], "-t");
+        assert_eq!(tokens[3], "remora_api_fix-login");
+        assert_eq!(tokens[4], "window-size");
+        assert_eq!(tokens[5], "latest");
+    }
+
+    #[test]
+    fn spawn_steps_include_tolerated_window_size_after_new_session() {
+        // spec D8: `window-size latest` is its own NON-FATAL batch step ordered
+        // after new-session (never chained into it, never fatal). tmux < 3.1
+        // lacks the option and must degrade to the smallest-client clamp without
+        // failing the spawn.
+        let steps = build_spawn_steps(&worktree_plan());
+        let ws = steps
+            .iter()
+            .position(|s| matches!(s.id, batch::StepId::WindowSize))
+            .expect("window_size step present");
+        let new = steps
+            .iter()
+            .position(|s| matches!(s.id, batch::StepId::NewSession))
+            .expect("new_session step present");
+        assert!(ws > new, "window_size must follow new_session");
+        assert!(
+            !steps[ws].fatal,
+            "window_size must be non-fatal (tmux < 3.1 degrades)"
+        );
+        assert!(
+            steps[ws].cmd.contains("window-size") && steps[ws].cmd.contains("latest"),
+            "window_size cmd must set window-size latest: {}",
+            steps[ws].cmd
+        );
+    }
+
+    #[test]
+    fn respawn_steps_include_tolerated_window_size_after_new_session() {
+        let steps = build_respawn_steps(&respawn_plan());
+        let ws = steps
+            .iter()
+            .position(|s| matches!(s.id, batch::StepId::WindowSize))
+            .expect("window_size step present");
+        let new = steps
+            .iter()
+            .position(|s| matches!(s.id, batch::StepId::NewSession))
+            .expect("new_session step present");
+        assert!(ws > new, "window_size must follow new_session");
+        assert!(
+            !steps[ws].fatal,
+            "window_size must be non-fatal (tmux < 3.1 degrades)"
+        );
+        assert!(
+            steps[ws].cmd.contains("window-size") && steps[ws].cmd.contains("latest"),
+            "window_size cmd must set window-size latest: {}",
+            steps[ws].cmd
+        );
     }
 
     #[test]
@@ -3023,6 +3118,33 @@ pub(crate) mod tests {
             rec(batch::StepId::WorktreeAdd, "", 0),
             rec(batch::StepId::NewSession, "", 0),
             rec(batch::StepId::Passthrough, "", 1), // rc=1, non-fatal
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+            rec(batch::StepId::SetEnv, "", 0),
+        ]
+        .concat();
+        let fake = FakeExec::new(vec![Ok(RemoteOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })]);
+        run_spawn(&fake, &worktree_plan()).expect("spawn");
+        assert_eq!(fake.opened.lock().expect("lock").len(), 1);
+    }
+
+    #[test]
+    fn window_size_failure_does_not_fail_spawn() {
+        // spec D8: `window-size latest` is non-fatal — a tmux < 3.1 that rejects
+        // the unknown option records rc=1, and the spawn must still succeed. The
+        // spawn-success classifier keys on the NewSession lock step (rc==0), NOT
+        // on a trailing option step, so a WindowSize failure never masquerades as
+        // the lock step (learning `batched-spawn-must-confirm-lock-step-ran`).
+        let stdout = [
+            rec(batch::StepId::Fetch, "", 0),
+            rec(batch::StepId::WorktreeAdd, "", 0),
+            rec(batch::StepId::NewSession, "", 0),
+            rec(batch::StepId::Passthrough, "", 0),
+            rec(batch::StepId::WindowSize, "unknown option: window-size", 1), // rc=1, non-fatal
             rec(batch::StepId::SetEnv, "", 0),
             rec(batch::StepId::SetEnv, "", 0),
             rec(batch::StepId::SetEnv, "", 0),
@@ -4926,6 +5048,7 @@ pub(crate) mod tests {
             vec![
                 batch::StepId::NewSession,
                 batch::StepId::Passthrough,
+                batch::StepId::WindowSize,
                 batch::StepId::SetEnv,
                 batch::StepId::SetEnv,
                 batch::StepId::SetEnv,
@@ -4976,6 +5099,7 @@ pub(crate) mod tests {
                 batch::StepId::WorktreeAdd,
                 batch::StepId::NewSession,
                 batch::StepId::Passthrough,
+                batch::StepId::WindowSize,
                 batch::StepId::SetEnv,
                 batch::StepId::SetEnv,
                 batch::StepId::SetEnv,
@@ -4999,6 +5123,7 @@ pub(crate) mod tests {
             vec![
                 batch::StepId::NewSession,
                 batch::StepId::Passthrough,
+                batch::StepId::WindowSize,
                 batch::StepId::SetEnv,
                 batch::StepId::SetEnv,
                 batch::StepId::SetEnv,

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use remora_core::config::{Config, HostId, Transport};
-use remora_core::{KubectlSource, SessionSource, SshSource};
+use remora_core::{ExclusiveSource, KubectlSource, SessionLocks, SessionSource, SshSource};
 use remora_protocol::ProjectId;
 
 use super::error::BridgeError;
@@ -25,7 +25,30 @@ pub trait SourceResolver: Send + Sync {
 }
 
 /// Production resolver: config is the source of truth.
-pub struct ConfigResolver;
+///
+/// Every source it hands out is wrapped in [`ExclusiveSource`] against one
+/// shared [`SessionLocks`] registry, so a session driven concurrently by the
+/// desktop UI and (once the relay lands) a phone still serializes its mutating
+/// ops below the `SessionSource` seam (ADR-0021). The registry is created once
+/// per process and cloned into every wrapper — the wrapper is per-call, the
+/// registry is shared.
+pub struct ConfigResolver {
+    locks: Arc<SessionLocks>,
+}
+
+impl ConfigResolver {
+    /// Build a resolver that wraps every resolved source against `locks`. The
+    /// caller owns the one-per-process registry (so a sibling — e.g. the future
+    /// remote-host loopback — can share it); see `Bridge`.
+    pub fn new(locks: Arc<SessionLocks>) -> Self {
+        Self { locks }
+    }
+
+    /// Wrap a raw source in the shared exclusion registry under `host_key`.
+    fn wrap(&self, raw: Arc<dyn SessionSource>, host_key: &str) -> Arc<dyn SessionSource> {
+        Arc::new(ExclusiveSource::new(raw, Arc::clone(&self.locks), host_key))
+    }
+}
 
 impl SourceResolver for ConfigResolver {
     fn for_project(
@@ -49,12 +72,11 @@ impl SourceResolver for ConfigResolver {
                     project.host.as_str()
                 ),
             })?;
-        match &host.transport {
-            Transport::Ssh(ssh) => Ok(Arc::new(SshSource::new(ssh.clone(), Arc::clone(config)))),
-            Transport::Kubectl(k) => {
-                Ok(Arc::new(KubectlSource::new(k.clone(), Arc::clone(config))))
-            }
-        }
+        let raw: Arc<dyn SessionSource> = match &host.transport {
+            Transport::Ssh(ssh) => Arc::new(SshSource::new(ssh.clone(), Arc::clone(config))),
+            Transport::Kubectl(k) => Arc::new(KubectlSource::new(k.clone(), Arc::clone(config))),
+        };
+        Ok(self.wrap(raw, project.host.as_str()))
     }
 
     fn all(&self, config: &Arc<Config>) -> Vec<(HostId, Arc<dyn SessionSource>)> {
@@ -62,7 +84,7 @@ impl SourceResolver for ConfigResolver {
             .hosts
             .iter()
             .map(|(id, host)| {
-                let source: Arc<dyn SessionSource> = match &host.transport {
+                let raw: Arc<dyn SessionSource> = match &host.transport {
                     Transport::Ssh(ssh) => {
                         Arc::new(SshSource::new(ssh.clone(), Arc::clone(config)))
                     }
@@ -70,7 +92,7 @@ impl SourceResolver for ConfigResolver {
                         Arc::new(KubectlSource::new(k.clone(), Arc::clone(config)))
                     }
                 };
-                (id.clone(), source)
+                (id.clone(), self.wrap(raw, id.as_str()))
             })
             .collect()
     }
@@ -86,6 +108,13 @@ mod tests {
     fn pid(s: &str) -> ProjectId {
         ProjectId::new(s).expect("slug")
     }
+    /// A resolver with its own fresh registry. Construction wiring is asserted
+    /// structurally here (it compiles and resolves); the load-bearing
+    /// serialization behaviour lives in `exclusive.rs` and the Bridge-level
+    /// ordering test in `mod.rs`.
+    fn resolver() -> ConfigResolver {
+        ConfigResolver::new(SessionLocks::new())
+    }
 
     const SSH_PROJECT: &str = "[hosts.hermes]\ntransport = \"ssh\"\nhost = \"hermes\"\n\
         [projects.api]\nhost = \"hermes\"\npath = \"/srv/api\"\nworkspace = \"worktree\"\nagent = \"claude\"\n\
@@ -93,13 +122,13 @@ mod tests {
 
     #[test]
     fn for_project_builds_ssh_source() {
-        let r = ConfigResolver;
+        let r = resolver();
         assert!(r.for_project(&config(SSH_PROJECT), &pid("api")).is_ok());
     }
 
     #[test]
     fn for_project_unknown_project_is_config_error() {
-        let r = ConfigResolver;
+        let r = resolver();
         assert!(matches!(
             r.for_project(&config(SSH_PROJECT), &pid("ghost")),
             Err(BridgeError::Config { .. })
@@ -111,7 +140,7 @@ mod tests {
         let toml = "[hosts.k8s]\ntransport = \"kubectl\"\npod = \"p\"\n\
             [projects.api]\nhost = \"k8s\"\npath = \"/srv/api\"\nworkspace = \"worktree\"\nagent = \"claude\"\n\
             [agents.claude]\ncommand = [\"claude\"]\n";
-        let r = ConfigResolver;
+        let r = resolver();
         assert!(r.for_project(&config(toml), &pid("api")).is_ok());
     }
 
@@ -120,13 +149,13 @@ mod tests {
         let toml = "[hosts.a]\ntransport = \"ssh\"\nhost = \"a\"\n\
             [hosts.b]\ntransport = \"ssh\"\nhost = \"b\"\n\
             [hosts.k]\ntransport = \"kubectl\"\npod = \"p\"\n";
-        let r = ConfigResolver;
+        let r = resolver();
         assert_eq!(r.all(&config(toml)).len(), 3);
     }
 
     #[test]
     fn all_empty_config_is_empty() {
-        let r = ConfigResolver;
+        let r = resolver();
         assert!(r.all(&config("")).is_empty());
     }
 
@@ -134,7 +163,7 @@ mod tests {
     fn all_pairs_each_source_with_its_host_id() {
         let toml = "[hosts.a]\ntransport = \"ssh\"\nhost = \"a\"\n\
             [hosts.k]\ntransport = \"kubectl\"\npod = \"p\"\n";
-        let r = ConfigResolver;
+        let r = resolver();
         let ids: Vec<String> = r
             .all(&config(toml))
             .iter()
