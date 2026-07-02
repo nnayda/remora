@@ -270,8 +270,8 @@ export function PairingDialog({ onClose }: { onClose: () => void }) {
         icon: smartphone,
         body: (
           <p className="pairing-hint">
-            Relay not configured. Add a <code>[relay]</code> section to pair
-            devices with this desktop.
+            No relay bridge is running. Configure a <code>[relay]</code> section
+            in config.toml to pair devices with this desktop.
           </p>
         ),
         footer: (

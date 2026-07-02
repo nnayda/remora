@@ -218,7 +218,9 @@ describe("PairingDialog — relay not configured", () => {
     });
     render(<PairingDialog onClose={() => {}} />);
 
-    expect(await screen.findByText(/relay not configured/i)).not.toBeNull();
+    expect(
+      await screen.findByText(/no relay bridge is running/i),
+    ).not.toBeNull();
     expect(screen.queryByText(CODE)).toBeNull();
     expect(qr.toDataURL).not.toHaveBeenCalled();
   });
