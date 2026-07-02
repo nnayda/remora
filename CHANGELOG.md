@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Open a session in an external terminal — core/config/shell half**: core
+  composes a coexisting (no `-d`) attach command via
+  `SessionSource::external_attach_command`; the desktop shell detects installed
+  terminals (Ghostty, kitty, Alacritty, WezTerm, foot) via absolute candidate
+  paths (GUI-launched apps inherit launchd's bare PATH) and launches the chosen
+  one detached, resolving the transport binary the same way. New optional
+  top-level `terminal` config key (`"ghostty"` or a custom argv array, loud
+  shape errors). Session-menu/Settings UI lands in the follow-up PR. Note: the
+  app's own reconnects still evict external clients (documented
+  sequential-handoff semantics).
 - **Per-session collapsed rail** (#184): the collapsed left sidebar now shows one
   navigable glyph per session instead of one avatar per host. Clicking a glyph
   focuses/opens that session (it used to only expand the rail). Sessions are
