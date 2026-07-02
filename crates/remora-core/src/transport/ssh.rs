@@ -360,6 +360,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn external_attach_command_bare_host_omits_optional_flags() {
+        let host = SshHost {
+            host: "devbox".into(),
+            user: None,
+            port: None,
+        };
+        let source = SshSource::new(host, Arc::new(Config::default()));
+        let argv = source
+            .external_attach_command(
+                &ProjectId::new("api").expect("slug"),
+                &SessionId::new("fix-login").expect("slug"),
+            )
+            .await
+            .expect("compose");
+        assert_eq!(argv[0], "ssh");
+        assert!(argv.contains(&"-tt".to_string()));
+        assert!(!argv.contains(&"-p".to_string()), "bare host must omit -p");
+        assert!(!argv.contains(&"-l".to_string()), "bare host must omit -l");
+        let tail: Vec<_> = argv.iter().rev().take(4).rev().cloned().collect();
+        assert_eq!(
+            tail,
+            ["tmux", "attach-session", "-t", "remora_api_fix-login"]
+        );
+        assert!(
+            !argv.contains(&"-d".to_string()),
+            "external attach must not evict"
+        );
+    }
+
     #[test]
     fn ssh_compose_attach_minimal_host_has_keepalive_no_dashdash() {
         let argv = ssh_compose(

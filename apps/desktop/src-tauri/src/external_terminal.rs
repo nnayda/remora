@@ -452,6 +452,46 @@ mod tests {
     }
 
     #[test]
+    fn assemble_concatenates_start_dashdash_exec_style_with_ssh_attach() {
+        // wezterm's exec style is two tokens ("start", "--") rather than
+        // ghostty/alacritty's single "-e" — pin the full concatenation order
+        // for that shape, with ssh (not kubectl) as the transport binary.
+        let probe = FakeProbe(BTreeSet::from(["/usr/bin/ssh"]));
+        let plan = LaunchPlan {
+            argv: vec![
+                "/opt/homebrew/bin/wezterm".into(),
+                "start".into(),
+                "--".into(),
+            ],
+        };
+        let attach = vec![
+            "ssh".to_string(),
+            "-tt".into(),
+            "devbox".into(),
+            "tmux".into(),
+            "attach-session".into(),
+            "-t".into(),
+            "remora_api_fix-login".into(),
+        ];
+        let argv = assemble_launch(&plan, &attach, &probe).expect("assemble");
+        assert_eq!(
+            argv,
+            [
+                "/opt/homebrew/bin/wezterm",
+                "start",
+                "--",
+                "/usr/bin/ssh",
+                "-tt",
+                "devbox",
+                "tmux",
+                "attach-session",
+                "-t",
+                "remora_api_fix-login",
+            ]
+        );
+    }
+
+    #[test]
     fn shell_quote_survives_spaces_quotes_and_tilde() {
         assert_eq!(
             shell_quote_command(&["ssh".into(), "-o".into(), "User=it's me".into()]),

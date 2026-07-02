@@ -288,11 +288,22 @@ async fn open_external_terminal(
     session_id: String,
     terminal_id: Option<String>,
 ) -> Result<(), BridgeError> {
-    let attach = bridge.external_attach_argv(project_id, session_id).await?;
+    // Resolve the terminal preference first: it's a cheap in-memory lookup,
+    // and if it fails (unconfigured/unknown/uninstalled) we should surface
+    // that -> Settings deep-link before paying for `external_attach_argv`,
+    // which for kubectl sessions can shell out to resolve `{ command }`
+    // fields.
     let pref = bridge.terminal_preference()?;
     let detected = detect_terminals(&RealProbe);
     let plan = resolve_terminal(terminal_id.as_deref(), pref.as_ref(), &detected)?;
-    let argv = assemble_launch(&plan, &attach, &RealProbe)?;
+    let attach = bridge.external_attach_argv(project_id, session_id).await?;
+    let argv = assemble_launch(&plan, &attach, &RealProbe).map_err(|e| match e {
+        // A missing transport binary is a launch-environment error, not a
+        // Settings-fixable preference: surface the message (notice), don't
+        // deep-link (spec flow: binary resolution -> error, not Settings).
+        ResolveError::NotDetected(message) => BridgeError::Transport { message },
+        other => other.into(),
+    })?;
     let terminal_name = argv.first().cloned().unwrap_or_default();
     let mut child = spawn_detached(&argv).map_err(|e| BridgeError::Transport {
         message: format!("could not launch `{terminal_name}`: {e}"),
