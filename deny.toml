@@ -10,13 +10,14 @@ yanked = "deny"
 # safe upgrade; that is upstream's to fix, and this heals automatically when
 # tauri moves off them.
 unmaintained = "workspace"
-# quick-xml 0.39.4 (transitive: wayland-scanner build-time protocol XML, zbus
-# D-Bus introspection — never attacker-controlled input here). Both advisories
-# are DoS-class and no patched release exists yet; cargo update finds nothing
-# newer. Temporary — remove when a fixed quick-xml lands (see #244).
+# quick-xml 0.39.4 advisories, fixed only in >= 0.41.0, which nothing in the
+# Tauri Linux stack accepts yet (plist ^1 pins 0.39; no 0.39.x patch exists).
+# The affected parsers only see local plist/wayland data here, not untrusted
+# XML. Temporary — remove once `cargo update` reaches quick-xml >= 0.41
+# through upstream; see #243.
 ignore = [
-  { id = "RUSTSEC-2026-0194", reason = "no patched quick-xml yet; trusted-input surfaces only (see #244)" },
-  { id = "RUSTSEC-2026-0195", reason = "no patched quick-xml yet; trusted-input surfaces only (see #244)" },
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
 ]
 
 [licenses]

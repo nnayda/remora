@@ -595,6 +595,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Awaiting status no longer stomped by cosmetic terminal output** (#224):
+  once an agent asserts `awaiting_input`, the red pulse and its prompt
+  preview now survive tmux status-line clock repaints and TUI spinner
+  frames. `awaiting` exits only on a real signal: another state marker,
+  typing into the session through Remora, or closing the session (ADR-0022).
+  Known residual: answering out-of-band (e.g. directly in tmux on the host)
+  doesn't emit any of those signals yet — tracked in #239, which adds
+  working/idle exit markers to the hook recipe.
+
 - **The activity pulse now catches AskUserQuestion menus.** A session sitting
   at Claude Code's interactive multiple-choice prompt showed a gray idle dot
   with no tooltip, because the marker recipe wired only the `Notification`
