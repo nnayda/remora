@@ -213,13 +213,18 @@ impl Router {
                 {
                     return None;
                 }
-                let entry =
-                    self.config.devices.iter().find(|d| {
-                        d.device_id == hello.device_id && d.bridge_id == hello.bridge_id
-                    })?;
-                if !token_matches(&hello.token, &entry.token) {
-                    return None;
-                }
+                // TEMPORARY (Task 7 of #232, ADR-0021 D4): the static
+                // `[[devices]]` config table is gone — device auth is moving to
+                // bridge-asserted soft state (the bridge tells the relay, at
+                // runtime, which devices it currently admits), which Task 8
+                // implements here. Until Task 8 lands, this arm cannot check a
+                // device's token or (device, bridge) scoping at all, so any
+                // hello that clears the structural routing checks above is
+                // admitted. This is a real, intentional widening of what the
+                // relay accepts during the window between these two tasks —
+                // Task 8 replaces it with a lookup against the router's
+                // asserted-device set and must land immediately after this
+                // commit.
                 Some((hello.routing_id, hello.bridge_id))
             }
         }
@@ -427,7 +432,7 @@ pub fn outbound_channel(budget: usize) -> (OutboundHandle, OutboundReceiver) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BridgeEntry, DeviceEntry};
+    use crate::config::BridgeEntry;
 
     // NOTE: the brief's `frames_before_hello_have_no_permit` case is not a test
     // here: `Router::route` takes a `&ConnPermit`, and a `ConnPermit` can only
@@ -444,8 +449,11 @@ mod tests {
         DeviceId([fill; 32])
     }
 
-    /// Config with one bridge (`BRIDGE`) and one device (`DEVICE`) bound to it,
-    /// plus a second bridge/device pair for cross-group tests.
+    /// Config with one bridge (`BRIDGE`), plus a second bridge (`OTHER_BRIDGE`)
+    /// for cross-group tests. Devices are no longer config-driven (ADR-0021
+    /// D4) — `device_hello`/`DEVICE`/`OTHER_DEVICE` below are accepted by the
+    /// router's temporary accept-any device auth (see `authenticate`'s
+    /// `HelloRole::Device` arm), not by a config lookup.
     fn config() -> Arc<RelayConfig> {
         Arc::new(RelayConfig {
             listen: "127.0.0.1:0".to_string(),
@@ -457,18 +465,6 @@ mod tests {
                 BridgeEntry {
                     token: "other-bridge-tok".to_string(),
                     device_id: did(OTHER_BRIDGE),
-                },
-            ],
-            devices: vec![
-                DeviceEntry {
-                    token: "device-tok".to_string(),
-                    device_id: did(DEVICE),
-                    bridge_id: did(BRIDGE),
-                },
-                DeviceEntry {
-                    token: "other-device-tok".to_string(),
-                    device_id: did(OTHER_DEVICE),
-                    bridge_id: did(OTHER_BRIDGE),
                 },
             ],
             buffer_bytes: 1_048_576,
@@ -517,27 +513,28 @@ mod tests {
         assert_eq!(permit.role(), HelloRole::Bridge);
     }
 
+    /// TEMPORARY (Task 7 of #232, ADR-0021 D4): with the static `[[devices]]`
+    /// config table gone, this arm cannot check a device's token or (device,
+    /// bridge) scoping at all — see `authenticate`'s `HelloRole::Device` arm.
+    /// A hello with a bogus token *and* a bridge scoping that would never
+    /// have matched the old static config is still admitted. This replaces
+    /// `device_hello_wrong_token_rejected` and
+    /// `device_token_bound_to_other_bridge_rejected`, which tested exactly
+    /// the config-driven checks this task removed; it locks in the
+    /// intentional widening so a silent regression is visible in review.
+    /// Task 8 replaces both the behavior and this test with real
+    /// bridge-asserted-credential checks.
     #[tokio::test]
-    async fn device_hello_wrong_token_rejected() {
+    async fn device_hello_any_token_accepted_pending_asserted_credentials() {
         let router = Router::new(config());
         let mut hello = device_hello(0x55);
-        hello.token = "wrong".to_string();
-        let (handle, _rx) = outbound_channel(1024);
-        let (outcome, displaced) = router.hello(&hello, handle);
-        assert!(matches!(outcome, HelloOutcome::Rejected));
-        assert!(displaced.is_none());
-    }
-
-    #[tokio::test]
-    async fn device_token_bound_to_other_bridge_rejected() {
-        // `DEVICE`'s token is valid only for `BRIDGE`; claiming `OTHER_BRIDGE`
-        // finds no matching (device_id, bridge_id) entry.
-        let router = Router::new(config());
-        let mut hello = device_hello(0x55);
+        hello.token = "not-a-real-token".to_string();
         hello.bridge_id = did(OTHER_BRIDGE);
         let (handle, _rx) = outbound_channel(1024);
-        let (outcome, _) = router.hello(&hello, handle);
-        assert!(matches!(outcome, HelloOutcome::Rejected));
+        let (outcome, displaced) = router.hello(&hello, handle);
+        let permit = accept(outcome);
+        assert_eq!(permit.routing_id(), did(0x55));
+        assert!(displaced.is_none());
     }
 
     #[tokio::test]

@@ -19,7 +19,7 @@ mod router;
 mod server;
 
 pub use audit::{AuditRecord, AuditSink, CloseReason};
-pub use config::{AuditConfig, BridgeEntry, DeviceEntry, RelayConfig, RelayConfigError};
+pub use config::{AuditConfig, BridgeEntry, RelayConfig, RelayConfigError};
 pub use router::{
     outbound_channel, ConnPermit, HelloOutcome, OutboundFrame, OutboundHandle, OutboundReceiver,
     RouteOutcome, Router,

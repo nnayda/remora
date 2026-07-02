@@ -199,7 +199,6 @@ mod tests {
         let config = RelayConfig {
             listen: "127.0.0.1:0".to_string(),
             bridges: Vec::new(),
-            devices: Vec::new(),
             buffer_bytes: 1 << 20,
             handshake_timeout_secs: 10,
             max_connections: 1024,

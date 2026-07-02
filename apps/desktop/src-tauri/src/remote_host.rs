@@ -41,7 +41,7 @@ use remora_bridge::{
 use remora_core::config::{Config, ConfigError};
 use remora_core::{SessionChannel, SessionSource, SourceError};
 use remora_protocol::{AgentId, DeviceId, ProjectId, SessionId, SessionMeta, SpawnSpec};
-use remora_relay::{serve, AuditSink, BridgeEntry, DeviceEntry, RelayConfig};
+use remora_relay::{serve, AuditSink, BridgeEntry, RelayConfig};
 
 use crate::bridge::resolve::SourceResolver;
 use crate::bridge::Bridge;
@@ -171,11 +171,6 @@ pub async fn start_loopback(
         bridges: vec![BridgeEntry {
             token: registration_token.clone(),
             device_id: bridge_id,
-        }],
-        devices: vec![DeviceEntry {
-            token: device_relay_token,
-            device_id,
-            bridge_id,
         }],
         buffer_bytes: 1 << 20,
         handshake_timeout_secs: 10,

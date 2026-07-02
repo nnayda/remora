@@ -52,7 +52,7 @@ use remora_protocol::{
     HelloRole, ProjectId, RelayHello, RemoteOp, SessionId, SessionMeta, SessionState,
     SessionStatus, SpawnSpec, PROTOCOL_VERSION,
 };
-use remora_relay::{serve, AuditSink, BridgeEntry, DeviceEntry, RelayConfig};
+use remora_relay::{serve, AuditSink, BridgeEntry, RelayConfig};
 
 /// Fixed test tokens. Real deployments mint random ones; the loopback proof
 /// only needs the relay config, bridge, and client to agree on a value.
@@ -214,17 +214,11 @@ impl Harness {
             token: BRIDGE_TOKEN.to_string(),
             device_id: bridge_id,
         }];
-        let devices = vec![DeviceEntry {
-            token: RENDEZVOUS_TOKEN.to_string(),
-            device_id,
-            bridge_id,
-        }];
 
         // Start the relay on an ephemeral port, then learn its address.
         let config0 = Arc::new(RelayConfig {
             listen: "127.0.0.1:0".to_string(),
             bridges: bridges.clone(),
-            devices: devices.clone(),
             buffer_bytes: opts.buffer_bytes,
             handshake_timeout_secs: 10,
             max_connections: 1024,
@@ -239,7 +233,6 @@ impl Harness {
         let relay_config = Arc::new(RelayConfig {
             listen: addr.to_string(),
             bridges,
-            devices,
             buffer_bytes: opts.buffer_bytes,
             handshake_timeout_secs: 10,
             max_connections: 1024,

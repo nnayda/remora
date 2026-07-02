@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use remora_protocol::{DeviceId, Envelope, FrameType, HelloRole, RelayHello};
-use remora_relay::{serve, AuditConfig, AuditSink, BridgeEntry, DeviceEntry, RelayConfig};
+use remora_relay::{serve, AuditConfig, AuditSink, BridgeEntry, RelayConfig};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
@@ -32,11 +32,6 @@ fn base_config(audit: Option<AuditConfig>) -> Arc<RelayConfig> {
         bridges: vec![BridgeEntry {
             token: "bridge-tok".to_string(),
             device_id: did(BRIDGE),
-        }],
-        devices: vec![DeviceEntry {
-            token: "device-tok".to_string(),
-            device_id: did(DEVICE),
-            bridge_id: did(BRIDGE),
         }],
         buffer_bytes: 1_048_576,
         handshake_timeout_secs: 10,
@@ -195,9 +190,13 @@ async fn round_trip_device_bridge_data() {
 
 #[tokio::test]
 async fn bad_token_closed_4001() {
+    // Device hello no longer validates a token against static config
+    // (ADR-0021 D4, #232 Task 7 — device auth moves to bridge-asserted soft
+    // state, landing in Task 8); a bad *bridge* token is still config-checked
+    // and exercises the same 4001 close path.
     let url = start(base_config(None)).await;
     let mut ws = connect(&url).await;
-    let mut hello = device_hello();
+    let mut hello = bridge_hello();
     hello.token = "wrong".to_string();
     send_bin(&mut ws, hello_frame(&hello)).await;
     expect_close(&mut ws, 4001).await;

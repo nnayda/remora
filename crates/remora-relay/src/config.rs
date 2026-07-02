@@ -1,8 +1,10 @@
 //! Relay configuration (ADR-0021's "Bridge→relay registration" and
 //! "Roster authority is per-bridge" sections): a self-hosted relay's TOML
-//! file lists the bridge-registration tokens and per-(device, bridge)
-//! device tokens it admits to routing. Absent `bridges`/`devices` means
-//! closed registration — the documented default.
+//! file lists the bridge-registration tokens it admits to routing. Absent
+//! `bridges` means closed registration for bridges — the documented
+//! default. Device admission is no longer a static config table (ADR-0021
+//! D4): it moves to bridge-asserted soft state, driven at runtime rather
+//! than read from this file.
 
 use std::path::PathBuf;
 
@@ -19,9 +21,6 @@ pub struct RelayConfig {
     /// registration: no bridge can register.
     #[serde(default)]
     pub bridges: Vec<BridgeEntry>,
-    /// Per-(device, bridge) device tokens admitted to routing.
-    #[serde(default)]
-    pub devices: Vec<DeviceEntry>,
     /// Per-connection buffer cap in bytes, enforcing the bounded-buffer
     /// requirement from ADR-0021 (relay load-shedding is
     /// connection-granular, not frame-granular).
@@ -69,16 +68,6 @@ pub struct BridgeEntry {
     pub device_id: DeviceId,
 }
 
-/// One registered device: the token it presents in its `RelayHello`, the
-/// device's own [`DeviceId`], and the bridge it is scoped to route through.
-/// A device token is valid only for this exact (device, bridge) pair.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct DeviceEntry {
-    pub token: String,
-    pub device_id: DeviceId,
-    pub bridge_id: DeviceId,
-}
-
 /// Opt-in audit log config (ADR-0021's "observability... catchable"
 /// section). Recording exactly the fields the relay observed is a
 /// regression guard against accidental leakage, not an audit of a
@@ -107,7 +96,7 @@ impl RelayConfig {
 
 /// Constant-time token comparison (`subtle::ConstantTimeEq` over bytes),
 /// used to check a `RelayHello`'s token against the configured
-/// [`BridgeEntry`]/[`DeviceEntry`] token it claims to be.
+/// [`BridgeEntry`] token it claims to be.
 ///
 /// Equal-length inputs are compared in constant time. Differing lengths
 /// short-circuit before any constant-time comparison runs, so **token
@@ -132,7 +121,6 @@ mod tests {
     #[test]
     fn parses_full_config() {
         let bridge_id = "11".repeat(32);
-        let device_id = "22".repeat(32);
         let toml = format!(
             r#"
             listen = "127.0.0.1:9440"
@@ -140,11 +128,6 @@ mod tests {
             [[bridges]]
             token = "bridge-token"
             device_id = "{bridge_id}"
-
-            [[devices]]
-            token = "device-token"
-            device_id = "{device_id}"
-            bridge_id = "{bridge_id}"
 
             [audit]
             path = "/var/log/remora-relay/audit.log"
@@ -157,12 +140,7 @@ mod tests {
         assert_eq!(config.bridges.len(), 1);
         assert_eq!(config.bridges[0].token, "bridge-token");
         let bridge_device_id: DeviceId = bridge_id.parse().expect("valid hex device id");
-        let device_device_id: DeviceId = device_id.parse().expect("valid hex device id");
         assert_eq!(config.bridges[0].device_id, bridge_device_id);
-        assert_eq!(config.devices.len(), 1);
-        assert_eq!(config.devices[0].token, "device-token");
-        assert_eq!(config.devices[0].device_id, device_device_id);
-        assert_eq!(config.devices[0].bridge_id, bridge_device_id);
         assert_eq!(config.buffer_bytes, 1_048_576);
         assert_eq!(config.handshake_timeout_secs, 10);
         assert_eq!(config.max_connections, 1024);
@@ -184,11 +162,25 @@ mod tests {
             config.bridges.is_empty(),
             "no bridges = closed registration"
         );
-        assert!(config.devices.is_empty());
         assert_eq!(config.buffer_bytes, 1_048_576);
         assert_eq!(config.handshake_timeout_secs, 10);
         assert_eq!(config.max_connections, 1024);
         assert_eq!(config.audit, None);
+    }
+
+    #[test]
+    fn devices_table_is_ignored_not_an_error() {
+        // A stale [[devices]] block from an old config must not break parsing
+        // (serde ignores unknown fields by default), but the field is gone.
+        let toml = r#"
+            listen = "127.0.0.1:9440"
+            [[devices]]
+            token = "x"
+            device_id = "2222222222222222222222222222222222222222222222222222222222222222"
+            bridge_id = "1111111111111111111111111111111111111111111111111111111111111111"
+        "#;
+        let config = RelayConfig::from_toml_str(toml).expect("parses, devices ignored");
+        assert_eq!(config.listen, "127.0.0.1:9440");
     }
 
     #[test]
