@@ -19,11 +19,11 @@
 
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use remora_bridge::{
-    serve_bridge, BridgeConfig, BridgeEvent, BridgeIdentity, PairingCommand, Roster,
+    fingerprint, serve_bridge, BridgeConfig, BridgeEvent, BridgeIdentity, PairingCommand, Roster,
 };
 use remora_core::config::{Config, ConfigError};
 use remora_core::SessionSource;
@@ -40,18 +40,42 @@ const PAIRING_CHANNEL_DEPTH: usize = 8;
 /// them. Present only when `[relay]` was configured at launch.
 ///
 /// `commands` is cloned per outgoing [`PairingCommand`]; `events` is a single
-/// consumer, so it sits behind a [`Mutex`] the one event pump locks to `recv`.
-/// Holding `shutdown` + the task handle keeps the bridge serving for the app's
-/// lifetime and lets a future teardown cancel it cleanly.
+/// consumer taken out exactly once at setup by the event-forwarder task (Task
+/// 16), so it sits behind an `Option` guarded by a plain [`std::sync::Mutex`]
+/// (locked once, never contended). Holding `shutdown` + the task handle keeps
+/// the bridge serving for the app's lifetime and lets a future teardown cancel
+/// it cleanly.
+///
+/// `roster` is the *same* `Arc<RwLock<Roster>>` the running bridge mutates on
+/// every pairing/revocation, so `list_devices` reads the live set with no
+/// staleness. `bridge_fingerprint` is this bridge's stable identity fingerprint,
+/// captured once at launch (the static key never changes for the process life).
 pub struct PairingHandles {
     /// Sender for pairing/roster commands into the running bridge.
     pub commands: mpsc::Sender<PairingCommand>,
-    /// Receiver for the bridge's pairing/roster events (single consumer).
-    pub events: Mutex<mpsc::Receiver<BridgeEvent>>,
+    /// Receiver for the bridge's pairing/roster events. Single consumer: taken
+    /// out once by the event-forwarder at setup ([`PairingHandles::take_events`]).
+    pub events: std::sync::Mutex<Option<mpsc::Receiver<BridgeEvent>>>,
+    /// The live paired-device roster, shared with the running bridge — reading it
+    /// reflects pairings/revocations immediately (no on-disk re-read).
+    pub roster: Arc<RwLock<Roster>>,
+    /// This bridge's own identity fingerprint (ADR-0021 D5), for the pairing UI
+    /// to display. Stable for the process lifetime.
+    pub bridge_fingerprint: String,
     /// Cancels the bridge's serve loop on app teardown.
     pub shutdown: CancellationToken,
     /// The spawned `serve_bridge` task; kept so it lives for the app lifetime.
     pub task: tauri::async_runtime::JoinHandle<()>,
+}
+
+impl PairingHandles {
+    /// Takes the bridge-event receiver out for the forwarder task. Returns the
+    /// receiver on the first call and `None` after (single consumer). A poisoned
+    /// lock also yields `None` — the forwarder simply does not start, which is
+    /// safe (the commands still work; only live event push is lost).
+    pub fn take_events(&self) -> Option<mpsc::Receiver<BridgeEvent>> {
+        self.events.lock().ok().and_then(|mut guard| guard.take())
+    }
 }
 
 /// Hosts this device's bridge when `[relay]` is configured, returning the
@@ -98,12 +122,22 @@ pub(crate) fn start_relay_bridge(bridge: &Bridge) -> Option<PairingHandles> {
     let source: Arc<dyn SessionSource> =
         Arc::new(ResolvingSource::new(bridge.resolver(), config_path));
 
+    // This bridge's own fingerprint (ADR-0021 D5) for the pairing UI. Captured
+    // now, before `identity` moves into the config; the static key is stable for
+    // the process life, so no re-read is ever needed.
+    let bridge_fingerprint = fingerprint(&identity.static_keypair.public);
+
+    // Share the one roster Arc between the running bridge and the UI's
+    // `list_devices`: the bridge mutates it on every pairing/revocation, so
+    // reading this handle reflects the live set with no staleness.
+    let roster = Arc::new(RwLock::new(roster));
+
     let shutdown = CancellationToken::new();
     let bridge_cfg = BridgeConfig {
         relay_url: relay.relay_url,
         registration_token: relay.registration_token,
         identity,
-        roster: Arc::new(RwLock::new(roster)),
+        roster: roster.clone(),
         roster_path,
     };
 
@@ -123,7 +157,9 @@ pub(crate) fn start_relay_bridge(bridge: &Bridge) -> Option<PairingHandles> {
 
     Some(PairingHandles {
         commands: commands_tx,
-        events: Mutex::new(events_rx),
+        events: std::sync::Mutex::new(Some(events_rx)),
+        roster,
+        bridge_fingerprint,
         shutdown,
         task,
     })

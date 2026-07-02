@@ -81,8 +81,11 @@ pub fn run() {
 
             app.manage(app_bridge);
             // Expose the pairing channels for the pairing UI's commands (Task 16,
-            // #232). Managed only when a relay bridge is actually running.
+            // #232). Managed only when a relay bridge is actually running. Before
+            // managing, start the forwarder that turns the bridge's `BridgeEvent`
+            // stream into frontend events (it takes the receiver out of `handles`).
             if let Some(handles) = pairing_handles {
+                bridge::pairing::spawn_event_forwarder(app.handle().clone(), &handles);
                 app.manage(handles);
             }
 
