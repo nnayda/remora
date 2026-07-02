@@ -92,9 +92,8 @@ impl RelayConfig {
 /// and hiding length would require padding every comparison to a
 /// worst-case bound for no threat-model benefit here.
 ///
-/// Not yet called outside tests — the hello-frame authentication that wires
-/// it in lands with the router (later slice of #231).
-#[cfg_attr(not(test), allow(dead_code))]
+/// Called by [`crate::Router`]'s hello authentication (`router.rs`) to check a
+/// connecting peer's token against the configured entry it claims to be.
 pub(crate) fn token_matches(candidate: &str, expected: &str) -> bool {
     if candidate.len() != expected.len() {
         return false;
