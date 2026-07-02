@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ActivityState } from "./activity-store";
 import { previewWhenAwaiting, rowTitle } from "./agent-claimed";
 import wordmark from "./assets/remora-wordmark.svg";
+import { canOpenExternal } from "./external-terminal";
 import { filterTree } from "./filter-tree";
 import type { HostTransport, ProjectNode, SessionNode } from "./session-tree";
 import { SIDEBAR_COLLAPSE_LABEL } from "./sidebar-labels";
@@ -21,6 +22,7 @@ import {
   Sidebar as SidebarIcon,
   Ssh,
   Sun,
+  Terminal as TerminalIcon,
   Trash,
   Unplug,
 } from "./ui/icons";
@@ -42,6 +44,12 @@ interface SidebarProps {
   /** True when the last discovery poll failed (last good tree still shown). */
   discoveryUnavailable: boolean;
   onRefresh: () => void;
+  /** Label from externalTerminalLabel (Task 9), computed once in App. */
+  externalLabel: string;
+  /** Launch the configured external terminal attached to a live session. */
+  onOpenExternal: (node: SessionNode) => void;
+  /** Copy the exact attach command for a live session to the clipboard. */
+  onCopyAttach: (node: SessionNode) => void;
   /** Stop a live worktree session (kills tmux, keeps the worktree). */
   onStop: (node: SessionNode) => void;
   /** Open the remove confirm dialog for any session. */
@@ -90,6 +98,9 @@ export function Sidebar({
   configError,
   discoveryUnavailable,
   onRefresh,
+  externalLabel,
+  onOpenExternal,
+  onCopyAttach,
   onStop,
   onRemove,
   onNewSession,
@@ -203,6 +214,9 @@ export function Sidebar({
               openKeys={openKeys}
               connectingKeys={connectingKeys}
               onOpenSession={onOpenSession}
+              externalLabel={externalLabel}
+              onOpenExternal={onOpenExternal}
+              onCopyAttach={onCopyAttach}
               onStop={onStop}
               onRemove={onRemove}
               onNewSession={onNewSession}
@@ -243,6 +257,9 @@ function ProjectGroup({
   openKeys,
   connectingKeys,
   onOpenSession,
+  externalLabel,
+  onOpenExternal,
+  onCopyAttach,
   onStop,
   onRemove,
   onNewSession,
@@ -257,6 +274,9 @@ function ProjectGroup({
   openKeys: Set<string>;
   connectingKeys: ReadonlySet<string>;
   onOpenSession: (node: SessionNode) => void;
+  externalLabel: string;
+  onOpenExternal: (node: SessionNode) => void;
+  onCopyAttach: (node: SessionNode) => void;
   onStop: (node: SessionNode) => void;
   onRemove: (node: SessionNode) => void;
   onNewSession: (projectId: string) => void;
@@ -343,6 +363,9 @@ function ProjectGroup({
                 actions={
                   <SessionMenu
                     session={session}
+                    externalLabel={externalLabel}
+                    onOpenExternal={onOpenExternal}
+                    onCopyAttach={onCopyAttach}
                     onStop={onStop}
                     onRemove={onRemove}
                   />
@@ -356,15 +379,23 @@ function ProjectGroup({
   );
 }
 
-/** Hover-revealed per-session menu: Stop (worktree live only) / Remove session.
+/** Hover-revealed per-session menu: Open in external terminal / Copy attach
+ * command (live only) / Stop (worktree live only) / Remove session.
  * Outside-click closes it (mousedown listener); the trigger stops propagation so
  * opening the menu never also opens the session. */
 function SessionMenu({
   session,
+  externalLabel,
+  onOpenExternal,
+  onCopyAttach,
   onStop,
   onRemove,
 }: {
   session: SessionNode;
+  /** Label from externalTerminalLabel (Task 9), computed once in App. */
+  externalLabel: string;
+  onOpenExternal: (node: SessionNode) => void;
+  onCopyAttach: (node: SessionNode) => void;
   onStop: (node: SessionNode) => void;
   onRemove: (node: SessionNode) => void;
 }) {
@@ -410,6 +441,27 @@ function SessionMenu({
       </IconButton>
       {open && (
         <div className="rk-smenu__pop" role="menu">
+          {canOpenExternal(session.state) && (
+            <>
+              <button
+                type="button"
+                className="rk-smenu__item"
+                role="menuitem"
+                onClick={pick(onOpenExternal)}
+              >
+                <TerminalIcon size={14} />
+                {externalLabel}
+              </button>
+              <button
+                type="button"
+                className="rk-smenu__item"
+                role="menuitem"
+                onClick={pick(onCopyAttach)}
+              >
+                Copy attach command
+              </button>
+            </>
+          )}
           {canStop && (
             <button
               type="button"
