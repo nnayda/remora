@@ -35,6 +35,8 @@
 //! both ends together. The caller then observes `recv() -> None` and
 //! `send_bytes() -> ChannelClosed`, exactly as [`SessionChannel`] specifies.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::stream::{SplitSink, SplitStream};
@@ -61,6 +63,12 @@ const DEVICE_ID_LEN: usize = 32;
 
 const B64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
+
+/// Deadline for a single relay setup/request read. The bridge can drop a peer
+/// (roster miss, protocol violation) *without* closing the client's relay
+/// socket, so a naive `recv` would hang `dial`/`list`/`attach` forever. Bounding
+/// each setup + request read turns that into a prompt typed error (#231).
+const RELAY_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Decoded Noise key material for one dial: device static private key, the
 /// bridge's pinned static public key, and the per-pair PSK.
@@ -251,7 +259,9 @@ impl SessionSource for RemoteSource {
         .await?;
 
         match conn.recv().await? {
-            BridgeMessage::Response { result, .. } => match result {
+            // Per the per-call single-request dial model, the response id must
+            // echo the request id; anything else is a protocol violation.
+            BridgeMessage::Response { id: got, result } if got == id => match result {
                 RemoteResult::Attached => {}
                 RemoteResult::Error(w) => return Err(map_wire_error(w)),
                 other => {
@@ -260,6 +270,9 @@ impl SessionSource for RemoteSource {
                     )))
                 }
             },
+            BridgeMessage::Response { .. } => {
+                return Err(SourceError::Transport("unexpected response id".to_string()))
+            }
             other => {
                 return Err(SourceError::Transport(format!(
                     "expected attach response, got {other:?}"
@@ -293,13 +306,17 @@ impl SessionSource for RemoteSource {
         .await?;
 
         match conn.recv().await? {
-            BridgeMessage::Response { result, .. } => match result {
+            // The response id must echo the request id (single-request dial).
+            BridgeMessage::Response { id: got, result } if got == id => match result {
                 RemoteResult::Sessions(sessions) => Ok(sessions),
                 RemoteResult::Error(w) => Err(map_wire_error(w)),
                 other => Err(SourceError::Transport(format!(
                     "unexpected list result: {other:?}"
                 ))),
             },
+            BridgeMessage::Response { .. } => {
+                Err(SourceError::Transport("unexpected response id".to_string()))
+            }
             other => Err(SourceError::Transport(format!(
                 "expected list response, got {other:?}"
             ))),
@@ -512,10 +529,24 @@ async fn send_frame(
         .map_err(|e| SourceError::Transport(format!("relay write failed: {e}")))
 }
 
+/// Reads the next Data frame addressed to `routing_id`, bounded by
+/// [`RELAY_READ_TIMEOUT`]. Used for every setup + request read (`dial`,
+/// `list`, `attach`); the attach *pump* reads the stream directly and is not
+/// deadline-bound, since a live attach legitimately idles waiting for output.
+async fn recv_frame(stream: &mut WsStream, routing_id: DeviceId) -> Result<Vec<u8>, SourceError> {
+    match tokio::time::timeout(RELAY_READ_TIMEOUT, recv_frame_inner(stream, routing_id)).await {
+        Ok(result) => result,
+        Err(_) => Err(SourceError::Transport("relay read timed out".to_string())),
+    }
+}
+
 /// Reads inbound frames until one is a Data frame addressed to `routing_id`,
 /// returning its payload. Frames not addressed to us are skipped; a malformed
 /// frame, a close, an EOF, or a read error is a transport error.
-async fn recv_frame(stream: &mut WsStream, routing_id: DeviceId) -> Result<Vec<u8>, SourceError> {
+async fn recv_frame_inner(
+    stream: &mut WsStream,
+    routing_id: DeviceId,
+) -> Result<Vec<u8>, SourceError> {
     loop {
         match stream.next().await {
             Some(Ok(Message::Binary(bytes))) => {

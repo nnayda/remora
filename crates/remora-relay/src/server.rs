@@ -60,6 +60,10 @@ use crate::router::{
 /// envelope codec would allocate for them (spec D13).
 const MAX_WS_MESSAGE: usize = ENVELOPE_HEADER_LEN + MAX_ENVELOPE_PAYLOAD;
 
+/// Backoff between `accept()` retries after an accept error, so a persistent
+/// failure condition (fd exhaustion) cannot spin the accept loop hot (#231).
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
 /// Kill signal sent to a victim connection's reader.
 type KillTx = mpsc::UnboundedSender<CloseReason>;
 
@@ -113,8 +117,14 @@ pub async fn serve(
         loop {
             let stream = match listener.accept().await {
                 Ok((stream, _peer)) => stream,
-                // A transient accept error must not kill the whole relay.
-                Err(_) => continue,
+                // A transient accept error must not kill the whole relay — but a
+                // *persistent* one (fd exhaustion, EMFILE/ENFILE) would spin this
+                // loop hot, burning CPU and starving teardown of the very FDs it
+                // needs to recover. Back off briefly before retrying (#231).
+                Err(_) => {
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                    continue;
+                }
             };
             // Gate on a global permit before spawning. At the cap we drop the
             // freshly accepted socket immediately (before the WebSocket
@@ -158,15 +168,19 @@ fn ws_config() -> WebSocketConfig {
         .max_frame_size(Some(MAX_WS_MESSAGE))
 }
 
-/// Accepts the WebSocket handshake and runs the connection. A failed handshake
-/// never became a relay connection, so it emits no audit record.
+/// Accepts the WebSocket handshake and runs the connection.
 ///
 /// The whole pre-authentication handshake — the WebSocket upgrade here plus the
 /// first (hello) frame read in [`run_connection`] — shares one `handshake_timeout`
 /// deadline. A client that stalls the upgrade or opens the socket and never
-/// sends a hello is dropped once the deadline elapses (slowloris defense, #231),
-/// with no audit record, matching the handshake-failure-emits-no-record
-/// convention.
+/// sends a hello is dropped once the deadline elapses (slowloris defense, #231).
+///
+/// Audit-record boundary: a connection that never completed the *WebSocket
+/// upgrade* — an upgrade error or an upgrade/hello-read *timeout* — never became
+/// a relay connection and emits **no** record. Once the upgrade succeeds, the
+/// connection existed, so its close is audited exactly once even before a hello:
+/// a clean pre-hello close/EOF as [`CloseReason::Normal`] and a malformed hello
+/// as [`CloseReason::Protocol`] (see [`run_connection`]).
 async fn handle_connection(
     stream: TcpStream,
     router: Arc<Router>,

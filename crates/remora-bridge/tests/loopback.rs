@@ -942,20 +942,23 @@ async fn unpaired_device_fails() {
     )
     .await;
 
-    // Availability-only: the unpinned device never completes an attach. (The
-    // bridge drops the peer at the roster check without replying, and the slice-1
-    // client has no handshake deadline, so the observable outcome is "no attach"
-    // rather than a prompt typed error — see the report's concerns.)
+    // The unpinned device never gets a channel (the security property): the
+    // bridge drops the peer at the roster check without replying. It no longer
+    // *hangs*, though — the client's bounded relay read (RELAY_READ_TIMEOUT)
+    // turns the silent drop into a prompt typed `Transport` error (#231). The
+    // outer timeout is a generous ceiling above that read deadline so a genuine
+    // hang would still fail the test rather than wedge CI.
     let (project, session) = ids("api", "one");
     let outcome = tokio::time::timeout(
-        Duration::from_millis(750),
+        Duration::from_secs(30),
         harness.remote.attach(&project, &session),
     )
-    .await;
+    .await
+    .expect("attach must return (typed error), not hang past the read deadline");
     match outcome {
-        Err(_) => {}     // pending forever: attach never succeeded
-        Ok(Err(_)) => {} // or a prompt transport error — both prove unavailability
-        Ok(Ok(_)) => panic!("an unpaired device must not attach"),
+        Err(remora_core::SourceError::Transport(_)) => {} // prompt typed unavailability
+        Ok(_) => panic!("an unpaired device must not attach"),
+        Err(other) => panic!("expected a Transport error, got {other:?}"),
     }
 }
 

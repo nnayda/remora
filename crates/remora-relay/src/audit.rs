@@ -13,7 +13,7 @@
 //! relay's connection metadata.
 
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -143,6 +143,11 @@ impl AuditSink {
                     .append(true)
                     .mode(0o600)
                     .open(&audit.path)?;
+                // `.mode()` only applies when O_CREAT actually creates the file;
+                // a pre-existing looser audit log would keep its mode. Re-assert
+                // 0600 so the "created 0600" guarantee holds for a file that
+                // already existed (e.g. left world-readable by an older build).
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
                 Some(Mutex::new(file))
             }
         };
@@ -164,5 +169,68 @@ impl AuditSink {
         if let Ok(mut guard) = file.lock() {
             let _ = guard.write_all(line.as_bytes());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_mode(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("stat audit file")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[test]
+    fn opening_tightens_a_preexisting_permissive_audit_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.log");
+
+        // A pre-existing audit log left world/group-readable (e.g. by an older
+        // build whose `.mode()` was a no-op on the already-created file).
+        std::fs::write(&path, b"{}\n").expect("seed audit file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen mode");
+        assert_eq!(file_mode(&path), 0o644);
+
+        let config = RelayConfig {
+            listen: "127.0.0.1:0".to_string(),
+            bridges: Vec::new(),
+            devices: Vec::new(),
+            buffer_bytes: 1 << 20,
+            handshake_timeout_secs: 10,
+            max_connections: 1024,
+            audit: Some(crate::config::AuditConfig { path: path.clone() }),
+        };
+        let sink = AuditSink::new(&config).expect("audit sink");
+
+        // Opening the sink must re-assert 0600 on the pre-existing file.
+        assert_eq!(
+            file_mode(&path),
+            0o600,
+            "a pre-existing audit file must be tightened to 0600 on open"
+        );
+
+        // And it is still a working append sink (the seed line is preserved).
+        sink.record(&AuditRecord::new(
+            Some(HelloRole::Device),
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            CloseReason::Normal,
+        ));
+        let contents = std::fs::read_to_string(&path).expect("read audit file");
+        assert!(contents.starts_with("{}\n"), "existing content preserved");
+        assert!(
+            contents.lines().count() >= 2,
+            "record must append a new line"
+        );
     }
 }

@@ -96,25 +96,74 @@ fn random_device_id() -> Result<DeviceId, IdentityError> {
     Ok(DeviceId(raw))
 }
 
-/// Creates (or truncates) `path` as a `0600` file and writes `contents`.
+/// Atomically writes `contents` to `path` as a `0600` file.
 ///
-/// The file is created with mode `0600` so a newly written secret is never
-/// briefly world-readable. Because `mode()` is ignored when opening a file that
-/// already exists, we also re-assert `0600` after truncation (which has already
-/// emptied the file, so no secret bytes are exposed before we tighten perms).
+/// Writes to a `0600` temp file in the *same* directory (so the final rename
+/// stays on one filesystem and is therefore atomic), flushes and `sync_all()`s
+/// it, then renames it over the target. This never truncates the target in
+/// place: a crash or `ENOSPC` mid-write leaves the previous file intact instead
+/// of an empty or half-written one — losing every paired PSK would otherwise be
+/// a single failed write away. The temp file is created `0600` via
+/// `create_new` (O_CREAT|O_EXCL) so a secret is never briefly world-readable and
+/// a stray temp is never silently reused.
 fn write_secret_file(path: &Path, contents: &str) -> Result<(), IdentityError> {
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| IdentityError::io(path, e))?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| IdentityError::io(path, e))?;
-    (&file)
-        .write_all(contents.as_bytes())
-        .map_err(|e| IdentityError::io(path, e))?;
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        // No parent component (a bare file name): write into the cwd.
+        _ => Path::new("."),
+    };
+
+    // A unique temp name in the same directory. The random suffix avoids
+    // colliding with a concurrent writer or a leftover temp.
+    let mut rand = [0u8; 8];
+    os_random(&mut rand)?;
+    let suffix: String = rand.iter().map(|b| format!("{b:02x}")).collect();
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(
+        path.file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("secret")),
+    );
+    tmp_name.push(".tmp.");
+    tmp_name.push(&suffix);
+    let tmp = dir.join(tmp_name);
+
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+
+    if let Err(e) = result {
+        // Best-effort cleanup so a failed write never leaves a temp secret behind.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(IdentityError::io(path, e));
+    }
+    Ok(())
+}
+
+/// Tightens `path` to `0600` when its mode grants any group/other access,
+/// warning once on stderr and naming the file.
+///
+/// The exposure already happened the moment the file existed with a loose mode;
+/// refusing to load would brick a running bridge for a condition we can simply
+/// correct. So we stop the *ongoing* exposure and continue.
+fn ensure_secret_mode(path: &Path) -> std::io::Result<()> {
+    let mode = std::fs::metadata(path)?.permissions().mode();
+    if mode & 0o077 != 0 {
+        eprintln!(
+            "warning: secret file {} had insecure mode {:o}; tightening to 0600",
+            path.display(),
+            mode & 0o777
+        );
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 
@@ -149,7 +198,13 @@ impl BridgeIdentity {
     /// exact same id and key bytes.
     pub fn load_or_create(path: &Path) -> Result<BridgeIdentity, IdentityError> {
         match std::fs::read_to_string(path) {
-            Ok(text) => Self::from_toml(&text),
+            Ok(text) => {
+                // An existing identity file holds the bridge's private key; if a
+                // prior run (or a bad umask) left it group/other-readable, tighten
+                // it now rather than keep leaking it.
+                ensure_secret_mode(path).map_err(|e| IdentityError::io(path, e))?;
+                Self::from_toml(&text)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::create(path),
             Err(e) => Err(IdentityError::io(path, e)),
         }
@@ -232,6 +287,8 @@ impl Roster {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Roster::default()),
             Err(e) => return Err(IdentityError::io(path, e)),
         };
+        // The roster holds every pair's PSK; tighten a loosened file on load.
+        ensure_secret_mode(path).map_err(|e| IdentityError::io(path, e))?;
         let doc: RosterFile = toml::from_str(&text)?;
         let mut entries = Vec::with_capacity(doc.entries.len());
         for e in doc.entries {
@@ -310,6 +367,9 @@ impl PairingFile {
     /// Loads a pairing file from `path` (JSON).
     pub fn load(path: &Path) -> Result<PairingFile, IdentityError> {
         let text = std::fs::read_to_string(path).map_err(|e| IdentityError::io(path, e))?;
+        // The pairing file carries the device private key and PSK; tighten a
+        // loosened file on load.
+        ensure_secret_mode(path).map_err(|e| IdentityError::io(path, e))?;
         Ok(serde_json::from_str(&text)?)
     }
 
@@ -396,6 +456,85 @@ mod tests {
         );
         assert_eq!(first.static_keypair.public.len(), 32);
         assert_eq!(first.static_keypair.private.len(), 32);
+    }
+
+    /// A helper that lists any leftover `.tmp.` scratch files in a directory.
+    fn temp_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp."))
+            .collect()
+    }
+
+    #[test]
+    fn write_secret_file_is_atomic_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("identity.toml");
+
+        // A successful create renames its temp over the target, leaving none.
+        BridgeIdentity::load_or_create(&path).expect("create");
+        assert_eq!(file_mode(&path), 0o600, "written secret must be 0600");
+        assert!(
+            temp_files(dir.path()).is_empty(),
+            "a successful write must leave no temp file: {:?}",
+            temp_files(dir.path())
+        );
+
+        // A rewrite (roster save into the same dir) is likewise clean.
+        let roster_path = dir.path().join("roster.toml");
+        Roster::default().save(&roster_path).expect("save roster");
+        Roster::default()
+            .save(&roster_path)
+            .expect("overwrite roster");
+        assert!(
+            temp_files(dir.path()).is_empty(),
+            "an overwrite must leave no temp file: {:?}",
+            temp_files(dir.path())
+        );
+    }
+
+    #[test]
+    fn load_tightens_a_permissive_identity_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("identity.toml");
+
+        // Create a valid identity, then loosen its mode as if a bad umask or an
+        // older build had written it 0644.
+        BridgeIdentity::load_or_create(&path).expect("create");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen mode");
+        assert_eq!(file_mode(&path), 0o644);
+
+        // Loading it back must tighten the mode to 0600 (and still parse).
+        BridgeIdentity::load_or_create(&path).expect("reload");
+        assert_eq!(
+            file_mode(&path),
+            0o600,
+            "loading a permissive identity file must tighten it to 0600"
+        );
+    }
+
+    #[test]
+    fn load_tightens_a_permissive_pairing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id_path = dir.path().join("identity.toml");
+        let pairing_path = dir.path().join("pairing.json");
+
+        let identity = BridgeIdentity::load_or_create(&id_path).expect("identity");
+        let mut roster = Roster::default();
+        let pairing = provision_device(&identity, &mut roster, "wss://r/ws", "tok").expect("prov");
+        pairing.save(&pairing_path).expect("save pairing");
+
+        std::fs::set_permissions(&pairing_path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen mode");
+        PairingFile::load(&pairing_path).expect("reload pairing");
+        assert_eq!(
+            file_mode(&pairing_path),
+            0o600,
+            "loading a permissive pairing file must tighten it to 0600"
+        );
     }
 
     #[test]

@@ -81,6 +81,12 @@ const PEER_FRAME_QUEUE: usize = 256;
 /// Depth of a peer's internal PTY-event queue (pump task → peer task).
 const PEER_EVENT_QUEUE: usize = 256;
 
+/// How long a peer may take to send its E2E [`ClientMessage::Hello`] after the
+/// Noise handshake completes. A paired client that finishes the handshake then
+/// stalls would otherwise pin its peer task and [`PeerRegistry`] slot forever;
+/// on expiry the peer task returns and its [`DoneGuard`] reaps the slot (#231).
+const PEER_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Static configuration for one [`serve_bridge`] run.
 ///
 /// Not `Debug`/`Clone`: [`BridgeIdentity`] holds a private key.
@@ -516,6 +522,26 @@ async fn handshake(
     Some(transport)
 }
 
+/// Reads the peer's first post-handshake frame (its E2E hello), bounded by
+/// `timeout`. Returns `None` — so the caller drops the peer — on connection
+/// teardown, a closed frame channel, or the timeout elapsing (a client that
+/// handshook then never sent Hello). Factored out so the timeout seam is unit
+/// testable without a live Noise transport.
+async fn recv_hello_frame(
+    frame_rx: &mut mpsc::Receiver<Vec<u8>>,
+    conn_token: &CancellationToken,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    tokio::select! {
+        _ = conn_token.cancelled() => None,
+        r = tokio::time::timeout(timeout, frame_rx.recv()) => match r {
+            Ok(Some(frame)) => Some(frame),
+            // Frame channel closed (Ok(None)) or the hello deadline elapsed (Err).
+            Ok(None) | Err(_) => None,
+        },
+    }
+}
+
 /// After a good handshake: the strict E2E hello exchange, then the serve loop
 /// (request/response + the attached PTY stream). Owns `transport` outright.
 async fn serve_peer(
@@ -533,13 +559,13 @@ async fn serve_peer(
     let peer_token = conn_token.child_token();
     let _guard = CancelGuard(peer_token.clone());
 
-    // --- E2E hello: the client's first application message must be Hello. ---
-    let hello_frame = tokio::select! {
-        _ = conn_token.cancelled() => return,
-        f = frame_rx.recv() => match f {
-            Some(f) => f,
-            None => return,
-        },
+    // --- E2E hello: the client's first application message must be Hello. A
+    // paired client that completes the handshake but never sends it is dropped
+    // once PEER_HELLO_TIMEOUT elapses, so the peer task + registry slot are
+    // reaped instead of pinned forever (#231). ---
+    let Some(hello_frame) = recv_hello_frame(&mut frame_rx, &conn_token, PEER_HELLO_TIMEOUT).await
+    else {
+        return;
     };
     let client_version = match transport.open::<ClientMessage>(&hello_frame) {
         Ok(ClientMessage::Hello { protocol_version }) => protocol_version,
@@ -967,6 +993,41 @@ mod tests {
         reg.insert(src, tx);
         reg.remove(&src);
         assert_eq!(reg.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn recv_hello_frame_times_out_when_no_hello_arrives() {
+        // A peer that completed the handshake but never sends its E2E hello must
+        // be dropped once the deadline elapses, so its task returns and the
+        // DoneGuard reaps the registry slot (#231). The sender is held open so
+        // `recv` would otherwise block forever — only the timeout ends it. A tiny
+        // real deadline keeps the test fast; production uses PEER_HELLO_TIMEOUT.
+        let (_tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
+        let token = CancellationToken::new();
+        let got = recv_hello_frame(&mut rx, &token, Duration::from_millis(30)).await;
+        assert!(got.is_none(), "a stalled hello must time out to None");
+    }
+
+    #[tokio::test]
+    async fn recv_hello_frame_returns_a_delivered_frame() {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
+        tx.send(vec![1, 2, 3]).await.expect("send hello frame");
+        let token = CancellationToken::new();
+        let got = recv_hello_frame(&mut rx, &token, Duration::from_secs(10)).await;
+        assert_eq!(
+            got,
+            Some(vec![1, 2, 3]),
+            "a delivered frame must pass through"
+        );
+    }
+
+    #[tokio::test]
+    async fn recv_hello_frame_returns_none_on_cancellation() {
+        let (_tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
+        let token = CancellationToken::new();
+        token.cancel();
+        let got = recv_hello_frame(&mut rx, &token, Duration::from_secs(10)).await;
+        assert!(got.is_none(), "a cancelled connection drops the peer");
     }
 
     #[test]
