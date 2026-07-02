@@ -20,7 +20,10 @@ mod noise;
 mod remote_source;
 mod wire_error;
 
-pub use bridge::{serve_bridge, BridgeConfig, BridgeServeError};
+pub use bridge::{
+    serve_bridge, BridgeConfig, BridgeError, BridgeEvent, BridgeServeError, PairingCommand,
+    PairingOutcome,
+};
 pub use identity::{fingerprint, BridgeIdentity, IdentityError, PairingFile, Roster, RosterEntry};
 pub use noise::{
     chunk_bytes, prologue, Handshake, HandshakeKind, NoiseError, Transport, MAX_NOISE_PLAINTEXT,

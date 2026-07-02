@@ -197,11 +197,19 @@ pub async fn start_loopback(
         relay_url,
         registration_token,
         identity,
-        roster,
+        roster: Arc::new(tokio::sync::RwLock::new(roster)),
+        roster_path: state_dir.join("bridge_roster.toml"),
     };
+    // Task 10 threads the pairing command/event channels through `serve_bridge`.
+    // The loopback dogfood path does not drive pairing yet (Task 14 rewrites this
+    // to run the real ceremony), so the desktop end of each channel is unused for
+    // now: an unfed command receiver and an undrained event sender both degrade
+    // gracefully (the bridge disables its command branch and ignores send errors).
+    let (_commands_tx, commands_rx) = tokio::sync::mpsc::channel(8);
+    let (events_tx, _events_rx) = tokio::sync::mpsc::channel(8);
     let shutdown_c = shutdown.clone();
     let bridge_task = tokio::spawn(async move {
-        if let Err(e) = serve_bridge(bridge_cfg, source, shutdown_c).await {
+        if let Err(e) = serve_bridge(bridge_cfg, source, commands_rx, events_tx, shutdown_c).await {
             eprintln!("loopback bridge stopped: {e}");
         }
     });

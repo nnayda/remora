@@ -41,8 +41,8 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
 use remora_bridge::{
-    prologue, serve_bridge, BridgeConfig, BridgeIdentity, Handshake, HandshakeKind, PairingFile,
-    RemoteSource, Roster, RosterEntry, Transport, NOISE_PATTERN,
+    prologue, serve_bridge, BridgeConfig, BridgeEvent, BridgeIdentity, Handshake, HandshakeKind,
+    PairingCommand, PairingFile, RemoteSource, Roster, RosterEntry, Transport, NOISE_PATTERN,
 };
 use remora_core::{
     ExclusiveSource, FakeSessionSource, SessionChannel, SessionLocks, SessionSource,
@@ -164,6 +164,11 @@ struct Harness {
     relay_config: Arc<RelayConfig>,
     shutdown: CancellationToken,
     bridge_task: JoinHandle<()>,
+    /// Held open so the bridge's command branch never observes a closed channel
+    /// (Task 14 drives commands through it); dropped when the harness drops.
+    _commands_tx: mpsc::Sender<PairingCommand>,
+    /// Held so the bridge's event sender always has a live receiver.
+    _events_rx: mpsc::Receiver<BridgeEvent>,
 }
 
 impl Harness {
@@ -248,7 +253,10 @@ impl Harness {
             relay_url,
             registration_token: BRIDGE_TOKEN.to_string(),
             identity,
-            roster,
+            roster: Arc::new(tokio::sync::RwLock::new(roster)),
+            // A never-written path: these tests never mutate the roster (Task 14
+            // drives the pairing/revocation ceremony that persists it).
+            roster_path: dir.path().join("bridge_roster.toml"),
         };
         // The bridge serves through the same per-session-locked seam the desktop
         // uses (ADR-0021 D7): wrap the source in an ExclusiveSource.
@@ -257,9 +265,21 @@ impl Harness {
             SessionLocks::new(),
             "loopback",
         ));
+        // Task 10 wires the pairing command/event channels; this task does not
+        // drive them (Task 14 does), so hold the command sender open so the
+        // bridge's command branch never spuriously closes, and drain events.
+        let (commands_tx, commands_rx) = mpsc::channel::<PairingCommand>(8);
+        let (events_tx, events_rx) = mpsc::channel::<BridgeEvent>(8);
         let shutdown_c = shutdown.clone();
         let bridge_task = tokio::spawn(async move {
-            let _ = serve_bridge(bridge_cfg, bridge_source, shutdown_c).await;
+            let _ = serve_bridge(
+                bridge_cfg,
+                bridge_source,
+                commands_rx,
+                events_tx,
+                shutdown_c,
+            )
+            .await;
         });
 
         let remote = RemoteSource::new(pairing.clone());
@@ -270,6 +290,8 @@ impl Harness {
             relay_config,
             shutdown,
             bridge_task,
+            _commands_tx: commands_tx,
+            _events_rx: events_rx,
         }
     }
 

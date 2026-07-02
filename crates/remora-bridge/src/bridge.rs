@@ -43,22 +43,27 @@
 //! done-signal.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::stream::Stream;
 use futures_util::{SinkExt as _, StreamExt as _};
-use tokio::sync::mpsc;
+use rand::TryRngCore as _;
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 use remora_core::SessionSource;
 use remora_protocol::{
-    BridgeMessage, ChannelInput, ChannelOutput, ClientMessage, DeviceId, Envelope, FrameType,
-    HelloRole, RelayHello, RemoteOp, RemoteResult, WireError, PROTOCOL_VERSION,
+    AssertedDevice, BridgeMessage, ChannelInput, ChannelOutput, ClientMessage, DeviceId, Envelope,
+    FrameType, HelloRole, PairingCode, RelayControl, RelayControlAck, RelayControlError,
+    RelayHello, RemoteOp, RemoteResult, WireError, PROTOCOL_VERSION,
 };
 
-use crate::identity::{BridgeIdentity, Roster};
+use crate::identity::{BridgeIdentity, IdentityError, Roster, RosterEntry};
 use crate::noise::{chunk_bytes, prologue, Handshake, HandshakeKind, Transport};
 use crate::wire_error::map_source_error;
 
@@ -97,8 +102,13 @@ pub struct BridgeConfig {
     pub registration_token: String,
     /// This bridge's durable identity (device id + static keypair).
     pub identity: BridgeIdentity,
-    /// The paired-device roster (pinned static keys + per-pair PSKs).
-    pub roster: Roster,
+    /// The paired-device roster (pinned static keys + per-pair PSKs), shared so
+    /// pairing/revocation can mutate it live and every relay (re)connect asserts
+    /// the current set (ADR-0021 D4).
+    pub roster: Arc<RwLock<Roster>>,
+    /// Where the roster persists; every roster mutation is written back here so
+    /// a restart re-asserts the same devices.
+    pub roster_path: PathBuf,
 }
 
 /// Fatal, non-retryable error from [`serve_bridge`].
@@ -114,14 +124,130 @@ pub enum BridgeServeError {
     InvalidRelayUrl(String),
 }
 
+/// A per-command failure surfaced back to the desktop over a [`PairingCommand`]
+/// reply channel — distinct from the fatal, loop-stopping [`BridgeServeError`].
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum BridgeError {
+    /// Persisting or reading roster/identity state on disk failed.
+    #[error("identity/roster storage error: {0}")]
+    Storage(#[from] IdentityError),
+    /// No relay connection was live to carry the command (e.g. opening a pairing
+    /// window while the bridge is between reconnects).
+    #[error("no relay connection is currently established")]
+    Disconnected,
+    /// The bridge could not build a pairing code from its current state (e.g. a
+    /// non-`ws` relay URL that cannot be handed to a device).
+    #[error("cannot mint a pairing code: {0}")]
+    Pairing(String),
+}
+
+/// A control message the desktop sends into a running [`serve_bridge`] to drive
+/// the pairing ceremony and roster changes (ADR-0021). The pairing-window and
+/// confirm/reject responder behaviour lands with #232's ceremony work (Task 11);
+/// this task wires the channel, the roster assertion, and revocation.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum PairingCommand {
+    /// Open (or replace) this bridge's single pairing window for `ttl_secs`,
+    /// replying with the freshly minted [`PairingCode`] the desktop renders as a
+    /// QR / copyable string.
+    OpenWindow {
+        ttl_secs: u64,
+        reply: oneshot::Sender<Result<PairingCode, BridgeError>>,
+    },
+    /// The user confirmed the arrived device's fingerprint (Task 11 responder).
+    Confirm { device_id: DeviceId },
+    /// The user rejected the arrived device (Task 11 responder).
+    Reject { device_id: DeviceId },
+    /// Un-pair a device: drop it from the roster, persist, and re-assert the
+    /// shrunken set so the relay kicks any live connection (ADR-0021 D6).
+    Revoke {
+        device_id: DeviceId,
+        reply: oneshot::Sender<Result<(), BridgeError>>,
+    },
+    /// Close the current pairing window without pairing anyone.
+    CancelWindow,
+}
+
+/// An event the bridge emits to the desktop over the [`serve_bridge`] event
+/// channel, mirroring pairing progress and roster changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BridgeEvent {
+    /// A pairing window opened; the desktop shows `code` until `expires_at`
+    /// (Unix seconds).
+    PairingWindowOpened { code: PairingCode, expires_at: u64 },
+    /// A device reached the open pairing window and awaits confirmation.
+    PairingDeviceArrived {
+        device_id: DeviceId,
+        name: String,
+        fingerprint: String,
+    },
+    /// A pairing attempt reached a terminal state.
+    PairingResult(PairingOutcome),
+    /// The roster changed (a device was enrolled or revoked); the desktop may
+    /// refresh its paired-devices view.
+    RosterChanged,
+}
+
+/// The terminal result of one pairing attempt (ADR-0021).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PairingOutcome {
+    /// The device was enrolled into the roster.
+    Paired { device_id: DeviceId, name: String },
+    /// The user rejected the device.
+    Rejected { device_id: DeviceId },
+    /// The pairing window expired or was cancelled before completion.
+    Expired,
+}
+
+/// Builds the [`RelayControl::AssertDevices`] message for the current roster
+/// (ADR-0021 D4): one [`AssertedDevice`] per entry, carrying the entry's stored
+/// per-device relay credential.
+fn assert_devices_msg(id: u32, roster: &Roster) -> RelayControl {
+    RelayControl::AssertDevices {
+        id,
+        devices: roster
+            .entries
+            .iter()
+            .map(|e| AssertedDevice {
+                device_id: e.device_id,
+                token: device_token_for(e),
+            })
+            .collect(),
+    }
+}
+
+/// The per-device relay credential the bridge asserts — the `relay_token` minted
+/// at pairing (Task 6) and mirrored into the device's `PairingFile.device_token`.
+fn device_token_for(entry: &RosterEntry) -> String {
+    entry.relay_token.clone()
+}
+
+/// Allocates the next control-request correlation id (wraps after `u32::MAX`,
+/// which no bridge reaches in one process lifetime).
+fn next_control_id(seq: &AtomicU32) -> u32 {
+    seq.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Shared, cheaply-clonable material every peer task needs.
 struct PeerDeps {
     /// The bridge's routing id (also its `src` on every outbound frame).
     bridge_id: DeviceId,
     /// The bridge's static private key, presented as the Noise responder.
     bridge_static_priv: Vec<u8>,
-    /// The paired-device roster (lookup by claimed identity).
-    roster: Roster,
+    /// The bridge's static public key — handed to a device in a minted
+    /// [`PairingCode`] so it can pin the bridge.
+    bridge_static_pub: Vec<u8>,
+    /// The relay endpoint devices dial, embedded into minted pairing codes.
+    relay_url: String,
+    /// The paired-device roster, shared so pairing/revocation mutate it live and
+    /// every (re)connect asserts the current set. Read under the lock per-peer.
+    roster: Arc<RwLock<Roster>>,
+    /// Where the roster persists; written back on every mutation.
+    roster_path: PathBuf,
     /// The local session source the bridge serves.
     source: Arc<dyn SessionSource>,
 }
@@ -251,6 +377,8 @@ impl Drop for DoneGuard {
 pub async fn serve_bridge(
     config: BridgeConfig,
     source: Arc<dyn SessionSource>,
+    mut commands: mpsc::Receiver<PairingCommand>,
+    events: mpsc::Sender<BridgeEvent>,
     shutdown: CancellationToken,
 ) -> Result<(), BridgeServeError> {
     if !is_ws_url(&config.relay_url) {
@@ -260,16 +388,33 @@ pub async fn serve_bridge(
     let deps = Arc::new(PeerDeps {
         bridge_id: config.identity.device_id,
         bridge_static_priv: config.identity.static_keypair.private.clone(),
+        bridge_static_pub: config.identity.static_keypair.public.clone(),
+        relay_url: config.relay_url.clone(),
         roster: config.roster.clone(),
+        roster_path: config.roster_path.clone(),
         source,
     });
+
+    // Correlation ids for relay control requests, monotonic across reconnects so
+    // a late reply from a dropped connection can never be mistaken for a fresh
+    // request's ack.
+    let control_seq = AtomicU32::new(0);
 
     let mut backoff = BACKOFF_MIN;
     loop {
         if shutdown.is_cancelled() {
             return Ok(());
         }
-        match run_connection(&config, &deps, &shutdown).await {
+        match run_connection(
+            &config,
+            &deps,
+            &control_seq,
+            &mut commands,
+            &events,
+            &shutdown,
+        )
+        .await
+        {
             ConnOutcome::Shutdown => return Ok(()),
             // A fresh loss starts backoff over; a never-connected attempt keeps
             // the current (growing) delay so a down relay is not hammered.
@@ -291,11 +436,14 @@ pub async fn serve_bridge(
     }
 }
 
-/// Runs one relay connection to completion: dial, hello, then read/route until
-/// the connection drops or `shutdown` fires.
+/// Runs one relay connection to completion: dial, hello, assert the roster, then
+/// read/route until the connection drops or `shutdown` fires.
 async fn run_connection(
     config: &BridgeConfig,
     deps: &Arc<PeerDeps>,
+    control_seq: &AtomicU32,
+    commands: &mut mpsc::Receiver<PairingCommand>,
+    events: &mpsc::Sender<BridgeEvent>,
     shutdown: &CancellationToken,
 ) -> ConnOutcome {
     let ws = match connect_async(&config.relay_url).await {
@@ -346,7 +494,37 @@ async fn run_connection(
         let _ = sink.close().await;
     });
 
+    // Assert-before-serve (ADR-0021 D4): the relay admits no device hello until
+    // it holds this bridge's device credentials, so we send `AssertDevices` for
+    // the current roster and await the matching ack before entering the serve
+    // loop. The reply rides back as an inbound Control frame, so we pump `stream`
+    // here until it arrives (only control frames can precede admission).
+    if let Some(outcome) =
+        match assert_roster_and_await_ack(&mut stream, deps, &outbound_tx, control_seq, shutdown)
+            .await
+        {
+            AssertPhase::Acked => None,
+            AssertPhase::Shutdown => Some(ConnOutcome::Shutdown),
+            // A relay that refuses our assertion is a config-level problem; grow the
+            // backoff rather than hammer a re-assert that will just re-fail.
+            AssertPhase::Rejected => Some(ConnOutcome::ConnectFailed),
+            AssertPhase::Disconnected => Some(ConnOutcome::Disconnected),
+        }
+    {
+        conn_token.cancel();
+        drop(outbound_tx);
+        writer.abort();
+        return outcome;
+    }
+
     let mut peers = PeerRegistry::new();
+    // Pending relay control requests (`RegisterPairing`/`CancelPairing`) awaiting
+    // their `RelayControlAck`/`RelayControlError`, keyed by correlation id. The
+    // read loop completes each waiter when its reply lands (see [`dispatch_inbound`]).
+    let mut control_waiters: HashMap<u32, oneshot::Sender<Result<(), String>>> = HashMap::new();
+    // Once the command channel closes (the desktop dropped its sender) we stop
+    // selecting on it so a closed channel does not spin the loop.
+    let mut commands_open = true;
     // Peer tasks echo their `(src, generation)` here on exit so the loop can
     // reap the dead slot promptly (see [`DoneGuard`]). Unbounded so the reap
     // never blocks a returning peer; drained synchronously by the select below.
@@ -361,6 +539,21 @@ async fn run_connection(
                     peers.remove_if_generation(&src, generation);
                 }
             }
+            cmd = commands.recv(), if commands_open => match cmd {
+                Some(cmd) => {
+                    handle_command(
+                        cmd,
+                        deps,
+                        &outbound_tx,
+                        events,
+                        control_seq,
+                        &mut control_waiters,
+                    )
+                    .await;
+                }
+                // Desktop dropped the command sender: no more commands will come.
+                None => commands_open = false,
+            },
             inbound = stream.next() => match inbound {
                 None => break ConnOutcome::Disconnected,
                 Some(Err(_)) => break ConnOutcome::Disconnected,
@@ -368,6 +561,7 @@ async fn run_connection(
                     dispatch_inbound(
                         bytes.as_ref(),
                         &mut peers,
+                        &mut control_waiters,
                         deps,
                         &outbound_tx,
                         &done_tx,
@@ -376,7 +570,7 @@ async fn run_connection(
                 }
                 Some(Ok(Message::Close(_))) => break ConnOutcome::Disconnected,
                 // Ping/Pong/Text/Frame: tungstenite answers pings itself; the
-                // bridge speaks only binary Data frames, so ignore the rest.
+                // bridge speaks only binary Data/Control frames, so ignore the rest.
                 Some(Ok(_)) => {}
             },
         }
@@ -391,12 +585,73 @@ async fn run_connection(
     outcome
 }
 
+/// The outcome of the assert-before-serve phase.
+enum AssertPhase {
+    /// The relay acked our `AssertDevices`; proceed to serve.
+    Acked,
+    /// The relay rejected the assertion (`RelayControlError`).
+    Rejected,
+    /// The connection dropped before the ack arrived.
+    Disconnected,
+    /// `shutdown` fired while awaiting the ack.
+    Shutdown,
+}
+
+/// Sends `AssertDevices` for the current roster and reads inbound frames until
+/// the matching `RelayControlAck` (or error) arrives. Generic over the stream so
+/// the reply-pump is exercised without a live socket in tests.
+async fn assert_roster_and_await_ack<S, E>(
+    stream: &mut S,
+    deps: &Arc<PeerDeps>,
+    outbound_tx: &mpsc::Sender<Message>,
+    control_seq: &AtomicU32,
+    shutdown: &CancellationToken,
+) -> AssertPhase
+where
+    S: Stream<Item = Result<Message, E>> + Unpin,
+{
+    let id = next_control_id(control_seq);
+    let msg = {
+        let roster = deps.roster.read().await;
+        assert_devices_msg(id, &roster)
+    };
+    if send_control(outbound_tx, deps.bridge_id, &msg)
+        .await
+        .is_err()
+    {
+        return AssertPhase::Disconnected;
+    }
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return AssertPhase::Shutdown,
+            inbound = stream.next() => match inbound {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {
+                    return AssertPhase::Disconnected
+                }
+                Some(Ok(Message::Binary(bytes))) => {
+                    match parse_control_reply(bytes.as_ref(), deps.bridge_id) {
+                        Some(ControlReply::Ack(ack)) if ack == id => return AssertPhase::Acked,
+                        Some(ControlReply::Error(eid)) if eid == id => {
+                            return AssertPhase::Rejected
+                        }
+                        // A stray/unrelated frame before the ack: keep reading
+                        // (the relay admits no device until the assert lands).
+                        _ => {}
+                    }
+                }
+                Some(Ok(_)) => {}
+            },
+        }
+    }
+}
+
 /// Routes one inbound binary frame to its peer task, spawning a new peer task
 /// for a `src` not seen before. Pure-sync: never awaits, so the read loop stays
 /// responsive across peers.
 fn dispatch_inbound(
     bytes: &[u8],
     peers: &mut PeerRegistry,
+    control_waiters: &mut HashMap<u32, oneshot::Sender<Result<(), String>>>,
     deps: &Arc<PeerDeps>,
     outbound_tx: &mpsc::Sender<Message>,
     done_tx: &mpsc::UnboundedSender<(DeviceId, u64)>,
@@ -406,6 +661,12 @@ fn dispatch_inbound(
         Ok(e) => e,
         Err(_) => return, // malformed frame from the relay: ignore
     };
+    // A relay-terminated Control reply (an ack/error for one of our control
+    // requests) completes the matching waiter, then we are done with the frame.
+    if envelope.frame_type == FrameType::Control && envelope.dst == deps.bridge_id {
+        route_control_reply(&envelope.payload, control_waiters);
+        return;
+    }
     // The relay only forwards Data frames between adjacent peers, addressed to
     // us; anything else is not ours to serve.
     if envelope.frame_type != FrameType::Data || envelope.dst != deps.bridge_id {
@@ -499,8 +760,14 @@ async fn handshake(
     // spec D16: 32-byte plaintext identity preamble ‖ noise msg1.
     let (initiator_identity, msg1) = split_preamble(&first)?;
 
-    // Roster lookup by claimed identity selects the PSK and pins the static.
-    let entry = deps.roster.find_by_device(&initiator_identity)?;
+    // Roster lookup by claimed identity selects the PSK and pins the static. The
+    // shared roster can be mutated by pairing/revocation, so copy out the two
+    // credentials this handshake needs and drop the read guard before awaiting.
+    let (psk, static_pubkey) = {
+        let roster = deps.roster.read().await;
+        let entry = roster.find_by_device(&initiator_identity)?;
+        (entry.psk, entry.static_pubkey.clone())
+    };
 
     // The prologue binds this exact route; a forged identity/routing yields a
     // different prologue than the honest client used, failing the handshake.
@@ -510,7 +777,7 @@ async fn handshake(
         routing_id,
         &deps.bridge_id,
     );
-    let mut hs = Handshake::responder(&deps.bridge_static_priv, &entry.psk, &bound).ok()?;
+    let mut hs = Handshake::responder(&deps.bridge_static_priv, &psk, &bound).ok()?;
     hs.read_message(msg1).ok()?;
     let msg2 = hs.write_message(&[]).ok()?;
     send_frame(outbound_tx, deps.bridge_id, *routing_id, msg2)
@@ -521,7 +788,7 @@ async fn handshake(
     // spec C7: the Noise-authenticated initiator static MUST equal the pinned
     // roster key. `into_transport` yields an empty vec when snow never learned
     // a remote static; treat empty OR mismatch as an auth failure.
-    if remote_static.is_empty() || remote_static != entry.static_pubkey {
+    if remote_static.is_empty() || remote_static != static_pubkey {
         return None;
     }
     Some(transport)
@@ -847,6 +1114,210 @@ async fn send_frame(
         .map_err(|_| ())
 }
 
+/// Wraps a [`RelayControl`] in a relay-terminated Control envelope (`dst` =
+/// [`DeviceId::ZERO`]) and enqueues it. `Err(())` means the writer is gone.
+async fn send_control(
+    outbound_tx: &mpsc::Sender<Message>,
+    bridge_id: DeviceId,
+    control: &RelayControl,
+) -> Result<(), ()> {
+    let payload = serde_json::to_vec(control).map_err(|_| ())?;
+    let frame = Envelope {
+        frame_type: FrameType::Control,
+        src: bridge_id,
+        dst: DeviceId::ZERO,
+        payload,
+    }
+    .encode();
+    outbound_tx
+        .send(Message::Binary(frame.into()))
+        .await
+        .map_err(|_| ())
+}
+
+/// A decoded relay-terminated control reply, carrying its correlation `id`.
+enum ControlReply {
+    /// A `RelayControlAck`.
+    Ack(u32),
+    /// A `RelayControlError`.
+    Error(u32),
+}
+
+/// Decodes a frame as a relay-terminated control reply addressed to this bridge,
+/// or `None` if it is not one. `RelayControlError` is tried first: its `message`
+/// field is absent from an ack, so an ack never mis-parses as an error, and an
+/// error (which also carries `id`) is not mistaken for an ack.
+fn parse_control_reply(bytes: &[u8], bridge_id: DeviceId) -> Option<ControlReply> {
+    let envelope = Envelope::decode(bytes).ok()?;
+    if envelope.frame_type != FrameType::Control || envelope.dst != bridge_id {
+        return None;
+    }
+    if let Ok(err) = serde_json::from_slice::<RelayControlError>(&envelope.payload) {
+        return Some(ControlReply::Error(err.id));
+    }
+    let ack = serde_json::from_slice::<RelayControlAck>(&envelope.payload).ok()?;
+    Some(ControlReply::Ack(ack.id))
+}
+
+/// Completes the pending control waiter for a relay-terminated reply payload.
+/// `RelayControlError` is tried first (see [`parse_control_reply`]).
+fn route_control_reply(
+    payload: &[u8],
+    control_waiters: &mut HashMap<u32, oneshot::Sender<Result<(), String>>>,
+) {
+    if let Ok(err) = serde_json::from_slice::<RelayControlError>(payload) {
+        if let Some(tx) = control_waiters.remove(&err.id) {
+            let _ = tx.send(Err(err.message));
+        }
+        return;
+    }
+    if let Ok(ack) = serde_json::from_slice::<RelayControlAck>(payload) {
+        if let Some(tx) = control_waiters.remove(&ack.id) {
+            let _ = tx.send(Ok(()));
+        }
+    }
+}
+
+/// Handles one [`PairingCommand`] from the desktop. This task wires the command
+/// plumbing, the pairing-window control sends + code minting, and revocation;
+/// the confirm/reject Pairing-frame responder lands with #232's ceremony work
+/// (Task 11), which slots into the corresponding arms.
+async fn handle_command(
+    cmd: PairingCommand,
+    deps: &Arc<PeerDeps>,
+    outbound_tx: &mpsc::Sender<Message>,
+    events: &mpsc::Sender<BridgeEvent>,
+    control_seq: &AtomicU32,
+    control_waiters: &mut HashMap<u32, oneshot::Sender<Result<(), String>>>,
+) {
+    match cmd {
+        PairingCommand::OpenWindow { ttl_secs, reply } => {
+            let (code, rendezvous_token) = match mint_pairing_code(deps) {
+                Ok(minted) => minted,
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                    return;
+                }
+            };
+            // Open the relay's single pairing window keyed by the rendezvous
+            // token embedded in the code, so the arriving device is admitted.
+            let id = next_control_id(control_seq);
+            let register = RelayControl::RegisterPairing {
+                id,
+                token: rendezvous_token,
+                ttl_secs,
+            };
+            // Register a waiter so the relay's ack/error is routed rather than
+            // dropped; the Task 11 responder awaits it before treating the window
+            // as live. The receiver is dropped here (fire-and-forget for now).
+            let (tx, _rx) = oneshot::channel();
+            control_waiters.insert(id, tx);
+            if send_control(outbound_tx, deps.bridge_id, &register)
+                .await
+                .is_err()
+            {
+                control_waiters.remove(&id);
+                let _ = reply.send(Err(BridgeError::Disconnected));
+                return;
+            }
+            let expires_at = now_secs().saturating_add(ttl_secs);
+            let _ = events
+                .send(BridgeEvent::PairingWindowOpened {
+                    code: code.clone(),
+                    expires_at,
+                })
+                .await;
+            let _ = reply.send(Ok(code));
+        }
+        PairingCommand::CancelWindow => {
+            let id = next_control_id(control_seq);
+            let _ = send_control(
+                outbound_tx,
+                deps.bridge_id,
+                &RelayControl::CancelPairing { id },
+            )
+            .await;
+        }
+        PairingCommand::Revoke { device_id, reply } => {
+            let result = revoke_device(&device_id, deps, outbound_tx, control_seq).await;
+            if result.is_ok() {
+                let _ = events.send(BridgeEvent::RosterChanged).await;
+            }
+            let _ = reply.send(result);
+        }
+        // The confirm/reject responder (the Pairing-frame ceremony) lands with
+        // #232's Task 11; the arms exist now so the desktop channel compiles.
+        PairingCommand::Confirm { .. } | PairingCommand::Reject { .. } => {}
+    }
+}
+
+/// Mints a fresh [`PairingCode`] for a new pairing window: a random rendezvous
+/// token (the relay routing credential) and a random `psk`, bound to this
+/// bridge's id, static public key, and relay URL. Returns the code and the
+/// rendezvous token (which the caller also hands to `RegisterPairing`).
+fn mint_pairing_code(deps: &Arc<PeerDeps>) -> Result<(PairingCode, String), BridgeError> {
+    let mut psk = [0u8; 32];
+    fill_random(&mut psk)?;
+    let mut token_raw = [0u8; 32];
+    fill_random(&mut token_raw)?;
+    let rendezvous_token: String = token_raw.iter().map(|b| format!("{b:02x}")).collect();
+
+    let bridge_key: [u8; 32] = deps
+        .bridge_static_pub
+        .clone()
+        .try_into()
+        .map_err(|_| BridgeError::Pairing("bridge static key is not 32 bytes".to_string()))?;
+
+    let code = PairingCode {
+        relay_url: Some(deps.relay_url.clone()),
+        rendezvous_token: Some(rendezvous_token.clone()),
+        mesh_addr: None,
+        psk,
+        bridge_id: deps.bridge_id,
+        bridge_key,
+        bridge_name: None,
+        min_protocol: PROTOCOL_VERSION,
+    };
+    Ok((code, rendezvous_token))
+}
+
+/// Removes `device_id` from the roster, persists the change, and re-asserts the
+/// shrunken set so the relay kicks any live connection (ADR-0021 D6). A device
+/// that was not paired is a no-op success (idempotent unpair).
+async fn revoke_device(
+    device_id: &DeviceId,
+    deps: &Arc<PeerDeps>,
+    outbound_tx: &mpsc::Sender<Message>,
+    control_seq: &AtomicU32,
+) -> Result<(), BridgeError> {
+    let assert = {
+        let mut roster = deps.roster.write().await;
+        if !roster.remove_by_device(device_id) {
+            return Ok(());
+        }
+        roster.save(&deps.roster_path)?;
+        assert_devices_msg(next_control_id(control_seq), &roster)
+    };
+    send_control(outbound_tx, deps.bridge_id, &assert)
+        .await
+        .map_err(|_| BridgeError::Disconnected)
+}
+
+/// Fills `buf` with cryptographically secure random bytes from the OS CSPRNG.
+fn fill_random(buf: &mut [u8]) -> Result<(), BridgeError> {
+    rand::rngs::OsRng
+        .try_fill_bytes(buf)
+        .map_err(|e| BridgeError::Pairing(format!("could not read random bytes: {e}")))
+}
+
+/// Current Unix time in whole seconds (0 before the epoch, which never occurs).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Splits a client's first frame into its 32-byte identity preamble and the
 /// trailing Noise `msg1`. `None` if the frame is too short to carry a preamble.
 fn split_preamble(frame: &[u8]) -> Option<(DeviceId, &[u8])> {
@@ -885,6 +1356,32 @@ fn jittered(base: Duration, rng: &mut impl rand::Rng) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assert_devices_msg_maps_roster() {
+        // The AssertDevices payload mirrors the roster one-for-one: each entry's
+        // device id and its stored `relay_token` become one `AssertedDevice`.
+        let roster = Roster {
+            entries: vec![RosterEntry {
+                device_id: DeviceId([0x11; 32]),
+                static_pubkey: vec![0xaa; 32],
+                psk: [0xbb; 32],
+                name: "iPhone".to_string(),
+                enrolled_at: None,
+                last_connected_at: None,
+                relay_token: "tok-abc".to_string(),
+            }],
+        };
+        match assert_devices_msg(7, &roster) {
+            RelayControl::AssertDevices { id, devices } => {
+                assert_eq!(id, 7);
+                assert_eq!(devices.len(), 1);
+                assert_eq!(devices[0].device_id, DeviceId([0x11; 32]));
+                assert_eq!(devices[0].token, "tok-abc");
+            }
+            other => panic!("expected AssertDevices, got {other:?}"),
+        }
+    }
 
     #[test]
     fn is_ws_url_accepts_ws_and_wss_only() {
