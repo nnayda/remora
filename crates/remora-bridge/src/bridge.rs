@@ -28,6 +28,19 @@
 //! which tears down every peer (clients then observe channel death). Nothing
 //! holds a lock across an `.await`; the only per-peer unboundedness is the
 //! bounded mpsc queues.
+//!
+//! # Bounding the peer map (#231)
+//!
+//! Under ADR-0021 the relay is untrusted for routing: it can inject Data frames
+//! with arbitrarily many distinct `src` ids, each spawning a peer task that may
+//! exit immediately (roster miss). To keep the connection-level peer map from
+//! growing without bound, every spawned peer task carries a [`DoneGuard`] that
+//! signals its `src` + generation back to the connection loop on *every* exit
+//! path (roster miss, handshake fail, hello mismatch, decrypt error, channel
+//! death, cancellation). The loop reaps that slot from the [`PeerRegistry`] —
+//! but only if the stored generation still matches, so a client reconnecting on
+//! the same routing id (a newer task) is never evicted by an older task's stale
+//! done-signal.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -135,6 +148,93 @@ impl Drop for CancelGuard {
     }
 }
 
+/// One live peer's slot in the [`PeerRegistry`]: its inbound frame sender plus
+/// the generation stamped when it was inserted.
+struct PeerSlot {
+    /// Inbound ciphertext-frame sender into the peer task.
+    tx: mpsc::Sender<Vec<u8>>,
+    /// Monotonic generation identifying *this* task's ownership of the slot, so
+    /// a stale done-signal cannot evict a newer task that reused the same `src`.
+    generation: u64,
+}
+
+/// The connection loop's map of live peers, keyed by routing `src`.
+///
+/// Bounded by proactive reaping: [`run_peer`] signals completion on every exit
+/// path and the loop calls [`PeerRegistry::remove_if_generation`], so a relay
+/// injecting many distinct `src` ids cannot grow this map without bound (#231).
+struct PeerRegistry {
+    peers: HashMap<DeviceId, PeerSlot>,
+    /// Source of the next slot generation. Monotonic for the connection's life.
+    next_generation: u64,
+}
+
+impl PeerRegistry {
+    fn new() -> Self {
+        Self {
+            peers: HashMap::new(),
+            next_generation: 0,
+        }
+    }
+
+    /// Inserts (or replaces) the peer at `src`, returning the generation stamped
+    /// into the new slot. The caller hands that generation to the spawned peer
+    /// task, which echoes it back on exit for a generation-guarded reap.
+    fn insert(&mut self, src: DeviceId, tx: mpsc::Sender<Vec<u8>>) -> u64 {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.peers.insert(src, PeerSlot { tx, generation });
+        generation
+    }
+
+    /// The inbound frame sender for `src`, if a peer is live there.
+    fn get(&self, src: &DeviceId) -> Option<&mpsc::Sender<Vec<u8>>> {
+        self.peers.get(src).map(|slot| &slot.tx)
+    }
+
+    /// Unconditionally drops the slot at `src` (used when its sender is already
+    /// observed `Closed`, so no newer task can be evicted).
+    fn remove(&mut self, src: &DeviceId) {
+        self.peers.remove(src);
+    }
+
+    /// Reaps the slot at `src` only if its stored generation equals
+    /// `generation`. A displaced (reconnected) peer holds a newer generation, so
+    /// an older task's late done-signal is a no-op and cannot evict the live one.
+    fn remove_if_generation(&mut self, src: &DeviceId, generation: u64) {
+        if let std::collections::hash_map::Entry::Occupied(slot) = self.peers.entry(*src) {
+            if slot.get().generation == generation {
+                slot.remove();
+            }
+        }
+    }
+
+    /// Number of live peers — for tests and invariant checks.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.peers.len()
+    }
+}
+
+/// Signals a peer task's completion (its `src` + generation) to the connection
+/// loop when dropped — firing on *every* peer exit path, including early
+/// returns and cancellation. The loop reaps the matching registry slot, keeping
+/// the peer map bounded against relay-driven `src` churn (#231).
+struct DoneGuard {
+    done: mpsc::UnboundedSender<(DeviceId, u64)>,
+    src: DeviceId,
+    generation: u64,
+}
+
+impl Drop for DoneGuard {
+    fn drop(&mut self) {
+        // Unbounded: a non-blocking sync send that only fails when the loop has
+        // already dropped the receiver (connection tearing down), where the
+        // whole map is discarded anyway — so a lost signal is harmless.
+        let _ = self.done.send((self.src, self.generation));
+    }
+}
+
 /// Serves relay-mode sessions for `source` until `shutdown` fires.
 ///
 /// Dials `config.relay_url` outbound, announces `role=bridge`, and serves E2E
@@ -238,15 +338,33 @@ async fn run_connection(
         let _ = sink.close().await;
     });
 
-    let mut peers: HashMap<DeviceId, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut peers = PeerRegistry::new();
+    // Peer tasks echo their `(src, generation)` here on exit so the loop can
+    // reap the dead slot promptly (see [`DoneGuard`]). Unbounded so the reap
+    // never blocks a returning peer; drained synchronously by the select below.
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(DeviceId, u64)>();
     let outcome = loop {
         tokio::select! {
             _ = shutdown.cancelled() => break ConnOutcome::Shutdown,
+            done = done_rx.recv() => {
+                // Only reaped when the stored generation still matches, so a
+                // reconnected peer on the same `src` is never evicted.
+                if let Some((src, generation)) = done {
+                    peers.remove_if_generation(&src, generation);
+                }
+            }
             inbound = stream.next() => match inbound {
                 None => break ConnOutcome::Disconnected,
                 Some(Err(_)) => break ConnOutcome::Disconnected,
                 Some(Ok(Message::Binary(bytes))) => {
-                    dispatch_inbound(bytes.as_ref(), &mut peers, deps, &outbound_tx, &conn_token);
+                    dispatch_inbound(
+                        bytes.as_ref(),
+                        &mut peers,
+                        deps,
+                        &outbound_tx,
+                        &done_tx,
+                        &conn_token,
+                    );
                 }
                 Some(Ok(Message::Close(_))) => break ConnOutcome::Disconnected,
                 // Ping/Pong/Text/Frame: tungstenite answers pings itself; the
@@ -259,6 +377,7 @@ async fn run_connection(
     // Tear down: cancel all peers, drop their inbound queues, stop the writer.
     conn_token.cancel();
     drop(peers);
+    drop(done_tx);
     drop(outbound_tx);
     writer.abort();
     outcome
@@ -269,9 +388,10 @@ async fn run_connection(
 /// responsive across peers.
 fn dispatch_inbound(
     bytes: &[u8],
-    peers: &mut HashMap<DeviceId, mpsc::Sender<Vec<u8>>>,
+    peers: &mut PeerRegistry,
     deps: &Arc<PeerDeps>,
     outbound_tx: &mpsc::Sender<Message>,
+    done_tx: &mpsc::UnboundedSender<(DeviceId, u64)>,
     conn_token: &CancellationToken,
 ) {
     let envelope = match Envelope::decode(bytes) {
@@ -302,16 +422,20 @@ fn dispatch_inbound(
     }
 
     let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(PEER_FRAME_QUEUE);
-    tokio::spawn(run_peer(
-        src,
-        frame_rx,
-        deps.clone(),
-        outbound_tx.clone(),
-        conn_token.clone(),
-    ));
     // The queue is empty and has capacity, so this first send cannot fail.
     if frame_tx.try_send(payload).is_ok() {
-        peers.insert(src, frame_tx);
+        // Stamp the slot's generation and hand it to the task, which echoes it
+        // back on exit for a generation-guarded reap.
+        let generation = peers.insert(src, frame_tx);
+        tokio::spawn(run_peer(
+            src,
+            frame_rx,
+            deps.clone(),
+            outbound_tx.clone(),
+            done_tx.clone(),
+            generation,
+            conn_token.clone(),
+        ));
     }
 }
 
@@ -321,8 +445,18 @@ async fn run_peer(
     mut frame_rx: mpsc::Receiver<Vec<u8>>,
     deps: Arc<PeerDeps>,
     outbound_tx: mpsc::Sender<Message>,
+    done_tx: mpsc::UnboundedSender<(DeviceId, u64)>,
+    generation: u64,
     conn_token: CancellationToken,
 ) {
+    // Reap this peer's registry slot when the task returns for *any* reason —
+    // roster miss, handshake fail, hello mismatch, decrypt error, channel death,
+    // or cancellation. Generation-guarded so a reconnected peer survives (#231).
+    let _done_guard = DoneGuard {
+        done: done_tx,
+        src: routing_id,
+        generation,
+    };
     let Some(transport) =
         handshake(&routing_id, &mut frame_rx, &deps, &outbound_tx, &conn_token).await
     else {
@@ -759,6 +893,78 @@ mod tests {
                 assert!(d <= base, "jitter above base: {d:?} for {base:?}");
             }
         }
+    }
+
+    #[test]
+    fn peer_registry_reaps_slot_on_matching_done_signal() {
+        // A peer's done-signal (its stamped generation) reaps its slot, so the
+        // map does not grow with every short-lived, immediately-exiting peer.
+        let mut reg = PeerRegistry::new();
+        let src = DeviceId([1u8; DEVICE_ID_LEN]);
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
+        let generation = reg.insert(src, tx);
+        assert_eq!(reg.len(), 1);
+        assert!(reg.get(&src).is_some());
+
+        reg.remove_if_generation(&src, generation);
+        assert_eq!(reg.len(), 0, "matching done-signal must reap the slot");
+        assert!(reg.get(&src).is_none());
+    }
+
+    #[test]
+    fn peer_registry_generation_guard_keeps_reconnected_peer() {
+        // A client reconnecting on the same routing id installs a NEWER task
+        // (higher generation). The OLD task's late done-signal must be a no-op —
+        // it must never evict the live replacement.
+        let mut reg = PeerRegistry::new();
+        let src = DeviceId([2u8; DEVICE_ID_LEN]);
+
+        let (tx_old, _rx_old) = mpsc::channel::<Vec<u8>>(1);
+        let gen_old = reg.insert(src, tx_old);
+
+        // Same src reconnects: a newer task replaces the slot.
+        let (tx_new, _rx_new) = mpsc::channel::<Vec<u8>>(1);
+        let gen_new = reg.insert(src, tx_new);
+        assert_ne!(gen_old, gen_new);
+
+        // The stale done-signal for the old generation must NOT evict gen_new.
+        reg.remove_if_generation(&src, gen_old);
+        assert_eq!(
+            reg.len(),
+            1,
+            "reconnected peer must survive the stale done-signal"
+        );
+        assert!(reg.get(&src).is_some());
+
+        // The live generation still reaps normally when its own task exits.
+        reg.remove_if_generation(&src, gen_new);
+        assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn peer_registry_generations_are_monotonic() {
+        // Distinct peers get distinct, increasing generations so done-signals
+        // are unambiguous across the connection's lifetime.
+        let mut reg = PeerRegistry::new();
+        let a = DeviceId([3u8; DEVICE_ID_LEN]);
+        let b = DeviceId([4u8; DEVICE_ID_LEN]);
+        let (tx_a, _rx_a) = mpsc::channel::<Vec<u8>>(1);
+        let (tx_b, _rx_b) = mpsc::channel::<Vec<u8>>(1);
+        assert_eq!(reg.insert(a, tx_a), 0);
+        assert_eq!(reg.insert(b, tx_b), 1);
+        assert_eq!(reg.len(), 2);
+    }
+
+    #[test]
+    fn peer_registry_remove_drops_slot_unconditionally() {
+        // The `Closed`-sender fast path removes the dead slot regardless of
+        // generation (no newer task can exist at that instant).
+        let mut reg = PeerRegistry::new();
+        let src = DeviceId([5u8; DEVICE_ID_LEN]);
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
+        reg.insert(src, tx);
+        reg.remove(&src);
+        assert_eq!(reg.len(), 0);
     }
 
     #[test]
