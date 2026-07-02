@@ -161,6 +161,7 @@ pub enum WorkspaceModeDto {
 pub struct EditorAgentDto {
     pub id: String,
     pub command: Vec<String>,
+    pub provision: Option<ProvisionFileDto>,
 }
 
 impl From<Config> for EditorConfigDto {
@@ -183,6 +184,7 @@ impl From<Config> for EditorConfigDto {
                 .map(|(id, agent)| EditorAgentDto {
                     id: id.as_str().to_owned(),
                     command: agent.command,
+                    provision: agent.provision.map(Into::into),
                 })
                 .collect(),
         }
@@ -298,11 +300,46 @@ impl ProjectInputDto {
     }
 }
 
+/// A single provisioned file (ADR-0003 data, #196): the editor's counterpart
+/// to core's `ProvisionFile`. Shared by the read projection and the write
+/// inputs so the form round-trips exactly what is on disk.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvisionFileDto {
+    pub path: String,
+    pub content: String,
+    pub mode: Option<u32>,
+}
+
+impl From<remora_core::config::ProvisionFile> for ProvisionFileDto {
+    fn from(file: remora_core::config::ProvisionFile) -> Self {
+        ProvisionFileDto {
+            path: file.path,
+            content: file.content,
+            mode: file.mode,
+        }
+    }
+}
+
+impl From<ProvisionFileDto> for remora_core::config::ProvisionFile {
+    fn from(dto: ProvisionFileDto) -> Self {
+        remora_core::config::ProvisionFile {
+            path: dto.path,
+            content: dto.content,
+            mode: dto.mode,
+        }
+    }
+}
+
 /// Form payload for create/edit of an agent.
 #[derive(Clone, Debug, serde::Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentInputDto {
     pub command: Vec<String>,
+    /// Preserved across the editor round-trip so that a TOML-set `provision`
+    /// file is not silently dropped when the user edits an unrelated field.
+    #[serde(default)]
+    pub provision: Option<ProvisionFileDto>,
 }
 
 impl AgentInputDto {
@@ -312,6 +349,7 @@ impl AgentInputDto {
     pub fn into_agent(self) -> Agent {
         Agent {
             command: self.command,
+            provision: self.provision.map(Into::into),
         }
     }
 }
@@ -405,6 +443,7 @@ mod tests {
             AgentId::new("claude").expect("id"),
             Agent {
                 command: vec!["claude".into(), "--flag".into()],
+                provision: None,
             },
         );
         config
@@ -606,6 +645,67 @@ mod tests {
         let input: AgentInputDto =
             serde_json::from_str(r#"{"command":["claude","--flag"]}"#).expect("deserialize");
         assert_eq!(input.into_agent().command, vec!["claude", "--flag"]);
+    }
+
+    #[test]
+    fn agent_input_maps_provision() {
+        let dto = AgentInputDto {
+            command: vec!["claude".into()],
+            provision: Some(ProvisionFileDto {
+                path: "~/.remora/hooks/claude-notify.sh".into(),
+                content: "x".into(),
+                mode: Some(0o755),
+            }),
+        };
+        let a = dto.into_agent();
+        let provision = a.provision.expect("p");
+        assert_eq!(provision.path, "~/.remora/hooks/claude-notify.sh");
+        assert_eq!(provision.content, "x");
+        assert_eq!(provision.mode, Some(0o755));
+    }
+
+    #[test]
+    fn agent_input_without_provision_deserializes_to_none() {
+        // `provision` must be optional on the wire (existing configs/forms omit
+        // it) — `#[serde(default)]` keeps old callers working.
+        let input: AgentInputDto =
+            serde_json::from_str(r#"{"command":["claude"]}"#).expect("deserialize");
+        assert!(input.provision.is_none());
+    }
+
+    #[test]
+    fn editor_agent_dto_round_trips_provision() {
+        // A TOML-set agent `provision` must survive out to the form and back
+        // through `into_agent`, matching the worktree_root/base patterns above.
+        let mut config = Config::default();
+        config.agents.insert(
+            AgentId::new("claude").expect("id"),
+            Agent {
+                command: vec!["claude".into()],
+                provision: Some(remora_core::config::ProvisionFile {
+                    path: "~/.remora/hooks/claude-notify.sh".into(),
+                    content: "#!/bin/sh\necho hi".into(),
+                    mode: Some(0o755),
+                }),
+            },
+        );
+
+        // out to the form…
+        let dto = EditorConfigDto::from(config);
+        let out_provision = dto.agents[0].provision.clone().expect("provision dto");
+        assert_eq!(out_provision.path, "~/.remora/hooks/claude-notify.sh");
+        assert_eq!(out_provision.content, "#!/bin/sh\necho hi");
+        assert_eq!(out_provision.mode, Some(0o755));
+
+        // …and back from the form must NOT drop provision.
+        let back = AgentInputDto {
+            command: dto.agents[0].command.clone(),
+            provision: dto.agents[0].provision.clone(),
+        }
+        .into_agent();
+        let back_provision = back.provision.expect("provision survives round trip");
+        assert_eq!(back_provision.path, "~/.remora/hooks/claude-notify.sh");
+        assert_eq!(back_provision.mode, Some(0o755));
     }
 
     #[test]

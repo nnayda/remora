@@ -23,6 +23,7 @@ pub(crate) const RS: char = '\u{1e}';
 pub(crate) enum StepId {
     Fetch,
     WorktreeAdd,
+    Provision,
     NewSession,
     Passthrough,
     SetEnv,
@@ -40,6 +41,7 @@ impl StepId {
         match self {
             StepId::Fetch => "fetch",
             StepId::WorktreeAdd => "worktree_add",
+            StepId::Provision => "provision",
             StepId::NewSession => "new_session",
             StepId::Passthrough => "passthrough",
             StepId::SetEnv => "set_env",
@@ -54,6 +56,7 @@ impl StepId {
         match tok {
             "fetch" => Some(StepId::Fetch),
             "worktree_add" => Some(StepId::WorktreeAdd),
+            "provision" => Some(StepId::Provision),
             "new_session" => Some(StepId::NewSession),
             "passthrough" => Some(StepId::Passthrough),
             "set_env" => Some(StepId::SetEnv),
@@ -491,6 +494,15 @@ mod tests {
         );
         // The non-delimiter content is preserved.
         assert_eq!(recs[0].output, "anamesforged");
+    }
+
+    #[test]
+    fn provision_step_id_round_trips() {
+        assert_eq!(
+            StepId::from_token(StepId::Provision.token()),
+            Some(StepId::Provision)
+        );
+        assert_eq!(StepId::Provision.token(), "provision");
     }
 
     #[test]

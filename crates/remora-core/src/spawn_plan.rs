@@ -53,6 +53,8 @@ pub struct SpawnPlan {
     pub env: Vec<(String, String)>,
     /// Resolved agent launch command.
     pub agent_argv: Vec<String>,
+    /// Optional file to materialize on the sandbox before launch (#196).
+    pub provision: Option<crate::config::ProvisionFile>,
 }
 
 /// Resolves a [`SpawnSpec`] against local [`Config`] into a [`SpawnPlan`].
@@ -146,6 +148,7 @@ pub fn plan_spawn(config: &Config, spec: &SpawnSpec) -> Result<SpawnPlan, PlanEr
         base,
         env,
         agent_argv: agent.command.clone(),
+        provision: agent.provision.clone(),
     })
 }
 
@@ -344,6 +347,38 @@ mod tests {
     fn agent_override_wins_over_project_default() {
         let plan = plan_spawn(&config(), &spec("api", "s1", Some("codex"))).expect("plan");
         assert_eq!(plan.agent_argv, vec!["codex"]);
+    }
+
+    #[test]
+    fn plan_carries_agent_provision_file() {
+        let toml = r#"
+            [hosts.devbox]
+            transport = "ssh"
+            host = "devbox"
+
+            [projects.api]
+            host = "devbox"
+            path = "/home/dev/api"
+            workspace = "worktree"
+            agent = "claude"
+
+            [agents.claude]
+            command = ["claude", "--continue"]
+
+            [agents.claude.provision]
+            path = "~/.claude/settings.json"
+            content = "{}"
+        "#;
+        let cfg = Config::from_toml_str(toml).expect("valid config");
+        let plan = plan_spawn(&cfg, &spec("api", "s1", None)).expect("plan");
+        let provision = plan.provision.expect("provision carried through");
+        assert_eq!(provision.path, "~/.claude/settings.json");
+    }
+
+    #[test]
+    fn plan_has_no_provision_when_agent_unset() {
+        let plan = plan_spawn(&config(), &spec("api", "s1", None)).expect("plan");
+        assert_eq!(plan.provision, None);
     }
 
     #[test]
