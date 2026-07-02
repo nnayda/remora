@@ -222,6 +222,120 @@ fn spawn_pty_channel_inner(
     Ok((channel, pid))
 }
 
+/// One detector-thread wake: dispatch the consumed user-input flag and the
+/// received bytes (if any) to the detector, in order. Pure so the wake
+/// semantics are unit-testable without threads.
+///
+/// The subtle rule lives in the `None` arm: a silent wake WITH user input
+/// calls `on_user_input` INSTEAD of `on_tick`. Typing counts as activity —
+/// settling in the same wake would churn a sticky `Awaiting` through
+/// `Working` straight to `Idle` when the keystroke produced no output
+/// (echo-off TUIs), and would decay a live `Working` under a quietly
+/// typing user.
+#[cfg_attr(not(test), allow(dead_code))] // wired into the detector thread in the next commit
+fn wake_events(
+    detector: &mut Detector,
+    user_input: bool,
+    bytes: Option<&[u8]>,
+) -> Vec<DetectorEvent> {
+    let mut events = Vec::new();
+    if user_input {
+        events.extend(detector.on_user_input());
+    }
+    match bytes {
+        Some(chunk) => events.extend(detector.on_bytes(chunk)),
+        None if !user_input => events.extend(detector.on_tick()),
+        None => {} // user input counts as activity; skip this wake's settle
+    }
+    events
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+    use remora_protocol::SessionStatus;
+
+    const AWAITING_MARKER: &[u8] = b"\x1b]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\x07";
+
+    fn statuses(evs: Vec<DetectorEvent>) -> Vec<SessionStatus> {
+        evs.into_iter()
+            .filter_map(|e| match e {
+                DetectorEvent::Status(s) => Some(s),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn awaiting_detector() -> Detector {
+        let mut d = Detector::new();
+        d.on_bytes(AWAITING_MARKER);
+        d
+    }
+
+    #[test]
+    fn user_input_on_a_silent_wake_exits_awaiting_without_settling() {
+        // Timeout arm with the flag set: on_user_input INSTEAD of on_tick,
+        // or a no-echo keystroke would churn Awaiting→Working→Idle in one
+        // wake. Idle arrives at the NEXT silent wake.
+        let mut d = awaiting_detector();
+        assert_eq!(
+            statuses(wake_events(&mut d, true, None)),
+            vec![SessionStatus::Working]
+        );
+        assert_eq!(
+            statuses(wake_events(&mut d, false, None)),
+            vec![SessionStatus::Idle]
+        );
+    }
+
+    #[test]
+    fn user_input_with_bytes_emits_working_exactly_once() {
+        // The echo path: on_user_input flips to Working first, then on_bytes
+        // sees Working and dedups — one Status(Working), not two.
+        let mut d = awaiting_detector();
+        assert_eq!(
+            statuses(wake_events(&mut d, true, Some(b"echoed keystroke"))),
+            vec![SessionStatus::Working]
+        );
+    }
+
+    #[test]
+    fn silent_wake_without_user_input_still_settles_working_to_idle() {
+        let mut d = Detector::new();
+        wake_events(&mut d, false, Some(b"output")); // → Working
+        assert_eq!(
+            statuses(wake_events(&mut d, false, None)),
+            vec![SessionStatus::Idle]
+        );
+    }
+
+    #[test]
+    fn user_input_while_working_skips_the_settle_tick() {
+        // Typing counts as activity: a silent wake with input must not decay
+        // Working → Idle (parity with how echo bytes would refresh Working).
+        let mut d = Detector::new();
+        wake_events(&mut d, false, Some(b"output")); // → Working
+        assert_eq!(statuses(wake_events(&mut d, true, None)), vec![]);
+        // The following silent wake settles as usual.
+        assert_eq!(
+            statuses(wake_events(&mut d, false, None)),
+            vec![SessionStatus::Idle]
+        );
+    }
+
+    #[test]
+    fn marker_in_the_wake_chunk_still_wins_over_user_input() {
+        // Input flag + a chunk carrying an awaiting marker: the marker is the
+        // agent re-asserting, and markers always win. on_user_input fires
+        // first (Awaiting→Working), then the marker re-enters Awaiting.
+        let mut d = awaiting_detector();
+        assert_eq!(
+            statuses(wake_events(&mut d, true, Some(AWAITING_MARKER))),
+            vec![SessionStatus::Working, SessionStatus::Awaiting]
+        );
+    }
+}
+
 impl From<DetectorEvent> for ChannelOutput {
     fn from(ev: DetectorEvent) -> Self {
         match ev {
