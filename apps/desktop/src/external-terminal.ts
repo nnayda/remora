@@ -1,7 +1,12 @@
-import type { BridgeError, DetectedTerminalDto, Result } from "./bindings";
+import type {
+  BridgeError,
+  DetectedTerminalDto,
+  Result,
+  TerminalPreferenceDto,
+} from "./bindings";
 
 /** ConfigDto.terminal as bindings project it: registry id, custom argv, or unset. */
-export type TerminalPreference = string | string[] | null;
+export type TerminalPreference = TerminalPreferenceDto | null;
 
 const GENERIC_LABEL = "Open in external terminal";
 

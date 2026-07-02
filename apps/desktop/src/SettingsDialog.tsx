@@ -76,8 +76,8 @@ export function SettingsDialog({
   const [view, setView] = useState<View>(initialView);
   // The editable config (above) has no `terminal` field — it's a separate,
   // non-editor read of the live ConfigDto plus a fresh PATH probe. Fetched
-  // once on open (no polling); `terminalPref` is updated locally after a
-  // successful save so the row reflects it without a full config re-read.
+  // once on open (no polling); `terminalPref` is refreshed via a fresh
+  // `getConfig()` call after a successful save so the row reflects it.
   const [terminalPref, setTerminalPref] =
     useState<TerminalPreferenceDto | null>(null);
   const [detectedTerminals, setDetectedTerminals] = useState<
@@ -119,11 +119,16 @@ export function SettingsDialog({
   // load — both are "the dialog could not read its data" conditions.
   useEffect(() => {
     let live = true;
-    commands.externalTerminals().then((r) => {
-      if (!live) return;
-      if (r.status === "ok") setDetectedTerminals(r.data);
-      else setLoadError(formErrorMessage(r.error));
-    });
+    commands
+      .externalTerminals()
+      .then((r) => {
+        if (!live) return;
+        if (r.status === "ok") setDetectedTerminals(r.data);
+        else setLoadError(formErrorMessage(r.error));
+      })
+      .catch((err) => {
+        if (live) setLoadError(formErrorMessage(err));
+      });
     getConfig()
       .then((config) => {
         if (live) setTerminalPref(config.terminal);

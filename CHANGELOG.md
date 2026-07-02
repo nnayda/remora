@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Open a session in an external terminal — UI half**: session menu gains
+  "Open in <terminal>" (launches the configured external terminal attached to
+  the session, coexisting with the embedded one) and "Copy attach command"
+  (puts the exact ssh/kubectl attach command on the clipboard for any other
+  terminal). Settings gains an External terminal picker over the detected
+  terminals. Configuring nothing and clicking the action deep-links Settings.
 - **Open a session in an external terminal — core/config/shell half**: core
   composes a coexisting (no `-d`) attach command via
   `SessionSource::external_attach_command`; the desktop shell detects installed
@@ -16,8 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   paths (GUI-launched apps inherit launchd's bare PATH) and launches the chosen
   one detached, resolving the transport binary the same way. New optional
   top-level `terminal` config key (`"ghostty"` or a custom argv array, loud
-  shape errors). Session-menu/Settings UI lands in the follow-up PR. Note: the
-  app's own reconnects still evict external clients (documented
+  shape errors). Session-menu/Settings UI ships in the companion UI change.
+  Note: the app's own reconnects still evict external clients (documented
   sequential-handoff semantics).
 - **Per-session collapsed rail** (#184): the collapsed left sidebar now shows one
   navigable glyph per session instead of one avatar per host. Clicking a glyph

@@ -49,9 +49,17 @@ export const APP_NAME = "Remora";
 function refreshDetectedTerminals(
   setDetectedTerminals: (terminals: DetectedTerminalDto[]) => void,
 ) {
-  void commands.externalTerminals().then((r) => {
-    if (r.status === "ok") setDetectedTerminals(r.data);
-  });
+  void commands
+    .externalTerminals()
+    .then((r) => {
+      if (r.status === "ok") setDetectedTerminals(r.data);
+    })
+    // Module-scope helper: no notice setter in scope here, and this is a
+    // background refresh (same guard-anyway rationale as the
+    // subscribeConfigChanged listen() failure below) — a failed IPC call
+    // should not become an unhandled rejection, but it's not worth
+    // interrupting the user over either.
+    .catch(() => {});
 }
 
 /** Single source of truth for the left sidebar's persisted width bounds. The
