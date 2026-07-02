@@ -125,9 +125,13 @@ impl Handshake {
     ) -> Result<Handshake, NoiseError> {
         let state = snow::Builder::new(noise_params()?)
             .local_private_key(local_priv)
+            .map_err(snow_err)?
             .remote_public_key(peer_pub)
+            .map_err(snow_err)?
             .psk(PSK_POSITION, psk)
+            .map_err(snow_err)?
             .prologue(prologue)
+            .map_err(snow_err)?
             .build_initiator()
             .map_err(snow_err)?;
         Ok(Handshake { state })
@@ -145,8 +149,11 @@ impl Handshake {
     ) -> Result<Handshake, NoiseError> {
         let state = snow::Builder::new(noise_params()?)
             .local_private_key(local_priv)
+            .map_err(snow_err)?
             .psk(PSK_POSITION, psk)
+            .map_err(snow_err)?
             .prologue(prologue)
+            .map_err(snow_err)?
             .build_responder()
             .map_err(snow_err)?;
         Ok(Handshake { state })
