@@ -25,6 +25,7 @@ import {
   updateProject,
 } from "./bridge";
 import { buildSettingsModel, type SettingsModel } from "./config-editor-model";
+import { DevicesPanel } from "./DevicesPanel";
 import { formErrorMessage } from "./form-error";
 import { HostForm } from "./HostForm";
 import { ProjectForm } from "./ProjectForm";
@@ -441,6 +442,7 @@ function SettingsList({
         ))}
       </Section>
       <TerminalSection model={terminalModel} onSetTerminal={onSetTerminal} />
+      <DevicesPanel />
     </div>
   );
 }
