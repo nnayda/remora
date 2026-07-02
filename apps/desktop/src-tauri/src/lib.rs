@@ -3,6 +3,7 @@ pub mod config_watch;
 mod external_terminal;
 mod launch;
 pub mod remote_host;
+mod vscode;
 
 use std::sync::Arc;
 use std::time::Duration;
