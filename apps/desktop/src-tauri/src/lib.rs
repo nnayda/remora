@@ -1,5 +1,6 @@
 pub mod bridge;
 pub mod config_watch;
+mod external_terminal;
 pub mod remote_host;
 
 use std::sync::Arc;

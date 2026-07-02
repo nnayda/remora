@@ -175,6 +175,18 @@ impl SessionSource for ExclusiveSource {
         self.inner.attach(project_id, session_id).await
     }
 
+    async fn external_attach_command(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<Vec<String>, SourceError> {
+        // Lock-free passthrough: pure argv composition with no session
+        // side effects, so it never contends with a mutation (like `list`).
+        self.inner
+            .external_attach_command(project_id, session_id)
+            .await
+    }
+
     async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
         // Lock-free passthrough: listing is a read across all sessions and
         // must not stall behind a mutation on any single one.
@@ -280,6 +292,15 @@ mod tests {
         ) -> Result<SessionChannel, SourceError> {
             log_push(&self.log, "attach");
             Ok(dead_channel())
+        }
+
+        async fn external_attach_command(
+            &self,
+            _project_id: &ProjectId,
+            _session_id: &SessionId,
+        ) -> Result<Vec<String>, SourceError> {
+            log_push(&self.log, "external_attach_command");
+            Ok(Vec::new())
         }
 
         async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {

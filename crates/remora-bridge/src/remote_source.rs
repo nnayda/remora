@@ -223,6 +223,17 @@ impl SessionSource for RemoteSource {
         Err(unsupported())
     }
 
+    async fn external_attach_command(
+        &self,
+        _project_id: &ProjectId,
+        _session_id: &SessionId,
+    ) -> Result<Vec<String>, SourceError> {
+        // An external-terminal attach runs a LOCAL transport argv
+        // (ssh/kubectl); a relay client holds no such command, so it is
+        // unsupported over the wire (spec D15, slice-1 scope).
+        Err(unsupported())
+    }
+
     async fn attach(
         &self,
         project_id: &ProjectId,

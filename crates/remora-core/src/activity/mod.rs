@@ -3,6 +3,25 @@
 //! sanitized previews, and a one-shot `MarkerSeen` liveness signal (#198,
 //! ADR-0019) on the first marker of any kind. The settle clock lives in the
 //! bridge thread that drives it (`transport::pty_process`), not here.
+//!
+//! State machine (#224 made `Awaiting` sticky — see the ADR):
+//!
+//! ```text
+//!            bytes (no marker)              marker: state S
+//! Unknown ──────────────────▶ Working ◀──────────────────▶ S (any state)
+//!                               │  ▲
+//!                    tick       │  │ bytes
+//!                               ▼  │
+//!                             Idle ┘
+//!
+//! Awaiting ── bytes (no marker) ──▶ Awaiting   (sticky — no event)
+//!          ── user input ─────────▶ Working
+//!          ── marker: state S ────▶ S
+//!          ── tick ───────────────▶ Awaiting   (unchanged)
+//! ```
+//!
+//! `Awaiting` is marker-only on entry (never inferred) and sticky on exit:
+//! only a state marker, `on_user_input`, or attach teardown leaves it.
 
 mod marker;
 mod sanitize;
@@ -41,17 +60,22 @@ impl Detector {
         }
     }
 
-    /// Bytes arrived: activity ⇒ `Working`, unless a terminal marker
-    /// (`idle`/`awaiting`) completed in this chunk, which wins. Emits a status
-    /// only on transition, plus any preview messages in order.
+    /// Bytes arrived: activity ⇒ `Working`, unless a terminal marker completed
+    /// in this chunk (which wins) or the state is `Awaiting` (#224: sticky —
+    /// marker-less output never exits it). Emits a status only on transition,
+    /// plus any preview messages in order.
     pub fn on_bytes(&mut self, chunk: &[u8]) -> Vec<DetectorEvent> {
         let hits = self.scanner.feed(chunk);
         let mut out = Vec::new();
 
-        // No marker in this chunk: the mere arrival of bytes means Working
-        // (emitted only on transition, so a byte firehose doesn't churn).
+        // No marker in this chunk: the mere arrival of bytes means Working —
+        // EXCEPT while `Awaiting` (#224): cosmetic output (tmux status-line
+        // clock, TUI spinner repaints) keeps arriving while the agent is
+        // blocked on the user, so marker-less bytes never exit `Awaiting`.
+        // Exits are a state marker, `on_user_input`, or attach teardown.
+        // (Emitted only on transition, so a byte firehose doesn't churn.)
         if hits.is_empty() {
-            if self.state != SessionStatus::Working {
+            if !matches!(self.state, SessionStatus::Working | SessionStatus::Awaiting) {
                 self.state = SessionStatus::Working;
                 out.push(DetectorEvent::Status(SessionStatus::Working));
             }
@@ -93,6 +117,21 @@ impl Detector {
             Vec::new()
         }
     }
+
+    /// The user sent input through Remora's own write path — the one signal
+    /// that unambiguously means "the user is responding" (#224). Exits
+    /// `Awaiting` to `Working` (which then decays via the normal settle
+    /// tick); a no-op in every other state, where bytes already drive
+    /// `Working`. The *when* of calling this lives in the bridge, exactly
+    /// like the settle clock does.
+    pub fn on_user_input(&mut self) -> Vec<DetectorEvent> {
+        if self.state == SessionStatus::Awaiting {
+            self.state = SessionStatus::Working;
+            vec![DetectorEvent::Status(SessionStatus::Working)]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 impl Default for Detector {
@@ -105,6 +144,9 @@ impl Default for Detector {
 mod detector_tests {
     use super::*;
     use remora_protocol::SessionStatus;
+
+    /// base64("awaiting_input") state marker — the #224 sticky-awaiting entry.
+    const AWAITING_MARKER: &[u8] = b"\x1b]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\x07";
 
     fn statuses(evs: Vec<DetectorEvent>) -> Vec<SessionStatus> {
         evs.into_iter()
@@ -167,6 +209,56 @@ mod detector_tests {
     }
 
     #[test]
+    fn awaiting_is_sticky_against_marker_less_bytes() {
+        // #224: cosmetic output (tmux status-line clock, TUI spinner repaints)
+        // keeps arriving while the agent is blocked on the user. It must not
+        // exit `Awaiting`.
+        let mut d = Detector::new();
+        d.on_bytes(AWAITING_MARKER);
+        assert_eq!(statuses(d.on_bytes(b"12:00 clock repaint")), vec![]);
+        assert_eq!(statuses(d.on_bytes(b"spinner frame")), vec![]);
+    }
+
+    #[test]
+    fn awaiting_still_exits_via_state_marker() {
+        // Markers always win: an idle/working marker is a real exit (#224).
+        let mut d = Detector::new();
+        d.on_bytes(AWAITING_MARKER);
+        assert_eq!(
+            statuses(d.on_bytes(b"\x1b]7366;remora;1;state;aWRsZQ==\x07")),
+            vec![SessionStatus::Idle]
+        );
+    }
+
+    #[test]
+    fn awaiting_refresh_re_emits_preview_without_status_churn() {
+        // A repeated awaiting marker re-asserts the preview (fresh episode
+        // text) but must not churn the status. b64 "A" = "QQ==", "B" = "Qg==".
+        let mut d = Detector::new();
+        d.on_bytes(b"\x1b]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=;QQ==\x07");
+        let evs = d.on_bytes(b"\x1b]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=;Qg==\x07");
+        assert!(
+            evs.iter().all(|e| !matches!(e, DetectorEvent::Status(_))),
+            "refresh must not re-emit status, got {evs:?}"
+        );
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, DetectorEvent::Preview(t) if t.as_str() == "B")),
+            "refresh must carry the fresh preview, got {evs:?}"
+        );
+    }
+
+    #[test]
+    fn tick_leaves_awaiting_untouched() {
+        // The settle clock never exits `Awaiting` (it is not Working decay).
+        let mut d = Detector::new();
+        d.on_bytes(AWAITING_MARKER);
+        for _ in 0..3 {
+            assert_eq!(statuses(d.on_tick()), vec![]);
+        }
+    }
+
+    #[test]
     fn marker_preview_is_emitted() {
         // "working" + "Run tests?" message segment.
         let mut d = Detector::new();
@@ -221,7 +313,7 @@ mod detector_tests {
     fn awaiting_marker_also_latches_marker_seen() {
         let mut d = Detector::new();
         // "awaiting_input" state marker.
-        let evs = d.on_bytes(b"\x1b]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\x07");
+        let evs = d.on_bytes(AWAITING_MARKER);
         assert_eq!(marker_seen_count(&evs), 1);
         assert_eq!(statuses(evs), vec![SessionStatus::Awaiting]);
     }
@@ -232,7 +324,7 @@ mod detector_tests {
         let first = d.on_bytes(b"\x1b]7366;remora;1;ping\x07");
         assert_eq!(marker_seen_count(&first), 1);
         // A later awaiting marker must NOT re-emit MarkerSeen.
-        let second = d.on_bytes(b"\x1b]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\x07");
+        let second = d.on_bytes(AWAITING_MARKER);
         assert_eq!(marker_seen_count(&second), 0);
     }
 
@@ -242,5 +334,27 @@ mod detector_tests {
         assert_eq!(marker_seen_count(&d.on_bytes(b"lots of output")), 0);
         assert_eq!(marker_seen_count(&d.on_tick()), 0);
         assert_eq!(marker_seen_count(&d.on_bytes(b"more")), 0);
+    }
+
+    #[test]
+    fn user_input_exits_awaiting_to_working_then_settles() {
+        // #224: keystrokes through Remora's write path are the unambiguous
+        // "the user is responding" signal. Working then decays normally.
+        let mut d = Detector::new();
+        d.on_bytes(AWAITING_MARKER);
+        assert_eq!(statuses(d.on_user_input()), vec![SessionStatus::Working]);
+        assert_eq!(statuses(d.on_tick()), vec![SessionStatus::Idle]);
+    }
+
+    #[test]
+    fn user_input_is_noop_outside_awaiting() {
+        // Bytes already drive Working in every other state; typing must not
+        // churn (Unknown), re-emit (Working), or revive (Idle) a status.
+        let mut d = Detector::new();
+        assert_eq!(statuses(d.on_user_input()), vec![]); // Unknown
+        d.on_bytes(b"output");
+        assert_eq!(statuses(d.on_user_input()), vec![]); // Working
+        d.on_tick();
+        assert_eq!(statuses(d.on_user_input()), vec![]); // Idle
     }
 }

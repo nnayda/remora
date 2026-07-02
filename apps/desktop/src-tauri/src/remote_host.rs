@@ -244,6 +244,16 @@ impl SessionSource for ResolvingSource {
             .await
     }
 
+    async fn external_attach_command(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<Vec<String>, SourceError> {
+        self.for_project(project_id)?
+            .external_attach_command(project_id, session_id)
+            .await
+    }
+
     async fn respawn(
         &self,
         project_id: &ProjectId,

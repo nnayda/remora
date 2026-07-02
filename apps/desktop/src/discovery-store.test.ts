@@ -6,7 +6,12 @@ import {
   RECONNECT_GRACE_MS,
 } from "./discovery-store";
 
-const emptyConfig: ConfigDto = { hosts: [], projects: [], agents: [] };
+const emptyConfig: ConfigDto = {
+  hosts: [],
+  projects: [],
+  agents: [],
+  terminal: null,
+};
 
 const session = (projectId: string, sessionId: string): SessionMetaDto => ({
   projectId,
@@ -67,6 +72,7 @@ describe("DiscoveryStore", () => {
           hosts: [{ id: "h", name: null, transport: "ssh" }],
           projects: [],
           agents: [],
+          terminal: null,
         }),
       ),
       listSessions: vi.fn(async () =>

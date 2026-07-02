@@ -3,7 +3,7 @@ import type { ConfigDto } from "./bindings";
 import { buildNewSessionModel, resolveSelection } from "./new-session-model";
 
 function config(over: Partial<ConfigDto> = {}): ConfigDto {
-  return { hosts: [], projects: [], agents: [], ...over };
+  return { hosts: [], projects: [], agents: [], terminal: null, ...over };
 }
 
 describe("buildNewSessionModel", () => {

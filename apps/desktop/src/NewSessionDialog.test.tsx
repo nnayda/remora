@@ -40,6 +40,7 @@ function makeConfig(over: Partial<ConfigDto> = {}): ConfigDto {
       },
     ],
     agents: [{ id: "claude" }],
+    terminal: null,
     ...over,
   };
 }

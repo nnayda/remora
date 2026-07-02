@@ -20,6 +20,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Open a session in an external terminal — core/config/shell half**: core
+  composes a coexisting (no `-d`) attach command via
+  `SessionSource::external_attach_command`; the desktop shell detects installed
+  terminals (Ghostty, kitty, Alacritty, WezTerm, foot) via absolute candidate
+  paths (GUI-launched apps inherit launchd's bare PATH) and launches the chosen
+  one detached, resolving the transport binary the same way. New optional
+  top-level `terminal` config key (`"ghostty"` or a custom argv array, loud
+  shape errors). Session-menu/Settings UI lands in the follow-up PR. Note: the
+  app's own reconnects still evict external clients (documented
+  sequential-handoff semantics).
+- **Background session removal**: confirming "Remove session" no longer locks
+  the app behind the dialog for the whole remote teardown. The dialog and the
+  session's tab close immediately, the teardown (tmux kill + worktree/branch
+  delete) runs in the background, and the sidebar row shows a "Removing…"
+  spinner until it completes. If the workspace has uncommitted work, the
+  dialog re-opens at the "Remove anyway?" stage once the background check
+  reports it; other failures surface in the notice bar with the reason, and
+  the session stays available to retry. Because results now arrive
+  asynchronously, the force re-prompt names its session, never replaces a
+  remove dialog you have open for a different session (it parks in the notice
+  bar instead), and a session already mid-removal can't be asked to remove
+  again — its tab is only closed once the store has actually accepted the
+  removal.
 - **ADR-0021: relay trust model — blind relay + user-side bridge** (#68):
   settles the relay architecture before any relay code exists. Relay mode
   splits into a self-hostable (or Remora-hosted, paid) **blind relay** that
@@ -603,6 +626,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent/created-at metadata.
 
 ### Fixed
+
+- **Awaiting status no longer stomped by cosmetic terminal output** (#224):
+  once an agent asserts `awaiting_input`, the red pulse and its prompt
+  preview now survive tmux status-line clock repaints and TUI spinner
+  frames. `awaiting` exits only on a real signal: another state marker,
+  typing into the session through Remora, or closing the session (ADR-0022).
+  Known residual: answering out-of-band (e.g. directly in tmux on the host)
+  doesn't emit any of those signals yet — tracked in #239, which adds
+  working/idle exit markers to the hook recipe.
 
 - **The activity pulse now catches AskUserQuestion menus.** A session sitting
   at Claude Code's interactive multiple-choice prompt showed a gray idle dot

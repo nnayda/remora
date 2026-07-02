@@ -350,6 +350,14 @@ impl SessionSource for ScriptedSource {
         Ok(channel)
     }
 
+    async fn external_attach_command(
+        &self,
+        _project_id: &ProjectId,
+        _session_id: &SessionId,
+    ) -> Result<Vec<String>, remora_core::SourceError> {
+        Err(scripted_unsupported())
+    }
+
     async fn list(&self) -> Result<Vec<SessionMeta>, remora_core::SourceError> {
         Ok(self.sessions.clone())
     }
