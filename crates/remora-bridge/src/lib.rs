@@ -19,6 +19,7 @@
 mod bridge;
 mod identity;
 mod noise;
+mod remote_source;
 mod wire_error;
 
 pub use bridge::{serve_bridge, BridgeConfig, BridgeServeError};
@@ -29,4 +30,5 @@ pub use noise::{
     chunk_bytes, prologue, Handshake, NoiseError, Transport, MAX_NOISE_PLAINTEXT, NOISE_PATTERN,
     PTY_CHUNK_BYTES,
 };
+pub use remote_source::RemoteSource;
 pub use wire_error::{map_source_error, map_wire_error};
