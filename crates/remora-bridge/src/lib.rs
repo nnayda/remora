@@ -17,7 +17,12 @@
 //! transport land in later tasks.
 
 mod identity;
+mod noise;
 
 pub use identity::{
     provision_device, BridgeIdentity, IdentityError, PairingFile, Roster, RosterEntry,
+};
+pub use noise::{
+    chunk_bytes, prologue, Handshake, NoiseError, Transport, MAX_NOISE_PLAINTEXT, NOISE_PATTERN,
+    PTY_CHUNK_BYTES,
 };
