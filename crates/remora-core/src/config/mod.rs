@@ -102,6 +102,23 @@ pub struct Config {
     pub projects: BTreeMap<ProjectId, Project>,
     pub agents: BTreeMap<AgentId, Agent>,
     pub terminal: Option<TerminalPreference>,
+    /// Optional `[relay]` section (ADR-0021 D7). Present means this device
+    /// hosts its own bridge at launch so paired devices can reach it through
+    /// the relay; absent means the app runs purely on the direct path.
+    pub relay: Option<RelayConfigSection>,
+}
+
+/// The `[relay]` section (ADR-0021 D7): where this device's bridge dials the
+/// blind relay and the token that admits it. Both are connection credentials —
+/// local-only, never projected to the sidebar DTO or sent across the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayConfigSection {
+    /// The relay endpoint the bridge dials (`ws://…` or `wss://…`). Validated
+    /// by the bridge at serve time (`BridgeServeError::InvalidRelayUrl`).
+    pub relay_url: String,
+    /// The relay-issued bridge registration token that proves admission.
+    pub registration_token: String,
 }
 
 /// A configured host: a transport plus its connection details (ADR-0004).
@@ -524,6 +541,11 @@ struct RawConfig {
     agents: BTreeMap<AgentId, Agent>,
     #[serde(default)]
     terminal: Option<RawTerminalPreference>,
+    // Plain-string fields with no shape ambiguity, so the derived
+    // `Deserialize` (with `deny_unknown_fields`) is used directly — no Raw
+    // wrapper needed like `terminal`/kubectl fields.
+    #[serde(default)]
+    relay: Option<RelayConfigSection>,
 }
 
 /// The guard for a value used verbatim as one argv token (literal fields AND
@@ -954,6 +976,7 @@ impl Config {
             projects: raw.projects,
             agents: raw.agents,
             terminal: raw.terminal.map(|r| r.0),
+            relay: raw.relay,
         };
         if issues.is_empty() {
             Ok(config)
@@ -1058,6 +1081,35 @@ mod tests {
 
     fn host_id(s: &str) -> HostId {
         HostId::new(s).expect("valid slug")
+    }
+
+    #[test]
+    fn parses_relay_section() {
+        let toml = r#"
+            [relay]
+            relay_url = "wss://relay.example/ws"
+            registration_token = "reg-tok"
+        "#;
+        let config = Config::from_toml_str(toml).expect("parse");
+        let relay = config.relay.expect("relay section present");
+        assert_eq!(relay.relay_url, "wss://relay.example/ws");
+        assert_eq!(relay.registration_token, "reg-tok");
+    }
+
+    #[test]
+    fn relay_section_absent_is_none() {
+        let config = Config::from_toml_str("").expect("empty config parses");
+        assert!(config.relay.is_none());
+    }
+
+    #[test]
+    fn relay_section_rejects_unknown_field() {
+        // A typo'd key must fail loudly (deny_unknown_fields), not be dropped.
+        let err = Config::from_toml_str(
+            "[relay]\nrelay_url = \"ws://r/ws\"\nregistration_token = \"t\"\nreg_token = \"x\"\n",
+        )
+        .expect_err("unknown relay field");
+        assert!(err.to_string().contains("reg_token"), "{err}");
     }
 
     #[test]

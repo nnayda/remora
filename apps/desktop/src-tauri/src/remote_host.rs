@@ -112,12 +112,11 @@ pub async fn start_loopback(
 ) -> Result<RemoteHost, Box<dyn std::error::Error + Send + Sync>> {
     // Bridge identity lives alongside config.toml (`…/remora/`), so the bridge id
     // is stable across runs like real bridge state; the roster is per-run (below).
+    // The identity/roster paths come from `bridge_state` so the loopback and the
+    // real relay bridge share one load-bearing layout (ADR-0021).
     let config_path = bridge.config_path();
-    let state_dir: PathBuf = config_path
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let identity = BridgeIdentity::load_or_create(&state_dir.join("bridge_identity.toml"))?;
+    let identity =
+        BridgeIdentity::load_or_create(&crate::bridge_state::identity_path(&config_path))?;
     // Start from an EMPTY roster: the device this run pairs is enrolled by the
     // real ceremony below, not seeded inline. The confirm path does persist the
     // enrolled entry to `bridge_roster.toml`, but it is overwritten each run and
@@ -150,10 +149,8 @@ pub async fn start_loopback(
     // The bridge serves through the *same* wrapping resolver the direct path
     // uses (resolver carries the shared SessionLocks), so both actors serialize
     // per session against one registry.
-    let source: Arc<dyn SessionSource> = Arc::new(ResolvingSource {
-        resolver: bridge.resolver(),
-        config_path,
-    });
+    let source: Arc<dyn SessionSource> =
+        Arc::new(ResolvingSource::new(bridge.resolver(), config_path.clone()));
 
     let shutdown = CancellationToken::new();
     let bridge_cfg = BridgeConfig {
@@ -161,7 +158,7 @@ pub async fn start_loopback(
         registration_token,
         identity,
         roster: Arc::new(tokio::sync::RwLock::new(roster)),
-        roster_path: state_dir.join("bridge_roster.toml"),
+        roster_path: crate::bridge_state::roster_path(&config_path),
     };
     // Thread the pairing command/event channels through `serve_bridge` and drive
     // the real ceremony over them (below). Once pairing completes we drop both
@@ -265,12 +262,22 @@ fn random_token() -> String {
 /// project through the desktop's own resolver against freshly-loaded config,
 /// exactly like the Bridge's direct path — so the bridge and the direct path go
 /// through the same per-session exclusion registry.
-struct ResolvingSource {
+pub(crate) struct ResolvingSource {
     resolver: Arc<dyn SourceResolver>,
     config_path: PathBuf,
 }
 
 impl ResolvingSource {
+    /// Build a source that resolves each request through `resolver` against the
+    /// config at `config_path`. Shared by the loopback and the real relay bridge
+    /// so both serve through the desktop's one per-session exclusion registry.
+    pub(crate) fn new(resolver: Arc<dyn SourceResolver>, config_path: PathBuf) -> Self {
+        Self {
+            resolver,
+            config_path,
+        }
+    }
+
     /// Load config fresh (a missing file is an empty config — a fresh device is
     /// valid, ADR-0004). Config problems surface as `Transport` across the seam.
     fn load_config(&self) -> Result<Arc<Config>, SourceError> {
