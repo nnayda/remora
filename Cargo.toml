@@ -21,7 +21,7 @@ async-trait = "0.1"
 base64 = "0.22"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 portable-pty = "0.9"
-rand = "0.9"
+rand = "0.10"
 remora-bridge = { path = "crates/remora-bridge" }
 remora-core = { path = "crates/remora-core" }
 remora-protocol = { path = "crates/remora-protocol" }
