@@ -106,6 +106,29 @@ describe("DevicesPanel — per-row revoke", () => {
     expect(b.revokeDevice).toHaveBeenCalledWith(PIXEL.deviceId);
   });
 
+  it("a failed revoke surfaces its message in the error banner", async () => {
+    b.listDevices.mockResolvedValue([PIXEL]);
+    b.revokeDevice.mockRejectedValue({
+      kind: "relay",
+      message: "roster storage failed",
+    });
+    render(<DevicesPanel />);
+
+    await screen.findByText("Pixel 7");
+    fireEvent.click(
+      screen.getByRole("button", { name: /Revoke device Pixel 7/i }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^Revoke$/ }));
+
+    // The bridge error's message lands in the alert banner, and the roster
+    // stays visible (a failed revoke must not blank the panel).
+    expect(await screen.findByText("roster storage failed")).not.toBeNull();
+    expect(screen.getByRole("alert").textContent).toContain(
+      "roster storage failed",
+    );
+    expect(screen.queryByText("Pixel 7")).not.toBeNull();
+  });
+
   it("cancelling the confirm dialog does not revoke", async () => {
     b.listDevices.mockResolvedValue([PIXEL]);
     render(<DevicesPanel />);

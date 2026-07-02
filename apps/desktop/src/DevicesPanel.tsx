@@ -55,6 +55,15 @@ export function DevicesPanel() {
   const [revokeTarget, setRevokeTarget] = useState<DeviceInfoDto | null>(null);
   // A failed revoke surfaces above the list (the load itself has its own state).
   const [revokeError, setRevokeError] = useState<string | null>(null);
+  // Unmount latch for `confirmRevoke`, which outlives the mount effect's local
+  // `live` flag: don't set state after the panel is gone.
+  const liveRef = useRef(true);
+  useEffect(
+    () => () => {
+      liveRef.current = false;
+    },
+    [],
+  );
 
   // Fetch fingerprint + roster together; a relayNotConfigured rejection from
   // either is the "no bridge" empty state, anything else is a read error.
@@ -110,9 +119,10 @@ export function DevicesPanel() {
     try {
       await revokeDevice(device.deviceId);
       const devices = await listDevices();
+      if (!liveRef.current) return;
       setPhase((prev) => (prev.kind === "ready" ? { ...prev, devices } : prev));
     } catch (err) {
-      setRevokeError(formErrorMessage(err));
+      if (liveRef.current) setRevokeError(formErrorMessage(err));
     }
   }
 
