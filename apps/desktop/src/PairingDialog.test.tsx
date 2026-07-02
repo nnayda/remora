@@ -224,6 +224,20 @@ describe("PairingDialog — relay not configured", () => {
   });
 });
 
+describe("PairingDialog — subscribe failure", () => {
+  it("shows the error state (not stuck on 'Opening…') when a subscription rejects", async () => {
+    b.subscribePairingDeviceArrived.mockRejectedValue(
+      new Error("listen failed"),
+    );
+    render(<PairingDialog onClose={() => {}} />);
+
+    expect(await screen.findByText(/listen failed/i)).not.toBeNull();
+    // Never got as far as opening the window or rendering a code.
+    expect(b.openPairingWindow).not.toHaveBeenCalled();
+    expect(screen.queryByText(/opening a pairing window/i)).toBeNull();
+  });
+});
+
 describe("PairingDialog — close mid-window", () => {
   it("cancels the pairing window and calls onClose when closed while open", async () => {
     const onClose = vi.fn();

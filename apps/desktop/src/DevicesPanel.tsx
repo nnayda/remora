@@ -155,8 +155,8 @@ export function DevicesPanel() {
         <p className="settings-section__hint">Loading…</p>
       ) : phase.kind === "not-configured" ? (
         <p className="settings-section__hint">
-          Relay not configured. Add a <code>[relay]</code> section to pair
-          devices with this desktop.
+          No relay bridge is running. Configure a <code>[relay]</code> section
+          in config.toml to pair devices with this desktop.
         </p>
       ) : phase.kind === "error" ? (
         <p className="settings-error" role="alert">

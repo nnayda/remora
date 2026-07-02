@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a single in-flight pairing window, and confirm-gated enrollment are all first
   class. Push notifications (#233) and the standalone headless bridge (#234)
   remain later slices.
+- **Device pairing over the relay — desktop UI** (#232): Settings gains a
+  Devices panel — the paired-device roster with this desktop's own
+  fingerprint for comparison, and a per-row Revoke behind a confirm dialog.
+  "Pair new device" opens a pairing dialog: a QR code (plus a copy-code
+  fallback) for the phone to scan, a live countdown to the window's expiry,
+  and a fingerprint confirm/reject step once a device arrives. The desktop
+  shell now also reads a new `[relay]` config section at launch to host the
+  bridge so paired devices can reach it.
 - **Open a session in an external terminal — UI half**: session menu gains
   "Open in <terminal>" (launches the configured external terminal attached to
   the session, coexisting with the embedded one) and "Copy attach command"

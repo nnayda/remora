@@ -86,32 +86,41 @@ export function PairingDialog({ onClose }: { onClose: () => void }) {
     const unlisteners: Array<() => void> = [];
 
     async function start() {
-      const subs = await Promise.all([
-        subscribePairingWindowOpened(({ code, expiresAt }) => {
-          // The authoritative window (re-)opened: refresh code + deadline.
-          setPhase((prev) =>
-            prev.kind === "opening" || prev.kind === "open"
-              ? { kind: "open", code, expiresAt, device: null, busy: false }
-              : prev,
-          );
-        }),
-        subscribePairingDeviceArrived((device) => {
-          setActionError(null);
-          setPhase((prev) =>
-            prev.kind === "open" ? { ...prev, device, busy: false } : prev,
-          );
-        }),
-        subscribePairingResult(({ outcome }) => {
-          setPhase({ kind: "result", outcome });
-        }),
-      ]);
-      if (!live) {
-        for (const un of subs) un();
-        return;
-      }
-      unlisteners.push(...subs);
-
       try {
+        // allSettled (not all): a rejected subscription must not orphan the
+        // ones that *did* succeed — each fulfilled listener is still torn
+        // down below, then the first rejection is rethrown into the shared
+        // catch so a subscribe failure lands in the dialog's error phase
+        // instead of leaving it stuck on "Opening a pairing window…".
+        const results = await Promise.allSettled([
+          subscribePairingWindowOpened(({ code, expiresAt }) => {
+            // The authoritative window (re-)opened: refresh code + deadline.
+            setPhase((prev) =>
+              prev.kind === "opening" || prev.kind === "open"
+                ? { kind: "open", code, expiresAt, device: null, busy: false }
+                : prev,
+            );
+          }),
+          subscribePairingDeviceArrived((device) => {
+            setActionError(null);
+            setPhase((prev) =>
+              prev.kind === "open" ? { ...prev, device, busy: false } : prev,
+            );
+          }),
+          subscribePairingResult(({ outcome }) => {
+            setPhase({ kind: "result", outcome });
+          }),
+        ]);
+        if (!live) {
+          for (const r of results) if (r.status === "fulfilled") r.value();
+          return;
+        }
+        for (const r of results) {
+          if (r.status === "fulfilled") unlisteners.push(r.value);
+        }
+        const failed = results.find((r) => r.status === "rejected");
+        if (failed) throw (failed as PromiseRejectedResult).reason;
+
         const dto = await openPairingWindow(null);
         if (!live) return;
         // The window-opened event carries the same values and may already have

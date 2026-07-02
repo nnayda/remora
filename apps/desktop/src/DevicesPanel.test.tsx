@@ -197,7 +197,7 @@ describe("DevicesPanel — pair new device", () => {
     });
     render(<DevicesPanel />);
 
-    await screen.findByText(/Relay not configured/i);
+    await screen.findByText(/No relay bridge is running/i);
     expect(
       screen.queryByRole("button", { name: /pair new device/i }),
     ).toBeNull();
@@ -216,7 +216,9 @@ describe("DevicesPanel — relay not configured", () => {
     });
     render(<DevicesPanel />);
 
-    expect(await screen.findByText(/Relay not configured/i)).not.toBeNull();
+    expect(
+      await screen.findByText(/No relay bridge is running/i),
+    ).not.toBeNull();
     expect(screen.queryByText(/1111-2222-3333/)).toBeNull();
   });
 });

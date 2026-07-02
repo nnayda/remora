@@ -71,8 +71,9 @@ pub fn run() {
             // this device's bridge so paired devices can reach it. Precedence: the
             // dev loopback WINS — when it is active this device is already its own
             // in-process bridge, so we do not also stand up the real relay bridge
-            // (they would contend for the one identity/roster). `[relay]` absent
-            // AND loopback off → nothing spawned, app behaves exactly as before.
+            // (they would contend for the one identity/roster). When loopback is
+            // off, startup still parses config.toml (`load_relay_section`) to
+            // check for the section; if it's absent, no bridge is spawned.
             let pairing_handles = if loopback_active {
                 None
             } else {
