@@ -239,6 +239,20 @@ impl Bridge {
         let workspace_path = meta.workspace_path.ok_or_else(|| BridgeError::Transport {
             message: "session has no known workspace path to open".into(),
         })?;
+        // `workspace_path` rides in from the remote tmux env (agent/host
+        // controlled); discovery's `clean_metadata` strips only control
+        // chars, so a value like `--install-extension=evil` would otherwise
+        // reach `code`'s argv-based flag parser as a bare token. Reject it
+        // here, before it becomes a local argv token (spawn is argv-based —
+        // no shell injection — but `code` still parses a leading-dash token
+        // as a flag).
+        if workspace_path.trim().starts_with('-') {
+            return Err(BridgeError::Transport {
+                message:
+                    "session workspace path looks like a flag, refusing to pass it to an editor"
+                        .into(),
+            });
+        }
         Ok(source.remote_workspace(&p, &s, &workspace_path).await?)
     }
 
@@ -894,6 +908,39 @@ mod tests {
             .await
             .expect_err("no path");
         assert!(matches!(err, BridgeError::Transport { .. }));
+    }
+
+    /// A workspace path that looks like a CLI flag (agent/host-controlled via
+    /// `REMORA_WORKSPACE`, discovery only strips control chars) must never
+    /// reach `code`'s argv-based flag parser as a bare token — reject it
+    /// before it gets anywhere near `remote_workspace`/`launch_argv`.
+    #[tokio::test]
+    async fn remote_workspace_rejects_flag_like_path() {
+        let source = Arc::new(WorkspaceSource {
+            workspace_path: Some("--install-extension=x".into()),
+        });
+        let bridge = bridge_with_config(source, temp_config_path("remote-ws-flag"));
+        let err = bridge
+            .remote_workspace("api".into(), "fix-login".into())
+            .await
+            .expect_err("flag-like path must be rejected");
+        assert!(matches!(err, BridgeError::Transport { .. }));
+    }
+
+    /// `list()` not carrying the requested session (wrong id here) is the
+    /// `SessionNotFound` branch, distinct from the "found but no path" and
+    /// "found but path looks like a flag" branches above.
+    #[tokio::test]
+    async fn remote_workspace_session_not_found() {
+        let source = Arc::new(WorkspaceSource {
+            workspace_path: Some("/w/api/fix-login".into()),
+        });
+        let bridge = bridge_with_config(source, temp_config_path("remote-ws-notfound"));
+        let err = bridge
+            .remote_workspace("api".into(), "ghost".into())
+            .await
+            .expect_err("no such session");
+        assert!(matches!(err, BridgeError::SessionNotFound { .. }));
     }
 
     #[tokio::test]
