@@ -3336,8 +3336,11 @@ dependencies = [
  "futures-util",
  "notify",
  "notify-debouncer-full",
+ "rand",
+ "remora-bridge",
  "remora-core",
  "remora-protocol",
+ "remora-relay",
  "serde",
  "serde_json",
  "specta",
@@ -3348,6 +3351,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-specta",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

@@ -22,6 +22,7 @@ use remora_protocol::{
 use resolve::SourceResolver;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::remote_host::RemoteHost;
 use dto::ConfigDto;
 use editor_dto::{
     AgentInputDto, EditableConfigDto, EditorConfigDto, HostInputDto, ProjectInputDto,
@@ -58,6 +59,12 @@ pub struct Bridge {
     /// a sibling below the seam — the future remote-host loopback — can share
     /// it rather than mint a second, non-serializing registry.
     session_locks: Arc<SessionLocks>,
+    /// Dev-only relay loopback (ADR-0021 spec D11, `REMORA_REMOTE_LOOPBACK=1`).
+    /// When present, `attach` routes through this in-process bridge + relay
+    /// instead of the direct transport; `list` and the mutating ops stay direct
+    /// (hybrid routing). Owned here so its relay/bridge tasks live for the app's
+    /// lifetime. `None` — and every code path unchanged — by default.
+    remote_host: Option<RemoteHost>,
 }
 
 impl Bridge {
@@ -95,7 +102,29 @@ impl Bridge {
             config_path,
             config_mutex: tokio::sync::Mutex::new(()),
             session_locks,
+            remote_host: None,
         }
+    }
+
+    /// Inject a started loopback (ADR-0021 spec D11). Called from `lib.rs` setup
+    /// before the Bridge is handed to Tauri's managed state, only when
+    /// `REMORA_REMOTE_LOOPBACK=1`. Owning the [`RemoteHost`] keeps its relay +
+    /// bridge tasks alive for the app's lifetime.
+    pub(crate) fn set_remote_host(&mut self, host: RemoteHost) {
+        self.remote_host = Some(host);
+    }
+
+    /// The wrapping resolver (carries the shared [`SessionLocks`]). Handed to the
+    /// loopback so its bridge serves through the *same* per-session exclusion
+    /// registry as the direct path.
+    pub(crate) fn resolver(&self) -> Arc<dyn SourceResolver> {
+        Arc::clone(&self.resolver)
+    }
+
+    /// The per-device config path. The loopback reads it to resolve projects and
+    /// derives its bridge identity/roster dir from its parent.
+    pub(crate) fn config_path(&self) -> PathBuf {
+        self.config_path.clone()
     }
 
     /// The shared session-lock registry (ADR-0021). Exposed for a sibling
@@ -170,7 +199,7 @@ impl Bridge {
         sink: Arc<dyn OutputSink>,
     ) -> Result<ChannelHandle, BridgeError> {
         let (p, s) = parse_ids(project_id, session_id)?;
-        let source = self.resolve_for(&p)?;
+        let source = self.session_source_for_attach(&p)?;
         let channel = source.attach(&p, &s).await?;
         Ok(self.open_channel(channel, sink))
     }
@@ -314,6 +343,20 @@ impl Bridge {
     fn resolve_for(&self, project_id: &ProjectId) -> Result<Arc<dyn SessionSource>, BridgeError> {
         let config = Arc::new(self.load_config()?);
         self.resolver.for_project(&config, project_id)
+    }
+
+    /// The source `attach` drives (ADR-0021 spec D11 hybrid). When a loopback
+    /// [`RemoteHost`] is present the desktop attaches *through its own bridge*
+    /// (the load-bearing dogfood); otherwise it takes the direct path. `list`
+    /// and the mutating ops deliberately stay direct — only `attach` is routed.
+    fn session_source_for_attach(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+        match &self.remote_host {
+            Some(host) => Ok(Arc::clone(&host.remote)),
+            None => self.resolve_for(project_id),
+        }
     }
 
     /// Load the per-device config fresh. A *missing* file is success → an
@@ -1023,6 +1066,37 @@ mod tests {
             b.attach("api".into(), "ghost".into(), s).await,
             Err(BridgeError::SessionNotFound { .. })
         ));
+    }
+
+    /// The hybrid routing seam (ADR-0021 D11): with a loopback `RemoteHost`
+    /// injected, `attach` resolves the remote source; without one it takes the
+    /// direct path. Uses `Arc::ptr_eq` to prove *which* source was chosen.
+    #[tokio::test]
+    async fn attach_routes_to_remote_when_present_else_direct() {
+        let direct: Arc<dyn SessionSource> = Arc::new(FakeSessionSource::new());
+        let mut b = bridge(Arc::clone(&direct));
+
+        // No remote host → the direct (resolver) source.
+        let got = b
+            .session_source_for_attach(&pid("api"))
+            .expect("direct resolves");
+        assert!(
+            Arc::ptr_eq(&got, &direct),
+            "no remote host must take the direct path"
+        );
+
+        // Inject a distinct remote source → attach routes to it, not the direct one.
+        let remote: Arc<dyn SessionSource> = Arc::new(FakeSessionSource::new());
+        b.set_remote_host(crate::remote_host::RemoteHost::stub_for_test(Arc::clone(
+            &remote,
+        )));
+        let got = b
+            .session_source_for_attach(&pid("api"))
+            .expect("remote resolves");
+        assert!(
+            Arc::ptr_eq(&got, &remote),
+            "a present remote host must route attach through the remote source"
+        );
     }
 
     #[tokio::test]
