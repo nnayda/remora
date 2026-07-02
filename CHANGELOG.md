@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   settles the relay architecture before any relay code exists. Relay mode
   splits into a self-hostable (or Remora-hosted, paid) **blind relay** that
   routes only end-to-end-encrypted frames — no sandbox credentials, no
-  plaintext, content-blindness designed to be auditable — and a **bridge**
+  plaintext; blindness guaranteed by cryptography, with an audit mode as a
+  regression guard against accidental metadata leakage — and a **bridge**
   holding host config + transport creds that runs only on user hardware
   (the desktop app by default; a headless container later for
   laptop-asleep phone access). Devices pair by QR with a split secret

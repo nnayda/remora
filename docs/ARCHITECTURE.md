@@ -17,10 +17,12 @@ DIRECT MODE (default, zero infra)
   App ──ssh / kubectl exec──► sandbox (tmux: one session per worktree)
 
 RELAY MODE (opt-in, enables phone-from-anywhere + push notifications)
-  Phone ──E2E──► relay (blind) ──E2E──► bridge ──ssh / kubectl exec──► sandbox (tmux)
-  App  ──┘      routes ciphertext       holds creds; = the desktop app
-                only, holds no creds    or a headless container, always
-                                        on user hardware (ADR-0021)
+  Phone ──WS/TLS──► relay (blind) ──WS/TLS──► bridge ──ssh / kubectl exec──► sandbox (tmux)
+  App  ──┘         routes ciphertext         holds creds; = the desktop app
+                   only, holds no creds      or a headless container, always
+                                             on user hardware (ADR-0021)
+  (one Noise session runs END-TO-END phone⇄bridge, through the relay — the
+   per-hop WS/TLS is transport framing, never where encryption terminates)
 ```
 
 Persistence is borrowed, not invented: tmux already solves "process survives
@@ -89,9 +91,13 @@ them — same seam, no UI changes.
   including the agent — can forge it. Discovered state informs display and
   the config join only; spawn and respawn build commands exclusively from
   local configuration ([ADR-0004](adr/0004-local-config-live-session-discovery.md)).
-- Clients hold no long-lived secrets beyond what the user already uses to
-  reach their sandbox (kubeconfig / SSH). In relay mode the phone
-  authenticates to the relay and never holds a key to the sandbox.
+- Clients hold no *sandbox-reaching* secrets beyond what the user already
+  uses (kubeconfig / SSH); on-device end-to-end identity keys (per-device
+  Noise statics, ADR-0021) are the deliberate carve-out — generated on the
+  device, never leaving it, never able to reach a sandbox. In relay mode the
+  phone authenticates **end-to-end to the bridge** (PSK-paired, pinned
+  statics); it presents only a routing credential to the relay, and never
+  holds a key to the sandbox.
 - Sandboxes need no public ingress. Direct mode rides the user's existing
   reachability (VPN / bastion / kubeconfig); in relay mode only the
   user-side bridge reaches them — the relay reaches nothing and routes only
@@ -99,8 +105,9 @@ them — same seam, no UI changes.
 - The relay stores no plaintext session content and no sandbox credentials,
   ever ([ADR-0021](adr/0021-blind-relay-bridge-trust-model.md)). E2E keys
   are generated on-device and never leave it. A fully compromised relay
-  yields metadata and denial of service — not session content, not code,
-  not sandbox access.
+  yields metadata and denial of service — no session *plaintext*, no code,
+  no sandbox access; timing/size side channels over the interactive stream
+  remain and are named as an accepted risk in ADR-0021.
 - Sandbox hardening is recommended and documented, not enforced: resource
   limits, network egress policy, no host cloud credentials, and
   ephemeral/disposable pods.
