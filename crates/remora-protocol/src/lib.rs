@@ -8,6 +8,7 @@
 mod channel;
 mod envelope;
 mod id;
+mod pairing;
 mod remote;
 mod session;
 
@@ -18,6 +19,7 @@ pub use envelope::{
     ENVELOPE_VERSION, MAX_ENVELOPE_PAYLOAD,
 };
 pub use id::{AgentId, InvalidIdError, ProjectId, SessionId, MAX_ID_LEN};
+pub use pairing::{PairingCode, PairingCodeError, PAIRING_CODE_VERSION};
 pub use remote::{BridgeMessage, ClientMessage, RemoteOp, RemoteResult, WireError};
 pub use session::{SessionMeta, SessionState, SessionStatus, SpawnSpec, WorkspaceMode};
 
