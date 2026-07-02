@@ -38,12 +38,34 @@ export function projectIcon(projectIndex: number): RailIcon {
   return RAIL_ICONS[projectIndex % RAIL_ICONS.length];
 }
 
+/** Reused grapheme segmenter (undefined locale = runtime default). `Intl.Segmenter`
+ * is widely available but guarded so the badge degrades instead of throwing. */
+const graphemeSegmenter =
+  typeof Intl !== "undefined" && "Segmenter" in Intl
+    ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+    : null;
+
+/** First user-perceived character of `label`: a whole grapheme cluster, so a
+ * base letter keeps its combining marks (e.g. "e"+U+0301 stays "é", not "e").
+ * Falls back to the first code point where `Intl.Segmenter` is unavailable —
+ * still surrogate-pair safe, just not combining-mark safe. */
+function firstGrapheme(label: string): string | undefined {
+  if (graphemeSegmenter) {
+    const { value } = graphemeSegmenter
+      .segment(label)
+      [Symbol.iterator]()
+      .next();
+    return value?.segment;
+  }
+  return [...label][0];
+}
+
 /** Per-session distinguisher: first character (uppercased) of the branch, or
- * sessionId when there's no branch. Grapheme-safe (spreads to code points so a
- * surrogate pair is not split). Empty/whitespace -> a stable middot fallback. */
+ * sessionId when there's no branch. Grapheme-cluster safe (a base letter keeps
+ * its combining marks). Empty/whitespace -> a stable middot fallback. */
 export function branchInitial(session: SessionNode): string {
   const label = (session.branch ?? session.sessionId).trim();
-  const first = [...label][0];
+  const first = firstGrapheme(label);
   return first ? first.toUpperCase() : "·";
 }
 
