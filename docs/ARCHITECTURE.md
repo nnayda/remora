@@ -69,7 +69,7 @@ a type or code path in core
 
 | Unit | Purpose | Depends on |
 | --- | --- | --- |
-| `crates/remora-protocol` | Wire types every client speaks (session ids, messages). Deliberately dependency-light — it is the contract third-party clients build against. | `serde` only |
+| `crates/remora-protocol` | Wire types every client speaks (session ids, messages). Deliberately dependency-light — it is the contract third-party clients build against, specified in [PROTOCOL.md](PROTOCOL.md). | `serde` only |
 | `crates/remora-core` | Session model, the `SessionSource` trait, and its direct-mode implementations (ssh, kubectl exec). | `remora-protocol`, `tokio`, `async-trait` |
 | `crates/remora-relay` | Blind envelope-frame relay binary (ADR-0021): routes opaque frames between authenticated WebSocket connections; never depends on crypto or session-content crates. | `remora-protocol`, `tokio-tungstenite` |
 | `crates/remora-bridge` | User-side bridge (ADR-0021): holds the bridge static identity, the paired-device roster, and a `RemoteSource` (`SessionSource` impl driven end-to-end over Noise, through the relay or loopback). Library only — hosted in-process by the desktop today; a headless binary is future work (#234). | `remora-core`, `remora-protocol`, `snow`, `tokio-tungstenite` |

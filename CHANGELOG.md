@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Wire-protocol spec for third-party clients** ([`docs/PROTOCOL.md`](docs/PROTOCOL.md)):
+  documents the `remora-protocol` surface a third-party client implements —
+  the session protocol (ids, `SessionMeta`, the attached channel, the remote
+  request/response wrapper) and the relay envelope (ADR-0021): its byte
+  layout, frame types, `RelayHello`, `PROTOCOL_VERSION`/`ENVELOPE_VERSION`
+  negotiation and compatibility rules, the relay-mode connection sequence, and
+  what a blind relay does and does not see. Fulfils ADR-0002's promise that
+  third-party clients can target `remora-protocol` without us building them.
 - **Open a session in an external terminal — UI half**: session menu gains
   "Open in <terminal>" (launches the configured external terminal attached to
   the session, coexisting with the embedded one) and "Copy attach command"
