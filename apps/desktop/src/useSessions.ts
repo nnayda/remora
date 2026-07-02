@@ -29,6 +29,7 @@ export function useSessions() {
     tabs: snapshot.tabs,
     activeKey: snapshot.activeKey,
     connecting: snapshot.connecting,
+    removing: snapshot.removing,
     openSession: sessionStore.openSession,
     openViaRespawn: sessionStore.openViaRespawn,
     openViaAttach: sessionStore.openViaAttach,

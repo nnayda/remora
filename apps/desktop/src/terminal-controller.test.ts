@@ -511,6 +511,92 @@ describe("TerminalController", () => {
     expect(ev.preventDefault).not.toHaveBeenCalled(); // not consumed
   });
 
+  // macOS line-editing chords: xterm drops meta+arrow entirely and treats
+  // Cmd+Backspace as a single-char delete, so the controller must translate
+  // them to the conventional control bytes itself (iTerm "Natural Text
+  // Editing" / VS Code terminal defaults).
+  describe("macOS editing chords", () => {
+    const bytes = (s: string) => new TextEncoder().encode(s);
+
+    it.each([
+      ["Backspace", "\x15"], // Cmd+Delete → kill line backward (^U)
+      ["ArrowLeft", "\x01"], // Cmd+Left → beginning of line (^A)
+      ["ArrowRight", "\x05"], // Cmd+Right → end of line (^E)
+    ])("translates Cmd+%s and consumes the event", (k, expected) => {
+      const conn = fakeConn();
+      new TerminalController(el, conn as unknown as SessionConnection);
+      const ev = key(k, { metaKey: true });
+      const handled = term().keyCb?.(ev);
+      expect(conn.write).toHaveBeenCalledWith(bytes(expected));
+      expect(handled).toBe(false); // consumed: xterm must not also act on it
+      expect(ev.preventDefault).toHaveBeenCalled(); // suppress webview default too
+    });
+
+    it("translates Option+Backspace to ESC+DEL (backward-kill-word)", () => {
+      const conn = fakeConn();
+      new TerminalController(el, conn as unknown as SessionConnection);
+      const ev = key("Backspace", { altKey: true });
+      const handled = term().keyCb?.(ev);
+      expect(conn.write).toHaveBeenCalledWith(bytes("\x1b\x7f"));
+      expect(handled).toBe(false);
+      expect(ev.preventDefault).toHaveBeenCalled();
+    });
+
+    it("leaves a plain Backspace and plain arrows to xterm", () => {
+      const conn = fakeConn();
+      new TerminalController(el, conn as unknown as SessionConnection);
+      for (const k of ["Backspace", "ArrowLeft", "ArrowRight"]) {
+        expect(term().keyCb?.(key(k, {}))).toBe(true);
+      }
+      expect(conn.write).not.toHaveBeenCalled();
+    });
+
+    it("does not intercept when Ctrl or Shift is also held", () => {
+      const conn = fakeConn();
+      new TerminalController(el, conn as unknown as SessionConnection);
+      // Cmd+Shift+Left is a selection gesture, Ctrl variants are distinct
+      // bindings — both must fall through to xterm untouched.
+      for (const mods of [
+        { metaKey: true, shiftKey: true },
+        { metaKey: true, ctrlKey: true },
+        { altKey: true, shiftKey: true },
+        { altKey: true, ctrlKey: true },
+      ]) {
+        for (const k of ["Backspace", "ArrowLeft", "ArrowRight"]) {
+          expect(term().keyCb?.(key(k, mods))).toBe(true);
+        }
+      }
+      expect(conn.write).not.toHaveBeenCalled();
+    });
+
+    it("does not intercept Cmd+Option combinations", () => {
+      const conn = fakeConn();
+      new TerminalController(el, conn as unknown as SessionConnection);
+      expect(
+        term().keyCb?.(key("Backspace", { metaKey: true, altKey: true })),
+      ).toBe(true);
+      expect(conn.write).not.toHaveBeenCalled();
+    });
+
+    it("ignores non-keydown chord events (keyup)", () => {
+      const conn = fakeConn();
+      new TerminalController(el, conn as unknown as SessionConnection);
+      expect(
+        term().keyCb?.(key("Backspace", { metaKey: true, type: "keyup" })),
+      ).toBe(true);
+      expect(conn.write).not.toHaveBeenCalled();
+    });
+
+    it("consumes the chord after close without writing to a dead session", () => {
+      const conn = fakeConn();
+      new TerminalController(el, conn as unknown as SessionConnection);
+      conn.emit({ event: "closed" });
+      conn.write.mockClear();
+      expect(term().keyCb?.(key("Backspace", { metaKey: true }))).toBe(false);
+      expect(conn.write).not.toHaveBeenCalled();
+    });
+  });
+
   // Reusable harness that creates a fresh fake connection + element pair.
   function makeHarness() {
     const conn = fakeConn();

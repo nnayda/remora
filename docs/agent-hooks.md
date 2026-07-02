@@ -18,21 +18,27 @@ markers work with no manual sandbox setup:
 2. Save the agent. On every spawn, Remora writes the provisioned script to the
    sandbox (base64-decoded, non-fatal `StepId::Provision` batch step) *before*
    `tmux new-session`, then launches `claude` with the inline `--settings`
-   flag whose **Notification** hook runs `$HOME/.remora/hooks/claude-notify.sh`.
-   Claude Code's Notification event is its "needs your attention" signal, so
-   Remora maps it to `awaiting_input` and carries the notification text as the
-   preview.
+   flag whose **Notification** and **PreToolUse** (matcher `AskUserQuestion`)
+   hooks both run `$HOME/.remora/hooks/claude-notify.sh`. Claude Code's
+   Notification event is its "needs your attention" signal (permission
+   prompts, the idle reminder), so Remora maps it to `awaiting_input` and
+   carries the notification text as the preview. An **AskUserQuestion** menu
+   fires no immediate Notification — only a delayed, generic
+   `permission_prompt` nag ("Claude needs your permission") — so the
+   PreToolUse hook covers it at display time, and the script pulls the actual
+   question text from `.tool_input.questions[0].question` as the preview.
 
 Both fields are plain, editable `Agent` config (`command` / `provision`) — you
 can hand-edit them in TOML the same way, or clear/replace them after applying
 the template.
 
 **Caveat (D6, ADR-0020):** Remora launches the agent with
-`claude --settings '{…}'` carrying a Notification hook. `--settings` layers on
-top of the user's `~/.claude/settings.json` (model/permissions/MCP survive),
-but whether a `--settings` `hooks` object shadows a user's OWN Notification
-hook is undocumented upstream — verified empirically in the hermes dogfood.
-Low risk in a coding sandbox, but if you have your own Notification hook in
+`claude --settings '{…}'` carrying Notification + PreToolUse hooks.
+`--settings` layers on top of the user's `~/.claude/settings.json`
+(model/permissions/MCP survive), but whether a `--settings` `hooks` object
+shadows a user's OWN hooks for the same events is undocumented upstream —
+verified empirically in the hermes dogfood. Low risk in a coding sandbox, but
+if you have your own Notification or PreToolUse hook in
 `~/.claude/settings.json`, don't assume both run.
 
 ## Fallback: manual install
@@ -45,13 +51,18 @@ through `provision`, install it directly:
    make it executable (`chmod +x`). It needs `jq` and `base64` on PATH. This
    file is the single source of truth — the desktop template embeds a copy
    pinned to it by a drift-guard test.
-2. Add to the sandbox's `~/.claude/settings.json`:
+2. Add to the sandbox's `~/.claude/settings.json` (the `PreToolUse` entry is
+   what covers AskUserQuestion menus — keep its matcher so every other tool
+   call stays silent):
 
    ```json
    {
      "hooks": {
        "Notification": [
          { "hooks": [ { "type": "command", "command": "/path/to/remora-notify.sh" } ] }
+       ],
+       "PreToolUse": [
+         { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "/path/to/remora-notify.sh" } ] }
        ]
      }
    }
@@ -69,15 +80,19 @@ correct install confirms itself without the agent having to ask anything.
    make it executable (`chmod +x`). It has no dependencies (a plain `printf`,
    no `jq`/`base64`).
 2. Add the `SessionStart` and `UserPromptSubmit` entries to the sandbox's
-   `~/.claude/settings.json` **alongside** the `Notification` entry from the
-   section above — they live under the same `hooks` object, so keep all three
-   rather than replacing it (dropping `Notification` would regress the preview):
+   `~/.claude/settings.json` **alongside** the `Notification` + `PreToolUse`
+   entries from the section above — they live under the same `hooks` object,
+   so keep all of them rather than replacing it (dropping `Notification` or
+   `PreToolUse` would regress the preview):
 
    ```json
    {
      "hooks": {
        "Notification": [
          { "hooks": [ { "type": "command", "command": "/path/to/remora-notify.sh" } ] }
+       ],
+       "PreToolUse": [
+         { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "/path/to/remora-notify.sh" } ] }
        ],
        "SessionStart": [
          { "hooks": [ { "type": "command", "command": "/path/to/remora-ping.sh" } ] }
