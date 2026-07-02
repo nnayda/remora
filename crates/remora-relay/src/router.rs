@@ -480,6 +480,20 @@ impl Router {
         }
     }
 
+    /// Enqueues an already-encoded frame onto `routing_id`'s outbound queue, if
+    /// that connection is still registered. Used by the server to hand a bridge
+    /// its relay-terminated `RelayControlAck`/`RelayControlError` reply (ADR-0021
+    /// D4) on the bridge's own outbound, without inspecting any payload. A frame
+    /// that would exceed the destination's byte budget is dropped (the reply is
+    /// tiny relative to the budget, and a control reply is not worth killing the
+    /// bridge over); a departed connection is a silent no-op.
+    pub fn enqueue_to(&self, routing_id: &DeviceId, raw: Vec<u8>) {
+        let state = self.lock();
+        if let Some(reg) = state.conns.get(routing_id) {
+            let _ = reg.outbound.try_enqueue(raw);
+        }
+    }
+
     /// Deregisters a connection on close — but only if the current registration
     /// at its routing key is still *this* connection's (serial match). A
     /// connection that was displaced by a newer one (4009) carries a stale

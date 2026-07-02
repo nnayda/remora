@@ -10,7 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use remora_protocol::{DeviceId, Envelope, FrameType, HelloRole, RelayHello};
+use remora_protocol::{
+    AssertedDevice, DeviceId, Envelope, FrameType, HelloRole, RelayControl, RelayControlAck,
+    RelayHello,
+};
 use remora_relay::{serve, AuditConfig, AuditSink, BridgeEntry, RelayConfig};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -99,6 +102,18 @@ fn frame(frame_type: FrameType, src: u8, dst: u8) -> Vec<u8> {
     .encode()
 }
 
+/// A bridge→relay [`FrameType::Control`] frame from `src` carrying `control`,
+/// addressed to the relay ([`DeviceId::ZERO`], relay-terminated).
+fn control_frame(src: u8, control: &RelayControl) -> Vec<u8> {
+    Envelope {
+        frame_type: FrameType::Control,
+        src: did(src),
+        dst: DeviceId::ZERO,
+        payload: serde_json::to_vec(control).expect("serialize control"),
+    }
+    .encode()
+}
+
 async fn start(config: Arc<RelayConfig>) -> String {
     let audit = AuditSink::new(&config).expect("audit sink");
     let (addr, _handle) = serve(config, audit).await.expect("serve binds");
@@ -148,13 +163,47 @@ async fn expect_close(ws: &mut Ws, code: u16) {
     }
 }
 
+/// Sends an `AssertDevices` (id 1) that asserts `DEVICE`/`device-tok` on an
+/// already-registered bridge connection and awaits its `RelayControlAck`.
+/// Device auth is bridge-asserted soft state (ADR-0021 D4), so a device hello
+/// is rejected until its bridge asserts it — every device-side test first drives
+/// this over the wire.
+async fn assert_device(bridge: &mut Ws) {
+    let control = RelayControl::AssertDevices {
+        id: 1,
+        devices: vec![AssertedDevice {
+            device_id: did(DEVICE),
+            token: "device-tok".to_string(),
+        }],
+    };
+    send_bin(bridge, control_frame(BRIDGE, &control)).await;
+    let bytes = recv_bin(bridge).await;
+    let envelope = Envelope::decode(&bytes).expect("decode control reply");
+    assert_eq!(
+        envelope.frame_type,
+        FrameType::Control,
+        "reply is a Control frame"
+    );
+    assert_eq!(envelope.dst, did(BRIDGE), "reply addressed to the bridge");
+    let ack: RelayControlAck = serde_json::from_slice(&envelope.payload).expect("decode ack");
+    assert_eq!(ack.id, 1, "ack correlates the request id");
+}
+
+/// Connects a bridge, completes its hello, and asserts `DEVICE` (awaiting the
+/// ack). Returns the live, registered bridge connection.
+async fn bridge_with_asserted_device(url: &str) -> Ws {
+    let mut bridge = connect(url).await;
+    send_bin(&mut bridge, hello_frame(&bridge_hello())).await;
+    assert_device(&mut bridge).await;
+    bridge
+}
+
 #[tokio::test]
 async fn round_trip_device_bridge_data() {
     let url = start(base_config(None)).await;
 
-    // Bridge connects and registers (long-lived receiver).
-    let mut bridge = connect(&url).await;
-    send_bin(&mut bridge, hello_frame(&bridge_hello())).await;
+    // Bridge connects, registers, and asserts the device (long-lived receiver).
+    let mut bridge = bridge_with_asserted_device(&url).await;
 
     // Device delivery: retry across the tiny bridge-registration race. Each
     // attempt is event-driven — we race "bridge receives" against "device gets
@@ -212,28 +261,87 @@ async fn data_before_hello_closed_4002() {
 }
 
 #[tokio::test]
-async fn pairing_frame_after_hello_closed_4002() {
+async fn bridge_control_assert_then_device_pairs_and_routes() {
     let url = start(base_config(None)).await;
-    let mut ws = connect(&url).await;
-    send_bin(&mut ws, hello_frame(&device_hello())).await;
-    // Post-hello, only Data is legal; a Pairing frame is a protocol error.
-    send_bin(&mut ws, frame(FrameType::Pairing, DEV_ROUTING, BRIDGE)).await;
-    expect_close(&mut ws, 4002).await;
+
+    // Bridge connects and asserts the device; the ack proves the Control frame
+    // was dispatched and answered on the bridge's own outbound.
+    let mut bridge = bridge_with_asserted_device(&url).await;
+
+    // The asserted device is admitted, and a Pairing frame from it to its bridge
+    // routes exactly like Data — delivered verbatim (the relay stays blind).
+    let mut device = connect(&url).await;
+    send_bin(&mut device, hello_frame(&device_hello())).await;
+    let pairing = frame(FrameType::Pairing, DEV_ROUTING, BRIDGE);
+    send_bin(&mut device, pairing.clone()).await;
+    let got = recv_bin(&mut bridge).await;
+    assert_eq!(got, pairing, "bridge received the identical Pairing frame");
+}
+
+#[tokio::test]
+async fn device_control_frame_is_closed_4002() {
+    let url = start(base_config(None)).await;
+    let mut _bridge = bridge_with_asserted_device(&url).await;
+
+    // A device is admitted, then sends a Control frame — illegal for a device
+    // (Control is bridge→relay only), so the relay closes it 4002.
+    let mut device = connect(&url).await;
+    send_bin(&mut device, hello_frame(&device_hello())).await;
+    send_bin(
+        &mut device,
+        control_frame(DEV_ROUTING, &RelayControl::CancelPairing { id: 7 }),
+    )
+    .await;
+    expect_close(&mut device, 4002).await;
 }
 
 #[tokio::test]
 async fn data_to_offline_dst_closes_sender_4004() {
     let url = start(base_config(None)).await;
-    let mut ws = connect(&url).await;
-    send_bin(&mut ws, hello_frame(&device_hello())).await;
-    // Bridge never connected — its routing id is unavailable.
-    send_bin(&mut ws, data_frame(DEV_ROUTING, BRIDGE, b"ping")).await;
-    expect_close(&mut ws, 4004).await;
+
+    // The device must first be asserted by a live bridge to be admitted. It
+    // then routes one frame to prove it is registered and the bridge reachable,
+    // before the bridge departs and leaves its routing id offline.
+    let mut bridge = bridge_with_asserted_device(&url).await;
+    let mut device = connect(&url).await;
+    send_bin(&mut device, hello_frame(&device_hello())).await;
+    let warmup = data_frame(DEV_ROUTING, BRIDGE, b"warmup");
+    send_bin(&mut device, warmup.clone()).await;
+    assert_eq!(
+        recv_bin(&mut bridge).await,
+        warmup,
+        "bridge reachable first"
+    );
+
+    // Bridge departs; its routing id goes offline. A subsequent device→bridge
+    // frame is undeliverable, closing the device 4004. Bounded event-driven
+    // retry across the server-side disconnect race.
+    drop(bridge);
+    let start_t = std::time::Instant::now();
+    loop {
+        assert!(
+            start_t.elapsed() < Duration::from_secs(10),
+            "no 4004 close after the bridge left"
+        );
+        send_bin(&mut device, data_frame(DEV_ROUTING, BRIDGE, b"ping")).await;
+        match tokio::time::timeout(Duration::from_millis(200), device.next()).await {
+            Ok(Some(Ok(Message::Close(Some(cf))))) => {
+                assert_eq!(u16::from(cf.code), 4004, "sender closed peer-gone");
+                return;
+            }
+            // A frame delivered before the bridge was reaped: retry.
+            Ok(Some(Ok(_))) | Err(_) => continue,
+            Ok(Some(Err(_))) | Ok(None) => panic!("device closed without a 4004 frame"),
+        }
+    }
 }
 
 #[tokio::test]
 async fn second_hello_same_routing_id_replaces_first_4009() {
     let url = start(base_config(None)).await;
+    // A live bridge must assert the device before either hello is admitted; keep
+    // it in scope so its soft state survives both device connections.
+    let _bridge = bridge_with_asserted_device(&url).await;
     let mut first = connect(&url).await;
     send_bin(&mut first, hello_frame(&device_hello())).await;
     let mut second = connect(&url).await;
@@ -341,9 +449,9 @@ async fn slow_client_that_never_sends_hello_is_dropped() {
 async fn connections_beyond_max_are_rejected() {
     let url = start(config_with_bounds(10, 2)).await;
 
-    // Two long-lived connections that complete hello and hold both permits.
-    let mut bridge = connect(&url).await;
-    send_bin(&mut bridge, hello_frame(&bridge_hello())).await;
+    // Two long-lived connections that complete hello and hold both permits: the
+    // bridge (which asserts the device) and the device it admits.
+    let bridge = bridge_with_asserted_device(&url).await;
     let mut device = connect(&url).await;
     send_bin(&mut device, hello_frame(&device_hello())).await;
 

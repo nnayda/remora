@@ -37,7 +37,8 @@ use std::time::{Duration, Instant};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use remora_protocol::{
-    DeviceId, Envelope, FrameType, HelloRole, RelayHello, ENVELOPE_HEADER_LEN, MAX_ENVELOPE_PAYLOAD,
+    DeviceId, Envelope, FrameType, HelloRole, RelayControl, RelayControlAck, RelayControlError,
+    RelayHello, ENVELOPE_HEADER_LEN, MAX_ENVELOPE_PAYLOAD,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
@@ -51,7 +52,8 @@ use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 use crate::audit::{AuditRecord, AuditSink, CloseReason};
 use crate::config::RelayConfig;
 use crate::router::{
-    outbound_channel, ConnPermit, HelloOutcome, OutboundReceiver, RouteOutcome, Router,
+    outbound_channel, ConnPermit, ControlOutcome, HelloOutcome, OutboundReceiver, RouteOutcome,
+    Router,
 };
 
 /// The largest inbound WebSocket message the relay accepts: a full envelope
@@ -363,8 +365,10 @@ async fn run_connection(
     let (final_tx, final_rx) = oneshot::channel::<CloseFrame>();
     let writer = tokio::spawn(writer_task(sink, out_rx, final_rx, stats.clone()));
 
-    // Data loop: only Data frames are legal; the reader also selects on its
-    // kill channel so another connection can shut it down (4008/4009) promptly.
+    // Post-hello loop: `Data`/`Pairing` route blindly, a bridge's `Control`
+    // frame is dispatched (D4), everything else closes the connection. The
+    // reader also selects on its kill channel so another connection can shut it
+    // down (4001/4008/4009) promptly.
     let close_reason = loop {
         tokio::select! {
             inbound = stream.next() => {
@@ -440,9 +444,9 @@ fn peer_unavailable_step(sender_role: HelloRole) -> DataStep {
     }
 }
 
-/// Handles one post-hello inbound message: routes a `Data` frame, or maps
-/// anything else to a close reason. On [`RouteOutcome::Overflow`] the *sender*
-/// keeps running and the slow *destination* is killed (spec D9).
+/// Handles one post-hello inbound message: routes a `Data`/`Pairing` frame,
+/// dispatches a bridge's `Control` frame (ADR-0021 D4), or maps anything else to
+/// a close reason.
 fn handle_data_message(
     msg: Message,
     router: &Router,
@@ -465,12 +469,37 @@ fn handle_data_message(
     let Ok(envelope) = Envelope::decode(&bytes) else {
         return DataStep::Close(CloseReason::Protocol);
     };
-    if envelope.frame_type != FrameType::Data {
-        // Hello-again, Pairing, PushTrigger post-hello are all illegal.
-        return DataStep::Close(CloseReason::Protocol);
+    match envelope.frame_type {
+        // `Data` and `Pairing` both flow device↔bridge blindly: the relay never
+        // inspects either payload and routes them by the same adjacency rules.
+        FrameType::Data | FrameType::Pairing => route_frame(
+            router,
+            permit,
+            registrar,
+            envelope.src,
+            envelope.dst,
+            bytes.to_vec(),
+        ),
+        // `Control` is a bridge→relay message the relay terminates (ADR-0021 D4):
+        // it is the only frame whose JSON the relay decodes.
+        FrameType::Control => dispatch_control(router, permit, registrar, &envelope.payload),
+        // Hello-again and PushTrigger post-hello are protocol violations.
+        FrameType::Hello | FrameType::PushTrigger => DataStep::Close(CloseReason::Protocol),
     }
+}
 
-    let (outcome, _victim) = router.route(permit, envelope.src, envelope.dst, bytes.to_vec());
+/// Routes one blind `Data`/`Pairing` envelope through [`Router::route`] and maps
+/// the outcome to the sender's next step. On [`RouteOutcome::Overflow`] the
+/// *sender* keeps running and the slow *destination* is killed (spec D9).
+fn route_frame(
+    router: &Router,
+    permit: &ConnPermit,
+    registrar: &Mutex<Registrar>,
+    src: DeviceId,
+    dst: DeviceId,
+    bytes: Vec<u8>,
+) -> DataStep {
+    let (outcome, _victim) = router.route(permit, src, dst, bytes);
     match outcome {
         RouteOutcome::Delivered => DataStep::Continue,
         // A gone peer closes only a *device* sender; a *bridge* addressing a
@@ -481,12 +510,106 @@ fn handle_data_message(
         RouteOutcome::Overflow => {
             // dst-kill: wake the slow destination's reader; the sender lives on.
             let reg = registrar.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(conn) = reg.conns.get(&envelope.dst) {
+            if let Some(conn) = reg.conns.get(&dst) {
                 let _ = conn.kill.send(CloseReason::BufferOverflow);
             }
             DataStep::Continue
         }
     }
+}
+
+/// Dispatches a bridge's relay-terminated [`RelayControl`] (ADR-0021 D4): decode
+/// the JSON, apply it via [`Router::handle_control`], reply an
+/// `RelayControlAck`/`RelayControlError` on the bridge's *own* outbound, and kick
+/// any de-asserted devices via their kill channels (4001).
+///
+/// A `Control` frame from a device (not a bridge) is a protocol violation → 4002.
+/// The relay decodes only this frame's JSON; `Data`/`Pairing` payloads stay
+/// opaque.
+fn dispatch_control(
+    router: &Router,
+    permit: &ConnPermit,
+    registrar: &Mutex<Registrar>,
+    payload: &[u8],
+) -> DataStep {
+    // Control is bridge→relay only; a device sending one is a protocol error.
+    if permit.role() != HelloRole::Bridge {
+        return DataStep::Close(CloseReason::Protocol);
+    }
+    let Ok(control) = serde_json::from_slice::<RelayControl>(payload) else {
+        return DataStep::Close(CloseReason::Protocol);
+    };
+    // The request `id` (echoed in the reply) is read before `handle_control`
+    // consumes the message. A successfully decoded control is always a known
+    // variant, so the fallback is unreachable.
+    let id = control_request_id(&control);
+    match router.handle_control(permit, control) {
+        ControlOutcome::Ack => {
+            reply_control(router, permit, control_ack_bytes(id));
+            DataStep::Continue
+        }
+        ControlOutcome::Error(message) => {
+            reply_control(router, permit, control_error_bytes(id, message));
+            DataStep::Continue
+        }
+        // Unreachable — the bridge role was checked above — but stay total.
+        ControlOutcome::NotBridge => DataStep::Close(CloseReason::Protocol),
+        ControlOutcome::KickDevices(routing_ids) => {
+            // De-asserted devices with live connections are kicked by routing id
+            // via the registrar kill channel (4001), then the assert is still
+            // acked so the bridge learns its roster change was applied.
+            {
+                let reg = registrar.lock().unwrap_or_else(|p| p.into_inner());
+                for routing_id in &routing_ids {
+                    if let Some(conn) = reg.conns.get(routing_id) {
+                        let _ = conn.kill.send(CloseReason::AuthFailure);
+                    }
+                }
+            }
+            reply_control(router, permit, control_ack_bytes(id));
+            DataStep::Continue
+        }
+    }
+}
+
+/// The correlation `id` a [`RelayControl`] carries, echoed in its reply. Every
+/// decodable variant has one; the fallback covers a future `#[non_exhaustive]`
+/// variant this build cannot decode (so it never actually runs).
+fn control_request_id(control: &RelayControl) -> u32 {
+    match control {
+        RelayControl::RegisterPairing { id, .. } => *id,
+        RelayControl::CancelPairing { id } => *id,
+        RelayControl::AssertDevices { id, .. } => *id,
+        _ => 0,
+    }
+}
+
+/// Encodes a relay-terminated reply envelope: `src` = [`DeviceId::ZERO`] (the
+/// relay), `dst` = the bridge's routing id.
+fn control_reply_frame(dst: DeviceId, payload: Vec<u8>) -> Vec<u8> {
+    Envelope {
+        frame_type: FrameType::Control,
+        src: DeviceId::ZERO,
+        dst,
+        payload,
+    }
+    .encode()
+}
+
+/// JSON payload of a [`RelayControlAck`] for request `id`.
+fn control_ack_bytes(id: u32) -> Vec<u8> {
+    serde_json::to_vec(&RelayControlAck { id }).unwrap_or_default()
+}
+
+/// JSON payload of a [`RelayControlError`] for request `id`.
+fn control_error_bytes(id: u32, message: String) -> Vec<u8> {
+    serde_json::to_vec(&RelayControlError { id, message }).unwrap_or_default()
+}
+
+/// Enqueues a relay-terminated control reply on the bridge's own outbound queue.
+fn reply_control(router: &Router, permit: &ConnPermit, payload: Vec<u8>) {
+    let routing_id = permit.routing_id();
+    router.enqueue_to(&routing_id, control_reply_frame(routing_id, payload));
 }
 
 /// Drains the outbound queue to the socket and, on the reader's signal, sends
