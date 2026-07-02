@@ -1,9 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { DirtyReasonDto, WorkspaceModeDto } from "./bindings";
+import {
+  commands,
+  type DetectedTerminalDto,
+  type DirtyReasonDto,
+  type WorkspaceModeDto,
+} from "./bindings";
 import { CollapsedRail } from "./CollapsedRail";
 import { ConfirmRemoveDialog } from "./ConfirmRemoveDialog";
 import { subscribeConfigChanged } from "./config-watch-listener";
 import { DiffPanel } from "./DiffPanel";
+import {
+  externalTerminalLabel,
+  runCopyAttach,
+  runOpenExternal,
+} from "./external-terminal";
 import { NewSessionDialog } from "./NewSessionDialog";
 import { SettingsDialog, type View as SettingsView } from "./SettingsDialog";
 import { Sidebar } from "./Sidebar";
@@ -38,6 +48,25 @@ import { useReconnect } from "./useReconnect";
 import { sessionStore, useSessions } from "./useSessions";
 
 export const APP_NAME = "Remora";
+
+/** Re-fetch the PATH-detected terminal list (Task 9's externalTerminalLabel
+ * input). Module-scope so effects can call it without listing a per-render
+ * closure as a dependency. */
+function refreshDetectedTerminals(
+  setDetectedTerminals: (terminals: DetectedTerminalDto[]) => void,
+) {
+  void commands
+    .externalTerminals()
+    .then((r) => {
+      if (r.status === "ok") setDetectedTerminals(r.data);
+    })
+    // Module-scope helper: no notice setter in scope here, and this is a
+    // background refresh (same guard-anyway rationale as the
+    // subscribeConfigChanged listen() failure below) — a failed IPC call
+    // should not become an unhandled rejection, but it's not worth
+    // interrupting the user over either.
+    .catch(() => {});
+}
 
 /** Single source of truth for the left sidebar's persisted width bounds. The
  * hook clamps to [min, effectiveMax(max)] and the ResizeHandle advertises the
@@ -80,12 +109,26 @@ function App() {
     refresh,
   } = useDiscovery();
 
+  // Terminals detected on PATH for the "Open in <Name>" menu label/action
+  // (Task 9's externalTerminalLabel). Not part of the discovery store's poll
+  // loop — fetched once on mount and again whenever config changes, since
+  // installing/configuring a terminal doesn't change session state.
+  const [detectedTerminals, setDetectedTerminals] = useState<
+    DetectedTerminalDto[]
+  >([]);
+  useEffect(() => {
+    refreshDetectedTerminals(setDetectedTerminals);
+  }, []);
+
   // Live-reload the sidebar when the config file changes on disk (backend
   // watcher emits ConfigChanged). Mirrors the manual refresh button.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
-    subscribeConfigChanged(() => void refresh())
+    subscribeConfigChanged(() => {
+      void refresh();
+      refreshDetectedTerminals(setDetectedTerminals);
+    })
       .then((fn) => {
         // If the effect already cleaned up before listen() resolved, unlisten
         // immediately; otherwise hand the cleanup the handle.
@@ -350,6 +393,45 @@ function App() {
       .catch(() => setNotice("Could not stop the session."));
   }
 
+  /** Launch the configured external terminal attached to this session. */
+  function onOpenExternal(node: SessionNode) {
+    setNotice(null);
+    void runOpenExternal(
+      {
+        open: (p, s, t) => commands.openExternalTerminal(p, s, t),
+        onNotConfigured: () => {
+          // No terminal configured (or ambiguous): the Settings list view
+          // hosts the External terminal row (initialView pattern, #161).
+          setSettingsView({ kind: "list" });
+          setSettingsOpen(true);
+        },
+        onError: (message) =>
+          setNotice(`Could not open the terminal: ${message}`),
+      },
+      node.projectId,
+      node.sessionId,
+    )
+      // The runner routes failures through onError, but guard anyway so an
+      // unexpected IPC throw can't become an unhandled rejection (see onStop).
+      .catch(() => setNotice("Could not open the terminal."));
+  }
+
+  /** Put the exact attach command on the clipboard (universal fallback). */
+  function onCopyAttach(node: SessionNode) {
+    setNotice(null);
+    void runCopyAttach(
+      {
+        copy: (p, s) => commands.copyAttachCommand(p, s),
+        onError: (message) =>
+          setNotice(`Could not copy the command: ${message}`),
+      },
+      node.projectId,
+      node.sessionId,
+    )
+      // Same guard-anyway rationale as onStop/onOpenExternal.
+      .catch(() => setNotice("Could not copy the command."));
+  }
+
   /** Open the remove confirm dialog for any session. A session whose removal
    * is already running in the background gets no dialog — confirming it would
    * only hit the store's busy-guard, and the row's spinner already says the
@@ -504,6 +586,15 @@ function App() {
     setDialogOpen(true);
   }
 
+  // Menu label for the primary "Open in <Name>" action (Task 9's
+  // externalTerminalLabel): the configured registry terminal's display name,
+  // the sole PATH-detected terminal when nothing is configured, or a generic
+  // fallback.
+  const externalLabel = externalTerminalLabel(
+    config?.terminal ?? null,
+    detectedTerminals,
+  );
+
   return (
     <main className={`rk-app rk-app--${mobilePane}`}>
       <div
@@ -541,6 +632,9 @@ function App() {
             configError={configError}
             discoveryUnavailable={discoveryUnavailable}
             onRefresh={() => void refresh()}
+            externalLabel={externalLabel}
+            onOpenExternal={onOpenExternal}
+            onCopyAttach={onCopyAttach}
             onStop={onStop}
             onRemove={onRemove}
             onNewSession={openNewSession}

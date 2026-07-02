@@ -57,6 +57,12 @@
   padding: var(--space-3) var(--space-2);
 }
 
+.settings-section__hint {
+  margin: 0;
+  font: var(--type-meta);
+  color: var(--text-muted);
+}
+
 .settings-row {
   display: flex;
   align-items: center;
