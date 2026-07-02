@@ -26,6 +26,12 @@ export interface SessionRowProps
    * spinner fills the status slot until it resolves, so a slow connect reads as
    * "working" rather than a dead click (#170). @default false */
   connecting?: boolean;
+  /** A remove for this session is running in the background (the confirm
+   * dialog closed immediately). A spinner fills the status slot until the
+   * teardown settles — the row then vanishes on success or returns to normal
+   * on failure. Takes precedence over `connecting` and the status dot.
+   * @default false */
+  removing?: boolean;
   /** Selected session. @default false */
   active?: boolean;
   /** Unread / queued count chip. */
@@ -43,6 +49,7 @@ export function SessionRow({
   state = "idle",
   connected = true,
   connecting = false,
+  removing = false,
   active = false,
   count = null,
   actions = null,
@@ -67,7 +74,15 @@ export function SessionRow({
     <div className={cls}>
       <button className="rmra-srow__main" {...props}>
         <span className="rmra-srow__pulse">
-          {connecting ? (
+          {removing ? (
+            // Remove in flight: same spinner as `connecting`, different label —
+            // the row is being torn down in the background, not opened.
+            <span
+              className="rmra-srow__spinner"
+              role="status"
+              aria-label="Removing…"
+            />
+          ) : connecting ? (
             // Open in flight: spin in the dot's footprint so a slow connect
             // reads as working, not a dead click (#170). Takes precedence over
             // the status dot — there is no live status to show yet.
