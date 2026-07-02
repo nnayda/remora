@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rand::RngCore as _;
+use rand::Rng as _;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
