@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Wire-protocol spec for third-party clients** ([`docs/PROTOCOL.md`](docs/PROTOCOL.md)):
+  documents the `remora-protocol` surface a third-party client implements —
+  the session protocol (ids, `SessionMeta`, the attached channel, the remote
+  request/response wrapper) and the relay envelope (ADR-0021): its byte
+  layout, frame types, `RelayHello`, `PROTOCOL_VERSION`/`ENVELOPE_VERSION`
+  negotiation and compatibility rules, the relay-mode connection sequence, and
+  what a blind relay does and does not see. Fulfils ADR-0002's promise that
+  third-party clients can target `remora-protocol` without us building them.
 - **Verified reproducible relay build**: the `remora-relay` container binary is
   now confirmed bit-for-bit reproducible (two clean-cache builds → identical
   sha256). `scripts/verify-relay-reproducible.sh` checks it and a weekly CI job
