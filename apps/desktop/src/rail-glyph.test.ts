@@ -62,8 +62,15 @@ describe("branchInitial", () => {
     expect(branchInitial(sessionNode("p", "   ", { branch: "  " }))).toBe("·");
   });
   it("handles a multi-byte first character without splitting it", () => {
+    // Precomposed "é" (single code point) and an astral emoji.
     expect(branchInitial(sessionNode("p", "s", { branch: "émile" }))).toBe("É");
     expect(branchInitial(sessionNode("p", "s", { branch: "🚀x" }))).toBe("🚀");
+  });
+  it("keeps a base + combining mark together as one grapheme cluster", () => {
+    // "e" + U+0301 (combining acute) — the decomposed form of "é".
+    // Splitting by code point would drop the mark and yield "E" instead of the
+    // composed "É"-class grapheme ("E" + U+0301).
+    expect(branchInitial(sessionNode("p", "s", { branch: "émain" }))).toBe("É");
   });
 });
 

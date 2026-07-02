@@ -535,6 +535,19 @@ describe("agent form", () => {
     expect(t.provision.content).toContain("7366;remora"); // wire marker
   });
 
+  it("claude template settings wire Notification AND PreToolUse(AskUserQuestion) to the notify script", () => {
+    const t = claudeMarkerTemplate();
+    const settings = JSON.parse(t.command[t.command.indexOf("--settings") + 1]);
+    const script = "$HOME/.remora/hooks/claude-notify.sh";
+    expect(settings.hooks.Notification[0].hooks[0].command).toBe(script);
+    // AskUserQuestion menus fire no immediate Notification (only a delayed
+    // generic permission_prompt nag), so the awaiting signal for them rides
+    // PreToolUse — scoped to that one tool so ordinary tool calls stay silent.
+    const pre = settings.hooks.PreToolUse[0];
+    expect(pre.matcher).toBe("AskUserQuestion");
+    expect(pre.hooks[0].command).toBe(script);
+  });
+
   describe("applyClaudeTemplate", () => {
     it("fills a blank command with the template outright", () => {
       const form = emptyAgentForm();

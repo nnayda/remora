@@ -3088,6 +3088,7 @@ name = "remora-desktop"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "notify",
  "notify-debouncer-full",
  "remora-core",

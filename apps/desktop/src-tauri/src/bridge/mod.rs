@@ -12,8 +12,9 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use futures_util::future::join_all;
 use remora_core::config::{Config, ConfigDocument, ConfigError, HostId};
-use remora_core::{SessionChannel, SessionSource, SourceError};
+use remora_core::{SessionChannel, SessionSource};
 
 use remora_protocol::{
     AgentId, ChannelInput, ChannelOutput, ProjectId, SessionId, SpawnSpec, TerminalSize,
@@ -224,19 +225,30 @@ impl Bridge {
         }
     }
 
-    /// One bucket per configured host. A host whose `source.list()` errors is
-    /// reported `available: false` with no sessions (the frontend retains its
-    /// last-good rows); only when *every* host fails do we return `Err` so the
-    /// sidebar shows the global "discovery unavailable" banner.
+    /// One bucket per configured host. Hosts are fanned out concurrently
+    /// (#101) rather than awaited one at a time, so a host that errors no
+    /// longer serializes discovery of the rest. `join_all` only resolves once
+    /// every host settles, and neither transport bounds its execution phase
+    /// (#99) — a host that hangs *after* connecting still blocks this whole
+    /// call, same as it did before this change. A host whose `source.list()`
+    /// errors is reported `available: false` with no sessions (the frontend
+    /// retains its last-good rows); only when *every* host fails do we return
+    /// `Err`, aggregating every host's cause, so the sidebar shows the global
+    /// "discovery unavailable" banner with the full picture rather than just
+    /// the last host to fail.
     pub async fn list(&self) -> Result<SessionListDto, BridgeError> {
         let config = Arc::new(self.load_config()?);
         let sources = self.resolver.all(&config);
         let total = sources.len();
+        let results = join_all(sources.into_iter().map(|(host_id, source)| async move {
+            let result = source.list().await;
+            (host_id, result)
+        }))
+        .await;
         let mut hosts: Vec<HostSessionsDto> = Vec::with_capacity(total);
-        let mut failed = 0usize;
-        let mut last_err: Option<SourceError> = None;
-        for (host_id, source) in sources {
-            match source.list().await {
+        let mut errors: Vec<String> = Vec::new();
+        for (host_id, result) in results {
+            match result {
                 Ok(ms) => {
                     let mut sessions: Vec<SessionMetaDto> =
                         ms.into_iter().map(Into::into).collect();
@@ -251,8 +263,7 @@ impl Bridge {
                     });
                 }
                 Err(e) => {
-                    failed += 1;
-                    last_err = Some(e);
+                    errors.push(format!("{host_id}: {e}"));
                     hosts.push(HostSessionsDto {
                         host_id: host_id.as_str().to_owned(),
                         available: false,
@@ -261,12 +272,12 @@ impl Bridge {
                 }
             }
         }
-        if total > 0 && failed == total {
+        if total > 0 && errors.len() == total {
             return Err(BridgeError::Transport {
-                message: match last_err {
-                    Some(e) => format!("all configured hosts are unreachable: {e}"),
-                    None => "all configured hosts are unreachable".into(),
-                },
+                message: format!(
+                    "all configured hosts are unreachable: {}",
+                    errors.join("; ")
+                ),
             });
         }
         Ok(SessionListDto { hosts })
@@ -1161,7 +1172,8 @@ mod tests {
     /// one that always errors on list(). The bridge must return the live one's
     /// sessions (partial), not error.
     struct TwoHostResolver;
-    struct ErroringSource;
+    /// A source whose `list()` always fails with the given message.
+    struct ErroringSource(&'static str);
     #[async_trait]
     impl SessionSource for ErroringSource {
         async fn spawn(&self, _: SpawnSpec) -> Result<SessionChannel, SourceError> {
@@ -1189,7 +1201,7 @@ mod tests {
             unreachable!()
         }
         async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
-            Err(SourceError::Transport("host down".into()))
+            Err(SourceError::Transport(self.0.into()))
         }
     }
     impl super::resolve::SourceResolver for TwoHostResolver {
@@ -1208,7 +1220,7 @@ mod tests {
                 ),
                 (
                     HostId::new("down").expect("id"),
-                    Arc::new(ErroringSource) as Arc<dyn SessionSource>,
+                    Arc::new(ErroringSource("host down")) as Arc<dyn SessionSource>,
                 ),
             ]
         }
@@ -1257,11 +1269,11 @@ mod tests {
             vec![
                 (
                     HostId::new("a").expect("id"),
-                    Arc::new(ErroringSource) as Arc<dyn SessionSource>,
+                    Arc::new(ErroringSource("host down")) as Arc<dyn SessionSource>,
                 ),
                 (
                     HostId::new("b").expect("id"),
-                    Arc::new(ErroringSource) as Arc<dyn SessionSource>,
+                    Arc::new(ErroringSource("host down")) as Arc<dyn SessionSource>,
                 ),
             ]
         }
@@ -1284,6 +1296,178 @@ mod tests {
             ),
             other => panic!("expected Transport, got {other:?}"),
         }
+    }
+
+    /// Two down hosts with *distinct* causes: the aggregated error must carry
+    /// both, not just the last host visited (#101).
+    struct TwoDistinctErrorsResolver;
+    impl super::resolve::SourceResolver for TwoDistinctErrorsResolver {
+        fn for_project(
+            &self,
+            _c: &Arc<Config>,
+            _p: &ProjectId,
+        ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+            unreachable!()
+        }
+        fn all(&self, _c: &Arc<Config>) -> Vec<(HostId, Arc<dyn SessionSource>)> {
+            vec![
+                (
+                    HostId::new("alpha").expect("id"),
+                    Arc::new(ErroringSource("alpha unreachable")) as Arc<dyn SessionSource>,
+                ),
+                (
+                    HostId::new("beta").expect("id"),
+                    Arc::new(ErroringSource("beta unreachable")) as Arc<dyn SessionSource>,
+                ),
+            ]
+        }
+    }
+
+    #[tokio::test]
+    async fn list_all_down_error_aggregates_every_host_cause() {
+        let b = Bridge::with_spawner(
+            Arc::new(TwoDistinctErrorsResolver),
+            temp_config_path("alldown-distinct"),
+            Arc::new(|fut| {
+                tokio::spawn(fut);
+            }),
+        );
+        let err = b.list().await.expect_err("all hosts down should error");
+        match err {
+            BridgeError::Transport { message } => {
+                assert!(
+                    message.contains("alpha unreachable"),
+                    "missing alpha's cause: {message}"
+                );
+                assert!(
+                    message.contains("beta unreachable"),
+                    "missing beta's cause: {message}"
+                );
+            }
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
+
+    /// A source whose `list()` sleeps while recording how many *other*
+    /// `list()` calls (across all hosts sharing this counter) are in flight at
+    /// the same time. If the bridge still awaited hosts one at a time, the
+    /// observed peak would never exceed 1.
+    struct ConcurrencyProbeSource {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl SessionSource for ConcurrencyProbeSource {
+        async fn spawn(&self, _: SpawnSpec) -> Result<SessionChannel, SourceError> {
+            unreachable!()
+        }
+        async fn attach(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+        ) -> Result<SessionChannel, SourceError> {
+            unreachable!()
+        }
+        async fn respawn(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+            _: Option<AgentId>,
+        ) -> Result<SessionChannel, SourceError> {
+            unreachable!()
+        }
+        async fn stop(&self, _: &ProjectId, _: &SessionId) -> Result<(), SourceError> {
+            unreachable!()
+        }
+        async fn remove(&self, _: &ProjectId, _: &SessionId, _: bool) -> Result<(), SourceError> {
+            unreachable!()
+        }
+        async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
+            use std::sync::atomic::Ordering as O;
+            let now = self.active.fetch_add(1, O::SeqCst) + 1;
+            self.peak.fetch_max(now, O::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            self.active.fetch_sub(1, O::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+    struct ConcurrencyProbeResolver {
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+        host_count: usize,
+    }
+    impl super::resolve::SourceResolver for ConcurrencyProbeResolver {
+        fn for_project(
+            &self,
+            _c: &Arc<Config>,
+            _p: &ProjectId,
+        ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+            unreachable!()
+        }
+        fn all(&self, _c: &Arc<Config>) -> Vec<(HostId, Arc<dyn SessionSource>)> {
+            let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (0..self.host_count)
+                .map(|i| {
+                    (
+                        HostId::new(format!("h{i}")).expect("id"),
+                        Arc::new(ConcurrencyProbeSource {
+                            active: Arc::clone(&active),
+                            peak: Arc::clone(&self.peak),
+                        }) as Arc<dyn SessionSource>,
+                    )
+                })
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn list_fans_out_hosts_concurrently() {
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let host_count = 3;
+        let b = Bridge::with_spawner(
+            Arc::new(ConcurrencyProbeResolver {
+                peak: Arc::clone(&peak),
+                host_count,
+            }),
+            temp_config_path("concurrency-probe"),
+            Arc::new(|fut| {
+                tokio::spawn(fut);
+            }),
+        );
+        b.list().await.expect("list");
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            host_count,
+            "all hosts' list() calls should have been in flight at once"
+        );
+    }
+
+    /// A resolver with no configured hosts at all — `join_all` over an empty
+    /// iterator must still resolve to `Ok` with no buckets, not hang or error.
+    struct NoHostsResolver;
+    impl super::resolve::SourceResolver for NoHostsResolver {
+        fn for_project(
+            &self,
+            _c: &Arc<Config>,
+            _p: &ProjectId,
+        ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+            unreachable!()
+        }
+        fn all(&self, _c: &Arc<Config>) -> Vec<(HostId, Arc<dyn SessionSource>)> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn list_with_no_configured_hosts_is_empty_ok() {
+        let b = Bridge::with_spawner(
+            Arc::new(NoHostsResolver),
+            temp_config_path("no-hosts"),
+            Arc::new(|fut| {
+                tokio::spawn(fut);
+            }),
+        );
+        let result = b.list().await.expect("no hosts is not an error");
+        assert!(result.hosts.is_empty());
     }
 
     #[tokio::test]
