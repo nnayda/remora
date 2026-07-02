@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-session collapsed rail** (#184): the collapsed left sidebar now shows one
+  navigable glyph per session instead of one avatar per host. Clicking a glyph
+  focuses/opens that session (it used to only expand the rail). Sessions are
+  grouped by project through a shared per-project icon (shape, assigned by
+  position so up to 8 projects stay distinct), a hairline divider, and spacing;
+  each glyph carries a mono branch-initial so same-project sessions are
+  distinguishable, plus its own activity dot. The grouping is deliberately
+  **marine-only** — DESIGN.md's rule is one brand accent, so the issue's literal
+  "color-coded by project" is delivered the DESIGN.md-native way (shape + spacing,
+  never hue-alone), which is also colorblind-safe by construction. Note: projects
+  with zero sessions no longer appear in the collapsed rail (it reflects actual
+  sessions now). New keyboard focus ring and 44px touch targets on the glyphs.
 - **Launch-time Claude activity-marker hook injection** (#196): a new
   "Claude Code (activity markers)" template on the desktop's new-agent form
   fills in a `--settings` flag wiring Claude Code's Notification hook to

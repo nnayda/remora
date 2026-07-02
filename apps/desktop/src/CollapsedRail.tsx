@@ -1,25 +1,22 @@
 import type { ActivityState } from "./activity-store";
-import { hostIndicatorState } from "./host-activity";
-import type { ProjectNode } from "./session-tree";
+import { type RailEntry, railEntries } from "./rail-glyph";
+import type { ProjectNode, SessionNode } from "./session-tree";
 import { SIDEBAR_EXPAND_LABEL } from "./sidebar-labels";
 import type { IndicatorState } from "./status-state";
-import { Avatar, IconButton, StatusIndicator, Tooltip, useTheme } from "./ui";
+import { IconButton, StatusIndicator, Tooltip, useTheme } from "./ui";
 import { ChevronRight, Moon, Settings, Sun } from "./ui/icons";
 
 interface CollapsedRailProps {
   tree: ProjectNode[];
   activeKey: string | null;
   openKeys: Set<string>;
+  connectingKeys: Set<string>;
   activity: ReadonlyMap<string, ActivityState>;
+  /** Focus/open a session (same handler the expanded sidebar uses). */
+  onOpenSession: (node: SessionNode) => void;
   /** Expand back to the full sidebar. */
   onExpand: () => void;
   onOpenSettings: () => void;
-}
-
-interface HostEntry {
-  label: string;
-  sessions: ProjectNode["sessions"];
-  hasActive: boolean;
 }
 
 /** Map an IndicatorState to a human-readable phrase for aria-labels. */
@@ -38,44 +35,33 @@ function activityPhrase(state: IndicatorState): string {
   }
 }
 
-/** Group projects by host label (deduped, tree order) for the narrow rail. */
-function hostsFromTree(
-  tree: ProjectNode[],
-  activeKey: string | null,
-): HostEntry[] {
-  const order: string[] = [];
-  const byHost = new Map<string, HostEntry>();
-  for (const project of tree) {
-    let entry = byHost.get(project.hostLabel);
-    if (!entry) {
-      entry = { label: project.hostLabel, sessions: [], hasActive: false };
-      byHost.set(project.hostLabel, entry);
-      order.push(project.hostLabel);
-    }
-    entry.sessions = entry.sessions.concat(project.sessions);
-    if (project.sessions.some((s) => s.key === activeKey))
-      entry.hasActive = true;
-  }
-  return order.map((label) => byHost.get(label) as HostEntry);
-}
-
 /**
  * The 56px consolidated rail shown when the sidebar is collapsed: an expand
- * toggle, one avatar per host with an aggregate activity dot, and the theme +
- * settings foot. Errors/banners are intentionally not shown here (no room) —
- * they surface when expanded. Purely navigational.
+ * toggle, one glyph PER SESSION (project icon = shape identity, a mono
+ * branch-initial to tell same-project sessions apart, a per-session activity
+ * dot), and the theme + settings foot. Grouping is by shape + a hairline
+ * divider — marine-only, no color (see #184 / DESIGN.md). Purely navigational;
+ * errors/banners surface only when expanded.
  */
 export function CollapsedRail({
   tree,
   activeKey,
   openKeys,
+  connectingKeys,
   activity,
+  onOpenSession,
   onExpand,
   onOpenSettings,
 }: CollapsedRailProps) {
   const { theme, cycle } = useTheme();
   const ThemeIcon = theme === "dark" ? Moon : Sun;
-  const hosts = hostsFromTree(tree, activeKey);
+  const entries = railEntries(
+    tree,
+    activeKey,
+    openKeys,
+    activity,
+    connectingKeys,
+  );
 
   return (
     <nav className="rk-railmini" aria-label="Sessions (collapsed)">
@@ -85,25 +71,51 @@ export function CollapsedRail({
         </IconButton>
       </div>
 
-      <div className="rk-railmini__hosts">
-        {hosts.map((host) => {
-          const state = hostIndicatorState(host.sessions, openKeys, activity);
-          const count = host.sessions.length;
+      <div className="rk-railmini__sessions">
+        {entries.map((entry: RailEntry) => {
+          const { Icon } = entry;
+          const cls = [
+            "rk-railmini__session",
+            entry.active ? "is-active" : "",
+            entry.reconnecting ? "is-reconnecting" : "",
+            entry.dividerBefore ? "is-project-start" : "",
+          ]
+            .filter(Boolean)
+            .join(" ");
+          const activityLabel =
+            entry.connected || entry.connecting
+              ? `, ${entry.connecting ? "connecting" : activityPhrase(entry.status)}`
+              : "";
           return (
-            <Tooltip key={host.label} content={host.label} side="right">
+            <Tooltip
+              key={entry.key}
+              content={`${entry.branchLabel} · ${entry.hostLabel}`}
+              side="right"
+            >
               <button
                 type="button"
-                className={
-                  host.hasActive
-                    ? "rk-railmini__host is-active"
-                    : "rk-railmini__host"
-                }
-                aria-current={host.hasActive ? "page" : undefined}
-                aria-label={`${host.label}, ${count} session${count === 1 ? "" : "s"}, ${activityPhrase(state)}`}
-                onClick={onExpand}
+                className={cls}
+                aria-current={entry.active ? "page" : undefined}
+                aria-label={`${entry.branchLabel}, ${entry.hostLabel}${activityLabel}`}
+                onClick={() => onOpenSession(entry.session)}
               >
-                <Avatar shape="circle" size="sm" name={host.label} />
-                <StatusIndicator state={state} />
+                <span className="rk-railmini__glyph">
+                  <Icon size={18} />
+                  <span className="rk-railmini__initial" aria-hidden="true">
+                    {entry.initial}
+                  </span>
+                </span>
+                <span className="rk-railmini__dot">
+                  {entry.connecting ? (
+                    <span
+                      className="rk-railmini__spinner"
+                      role="status"
+                      aria-label="Connecting…"
+                    />
+                  ) : entry.connected ? (
+                    <StatusIndicator state={entry.status} />
+                  ) : null}
+                </span>
               </button>
             </Tooltip>
           );
