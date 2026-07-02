@@ -2,13 +2,17 @@ import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import { AgentForm } from "./AgentForm";
 import type {
   AgentInputDto,
+  DetectedTerminalDto,
   EditorAgentDto,
   EditorHostDto,
   EditorProjectDto,
   HostInputDto,
   ProjectInputDto,
+  TerminalPreferenceDto,
 } from "./bindings";
+import { commands } from "./bindings";
 import {
+  getConfig,
   getEditableConfig,
   insertAgent,
   insertHost,
@@ -25,8 +29,17 @@ import { formErrorMessage } from "./form-error";
 import { HostForm } from "./HostForm";
 import { ProjectForm } from "./ProjectForm";
 import "./SettingsDialog.css";
-import { Button, Dialog, IconButton } from "./ui";
-import { Cpu, Folder, Plus, Server, Settings, Trash } from "./ui/icons";
+import { type TerminalRowModel, terminalRowModel } from "./terminal-row-model";
+import { Button, Dialog, IconButton, Select } from "./ui";
+import {
+  Cpu,
+  Folder,
+  Plus,
+  Server,
+  Settings,
+  Terminal as TerminalIcon,
+  Trash,
+} from "./ui/icons";
 
 interface SettingsDialogProps {
   /** Re-read the sidebar's (redacted) config after a mutation. */
@@ -61,6 +74,15 @@ export function SettingsDialog({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [listError, setListError] = useState<string | null>(null);
   const [view, setView] = useState<View>(initialView);
+  // The editable config (above) has no `terminal` field — it's a separate,
+  // non-editor read of the live ConfigDto plus a fresh PATH probe. Fetched
+  // once on open (no polling); `terminalPref` is updated locally after a
+  // successful save so the row reflects it without a full config re-read.
+  const [terminalPref, setTerminalPref] =
+    useState<TerminalPreferenceDto | null>(null);
+  const [detectedTerminals, setDetectedTerminals] = useState<
+    DetectedTerminalDto[]
+  >([]);
   // Anchored inside the presentational Dialog body; the focus trap operates on
   // the enclosing `.rmra-dialog` element resolved via `dialogRoot()`.
   const anchorRef = useRef<HTMLDivElement>(null);
@@ -81,6 +103,30 @@ export function SettingsDialog({
     getEditableConfig()
       .then((dto) => {
         if (live) setModel(buildSettingsModel(dto));
+      })
+      .catch((err) => {
+        if (live) setLoadError(formErrorMessage(err));
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  // Fresh terminal-picker data on open: a PATH probe (external terminals can
+  // be installed/removed between opens) plus the current preference. Separate
+  // from the editable-config load above since EditorConfigDto carries no
+  // `terminal` field. Failures land in the same banner as the sibling initial
+  // load — both are "the dialog could not read its data" conditions.
+  useEffect(() => {
+    let live = true;
+    commands.externalTerminals().then((r) => {
+      if (!live) return;
+      if (r.status === "ok") setDetectedTerminals(r.data);
+      else setLoadError(formErrorMessage(r.error));
+    });
+    getConfig()
+      .then((config) => {
+        if (live) setTerminalPref(config.terminal);
       })
       .catch((err) => {
         if (live) setLoadError(formErrorMessage(err));
@@ -180,6 +226,26 @@ export function SettingsDialog({
       .catch((err) => setListError(formErrorMessage(err)));
   }
 
+  /** Write the terminal preference (registry id, or null to clear). The
+   * custom-argv form is read-only and never reaches this path. On success,
+   * re-read the preference from the config and refresh the sidebar — the
+   * write-then-re-fetch convergence the entity mutations get from `reload`. */
+  function setTerminal(id: string | null) {
+    setListError(null);
+    void commands.configSetTerminal(id).then(async (r) => {
+      if (r.status === "error") {
+        setListError(formErrorMessage(r.error));
+        return;
+      }
+      try {
+        setTerminalPref((await getConfig()).terminal);
+      } catch (err) {
+        setListError(formErrorMessage(err));
+      }
+      onConfigChanged();
+    });
+  }
+
   // Forms render their own actions; the list/error states get a Close footer.
   const footer =
     view.kind === "list" && model !== null ? (
@@ -244,6 +310,8 @@ export function SettingsDialog({
           <SettingsList
             model={model}
             listError={listError}
+            terminalModel={terminalRowModel(terminalPref, detectedTerminals)}
+            onSetTerminal={setTerminal}
             onAdd={(kind) => {
               setListError(null);
               setView({ kind, mode: "create" });
@@ -270,6 +338,8 @@ export function SettingsDialog({
 interface SettingsListProps {
   model: SettingsModel;
   listError: string | null;
+  terminalModel: TerminalRowModel;
+  onSetTerminal: (id: string | null) => void;
   onAdd: (kind: "host" | "project" | "agent") => void;
   onEditHost: (initial: EditorHostDto) => void;
   onEditProject: (initial: EditorProjectDto) => void;
@@ -279,10 +349,13 @@ interface SettingsListProps {
   onRemoveAgent: (id: string) => void;
 }
 
-/** The list body: three entity sections, or the degraded-recovery view. */
+/** The list body: three entity sections plus the terminal picker, or the
+ * degraded-recovery view. */
 function SettingsList({
   model,
   listError,
+  terminalModel,
+  onSetTerminal,
   onAdd,
   onEditHost,
   onEditProject,
@@ -362,6 +435,7 @@ function SettingsList({
           />
         ))}
       </Section>
+      <TerminalSection model={terminalModel} onSetTerminal={onSetTerminal} />
     </div>
   );
 }
@@ -376,7 +450,12 @@ function DegradedRecovery({
   onRemoveAgent,
 }: Omit<
   SettingsListProps,
-  "onAdd" | "onEditHost" | "onEditProject" | "onEditAgent"
+  | "onAdd"
+  | "onEditHost"
+  | "onEditProject"
+  | "onEditAgent"
+  | "terminalModel"
+  | "onSetTerminal"
 >) {
   return (
     <div className="settings-body">
@@ -454,6 +533,56 @@ function DegradedSection({
           </li>
         ))}
       </ul>
+    </section>
+  );
+}
+
+/** The terminal-preference row (spec §4 / Task 9): a dropdown over
+ * PATH-detected terminals, or a read-only display when the config carries a
+ * hand-authored argv. The dropdown only ever writes the registry-id form
+ * (`onSetTerminal`) — a custom command is never shown as editable, so a
+ * Settings save can't clobber it. Has no "Add" — unlike the entity sections,
+ * this is a single setting, not a repeatable list. */
+function TerminalSection({
+  model,
+  onSetTerminal,
+}: {
+  model: TerminalRowModel;
+  onSetTerminal: (id: string | null) => void;
+}) {
+  return (
+    <section className="settings-section">
+      <div className="settings-section__head">
+        <span className="settings-section__title">
+          <TerminalIcon size={14} />
+          External terminal
+        </span>
+      </div>
+      {model.mode === "custom" ? (
+        <p className="settings-section__hint">{model.display}</p>
+      ) : (
+        <>
+          <Select
+            aria-label="External terminal"
+            value={model.current ?? ""}
+            onChange={(value) => onSetTerminal(value === "" ? null : value)}
+            options={[
+              { value: "", label: "Not set" },
+              ...model.options.map((t) => ({ value: t.id, label: t.name })),
+              ...(model.current !== null &&
+              !model.options.some((t) => t.id === model.current)
+                ? [
+                    {
+                      value: model.current,
+                      label: `${model.current} (not installed)`,
+                    },
+                  ]
+                : []),
+            ]}
+          />
+          <p className="settings-section__hint">{model.hint}</p>
+        </>
+      )}
     </section>
   );
 }
