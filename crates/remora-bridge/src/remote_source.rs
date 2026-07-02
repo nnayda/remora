@@ -54,7 +54,7 @@ use remora_protocol::{
 };
 
 use crate::identity::PairingFile;
-use crate::noise::{chunk_bytes, prologue, Handshake, NoiseError, Transport};
+use crate::noise::{chunk_bytes, prologue, Handshake, HandshakeKind, NoiseError, Transport};
 use crate::wire_error::map_wire_error;
 
 /// Length of the plaintext identity preamble prefixing a client's first
@@ -155,7 +155,7 @@ impl RemoteSource {
 
         // --- Noise IKpsk2 as initiator. The prologue binds this exact route
         // (identity, routing id, bridge id); the bridge builds the same one. ---
-        let bound = prologue(&device_id, &routing_id, &bridge_id);
+        let bound = prologue(HandshakeKind::Session, &device_id, &routing_id, &bridge_id);
         let mut hs =
             Handshake::initiator(&device_priv, &bridge_pub, &psk, &bound).map_err(noise_err)?;
         let msg1 = hs.write_message(&[]).map_err(noise_err)?;

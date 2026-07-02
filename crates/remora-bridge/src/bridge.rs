@@ -59,7 +59,7 @@ use remora_protocol::{
 };
 
 use crate::identity::{BridgeIdentity, Roster};
-use crate::noise::{chunk_bytes, prologue, Handshake, Transport};
+use crate::noise::{chunk_bytes, prologue, Handshake, HandshakeKind, Transport};
 use crate::wire_error::map_source_error;
 
 /// Length of a [`DeviceId`], and of the plaintext identity preamble that
@@ -504,7 +504,12 @@ async fn handshake(
 
     // The prologue binds this exact route; a forged identity/routing yields a
     // different prologue than the honest client used, failing the handshake.
-    let bound = prologue(&initiator_identity, routing_id, &deps.bridge_id);
+    let bound = prologue(
+        HandshakeKind::Session,
+        &initiator_identity,
+        routing_id,
+        &deps.bridge_id,
+    );
     let mut hs = Handshake::responder(&deps.bridge_static_priv, &entry.psk, &bound).ok()?;
     hs.read_message(msg1).ok()?;
     let msg2 = hs.write_message(&[]).ok()?;

@@ -27,8 +27,8 @@ pub use identity::{
     provision_device, BridgeIdentity, IdentityError, PairingFile, Roster, RosterEntry,
 };
 pub use noise::{
-    chunk_bytes, prologue, Handshake, NoiseError, Transport, MAX_NOISE_PLAINTEXT, NOISE_PATTERN,
-    PTY_CHUNK_BYTES,
+    chunk_bytes, prologue, Handshake, HandshakeKind, NoiseError, Transport, MAX_NOISE_PLAINTEXT,
+    NOISE_PATTERN, PTY_CHUNK_BYTES,
 };
 pub use remote_source::RemoteSource;
 pub use wire_error::{map_source_error, map_wire_error};

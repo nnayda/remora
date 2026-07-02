@@ -40,8 +40,8 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
 use remora_bridge::{
-    prologue, provision_device, serve_bridge, BridgeConfig, BridgeIdentity, Handshake, PairingFile,
-    RemoteSource, Roster, Transport,
+    prologue, provision_device, serve_bridge, BridgeConfig, BridgeIdentity, Handshake,
+    HandshakeKind, PairingFile, RemoteSource, Roster, Transport,
 };
 use remora_core::{
     ExclusiveSource, FakeSessionSource, SessionChannel, SessionLocks, SessionSource,
@@ -508,7 +508,7 @@ impl RawClient {
         )
         .await;
 
-        let bound = prologue(&device_id, &routing_id, &bridge_id);
+        let bound = prologue(HandshakeKind::Session, &device_id, &routing_id, &bridge_id);
         let mut hs =
             Handshake::initiator(&device_priv, &bridge_pub, &psk, &bound).expect("build initiator");
         let msg1 = hs.write_message(&[]).expect("write msg1");
