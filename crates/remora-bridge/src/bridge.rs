@@ -44,7 +44,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -59,10 +59,10 @@ use tokio_util::sync::CancellationToken;
 
 use remora_core::{sanitize, SessionSource};
 use remora_protocol::{
-    AssertedDevice, BridgeMessage, ChannelInput, ChannelOutput, ClientMessage, DeviceId, Envelope,
-    FrameType, HelloRole, PairingBridgeMsg, PairingClientMsg, PairingCode, PairingRejectReason,
-    RelayControl, RelayControlAck, RelayControlError, RelayHello, RemoteOp, RemoteResult,
-    WireError, PROTOCOL_VERSION,
+    AssertedDevice, BridgeMessage, ChannelInput, ChannelOutput, ClientMessage, DeviceId,
+    DeviceInfo, Envelope, FrameType, HelloRole, PairingBridgeMsg, PairingClientMsg, PairingCode,
+    PairingRejectReason, RelayControl, RelayControlAck, RelayControlError, RelayHello, RemoteOp,
+    RemoteResult, WireError, PROTOCOL_VERSION,
 };
 
 use crate::identity::{fingerprint, BridgeIdentity, IdentityError, Roster, RosterEntry};
@@ -85,6 +85,16 @@ const MAX_DEVICE_NAME_CHARS: usize = 64;
 /// waiters) and a spawned pairing task (which registers one for its assert). Each
 /// value is completed with `Ok(())` on ack or `Err(message)` on a relay error.
 type ControlWaiters = Arc<Mutex<HashMap<u32, oneshot::Sender<Result<(), String>>>>>;
+
+/// Live authenticated peer sessions, keyed by the peer's roster-proven
+/// `device_id`, so revoking a device can sever every live session that device
+/// currently holds bridge-side — the authoritative kick (ADR-0021 D6: the roster
+/// is the boundary; the relay re-assert is defense-in-depth). One device may
+/// hold several sessions at once (D16: each attach is its own connection), so
+/// each device maps to a set of `(registration id → cancellation token)`; the
+/// registration id lets a peer task deregister exactly its own slot on exit
+/// without disturbing a sibling session that reused the same `device_id`.
+type LivePeers = Arc<Mutex<HashMap<DeviceId, HashMap<u64, CancellationToken>>>>;
 
 /// Length of a [`DeviceId`], and of the plaintext identity preamble that
 /// prefixes a client's first (handshake) frame (spec D16).
@@ -279,6 +289,73 @@ struct PeerDeps {
     roster_path: PathBuf,
     /// The local session source the bridge serves.
     source: Arc<dyn SessionSource>,
+    /// Live authenticated peer sessions keyed by `device_id`, so a revocation
+    /// (from a wire `RevokeDevice` or a `PairingCommand::Revoke`) can cancel
+    /// every live session that device holds. Shared across every connection and
+    /// peer task (ADR-0021 D6 bridge-side kick).
+    live_peers: LivePeers,
+    /// Monotonic source of per-session registration ids for [`LivePeers`], unique
+    /// for this bridge process so two sessions (even on different connections)
+    /// never collide on a slot key.
+    next_peer_reg: AtomicU64,
+}
+
+/// Deregisters a peer's [`LivePeers`] slot when the peer task returns, for any
+/// reason. Mirrors [`DoneGuard`]/[`CancelGuard`]: registration is RAII so a
+/// revocation kick never targets a session that has already ended.
+struct LivePeerGuard {
+    live_peers: LivePeers,
+    device_id: DeviceId,
+    reg_id: u64,
+}
+
+impl Drop for LivePeerGuard {
+    fn drop(&mut self) {
+        // A poisoned lock (a holder panicked) leaves the map unmutated; a stale
+        // token there can only over-cancel an already-returning task, never a
+        // wrong device, so it is harmless.
+        if let Ok(mut map) = self.live_peers.lock() {
+            if let Some(slots) = map.get_mut(&self.device_id) {
+                slots.remove(&self.reg_id);
+                if slots.is_empty() {
+                    map.remove(&self.device_id);
+                }
+            }
+        }
+    }
+}
+
+/// Registers `token` as `device_id`'s live session under `reg_id`, returning an
+/// RAII guard that deregisters it on drop. `None` only if the shared lock is
+/// poisoned — the caller then serves without kick-registration (the relay
+/// re-assert still revokes; the roster is the boundary).
+fn register_live_peer(
+    live_peers: &LivePeers,
+    device_id: DeviceId,
+    reg_id: u64,
+    token: CancellationToken,
+) -> Option<LivePeerGuard> {
+    let mut map = live_peers.lock().ok()?;
+    map.entry(device_id).or_default().insert(reg_id, token);
+    drop(map);
+    Some(LivePeerGuard {
+        live_peers: live_peers.clone(),
+        device_id,
+        reg_id,
+    })
+}
+
+/// Cancels every live session held by `device_id` (the bridge-side revocation
+/// kick). A no-op when the device has no live session.
+fn cancel_live_peers(device_id: &DeviceId, live_peers: &LivePeers) {
+    let Ok(map) = live_peers.lock() else {
+        return;
+    };
+    if let Some(slots) = map.get(device_id) {
+        for token in slots.values() {
+            token.cancel();
+        }
+    }
 }
 
 /// Why one connection attempt ended — drives the backoff decision.
@@ -529,6 +606,8 @@ pub async fn serve_bridge(
         roster: config.roster.clone(),
         roster_path: config.roster_path.clone(),
         source,
+        live_peers: Arc::new(Mutex::new(HashMap::new())),
+        next_peer_reg: AtomicU64::new(0),
     });
 
     // Correlation ids for relay control requests, monotonic across reconnects so
@@ -910,6 +989,7 @@ fn dispatch_inbound(
             outbound_tx.clone(),
             done_tx.clone(),
             generation,
+            control_seq.clone(),
             conn_token.clone(),
         ));
     }
@@ -1505,6 +1585,7 @@ async fn send_pairing_msg(
 }
 
 /// One client peer's whole lifecycle: Noise handshake, E2E hello, then serve.
+#[allow(clippy::too_many_arguments)]
 async fn run_peer(
     routing_id: DeviceId,
     mut frame_rx: mpsc::Receiver<Vec<u8>>,
@@ -1512,6 +1593,7 @@ async fn run_peer(
     outbound_tx: mpsc::Sender<Message>,
     done_tx: mpsc::UnboundedSender<(DeviceId, u64)>,
     generation: u64,
+    control_seq: Arc<AtomicU32>,
     conn_token: CancellationToken,
 ) {
     // Reap this peer's registry slot when the task returns for *any* reason —
@@ -1522,17 +1604,22 @@ async fn run_peer(
         src: routing_id,
         generation,
     };
-    let Some(transport) =
+    // The handshake yields the roster-proven `device_id` (the authenticated
+    // identity), distinct from the relay routing id: revocation targets the
+    // device, so the serve loop keys its live-session registration by it.
+    let Some((transport, device_id)) =
         handshake(&routing_id, &mut frame_rx, &deps, &outbound_tx, &conn_token).await
     else {
         return; // any handshake / auth failure drops just this peer
     };
     serve_peer(
         routing_id,
+        device_id,
         frame_rx,
         transport,
         deps,
         outbound_tx,
+        control_seq,
         conn_token,
     )
     .await;
@@ -1540,14 +1627,16 @@ async fn run_peer(
 
 /// Drives the responder side of the Noise handshake from the peer's first
 /// frame, verifying the authenticated static against the roster. Returns the
-/// established [`Transport`], or `None` to drop the peer.
+/// established [`Transport`] paired with the roster-proven `device_id` (the
+/// initiator's claimed identity, now Noise-authenticated against its pinned
+/// static), or `None` to drop the peer.
 async fn handshake(
     routing_id: &DeviceId,
     frame_rx: &mut mpsc::Receiver<Vec<u8>>,
     deps: &Arc<PeerDeps>,
     outbound_tx: &mpsc::Sender<Message>,
     conn_token: &CancellationToken,
-) -> Option<Transport> {
+) -> Option<(Transport, DeviceId)> {
     let first = tokio::select! {
         _ = conn_token.cancelled() => return None,
         f = frame_rx.recv() => f?,
@@ -1587,7 +1676,7 @@ async fn handshake(
     if remote_static.is_empty() || remote_static != static_pubkey {
         return None;
     }
-    Some(transport)
+    Some((transport, initiator_identity))
 }
 
 /// Reads the peer's first post-handshake frame (its E2E hello), bounded by
@@ -1612,26 +1701,36 @@ async fn recv_hello_frame(
 
 /// After a good handshake: the strict E2E hello exchange, then the serve loop
 /// (request/response + the attached PTY stream). Owns `transport` outright.
+#[allow(clippy::too_many_arguments)]
 async fn serve_peer(
     routing_id: DeviceId,
+    device_id: DeviceId,
     mut frame_rx: mpsc::Receiver<Vec<u8>>,
     mut transport: Transport,
     deps: Arc<PeerDeps>,
     outbound_tx: mpsc::Sender<Message>,
+    control_seq: Arc<AtomicU32>,
     conn_token: CancellationToken,
 ) {
     let bridge_id = deps.bridge_id;
 
     // A peer-scoped token (child of the connection token) so returning from
-    // this task — for any reason — stops the peer's pump task promptly.
+    // this task — for any reason — stops the peer's pump task promptly, and so a
+    // revocation of this `device_id` can cancel *this* session directly. As a
+    // child of `conn_token` it still fires on a connection-wide teardown.
     let peer_token = conn_token.child_token();
     let _guard = CancelGuard(peer_token.clone());
+
+    // Register this authenticated session so revoking `device_id` severs it
+    // bridge-side (ADR-0021 D6). Deregistered by the RAII guard on any exit.
+    let reg_id = deps.next_peer_reg.fetch_add(1, Ordering::Relaxed);
+    let _live_guard = register_live_peer(&deps.live_peers, device_id, reg_id, peer_token.clone());
 
     // --- E2E hello: the client's first application message must be Hello. A
     // paired client that completes the handshake but never sends it is dropped
     // once PEER_HELLO_TIMEOUT elapses, so the peer task + registry slot are
     // reaped instead of pinned forever (#231). ---
-    let Some(hello_frame) = recv_hello_frame(&mut frame_rx, &conn_token, PEER_HELLO_TIMEOUT).await
+    let Some(hello_frame) = recv_hello_frame(&mut frame_rx, &peer_token, PEER_HELLO_TIMEOUT).await
     else {
         return;
     };
@@ -1661,6 +1760,18 @@ async fn serve_peer(
         return;
     }
 
+    // The session is now fully established: stamp the successful connect on the
+    // device's roster entry so ghost / re-paired entries are self-evident in
+    // `ListDevices`. Best-effort metadata — a failed persist must not drop a
+    // live session, and a since-revoked device (no entry) is simply skipped.
+    {
+        let mut roster = deps.roster.write().await;
+        if let Some(entry) = roster.find_by_device_mut(&device_id) {
+            entry.last_connected_at = Some(now_secs());
+            let _ = roster.save(&deps.roster_path);
+        }
+    }
+
     // --- Serve. `transport` is sealed/opened only here, so nonce order is the
     // send order. The peer's attached PTY stream arrives as plaintext
     // `PeerEvent`s over `events_rx`, which is always present (no `Option` in
@@ -1671,7 +1782,7 @@ async fn serve_peer(
 
     loop {
         tokio::select! {
-            _ = conn_token.cancelled() => return,
+            _ = peer_token.cancelled() => return,
             frame = frame_rx.recv() => {
                 let Some(frame) = frame else { return };
                 let msg = match transport.open::<ClientMessage>(&frame) {
@@ -1682,6 +1793,11 @@ async fn serve_peer(
                     // A second hello is out of protocol; ignore it.
                     ClientMessage::Hello { .. } => {}
                     ClientMessage::Request { id, op } => {
+                        // A successful `RevokeDevice` mutates the roster inside
+                        // `handle_request` but defers the *kick* to here (see
+                        // below), so the `Revoked` response is enqueued before
+                        // the relay re-assert that severs the transport.
+                        let mut revoke_target: Option<DeviceId> = None;
                         let result = handle_request(
                             op,
                             &deps,
@@ -1689,6 +1805,8 @@ async fn serve_peer(
                             &peer_token,
                             &mut attach_input,
                             &mut has_attached,
+                            device_id,
+                            &mut revoke_target,
                         )
                         .await;
                         if send_msg(
@@ -1702,6 +1820,16 @@ async fn serve_peer(
                         .is_err()
                         {
                             return;
+                        }
+                        // Response-first, kick-after (ADR-0021 D6): the roster is
+                        // already shrunken; now sever the target's live
+                        // session(s) bridge-side and re-assert the shrunken set to
+                        // the relay. For a self-revoke this cancels *this* peer —
+                        // the loop returns on its next iteration — but the
+                        // `Revoked` above is already on the outbound queue ahead of
+                        // the re-assert, so the requester still gets its answer.
+                        if let Some(target) = revoke_target.take() {
+                            assert_and_kick(&target, &deps, &outbound_tx, &control_seq).await;
                         }
                     }
                     ClientMessage::Input(input) => {
@@ -1767,6 +1895,11 @@ async fn serve_peer(
 ///
 /// `List` runs the source list; `Attach` enforces at-most-one attach per peer,
 /// and on success installs the input sender and spawns the PTY pump task.
+/// `ListDevices` projects the roster (with `is_self` marked for `requester_id`);
+/// `RevokeDevice` removes the target from the roster and persists it, then sets
+/// `revoke_target` so the caller can enqueue the response *before* the kick
+/// (the relay re-assert severs the transport — see [`serve_peer`]).
+#[allow(clippy::too_many_arguments)]
 async fn handle_request(
     op: RemoteOp,
     deps: &Arc<PeerDeps>,
@@ -1774,6 +1907,8 @@ async fn handle_request(
     peer_token: &CancellationToken,
     attach_input: &mut Option<mpsc::Sender<ChannelInput>>,
     has_attached: &mut bool,
+    requester_id: DeviceId,
+    revoke_target: &mut Option<DeviceId>,
 ) -> RemoteResult {
     match op {
         RemoteOp::List => match deps.source.list().await {
@@ -1803,6 +1938,26 @@ async fn handle_request(
                 Err(e) => RemoteResult::Error(map_source_error(&e)),
             }
         }
+        RemoteOp::ListDevices => {
+            let roster = deps.roster.read().await;
+            RemoteResult::Devices(device_infos(&roster, &requester_id))
+        }
+        RemoteOp::RevokeDevice { device_id } => {
+            match revoke_from_roster(&device_id, deps).await {
+                // Removed: defer the kick so the response goes out first.
+                Ok(true) => {
+                    *revoke_target = Some(device_id);
+                    RemoteResult::Revoked
+                }
+                // Not paired: an idempotent unpair — no kick, still success.
+                Ok(false) => RemoteResult::Revoked,
+                // Persisting the shrunken roster failed: report it rather than
+                // claim a revocation the bridge did not durably record.
+                Err(_e) => RemoteResult::Error(WireError::Transport {
+                    message: "could not persist roster".to_string(),
+                }),
+            }
+        }
         // `RemoteOp` is `#[non_exhaustive]`: a client speaking a newer protocol
         // could ask for an op this bridge predates. Refuse it explicitly rather
         // than dropping the peer, so the client gets a typed answer.
@@ -1810,6 +1965,61 @@ async fn handle_request(
             message: "unsupported operation".to_string(),
         }),
     }
+}
+
+/// Projects the roster into wire [`DeviceInfo`]s (ADR-0021 D6 `ListDevices`),
+/// marking the entry whose id equals `requester_id` as `is_self`. `name` is the
+/// already-sanitized roster value (scrubbed at pairing time), and `fingerprint`
+/// is derived from the pinned static key — both display-safe, no re-sanitizing.
+fn device_infos(roster: &Roster, requester_id: &DeviceId) -> Vec<DeviceInfo> {
+    roster
+        .entries
+        .iter()
+        .map(|e| DeviceInfo {
+            device_id: e.device_id,
+            name: e.name.clone(),
+            fingerprint: fingerprint(&e.static_pubkey),
+            enrolled_at: e.enrolled_at,
+            last_connected_at: e.last_connected_at,
+            is_self: e.device_id == *requester_id,
+        })
+        .collect()
+}
+
+/// Removes `device_id` from the roster and persists the shrunken set, returning
+/// whether an entry was removed (`false` = already absent, an idempotent
+/// no-op). The caller performs the kick (relay re-assert + live-session cancel)
+/// separately — see [`assert_and_kick`] — so it can order it after any response.
+async fn revoke_from_roster(
+    device_id: &DeviceId,
+    deps: &Arc<PeerDeps>,
+) -> Result<bool, BridgeError> {
+    let mut roster = deps.roster.write().await;
+    if !roster.remove_by_device(device_id) {
+        return Ok(false);
+    }
+    roster.save(&deps.roster_path)?;
+    Ok(true)
+}
+
+/// Applies the revocation kick for a device already removed from the roster
+/// (ADR-0021 D6): first the authoritative bridge-side cut — cancel every live
+/// session that device holds — then the defense-in-depth relay re-assert of the
+/// shrunken roster, which severs the device's relay connection so it cannot
+/// route or reconnect. The relay step is best-effort: a dropped link needs no
+/// re-assert because the relay clears a bridge's whole set on disconnect (D4).
+async fn assert_and_kick(
+    device_id: &DeviceId,
+    deps: &Arc<PeerDeps>,
+    outbound_tx: &mpsc::Sender<Message>,
+    control_seq: &AtomicU32,
+) {
+    cancel_live_peers(device_id, &deps.live_peers);
+    let assert = {
+        let roster = deps.roster.read().await;
+        assert_devices_msg(next_control_id(control_seq), &roster)
+    };
+    let _ = send_control(outbound_tx, deps.bridge_id, &assert).await;
 }
 
 /// Drains one attached session's output receiver, forwarding each
@@ -2122,26 +2332,23 @@ fn mint_pairing_code(deps: &Arc<PeerDeps>) -> Result<(PairingCode, String), Brid
     Ok((code, rendezvous_token))
 }
 
-/// Removes `device_id` from the roster, persists the change, and re-asserts the
-/// shrunken set so the relay kicks any live connection (ADR-0021 D6). A device
-/// that was not paired is a no-op success (idempotent unpair).
+/// Removes `device_id` from the roster, persists the change, and kicks the
+/// device — cancelling its live session(s) bridge-side and re-asserting the
+/// shrunken set to the relay (ADR-0021 D6). A device that was not paired is a
+/// no-op success (idempotent unpair). Shares the roster-mutation and kick path
+/// with the wire `RemoteOp::RevokeDevice` handler; this desktop-driven path has
+/// no relay-response to order, so it kicks inline.
 async fn revoke_device(
     device_id: &DeviceId,
     deps: &Arc<PeerDeps>,
     outbound_tx: &mpsc::Sender<Message>,
     control_seq: &AtomicU32,
 ) -> Result<(), BridgeError> {
-    let assert = {
-        let mut roster = deps.roster.write().await;
-        if !roster.remove_by_device(device_id) {
-            return Ok(());
-        }
-        roster.save(&deps.roster_path)?;
-        assert_devices_msg(next_control_id(control_seq), &roster)
-    };
-    send_control(outbound_tx, deps.bridge_id, &assert)
-        .await
-        .map_err(|_| BridgeError::Disconnected)
+    if !revoke_from_roster(device_id, deps).await? {
+        return Ok(());
+    }
+    assert_and_kick(device_id, deps, outbound_tx, control_seq).await;
+    Ok(())
 }
 
 /// Fills `buf` with cryptographically secure random bytes from the OS CSPRNG.
@@ -2199,6 +2406,139 @@ mod tests {
     use super::*;
 
     #[test]
+    fn device_info_projection_marks_self() {
+        let roster = Roster {
+            entries: vec![
+                RosterEntry {
+                    device_id: DeviceId([0x11; 32]),
+                    static_pubkey: vec![0xaa; 32],
+                    psk: [0; 32],
+                    name: "a".into(),
+                    enrolled_at: Some(1),
+                    last_connected_at: None,
+                    relay_token: "t".into(),
+                },
+                RosterEntry {
+                    device_id: DeviceId([0x22; 32]),
+                    static_pubkey: vec![0xbb; 32],
+                    psk: [0; 32],
+                    name: "b".into(),
+                    enrolled_at: Some(2),
+                    last_connected_at: Some(9),
+                    relay_token: "u".into(),
+                },
+            ],
+        };
+        let infos = device_infos(&roster, &DeviceId([0x22; 32]));
+        assert_eq!(infos.len(), 2);
+        assert!(!infos[0].is_self);
+        assert!(infos[1].is_self);
+        assert_eq!(infos[0].fingerprint, fingerprint(&[0xaa; 32]));
+        assert_eq!(infos[1].last_connected_at, Some(9));
+    }
+
+    fn entry(id: u8, name: &str) -> RosterEntry {
+        RosterEntry {
+            device_id: DeviceId([id; 32]),
+            static_pubkey: vec![id; 32],
+            psk: [0; 32],
+            name: name.to_string(),
+            enrolled_at: None,
+            last_connected_at: None,
+            relay_token: "tok".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_from_roster_removes_persists_and_is_idempotent() {
+        // Removing a paired device drops its entry, persists the shrunken roster
+        // to disk, and reports `true`; a second removal of the same id is an
+        // idempotent no-op reporting `false` (the wire path still answers
+        // `Revoked`, but performs no kick).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("roster.toml");
+        let deps = Arc::new(PeerDeps {
+            bridge_id: DeviceId([9u8; 32]),
+            bridge_static_priv: vec![0u8; 32],
+            bridge_static_pub: vec![0u8; 32],
+            relay_url: "ws://test".to_string(),
+            roster: Arc::new(RwLock::new(Roster {
+                entries: vec![entry(0x11, "a"), entry(0x22, "b")],
+            })),
+            roster_path: path.clone(),
+            source: Arc::new(remora_core::FakeSessionSource::new()),
+            live_peers: Arc::new(Mutex::new(HashMap::new())),
+            next_peer_reg: AtomicU64::new(0),
+        });
+
+        assert!(
+            revoke_from_roster(&DeviceId([0x11; 32]), &deps)
+                .await
+                .expect("remove ok"),
+            "removing a paired device reports true"
+        );
+        // Persisted: reloading from disk shows only the surviving device.
+        let reloaded = Roster::load(&path).expect("reload roster");
+        assert_eq!(reloaded.entries.len(), 1);
+        assert_eq!(reloaded.entries[0].device_id, DeviceId([0x22; 32]));
+
+        assert!(
+            !revoke_from_roster(&DeviceId([0x11; 32]), &deps)
+                .await
+                .expect("second remove ok"),
+            "removing an absent device is an idempotent no-op (false)"
+        );
+    }
+
+    #[test]
+    fn cancel_live_peers_cancels_only_the_target_devices_sessions() {
+        // Two live sessions for one device plus one for another: revoking the
+        // first device cancels *both* of its sessions and leaves the other's
+        // session untouched (D16: a device may hold several sessions at once).
+        let live: LivePeers = Arc::new(Mutex::new(HashMap::new()));
+        let target = DeviceId([0x11; 32]);
+        let other = DeviceId([0x22; 32]);
+
+        let t1 = CancellationToken::new();
+        let t2 = CancellationToken::new();
+        let t3 = CancellationToken::new();
+        let _g1 = register_live_peer(&live, target, 0, t1.clone()).expect("register 1");
+        let _g2 = register_live_peer(&live, target, 1, t2.clone()).expect("register 2");
+        let _g3 = register_live_peer(&live, other, 2, t3.clone()).expect("register 3");
+
+        cancel_live_peers(&target, &live);
+        assert!(t1.is_cancelled(), "target session 1 kicked");
+        assert!(t2.is_cancelled(), "target session 2 kicked");
+        assert!(!t3.is_cancelled(), "another device's session survives");
+    }
+
+    #[test]
+    fn live_peer_guard_deregisters_its_slot_on_drop() {
+        // The RAII guard removes exactly its own slot on drop, and the device
+        // key is dropped entirely once its last session ends — so a later
+        // revocation kick never targets a session that already returned.
+        let live: LivePeers = Arc::new(Mutex::new(HashMap::new()));
+        let device = DeviceId([0x33; 32]);
+        let g1 = register_live_peer(&live, device, 0, CancellationToken::new()).expect("reg 1");
+        let g2 = register_live_peer(&live, device, 1, CancellationToken::new()).expect("reg 2");
+        assert_eq!(
+            live.lock().expect("lock").get(&device).map(HashMap::len),
+            Some(2)
+        );
+        drop(g1);
+        assert_eq!(
+            live.lock().expect("lock").get(&device).map(HashMap::len),
+            Some(1),
+            "dropping one guard leaves the sibling session registered"
+        );
+        drop(g2);
+        assert!(
+            live.lock().expect("lock").get(&device).is_none(),
+            "the device key is gone once its last session ends"
+        );
+    }
+
+    #[test]
     fn assert_devices_msg_maps_roster() {
         // The AssertDevices payload mirrors the roster one-for-one: each entry's
         // device id and its stored `relay_token` become one `AssertedDevice`.
@@ -2234,6 +2574,8 @@ mod tests {
             roster: Arc::new(RwLock::new(Roster::default())),
             roster_path: PathBuf::from("unused-roster.toml"),
             source: Arc::new(remora_core::FakeSessionSource::new()),
+            live_peers: Arc::new(Mutex::new(HashMap::new())),
+            next_peer_reg: AtomicU64::new(0),
         })
     }
 
@@ -2539,6 +2881,8 @@ mod tests {
             roster: Arc::new(RwLock::new(Roster::default())),
             roster_path: PathBuf::from("unused-roster.toml"),
             source: Arc::new(remora_core::FakeSessionSource::new()),
+            live_peers: Arc::new(Mutex::new(HashMap::new())),
+            next_peer_reg: AtomicU64::new(0),
         })
     }
 

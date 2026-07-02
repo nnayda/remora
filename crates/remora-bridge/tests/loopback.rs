@@ -49,7 +49,7 @@ use remora_core::{
 };
 use remora_protocol::{
     BridgeMessage, ChannelInput, ChannelOutput, ClientMessage, DeviceId, Envelope, FrameType,
-    HelloRole, ProjectId, RelayHello, RemoteOp, SessionId, SessionMeta, SessionState,
+    HelloRole, ProjectId, RelayHello, RemoteOp, RemoteResult, SessionId, SessionMeta, SessionState,
     SessionStatus, SpawnSpec, PROTOCOL_VERSION,
 };
 use remora_relay::{serve, AuditSink, BridgeEntry, RelayConfig};
@@ -1004,6 +1004,53 @@ async fn unpaired_device_fails() {
         Err(remora_core::SourceError::Transport(_)) => {} // prompt typed unavailability
         Ok(_) => panic!("an unpaired device must not attach"),
         Err(other) => panic!("expected a Transport error, got {other:?}"),
+    }
+}
+
+/// `ListDevices` over the wire returns the bridge's roster projected as
+/// `DeviceInfo`s: the single paired device, marked `is_self` for the requester,
+/// with `last_connected_at` stamped by the session it is asking over. The full
+/// revoke-kick E2E (`revoke_kicks_live_device`) is Task 14's; this proves the
+/// read side and the connect-time stamp end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_devices_returns_self_with_connect_stamp() {
+    let fake = Arc::new(FakeSessionSource::new());
+    let harness = Harness::with_source(fake).await;
+    harness.wait_ready().await;
+
+    // Drive a real handshake + E2E hello, then ask for the device list.
+    let mut raw = RawClient::connect(&harness.pairing).await;
+    raw.send(&ClientMessage::Hello {
+        protocol_version: PROTOCOL_VERSION,
+    })
+    .await;
+    match raw.recv(RECV_TIMEOUT).await {
+        Some(BridgeMessage::Hello { protocol_version }) => {
+            assert_eq!(protocol_version, PROTOCOL_VERSION)
+        }
+        other => panic!("expected bridge Hello, got {other:?}"),
+    }
+
+    raw.send(&ClientMessage::Request {
+        id: 1,
+        op: RemoteOp::ListDevices,
+    })
+    .await;
+    match raw.recv(RECV_TIMEOUT).await {
+        Some(BridgeMessage::Response {
+            id: 1,
+            result: RemoteResult::Devices(devices),
+        }) => {
+            assert_eq!(devices.len(), 1, "one paired device in the roster");
+            let d = &devices[0];
+            assert_eq!(d.device_id, harness.pairing.device_id);
+            assert!(d.is_self, "the requesting device is marked is_self");
+            assert!(
+                d.last_connected_at.is_some(),
+                "a successful session stamps last_connected_at"
+            );
+        }
+        other => panic!("expected Response(Devices), got {other:?}"),
     }
 }
 
