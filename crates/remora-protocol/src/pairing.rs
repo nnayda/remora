@@ -160,6 +160,58 @@ impl PairingCode {
     }
 }
 
+/// Device → bridge, inside the pairing Noise session (ADR-0021 D3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PairingClientMsg {
+    /// First message after the pairing handshake: the device's protocol version
+    /// (for a clean skew error) and its display name for the confirm dialog.
+    Hello {
+        protocol_version: u32,
+        device_name: String,
+    },
+    /// Device acknowledges it stored the granted credentials.
+    Confirm,
+}
+
+/// Bridge → device, inside the pairing Noise session (ADR-0021 D3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PairingBridgeMsg {
+    /// The bridge is waiting for the user to confirm this device's fingerprint.
+    Pending,
+    /// The user confirmed: durable credentials the device persists. `psk` is
+    /// standard-base64 32 bytes.
+    Grant {
+        device_token: String,
+        psk: String,
+        bridge_name: Option<String>,
+    },
+    /// Final ack after the bridge persisted the roster entry — only now is the
+    /// device paired.
+    Confirmed,
+    /// The pairing was refused; `reason` distinguishes user-reject from a
+    /// protocol condition.
+    Rejected { reason: PairingRejectReason },
+}
+
+/// Why a [`PairingBridgeMsg::Rejected`] was sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PairingRejectReason {
+    /// The user pressed Reject in the confirm dialog.
+    UserRejected,
+    /// The device's self-minted id already exists in the roster or window.
+    DuplicateId,
+    /// The device's protocol version is below the bridge's minimum.
+    VersionMismatch { bridge_min: u32 },
+    /// The pairing window closed (expired or was replaced) before completion.
+    WindowClosed,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +288,72 @@ mod tests {
         assert_eq!(
             PairingCode::parse(&code.encode()).expect("mesh parse"),
             code
+        );
+    }
+
+    #[test]
+    fn pairing_client_hello_wire_format() {
+        let msg = PairingClientMsg::Hello {
+            protocol_version: 3,
+            device_name: "iPhone".to_string(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"hello":{"protocol_version":3,"device_name":"iPhone"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<PairingClientMsg>(&json).expect("deserialize"),
+            msg
+        );
+    }
+
+    #[test]
+    fn pairing_bridge_grant_wire_format() {
+        let msg = PairingBridgeMsg::Grant {
+            device_token: "dt".to_string(),
+            psk: "cHNr".to_string(),
+            bridge_name: Some("desktop".to_string()),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<PairingBridgeMsg>(&json).expect("deserialize"),
+            msg
+        );
+    }
+
+    #[test]
+    fn pairing_reject_reasons_round_trip() {
+        for reason in [
+            PairingRejectReason::UserRejected,
+            PairingRejectReason::DuplicateId,
+            PairingRejectReason::VersionMismatch { bridge_min: 3 },
+            PairingRejectReason::WindowClosed,
+        ] {
+            let msg = PairingBridgeMsg::Rejected {
+                reason: reason.clone(),
+            };
+            let json = serde_json::to_string(&msg).expect("serialize");
+            assert_eq!(
+                serde_json::from_str::<PairingBridgeMsg>(&json).expect("deserialize"),
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn pairing_pending_confirm_confirmed_round_trip() {
+        assert_eq!(
+            serde_json::to_string(&PairingBridgeMsg::Pending).expect("serialize"),
+            r#""pending""#
+        );
+        assert_eq!(
+            serde_json::to_string(&PairingClientMsg::Confirm).expect("serialize"),
+            r#""confirm""#
+        );
+        assert_eq!(
+            serde_json::to_string(&PairingBridgeMsg::Confirmed).expect("serialize"),
+            r#""confirmed""#
         );
     }
 }
