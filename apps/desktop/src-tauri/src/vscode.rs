@@ -8,14 +8,12 @@ use remora_core::RemoteWorkspace;
 use crate::launch::{resolve_binary, PathProbe};
 
 /// macOS bundles the CLI here; a GUI-launched Remora won't have it on PATH.
-#[allow(dead_code)]
 const CODE_EXTRA_CANDIDATES: &[&str] =
     &["/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"];
 
 /// Build the argv the desktop spawns to open `target` in VS Code, resolving
 /// the local `code` binary to an absolute path. `Err` (display string) when
 /// `code` is not installed / not on the bare GUI PATH.
-#[allow(dead_code)]
 pub fn launch_argv(target: &RemoteWorkspace, probe: &dyn PathProbe) -> Result<Vec<String>, String> {
     let code = resolve_binary("code", CODE_EXTRA_CANDIDATES, probe).ok_or_else(|| {
         "VS Code (`code`) not found — install VS Code or add `code` to your PATH".to_string()

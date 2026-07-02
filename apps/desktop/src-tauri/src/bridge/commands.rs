@@ -244,6 +244,7 @@ use crate::external_terminal::{
     assemble_launch, detect_terminals, resolve_terminal, shell_quote_command, ResolveError,
 };
 use crate::launch::{spawn_detached, RealProbe};
+use crate::vscode;
 
 /// A detected terminal, id + display name only.
 #[derive(Clone, Debug, serde::Serialize, specta::Type)]
@@ -361,6 +362,38 @@ async fn config_set_terminal(
     bridge.config_set_terminal(terminal_id).await
 }
 
+#[tauri::command]
+#[specta::specta]
+async fn open_in_vscode(
+    bridge: tauri::State<'_, Bridge>,
+    project_id: String,
+    session_id: String,
+) -> Result<(), BridgeError> {
+    // Core resolves the authoritative path + ssh authority; the shell owns the
+    // `code` binary and the launch (mirrors open_external_terminal).
+    let target = bridge.remote_workspace(project_id, session_id).await?;
+    let argv = vscode::launch_argv(&target, &RealProbe)
+        .map_err(|message| BridgeError::Transport { message })?;
+    let mut child = spawn_detached(&argv).map_err(|e| BridgeError::Transport {
+        message: format!("could not launch VS Code: {e}"),
+    })?;
+    // Early-exit check (same rationale as open_external_terminal): a `code`
+    // that dies within ~1s (bad install) becomes a real error, not a silent
+    // no-op. A missing Remote-SSH extension fails later, inside VS Code.
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    if let Ok(Some(status)) = child.try_wait() {
+        if !status.success() {
+            return Err(BridgeError::Transport {
+                message: format!("VS Code exited immediately ({status})"),
+            });
+        }
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 /// Shared by `run()` and the bindings export test, so the command list lives once.
 pub fn builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new()
@@ -388,7 +421,8 @@ pub fn builder() -> Builder<tauri::Wry> {
             external_terminals,
             open_external_terminal,
             copy_attach_command,
-            config_set_terminal
+            config_set_terminal,
+            open_in_vscode
         ])
         .events(collect_events![ConfigChanged])
 }
