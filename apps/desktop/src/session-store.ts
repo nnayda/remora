@@ -748,3 +748,25 @@ export function removeErrorMessage(result: RemoveResult): string {
   }
   return "Could not remove the session.";
 }
+
+/** What App should do after a *backgrounded* remove settles. Removal no longer
+ * blocks a modal (the confirm dialog closes as soon as it fires), so the
+ * result routing — nothing / re-prompt for force / surface an error — happens
+ * async in App. Pure so it is testable without rendering App. A dirty result
+ * re-prompts only when the attempt was NOT forced: force skips the dirty probe
+ * server-side, so honoring `force` here guarantees the prompt cannot loop. */
+export type RemoveFollowUp =
+  | { kind: "done" }
+  | { kind: "confirm-force"; reason: DirtyReasonDto }
+  | { kind: "error"; message: string };
+
+export function routeRemoveResult(
+  result: RemoveResult,
+  force: boolean,
+): RemoveFollowUp {
+  if (result.ok) return { kind: "done" };
+  if (!force && result.dirty) {
+    return { kind: "confirm-force", reason: result.dirty };
+  }
+  return { kind: "error", message: removeErrorMessage(result) };
+}

@@ -6,6 +6,7 @@ import {
   OPEN_CANCELLED,
   removeErrorMessage,
   reorderTabs,
+  routeRemoveResult,
   SessionStore,
   tabKey,
 } from "./session-store";
@@ -563,6 +564,39 @@ describe("removeErrorMessage", () => {
     expect(removeErrorMessage({ ok: false })).toBe(
       "Could not remove the session.",
     );
+  });
+});
+
+describe("routeRemoveResult", () => {
+  it("routes success to done", () => {
+    expect(routeRemoveResult({ ok: true }, false)).toEqual({ kind: "done" });
+  });
+
+  it("routes a dirty first attempt to the force re-prompt", () => {
+    expect(
+      routeRemoveResult({ ok: false, dirty: "uncommitted" }, false),
+    ).toEqual({ kind: "confirm-force", reason: "uncommitted" });
+  });
+
+  it("never re-prompts after a force attempt, even if dirty (no loop)", () => {
+    const r = routeRemoveResult({ ok: false, dirty: "uncommitted" }, true);
+    expect(r.kind).toBe("error");
+  });
+
+  it("routes a backend error to a notice with its message", () => {
+    expect(
+      routeRemoveResult(
+        { ok: false, error: new Error("kill tmux: nope") },
+        false,
+      ),
+    ).toEqual({ kind: "error", message: "kill tmux: nope" });
+  });
+
+  it("routes a bare {ok:false} (busy-guard/disposed) to the fallback copy", () => {
+    expect(routeRemoveResult({ ok: false }, false)).toEqual({
+      kind: "error",
+      message: "Could not remove the session.",
+    });
   });
 });
 
