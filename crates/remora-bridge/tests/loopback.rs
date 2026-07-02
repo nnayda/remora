@@ -32,6 +32,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt as _, StreamExt as _};
+use rand::RngCore as _;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -40,8 +41,8 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
 use remora_bridge::{
-    prologue, provision_device, serve_bridge, BridgeConfig, BridgeIdentity, Handshake,
-    HandshakeKind, PairingFile, RemoteSource, Roster, Transport,
+    prologue, serve_bridge, BridgeConfig, BridgeIdentity, Handshake, HandshakeKind, PairingFile,
+    RemoteSource, Roster, RosterEntry, Transport, NOISE_PATTERN,
 };
 use remora_core::{
     ExclusiveSource, FakeSessionSource, SessionChannel, SessionLocks, SessionSource,
@@ -171,14 +172,43 @@ impl Harness {
         let identity =
             BridgeIdentity::load_or_create(&dir.path().join("identity.toml")).expect("identity");
         let mut roster = Roster::default();
+
+        // Loopback-harness scaffolding: mints a device + pairing file inline
+        // (replaces the slice-1 `provision_device` helper, deleted in #232);
+        // Task 14 drives this harness through the real pairing ceremony
+        // instead.
+        let bridge_id = identity.device_id;
+        let device_keypair = {
+            let params: snow::params::NoiseParams =
+                NOISE_PATTERN.parse().expect("valid noise pattern");
+            snow::Builder::new(params)
+                .generate_keypair()
+                .expect("generate device keypair")
+        };
+        let device_id = DeviceId(rand::random());
+        let mut psk = [0u8; 32];
+        rand::rng().fill_bytes(&mut psk);
+        roster.entries.push(RosterEntry {
+            device_id,
+            static_pubkey: device_keypair.public.clone(),
+            psk,
+            relay_token: RENDEZVOUS_TOKEN.to_string(),
+            name: "loopback test device".to_string(),
+            enrolled_at: None,
+            last_connected_at: None,
+        });
         // Provision against a placeholder URL; the real one is stamped in once
         // the relay's ephemeral port is known.
-        let mut pairing =
-            provision_device(&identity, &mut roster, "ws://placeholder", RENDEZVOUS_TOKEN)
-                .expect("provision device");
-
-        let bridge_id = identity.device_id;
-        let device_id = pairing.device_id;
+        let mut pairing = PairingFile {
+            relay_url: "ws://placeholder".to_string(),
+            device_token: RENDEZVOUS_TOKEN.to_string(),
+            bridge_id,
+            bridge_static_pubkey: B64.encode(&identity.static_keypair.public),
+            psk: B64.encode(psk),
+            device_id,
+            device_private_key: B64.encode(&device_keypair.private),
+            device_public_key: B64.encode(&device_keypair.public),
+        };
 
         let bridges = vec![BridgeEntry {
             token: BRIDGE_TOKEN.to_string(),
@@ -493,7 +523,7 @@ impl RawClient {
         let routing_id = DeviceId(rand::random());
         let hello = RelayHello {
             role: HelloRole::Device,
-            token: pairing.rendezvous_token.clone(),
+            token: pairing.device_token.clone(),
             device_id,
             routing_id,
             bridge_id,

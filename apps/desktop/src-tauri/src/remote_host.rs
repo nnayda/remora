@@ -29,20 +29,25 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use rand::RngCore as _;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use remora_bridge::{
-    provision_device, serve_bridge, BridgeConfig, BridgeIdentity, RemoteSource, Roster,
+    serve_bridge, BridgeConfig, BridgeIdentity, PairingFile, RemoteSource, Roster, RosterEntry,
+    NOISE_PATTERN,
 };
 use remora_core::config::{Config, ConfigError};
 use remora_core::{SessionChannel, SessionSource, SourceError};
-use remora_protocol::{AgentId, ProjectId, SessionId, SessionMeta, SpawnSpec};
+use remora_protocol::{AgentId, DeviceId, ProjectId, SessionId, SessionMeta, SpawnSpec};
 use remora_relay::{serve, AuditSink, BridgeEntry, DeviceEntry, RelayConfig};
 
 use crate::bridge::resolve::SourceResolver;
 use crate::bridge::Bridge;
+
+const B64: base64::engine::general_purpose::GeneralPurpose =
+    base64::engine::general_purpose::STANDARD;
 
 /// `true` only when `REMORA_REMOTE_LOOPBACK` is exactly `"1"`. Any other value
 /// (unset, `"0"`, `"true"`, whitespace) leaves the loopback off.
@@ -117,18 +122,49 @@ pub async fn start_loopback(
     // Fresh admission tokens per run (spec D11): the relay authorizes this run's
     // bridge + device and nothing else.
     let registration_token = random_token();
-    let rendezvous_token = random_token();
+    let device_relay_token = random_token();
 
-    // Provision this run's ephemeral device against a placeholder relay URL; the
-    // real ws:// URL is stamped in once the relay's ephemeral port is known.
-    let pairing = provision_device(
-        &identity,
-        &mut roster,
-        "ws://placeholder",
-        &rendezvous_token,
-    )?;
+    // Loopback-only scaffolding: mints this run's ephemeral device + pairing
+    // file inline. This replaces the slice-1 `provision_device` helper (deleted
+    // in #232) — it is dev-only dogfood wiring, not the real pairing story; the
+    // out-of-band pairing ceremony (QR display, confirm-gated enrollment)
+    // lands in this branch's later work and replaces this block outright.
     let bridge_id = identity.device_id;
-    let device_id = pairing.device_id;
+    let device_keypair = {
+        let params: snow::params::NoiseParams =
+            NOISE_PATTERN.parse().map_err(|e: snow::Error| {
+                Box::<dyn std::error::Error + Send + Sync>::from(e.to_string())
+            })?;
+        snow::Builder::new(params)
+            .generate_keypair()
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?
+    };
+    let device_id = DeviceId(rand::random());
+    let mut psk = [0u8; 32];
+    rand::rng().fill_bytes(&mut psk);
+
+    roster.entries.push(RosterEntry {
+        device_id,
+        static_pubkey: device_keypair.public.clone(),
+        psk,
+        relay_token: device_relay_token.clone(),
+        name: "desktop loopback".to_string(),
+        enrolled_at: None,
+        last_connected_at: None,
+    });
+
+    // Provisioned against a placeholder relay URL; the real ws:// URL is
+    // stamped in once the relay's ephemeral port is known.
+    let pairing = PairingFile {
+        relay_url: "ws://placeholder".to_string(),
+        device_token: device_relay_token.clone(),
+        bridge_id,
+        bridge_static_pubkey: B64.encode(&identity.static_keypair.public),
+        psk: B64.encode(psk),
+        device_id,
+        device_private_key: B64.encode(&device_keypair.private),
+        device_public_key: B64.encode(&device_keypair.public),
+    };
 
     let relay_cfg = Arc::new(RelayConfig {
         listen: "127.0.0.1:0".to_string(),
@@ -137,7 +173,7 @@ pub async fn start_loopback(
             device_id: bridge_id,
         }],
         devices: vec![DeviceEntry {
-            token: rendezvous_token,
+            token: device_relay_token,
             device_id,
             bridge_id,
         }],

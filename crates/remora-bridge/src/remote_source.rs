@@ -137,7 +137,7 @@ impl RemoteSource {
         // relay's anti-spoof check requires the envelope src == routing_id. ---
         let hello = RelayHello {
             role: HelloRole::Device,
-            token: self.pairing.rendezvous_token.clone(),
+            token: self.pairing.device_token.clone(),
             device_id,
             routing_id,
             bridge_id,
@@ -579,7 +579,7 @@ mod tests {
     fn pairing() -> PairingFile {
         PairingFile {
             relay_url: "wss://relay.example/ws".to_string(),
-            rendezvous_token: "rendezvous-tok".to_string(),
+            device_token: "device-tok".to_string(),
             bridge_id: DeviceId([0xab; 32]),
             bridge_static_pubkey: B64.encode([0u8; 32]),
             psk: B64.encode([0u8; 32]),
