@@ -23,7 +23,7 @@ pub use pairing::{
     PairingBridgeMsg, PairingClientMsg, PairingCode, PairingCodeError, PairingRejectReason,
     PAIRING_CODE_VERSION,
 };
-pub use remote::{BridgeMessage, ClientMessage, RemoteOp, RemoteResult, WireError};
+pub use remote::{BridgeMessage, ClientMessage, DeviceInfo, RemoteOp, RemoteResult, WireError};
 pub use session::{SessionMeta, SessionState, SessionStatus, SpawnSpec, WorkspaceMode};
 
 /// Version of the wire format defined by this crate.
