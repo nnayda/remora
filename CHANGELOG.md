@@ -93,6 +93,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RS/US delimiter bytes from each step's captured output, so an attacker-set
   tmux `#{E:}` value can never forge a record boundary — making the framing
   unforgeable by construction (this also retroactively hardens the spawn path).
+- **Cross-host discovery fan-out** (#101): `Bridge::list()` now awaits every
+  configured host's `SessionSource::list()` concurrently instead of one at a
+  time, so a host that *errors* (or connects within ssh's 10s handshake
+  timeout and then responds) no longer serializes discovery of the rest —
+  latency now tracks the slowest finite host rather than their sum. A host
+  that hangs *after* connecting still blocks the whole call, since neither
+  transport bounds the execution phase yet (tracked separately in #99); this
+  change doesn't regress that case, it was equally unbounded before. When
+  *every* host is down, the resulting error aggregates each host's cause
+  instead of surfacing only the last one visited.
 - **Design system documented in `DESIGN.md`** (#150): the shipped token system
   (`apps/desktop/src/styles/tokens/*.css`) now has a written home in the
   [Google design.md](https://github.com/google-labs-code/design.md) format —
