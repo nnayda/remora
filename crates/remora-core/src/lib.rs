@@ -13,12 +13,14 @@ pub mod transport;
 
 mod channel;
 mod error;
+pub mod exclusive;
 pub mod fake;
 mod source;
 
 pub use activity::{sanitize, SanitizedText};
 pub use channel::{SessionChannel, CHANNEL_CAPACITY};
 pub use error::{DirtyReason, SourceError};
+pub use exclusive::{ExclusiveSource, SessionLocks};
 pub use fake::FakeSessionSource;
 pub use source::SessionSource;
 pub use spawn_plan::{plan_spawn, PlanError, SpawnPlan};
