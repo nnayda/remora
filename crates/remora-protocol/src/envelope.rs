@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! offset 0    u8   ENVELOPE_VERSION (decode rejects != 1)
-//! offset 1    u8   frame type (decode rejects > 3)
+//! offset 1    u8   frame type (decode rejects > 4)
 //! offset 2    [u8;32] src routing id
 //! offset 34   [u8;32] dst routing id
 //! offset 66   payload (len 0..=65535; decode rejects longer)
@@ -147,6 +147,10 @@ pub enum FrameType {
     Pairing = 2,
     /// Reserved for the push-notification follow-up (#233).
     PushTrigger = 3,
+    /// Bridge→relay control plane (ADR-0021 D4): pairing-window lifecycle and
+    /// device-credential assertion. Relay-visible JSON like [`RelayHello`]; only
+    /// a bridge may send one (the server closes a device that does, 4002).
+    Control = 4,
 }
 
 /// One relay-routed frame: the fixed header plus an opaque payload.
@@ -192,6 +196,7 @@ impl Envelope {
             1 => FrameType::Data,
             2 => FrameType::Pairing,
             3 => FrameType::PushTrigger,
+            4 => FrameType::Control,
             other => return Err(EnvelopeError::UnknownFrameType(other)),
         };
         let mut src = [0u8; 32];
@@ -216,7 +221,7 @@ impl Envelope {
 pub enum EnvelopeError {
     /// The version byte was not [`ENVELOPE_VERSION`].
     UnknownVersion(u8),
-    /// The frame type byte was not one of the four defined [`FrameType`]
+    /// The frame type byte was not one of the five defined [`FrameType`]
     /// values.
     UnknownFrameType(u8),
     /// Fewer than [`ENVELOPE_HEADER_LEN`] bytes were supplied.
@@ -235,7 +240,7 @@ impl std::fmt::Display for EnvelopeError {
                 )
             }
             EnvelopeError::UnknownFrameType(t) => {
-                write!(f, "unknown envelope frame type {t}: expected 0-3")
+                write!(f, "unknown envelope frame type {t}: expected 0-4")
             }
             EnvelopeError::Truncated(n) => {
                 write!(
@@ -286,6 +291,53 @@ pub enum HelloRole {
     Device,
 }
 
+/// Bridge→relay control message (ADR-0021 D4). Relay-visible plaintext JSON,
+/// carried in a [`FrameType::Control`] envelope whose `dst` is
+/// [`DeviceId::ZERO`] (relay-terminated). `id` correlates the relay's
+/// [`RelayControlAck`]/[`RelayControlError`] reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RelayControl {
+    /// Open (or replace) this bridge's single pairing window: `token` is the
+    /// rendezvous token that admits the pairing device to routing for the
+    /// window's `ttl_secs` lifetime.
+    RegisterPairing {
+        id: u32,
+        token: String,
+        ttl_secs: u64,
+    },
+    /// Close this bridge's pairing window early (on pairing success or abort).
+    CancelPairing { id: u32 },
+    /// Full replacement of this bridge's asserted device-credential set. Sent
+    /// on every bridge connect and after every roster change; the relay kicks
+    /// live connections of devices no longer present.
+    AssertDevices {
+        id: u32,
+        devices: Vec<AssertedDevice>,
+    },
+}
+
+/// One asserted device credential inside [`RelayControl::AssertDevices`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssertedDevice {
+    pub device_id: DeviceId,
+    pub token: String,
+}
+
+/// Relay→bridge acknowledgement of a [`RelayControl`] with matching `id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayControlAck {
+    pub id: u32,
+}
+
+/// Relay→bridge rejection of a [`RelayControl`] with matching `id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayControlError {
+    pub id: u32,
+    pub message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,11 +377,11 @@ mod tests {
 
     #[test]
     fn decode_rejects_unknown_frame_type() {
-        let mut bytes = vec![ENVELOPE_VERSION, 4u8];
+        let mut bytes = vec![ENVELOPE_VERSION, 5u8];
         bytes.extend_from_slice(&[0u8; 64]);
         assert_eq!(bytes.len(), ENVELOPE_HEADER_LEN);
         let err = Envelope::decode(&bytes).expect_err("unknown frame type");
-        assert_eq!(err, EnvelopeError::UnknownFrameType(4));
+        assert_eq!(err, EnvelopeError::UnknownFrameType(5));
     }
 
     #[test]
@@ -429,5 +481,72 @@ mod tests {
             let decoded = Envelope::decode(&encoded).expect("decode");
             assert_eq!(decoded.frame_type, expected);
         }
+    }
+
+    #[test]
+    fn control_frame_type_round_trips() {
+        let envelope = Envelope {
+            frame_type: FrameType::Control,
+            src: nonzero_device_id(0x11),
+            dst: DeviceId::ZERO,
+            payload: b"{}".to_vec(),
+        };
+        let encoded = envelope.encode();
+        assert_eq!(encoded[1], 4, "Control is frame byte 4");
+        let decoded = Envelope::decode(&encoded).expect("decode");
+        assert_eq!(decoded.frame_type, FrameType::Control);
+    }
+
+    #[test]
+    fn relay_control_register_pairing_wire_format() {
+        let msg = RelayControl::RegisterPairing {
+            id: 7,
+            token: "rvz".to_string(),
+            ttl_secs: 120,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"register_pairing":{"id":7,"token":"rvz","ttl_secs":120}}"#
+        );
+        let back: RelayControl = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn relay_control_assert_devices_wire_format() {
+        let msg = RelayControl::AssertDevices {
+            id: 3,
+            devices: vec![AssertedDevice {
+                device_id: DeviceId([0x22; 32]),
+                token: "dev-tok".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let back: RelayControl = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn relay_control_ack_and_error_round_trip() {
+        let ack = RelayControlAck { id: 1 };
+        let err = RelayControlError {
+            id: 1,
+            message: "no such window".to_string(),
+        };
+        assert_eq!(
+            serde_json::from_str::<RelayControlAck>(
+                &serde_json::to_string(&ack).expect("serialize")
+            )
+            .expect("deserialize"),
+            ack
+        );
+        assert_eq!(
+            serde_json::from_str::<RelayControlError>(
+                &serde_json::to_string(&err).expect("serialize")
+            )
+            .expect("deserialize"),
+            err
+        );
     }
 }

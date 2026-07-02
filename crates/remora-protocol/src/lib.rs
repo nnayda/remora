@@ -13,8 +13,9 @@ mod session;
 
 pub use channel::{ChannelInput, ChannelOutput, InvalidTerminalSizeError, TerminalSize};
 pub use envelope::{
-    DeviceId, Envelope, EnvelopeError, FrameType, HelloRole, InvalidDeviceIdError, RelayHello,
-    ENVELOPE_HEADER_LEN, ENVELOPE_VERSION, MAX_ENVELOPE_PAYLOAD,
+    AssertedDevice, DeviceId, Envelope, EnvelopeError, FrameType, HelloRole, InvalidDeviceIdError,
+    RelayControl, RelayControlAck, RelayControlError, RelayHello, ENVELOPE_HEADER_LEN,
+    ENVELOPE_VERSION, MAX_ENVELOPE_PAYLOAD,
 };
 pub use id::{AgentId, InvalidIdError, ProjectId, SessionId, MAX_ID_LEN};
 pub use remote::{BridgeMessage, ClientMessage, RemoteOp, RemoteResult, WireError};
@@ -26,4 +27,4 @@ pub use session::{SessionMeta, SessionState, SessionStatus, SpawnSpec, Workspace
 /// message enum (or changing a representation) is a breaking change: bump
 /// this constant and gate compatibility on it. The tmux naming and worktree
 /// conventions of ADR-0004 version alongside it.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
