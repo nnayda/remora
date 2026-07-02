@@ -18,9 +18,17 @@
 //! case the child has already exited so nothing leaks; the lingering writer
 //! just reaps later. A `tokio::select!`-style writer is the future option if
 //! prompt idle-reap is ever required.
+//!
+//! The writer and detector threads share one `AtomicBool` (#224): the writer
+//! sets it after each successful input write, and the detector thread
+//! swap-consumes it at every wake to exit a sticky `Awaiting` (see
+//! `wake_events`). It is a flag, not a channel: it adds no `output_tx`
+//! sender and cannot stall the `recv()→None` teardown.
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self as std_mpsc, sync_channel, RecvTimeoutError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -108,6 +116,14 @@ fn spawn_pty_channel_inner(
     // this, the reader blocks here, the PTY fills). SyncSender::send blocks when full.
     let (raw_tx, raw_rx) = sync_channel::<Vec<u8>>(DETECT_QUEUE);
 
+    // #224: "user typed since the detector's last wake". Writer sets it after
+    // a successful write; detector swap-consumes it each wake. SeqCst is free
+    // at keystroke rate; a missed flag self-heals at the next wake (≤1 settle
+    // window). NOT a second output_tx sender and NOT a raw_tx clone — both
+    // were rejected to preserve ADR-0013's ordering + teardown invariants.
+    let user_input = Arc::new(AtomicBool::new(false));
+    let user_input_writer = Arc::clone(&user_input);
+
     // Reader thread: master output -> raw_tx (NO direct output_tx anymore).
     // The child's stderr is wired to the PTY slave by portable-pty's default,
     // so ssh/tmux diagnostics arrive here in-band (the mechanism optimistic
@@ -134,10 +150,18 @@ fn spawn_pty_channel_inner(
         loop {
             match raw_rx.recv_timeout(settle) {
                 Ok(bytes) => {
-                    // Compute events first (borrow ends), then move-send bytes
-                    // (no clone needed). Bytes is still delivered before the
-                    // status/preview events that accompany it.
-                    let events = detector.on_bytes(&bytes); // borrow ends here
+                    // Consume the flag at the wake (after recv returns) so a
+                    // keystroke's echo pairs with its own flag in the SAME
+                    // wake — the pulse flips promptly instead of one settle
+                    // window later. Compute events first (borrow ends), then
+                    // move-send bytes (no clone needed). Bytes is still
+                    // delivered before the status/preview events that
+                    // accompany it. An input-caused Status(Working) may
+                    // precede queued cosmetic bytes from before the keystroke
+                    // — harmless; ADR-0013's ordering guarantee is about
+                    // byte-caused status events.
+                    let typed = user_input.swap(false, Ordering::SeqCst);
+                    let events = wake_events(&mut detector, typed, Some(&bytes));
                     if output_tx
                         .blocking_send(ChannelOutput::Bytes(bytes))
                         .is_err()
@@ -156,8 +180,9 @@ fn spawn_pty_channel_inner(
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    let typed = user_input.swap(false, Ordering::SeqCst);
                     let mut closed = false;
-                    for ev in detector.on_tick() {
+                    for ev in wake_events(&mut detector, typed, None) {
                         if output_tx.blocking_send(ev.into()).is_err() {
                             closed = true;
                             break;
@@ -193,6 +218,11 @@ fn spawn_pty_channel_inner(
                         break; // child/PTY is gone (write returned EIO)
                     }
                     let _ = writer.flush();
+                    // #224: signal AFTER the successful write — a failed or
+                    // torn-down write must not read as "the user responded".
+                    // Resize below deliberately does NOT set this: a resize
+                    // causes repaints but is not the user answering.
+                    user_input_writer.store(true, Ordering::SeqCst);
                     // Re-check death signal after each write so we don't spin
                     // sending to a dead PTY on platforms that swallow writes.
                     if death_rx.try_recv().is_ok() {
@@ -232,7 +262,6 @@ fn spawn_pty_channel_inner(
 /// `Working` straight to `Idle` when the keystroke produced no output
 /// (echo-off TUIs), and would decay a live `Working` under a quietly
 /// typing user.
-#[cfg_attr(not(test), allow(dead_code))] // wired into the detector thread in the next commit
 fn wake_events(
     detector: &mut Detector,
     user_input: bool,
@@ -657,5 +686,94 @@ mod tests {
             "spurious StatusChange(Idle) fired while detector was blocked under backpressure"
         );
         assert_eq!(bytes_total, TOTAL, "lost output under backpressure");
+    }
+
+    /// Child fires an awaiting marker, then keeps printing cosmetic noise
+    /// across several settle windows, then exits. After `Awaiting` no
+    /// Working/Idle may follow (#224 sticky) — pre-fix, the noise chunks
+    /// flipped Working and the settle decayed to Idle.
+    #[tokio::test]
+    async fn awaiting_survives_marker_less_output() {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg(
+            "printf '\\033]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\\007'; \
+             sleep 0.3; printf 'clock repaint'; sleep 0.3; printf 'spinner'",
+        );
+        let mut channel =
+            spawn_pty_channel_with_settle(cmd, Duration::from_millis(100)).expect("spawn");
+
+        let mut saw_awaiting = false;
+        let mut after_awaiting = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), channel.recv()).await {
+                Ok(Some(ChannelOutput::StatusChange(s))) => {
+                    if s == remora_protocol::SessionStatus::Awaiting {
+                        saw_awaiting = true;
+                    } else if saw_awaiting {
+                        after_awaiting.push(s);
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => panic!("timed out draining"),
+            }
+        }
+        assert!(saw_awaiting, "never saw Awaiting");
+        assert!(
+            after_awaiting.is_empty(),
+            "awaiting was stomped by cosmetic output: {after_awaiting:?}"
+        );
+    }
+
+    /// Child fires the marker then `cat`s (stays alive). Typing through the
+    /// channel is "the user is responding": Working must follow (#224).
+    #[tokio::test]
+    async fn user_input_exits_awaiting() {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg("printf '\\033]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\\007'; cat");
+        let mut channel =
+            spawn_pty_channel_with_settle(cmd, Duration::from_millis(100)).expect("spawn");
+
+        recv_status(&mut channel, remora_protocol::SessionStatus::Awaiting).await;
+        channel.send_bytes(b"y\n".to_vec()).await.expect("send");
+        recv_status(&mut channel, remora_protocol::SessionStatus::Working).await;
+        drop(channel); // teardown reaps cat
+    }
+
+    /// Resize is repaint-causing but is NOT "the user answered": neither the
+    /// resize nor output arriving after it may exit `Awaiting` (#224).
+    #[tokio::test]
+    async fn resize_does_not_exit_awaiting() {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.arg("-c");
+        cmd.arg(
+            "printf '\\033]7366;remora;1;state;YXdhaXRpbmdfaW5wdXQ=\\007'; \
+             sleep 0.5; printf 'post-resize repaint'",
+        );
+        let mut channel =
+            spawn_pty_channel_with_settle(cmd, Duration::from_millis(100)).expect("spawn");
+
+        recv_status(&mut channel, remora_protocol::SessionStatus::Awaiting).await;
+        let size = TerminalSize::new(40, 120).expect("nonzero");
+        channel.resize(size).await.expect("resize while live");
+
+        // Drain to close; the repaint printf lands AFTER the resize, so if
+        // Resize wrongly set the user-input flag, that chunk would flip
+        // Working. Nothing may follow Awaiting.
+        let mut after_awaiting = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), channel.recv()).await {
+                Ok(Some(ChannelOutput::StatusChange(s))) => after_awaiting.push(s),
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => panic!("timed out draining"),
+            }
+        }
+        assert!(
+            after_awaiting.is_empty(),
+            "resize path exited awaiting: {after_awaiting:?}"
+        );
     }
 }
