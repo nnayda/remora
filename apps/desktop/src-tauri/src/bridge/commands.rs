@@ -241,9 +241,9 @@ async fn config_remove_agent(
 // ---- External terminal (spec 2026-07-02) ----
 
 use crate::external_terminal::{
-    assemble_launch, detect_terminals, resolve_terminal, shell_quote_command, spawn_detached,
-    RealProbe, ResolveError,
+    assemble_launch, detect_terminals, resolve_terminal, shell_quote_command, ResolveError,
 };
+use crate::launch::{spawn_detached, RealProbe};
 
 /// A detected terminal, id + display name only.
 #[derive(Clone, Debug, serde::Serialize, specta::Type)]

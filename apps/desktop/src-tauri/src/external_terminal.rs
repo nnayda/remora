@@ -8,10 +8,11 @@
 //! the same launchd-PATH class for the transport binary is D8, and the
 //! embedded kubectl transport's own copy of this bug is #229).
 
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::PathBuf;
 
 use remora_core::config::TerminalPreference;
+
+use crate::launch::{resolve_binary_with, PathProbe, SearchEnv};
 
 /// One registry entry: how to find and invoke a terminal.
 struct TerminalSpec {
@@ -66,26 +67,6 @@ const REGISTRY: &[TerminalSpec] = &[
     },
 ];
 
-/// Directories probed (in order) for any binary this module resolves —
-/// terminals AND the transport binary (ssh/kubectl). `PATH` entries are
-/// appended last: useful in dev (terminal-launched, full PATH), empty-handed
-/// in a packaged GUI launch.
-const BIN_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
-
-/// Filesystem seam so detection/assembly are unit-testable without an OS.
-pub trait PathProbe {
-    fn is_file(&self, path: &Path) -> bool;
-}
-
-/// Production probe: plain filesystem checks.
-pub struct RealProbe;
-
-impl PathProbe for RealProbe {
-    fn is_file(&self, path: &Path) -> bool {
-        path.is_file()
-    }
-}
-
 /// A terminal found on this machine, with the ABSOLUTE path detection hit —
 /// which is exactly what launch executes (never a bare name).
 #[derive(Debug, Clone)]
@@ -95,55 +76,11 @@ pub struct DetectedTerminal {
     pub path: PathBuf,
 }
 
-/// Environment inputs to candidate enumeration (`$HOME`, `$PATH`),
-/// injectable so tests can pin env-dependent ordering deterministically —
-/// the same seam philosophy as [`PathProbe`]. The pub API always reads the
-/// real process env via [`SearchEnv::from_process`].
-struct SearchEnv {
-    home: Option<std::ffi::OsString>,
-    path: Option<std::ffi::OsString>,
-}
-
-impl SearchEnv {
-    fn from_process() -> Self {
-        Self {
-            home: std::env::var_os("HOME"),
-            path: std::env::var_os("PATH"),
-        }
-    }
-}
-
-/// Candidate paths for a base name: `BIN_DIRS`, `~/.local/bin`, then every
-/// `PATH` entry. Probing is a handful of stat calls — microseconds — so
-/// callers run it fresh every time (no cache, no staleness).
-fn candidate_paths(bin: &str, env: &SearchEnv) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = BIN_DIRS.iter().map(|d| Path::new(d).join(bin)).collect();
-    if let Some(home) = &env.home {
-        paths.push(Path::new(home).join(".local/bin").join(bin));
-    }
-    if let Some(path_var) = &env.path {
-        paths.extend(std::env::split_paths(path_var).map(|d| d.join(bin)));
-    }
-    paths
-}
-
-fn resolve_binary(
-    bin: &str,
-    extra: &[&'static str],
-    probe: &dyn PathProbe,
-    env: &SearchEnv,
-) -> Option<PathBuf> {
-    candidate_paths(bin, env)
-        .into_iter()
-        .chain(extra.iter().map(PathBuf::from))
-        .find(|p| probe.is_file(p))
-}
-
 fn detect_terminals_with(probe: &dyn PathProbe, env: &SearchEnv) -> Vec<DetectedTerminal> {
     REGISTRY
         .iter()
         .filter_map(|spec| {
-            resolve_binary(spec.bin, spec.extra_candidates, probe, env).map(|path| {
+            resolve_binary_with(spec.bin, spec.extra_candidates, probe, env).map(|path| {
                 DetectedTerminal {
                     id: spec.id,
                     name: spec.name,
@@ -157,12 +94,6 @@ fn detect_terminals_with(probe: &dyn PathProbe, env: &SearchEnv) -> Vec<Detected
 /// Every registry terminal present on this machine, in registry order.
 pub fn detect_terminals(probe: &dyn PathProbe) -> Vec<DetectedTerminal> {
     detect_terminals_with(probe, &SearchEnv::from_process())
-}
-
-/// Resolve the transport binary (attach argv\[0\]: `ssh`/`kubectl`) to an
-/// absolute path — same launchd-PATH failure class as the terminals (D8).
-pub fn resolve_transport_binary(bin: &str, probe: &dyn PathProbe) -> Option<PathBuf> {
-    resolve_binary(bin, &[], probe, &SearchEnv::from_process())
 }
 
 /// Why a launch could not even be attempted. `NotConfigured` deep-links
@@ -233,7 +164,7 @@ pub fn assemble_launch(
     let (transport, rest) = attach_argv
         .split_first()
         .ok_or_else(|| ResolveError::NotDetected("empty attach command".into()))?;
-    let resolved = resolve_transport_binary(transport, probe).ok_or_else(|| {
+    let resolved = crate::launch::resolve_binary(transport, &[], probe).ok_or_else(|| {
         ResolveError::NotDetected(format!(
             "`{transport}` not found in standard locations — required to attach"
         ))
@@ -262,26 +193,6 @@ pub fn shell_quote_command(argv: &[String]) -> String {
         }
     }
     argv.iter().map(|t| quote(t)).collect::<Vec<_>>().join(" ")
-}
-
-/// Spawn the terminal detached: null stdio, own process group (unix) so it
-/// outlives Remora. The caller keeps the `Child` briefly for the early-exit
-/// check (D9), then drops it.
-pub fn spawn_detached(argv: &[String]) -> std::io::Result<Child> {
-    let (program, args) = argv
-        .split_first()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty argv"))?;
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    cmd.spawn()
 }
 
 #[cfg(test)]
