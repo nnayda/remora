@@ -869,7 +869,7 @@ fn next_backoff(current: Duration) -> Duration {
 /// Applies "equal jitter" to a backoff `base`: keep half fixed, randomize the
 /// other half, so the delay stays in `[base/2, base]` and never collapses to
 /// ~0 (which would hammer a flapping relay).
-fn jittered(base: Duration, rng: &mut impl rand::Rng) -> Duration {
+fn jittered(base: Duration, rng: &mut impl rand::RngExt) -> Duration {
     let half = base / 2;
     // `half` is at most BACKOFF_MAX/2 = 15 s, whose nanos fit comfortably in a
     // u64, so this cast never truncates.

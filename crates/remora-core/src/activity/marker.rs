@@ -49,10 +49,8 @@ impl MarkerScanner {
     }
 
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<MarkerHit> {
-        // vte 0.13.1: advance takes a single byte, not a slice.
-        for &byte in chunk {
-            self.parser.advance(&mut self.sink, byte);
-        }
+        // vte 0.14: advance consumes the whole slice in one call.
+        self.parser.advance(&mut self.sink, chunk);
         // std::mem::take leaves self.sink.hits empty for the next call.
         std::mem::take(&mut self.sink.hits)
     }
