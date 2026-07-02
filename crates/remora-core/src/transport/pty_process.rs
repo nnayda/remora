@@ -777,6 +777,33 @@ mod tests {
         drop(channel); // teardown reaps cat
     }
 
+    /// An empty write (empty paste, programmatic flush) carries no user
+    /// intent: it must not set the flag, so nothing may exit `Awaiting`
+    /// (#224). If the guard regressed, the settle wakes during the child's
+    /// sleep — or the tail chunk's wake — would consume the flag and flip
+    /// Working.
+    #[tokio::test]
+    async fn empty_write_does_not_exit_awaiting() {
+        let mut channel = spawn_after_awaiting_marker("sleep 0.6; printf 'tail'");
+
+        recv_status(&mut channel, remora_protocol::SessionStatus::Awaiting).await;
+        channel.send_bytes(Vec::new()).await.expect("send empty");
+
+        let mut after_awaiting = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), channel.recv()).await {
+                Ok(Some(ChannelOutput::StatusChange(s))) => after_awaiting.push(s),
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => panic!("timed out draining"),
+            }
+        }
+        assert!(
+            after_awaiting.is_empty(),
+            "empty write exited awaiting: {after_awaiting:?}"
+        );
+    }
+
     /// Resize is repaint-causing but is NOT "the user answered": neither the
     /// resize nor output arriving after it may exit `Awaiting` (#224).
     #[tokio::test]
