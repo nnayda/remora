@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- "Open in VS Code" per-session action for SSH sessions: opens the remote
+  workspace in local VS Code via Remote-SSH (`code --remote`). Works for live
+  and stopped sessions. kubectl sessions are not yet supported.
 - **Open a session in an external terminal — UI half**: session menu gains
   "Open in <terminal>" (launches the configured external terminal attached to
   the session, coexisting with the embedded one) and "Copy attach command"
