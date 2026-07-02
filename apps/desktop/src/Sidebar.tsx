@@ -35,6 +35,9 @@ interface SidebarProps {
   /** Session keys whose open is in flight — their row shows a connecting
    * spinner until the open resolves, fails, or is cancelled (#170). */
   connectingKeys: ReadonlySet<string>;
+  /** Session keys whose remove is running in the background — their row shows
+   * a "Removing…" spinner until the teardown settles. */
+  removingKeys: ReadonlySet<string>;
   /** Open (attach/focus) a session. App routes by node.state: live→attach, stopped→respawn. */
   onOpenSession: (node: SessionNode) => void;
   /** Non-fatal config read error; shown as a banner above the tree. */
@@ -86,6 +89,7 @@ export function Sidebar({
   activeKey,
   openKeys,
   connectingKeys,
+  removingKeys,
   onOpenSession,
   configError,
   discoveryUnavailable,
@@ -202,6 +206,7 @@ export function Sidebar({
               activeKey={activeKey}
               openKeys={openKeys}
               connectingKeys={connectingKeys}
+              removingKeys={removingKeys}
               onOpenSession={onOpenSession}
               onStop={onStop}
               onRemove={onRemove}
@@ -242,6 +247,7 @@ function ProjectGroup({
   activeKey,
   openKeys,
   connectingKeys,
+  removingKeys,
   onOpenSession,
   onStop,
   onRemove,
@@ -256,6 +262,7 @@ function ProjectGroup({
   activeKey: string | null;
   openKeys: Set<string>;
   connectingKeys: ReadonlySet<string>;
+  removingKeys: ReadonlySet<string>;
   onOpenSession: (node: SessionNode) => void;
   onStop: (node: SessionNode) => void;
   onRemove: (node: SessionNode) => void;
@@ -328,6 +335,7 @@ function ProjectGroup({
                 )}
                 connected={openKeys.has(session.key)}
                 connecting={connectingKeys.has(session.key)}
+                removing={removingKeys.has(session.key)}
                 active={session.key === activeKey}
                 aria-current={session.key === activeKey ? "true" : undefined}
                 title={rowTitle({

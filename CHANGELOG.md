@@ -20,6 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Background session removal**: confirming "Remove session" no longer locks
+  the app behind the dialog for the whole remote teardown. The dialog and the
+  session's tab close immediately, the teardown (tmux kill + worktree/branch
+  delete) runs in the background, and the sidebar row shows a "Removing…"
+  spinner until it completes. If the workspace has uncommitted work, the
+  dialog re-opens at the "Remove anyway?" stage once the background check
+  reports it; other failures surface in the notice bar with the reason, and
+  the session stays available to retry. Because results now arrive
+  asynchronously, the force re-prompt names its session, never replaces a
+  remove dialog you have open for a different session (it parks in the notice
+  bar instead), and a session already mid-removal can't be asked to remove
+  again — its tab is only closed once the store has actually accepted the
+  removal.
 - **ADR-0021: relay trust model — blind relay + user-side bridge** (#68):
   settles the relay architecture before any relay code exists. Relay mode
   splits into a self-hostable (or Remora-hosted, paid) **blind relay** that

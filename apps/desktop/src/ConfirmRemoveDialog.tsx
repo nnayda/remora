@@ -1,6 +1,5 @@
-import { type KeyboardEvent, useEffect, useRef, useState } from "react";
-import type { WorkspaceModeDto } from "./bindings";
-import { type RemoveResult, removeErrorMessage } from "./session-store";
+import { type KeyboardEvent, useEffect, useRef } from "react";
+import type { DirtyReasonDto, WorkspaceModeDto } from "./bindings";
 import { Button, Dialog } from "./ui";
 import { AlertTriangle } from "./ui/icons";
 
@@ -8,7 +7,14 @@ interface ConfirmRemoveDialogProps {
   projectId: string;
   sessionId: string;
   workspace: WorkspaceModeDto | null;
-  onConfirm: (force: boolean) => Promise<RemoveResult>;
+  /** Set when a backgrounded removal came back WorkspaceDirty: App re-opens
+   * the dialog with the reason and it starts directly at the force stage. */
+  forceReason?: DirtyReasonDto | null;
+  /** Fire the removal (force=true from the force stage). Fire-and-forget:
+   * App backgrounds the call, owns the follow-up (dirty re-prompt / error
+   * notice), and closes this dialog — the dialog never awaits or self-closes
+   * on confirm. */
+  onConfirm: (force: boolean) => void;
   onClose: () => void;
 }
 
@@ -20,11 +26,14 @@ const REASON_COPY: Record<string, string> = {
 
 /** Two-stage confirm dialog for removing a session.
  *
- * Stage 1: asks for confirmation, varying copy when workspace === "worktree".
- * Stage 2 (force): shown only when the first attempt returns {ok:false, dirty};
- *   lets the user confirm with force=true.
+ * Confirm stage: asks for confirmation, varying copy when workspace === "worktree".
+ * Force stage: rendered when `forceReason` is set — the backgrounded first
+ *   attempt returned WorkspaceDirty and App re-opened the dialog to confirm
+ *   force=true. The stage is a prop, not local state: removal runs in the
+ *   background, so the dirty answer arrives after this dialog has unmounted.
  *
- * Buttons are disabled while a call is in flight. Esc closes. Tab is trapped.
+ * Confirm fires `onConfirm` and nothing else; there is no in-flight state to
+ * disable buttons over. Esc closes. Tab is trapped.
  *
  * The design-system <Dialog> is presentational (no focus trap / Esc / focus
  * restore), so this component keeps that behavior itself. */
@@ -32,13 +41,10 @@ export function ConfirmRemoveDialog({
   projectId,
   sessionId,
   workspace,
+  forceReason = null,
   onConfirm,
   onClose,
 }: ConfirmRemoveDialogProps) {
-  type Stage = { kind: "confirm" } | { kind: "force"; dirtyReason: string };
-  const [stage, setStage] = useState<Stage>({ kind: "confirm" });
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const firstButtonRef = useRef<HTMLButtonElement>(null);
 
   // Focus the primary action button on open; restore focus on close.
@@ -48,53 +54,11 @@ export function ConfirmRemoveDialog({
     return () => previouslyFocused?.focus?.();
   }, []);
 
-  // Re-focus the primary action button when transitioning to stage 2.
-  useEffect(() => {
-    if (stage.kind === "force") {
-      firstButtonRef.current?.focus();
-    }
-  }, [stage]);
-
-  function requestClose() {
-    if (!busy) onClose();
-  }
-
-  async function handleConfirm(force: boolean) {
-    if (busy) return;
-    setBusy(true);
-    setError(null);
-    let result: RemoveResult;
-    try {
-      result = await onConfirm(force);
-    } catch (err) {
-      setBusy(false);
-      setError("An unexpected error occurred.");
-      console.error("removeSession threw", err);
-      return;
-    }
-    setBusy(false);
-    if (result.ok) {
-      onClose();
-      return;
-    }
-    if (!force && "dirty" in result && result.dirty) {
-      // Escalate to the force stage with the reason from the server.
-      setStage({
-        kind: "force",
-        dirtyReason: REASON_COPY[result.dirty] ?? result.dirty,
-      });
-      return;
-    }
-    // Error from a force attempt (or unexpected non-dirty error on first
-    // attempt). Surfaces a BridgeError's message instead of a generic string.
-    setError(removeErrorMessage(result));
-  }
-
   /** Modal keyboard handling: Esc closes, Tab is trapped within the dialog. */
   function onKeyDown(e: KeyboardEvent) {
     if (e.key === "Escape") {
       e.preventDefault();
-      requestClose();
+      onClose();
       return;
     }
     if (e.key !== "Tab") return;
@@ -116,20 +80,19 @@ export function ConfirmRemoveDialog({
   const worktreeNote =
     workspace === "worktree" ? " and deletes its worktree and branch." : ".";
 
-  const isForce = stage.kind === "force";
+  const isForce = forceReason != null;
+  const dirtyCopy = isForce ? (REASON_COPY[forceReason] ?? forceReason) : null;
   const isShared = workspace === "shared";
 
   const footer = (
     <>
-      <Button variant="ghost" onClick={onClose} disabled={busy}>
+      <Button variant="ghost" onClick={onClose}>
         Cancel
       </Button>
       <Button
         ref={firstButtonRef}
         variant={isShared && !isForce ? "primary" : "danger"}
-        onClick={() => void handleConfirm(isForce)}
-        disabled={busy}
-        loading={busy}
+        onClick={() => onConfirm(isForce)}
       >
         {isForce ? "Remove anyway" : isShared ? "Close" : "Remove"}
       </Button>
@@ -154,12 +117,18 @@ export function ConfirmRemoveDialog({
             : "This kills the tmux session and cannot be undone."
       }
       icon={<AlertTriangle size={18} />}
-      onClose={requestClose}
+      onClose={onClose}
       onKeyDown={onKeyDown}
       footer={footer}
     >
       {isForce ? (
-        <p>This session has {stage.dirtyReason}. Remove anyway?</p>
+        <p>
+          Session{" "}
+          <strong style={{ fontFamily: "var(--font-mono)" }}>
+            {projectId}/{sessionId}
+          </strong>{" "}
+          has {dirtyCopy}. Remove anyway?
+        </p>
       ) : isShared ? (
         <p>
           Close session{" "}
@@ -175,11 +144,6 @@ export function ConfirmRemoveDialog({
             {projectId}/{sessionId}
           </strong>
           ? This kills tmux{worktreeNote}
-        </p>
-      )}
-      {error && (
-        <p role="alert" style={{ color: "var(--danger)" }}>
-          {error}
         </p>
       )}
     </Dialog>

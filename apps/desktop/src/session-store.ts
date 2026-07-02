@@ -80,6 +80,11 @@ export interface Snapshot {
    * has no tab to carry a status until it resolves, so this transient set is the
    * only signal the click registered. Mirrors the `pending` open guard. */
   connecting: string[];
+  /** Keys whose remove is in flight. Removal runs in the background (the
+   * confirm dialog closes immediately), so this transient set drives the
+   * sidebar row's "Removing…" spinner until the teardown settles. Remove-only
+   * by design — a `stop` is quick and must not read as a removal. */
+  removing: string[];
 }
 
 export interface StoreOpeners {
@@ -146,8 +151,17 @@ export class SessionStore {
   private reconnectTokens = new Map<string, ReconnectToken>();
   private disposed = false;
   private listeners = new Set<() => void>();
-  private snapshot: Snapshot = { tabs: [], activeKey: null, connecting: [] };
+  private snapshot: Snapshot = {
+    tabs: [],
+    activeKey: null,
+    connecting: [],
+    removing: [],
+  };
   private teardownPending = new Set<string>();
+  // Keys with a remove in flight — the UI-facing subset of `teardownPending`
+  // (which also covers stops and exists only for the busy-guard). Mutations
+  // are followed by commit() so the sidebar spinner tracks the teardown.
+  private removing = new Set<string>();
   // Per-key count of in-flight respawns. A respawn is an "open" for
   // mutual-exclusion purposes but, unlike `openTab`, isn't tracked in `pending`
   // (it cancels via the reconnect token, not the pending token — see
@@ -193,6 +207,7 @@ export class SessionStore {
       // `pending` is exactly the set of in-flight opens (set/cleared only in
       // openTab), so it doubles as the connecting set the UI spins on.
       connecting: [...this.pending.keys()],
+      removing: [...this.removing],
     };
     for (const listener of this.listeners) listener();
   }
@@ -660,9 +675,29 @@ export class SessionStore {
     return { ok: true };
   };
 
-  /** Remove a session for good. On success the local tab is closed (silent;
-   * closeTab also cancels the reconnect token). WorkspaceDirty is surfaced so the
-   * UI can confirm a force-remove (D2/D5). */
+  /** Mark a remove in flight for `key` in BOTH sets (busy-guard + published
+   * spinner signal) and commit, so the two can never drift apart. Runs
+   * synchronously inside `remove()` before its first await — App relies on
+   * that to tell an accepted remove from a busy-guard refusal. */
+  private beginRemove(key: string): void {
+    this.teardownPending.add(key);
+    this.removing.add(key);
+    this.commit();
+  }
+
+  /** Clear the in-flight remove marks for `key` (both settle paths). */
+  private endRemove(key: string): void {
+    this.teardownPending.delete(key);
+    this.removing.delete(key);
+    this.commit();
+  }
+
+  /** Remove a session for good. Runs in the background from the UI's point of
+   * view: the key is published in `snapshot.removing` for the whole call so
+   * the sidebar row spins while the multi-round-trip teardown runs. On success
+   * the local tab is closed (silent; closeTab also cancels the reconnect
+   * token). WorkspaceDirty is surfaced so the UI can confirm a force-remove
+   * (D2/D5). */
   remove = async (
     projectId: string,
     sessionId: string,
@@ -673,15 +708,15 @@ export class SessionStore {
     // Refuse if any open/respawn/teardown for this key is already in flight —
     // removing a session mid-spawn is the orphaning race.
     if (this.busy(key)) return { ok: false };
-    this.teardownPending.add(key);
+    this.beginRemove(key);
     try {
       await this.openers.remove(projectId, sessionId, force);
     } catch (error) {
-      this.teardownPending.delete(key);
+      this.endRemove(key);
       if (isWorkspaceDirty(error)) return { ok: false, dirty: error.reason };
       return { ok: false, error };
     }
-    this.teardownPending.delete(key);
+    this.endRemove(key);
     this.closeTab(key); // no-op if not open; else silent close + token cancel
     return { ok: true };
   };
@@ -723,4 +758,36 @@ export function removeErrorMessage(result: RemoveResult): string {
     return errorMessage(e); // BridgeError → its message; string → itself
   }
   return "Could not remove the session.";
+}
+
+/** What App should do after a *backgrounded* remove settles. Removal no longer
+ * blocks a modal (the confirm dialog closes as soon as it fires), so the
+ * result routing — nothing / re-prompt for force / surface an error / stay
+ * quiet — happens async in App. Pure so it is testable without rendering App.
+ * A dirty result re-prompts only when the attempt was NOT forced: force skips
+ * the dirty probe server-side, so honoring `force` here guarantees the prompt
+ * cannot loop. A bare `{ok:false}` (no dirty, no error) is the in-flight
+ * busy-guard or a disposed store, never a real failure, so it routes to
+ * `ignored` rather than a false error notice. */
+export type RemoveFollowUp =
+  | { kind: "done" }
+  | { kind: "confirm-force"; reason: DirtyReasonDto }
+  | { kind: "error"; message: string }
+  | { kind: "ignored" };
+
+export function routeRemoveResult(
+  result: RemoveResult,
+  force: boolean,
+): RemoveFollowUp {
+  if (result.ok) return { kind: "done" };
+  if (!force && result.dirty) {
+    return { kind: "confirm-force", reason: result.dirty };
+  }
+  if ("error" in result && result.error !== undefined) {
+    return { kind: "error", message: removeErrorMessage(result) };
+  }
+  // Bare {ok:false}: the in-flight busy-guard (e.g. a retry while the
+  // removal is already running) or a disposed store — not a real failure,
+  // so stay quiet (matches onStop's convention).
+  return { kind: "ignored" };
 }
