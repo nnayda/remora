@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Background session removal**: confirming "Remove session" no longer locks
+  the app behind the dialog for the whole remote teardown. The dialog and the
+  session's tab close immediately, the teardown (tmux kill + worktree/branch
+  delete) runs in the background, and the sidebar row shows a "Removing…"
+  spinner until it completes. If the workspace has uncommitted work, the
+  dialog re-opens at the "Remove anyway?" stage once the background check
+  reports it; other failures surface in the notice bar with the reason, and
+  the session stays available to retry.
 - **Per-session collapsed rail** (#184): the collapsed left sidebar now shows one
   navigable glyph per session instead of one avatar per host. Clicking a glyph
   focuses/opens that session (it used to only expand the rail). Sessions are
