@@ -22,7 +22,7 @@ pub use channel::{SessionChannel, CHANNEL_CAPACITY};
 pub use error::{DirtyReason, SourceError};
 pub use exclusive::{ExclusiveSource, SessionLocks};
 pub use fake::FakeSessionSource;
-pub use source::SessionSource;
+pub use source::{unsupported_remote_workspace, RemoteWorkspace, SessionSource};
 pub use spawn_plan::{plan_spawn, PlanError, SpawnPlan};
 pub use transport::{KubectlSource, SshSource};
 

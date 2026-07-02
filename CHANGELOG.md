@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- "Open in VS Code" per-session action for SSH sessions: opens the remote
+  workspace in local VS Code via Remote-SSH (`code --remote`). Works for live
+  and stopped sessions. kubectl sessions are not yet supported.
 - **Wire-protocol spec for third-party clients** ([`docs/PROTOCOL.md`](docs/PROTOCOL.md)):
   documents the `remora-protocol` surface a third-party client implements —
   the session protocol (ids, `SessionMeta`, the attached channel, the remote

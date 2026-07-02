@@ -216,6 +216,46 @@ impl Bridge {
         Ok(source.external_attach_command(&p, &s).await?)
     }
 
+    /// The editor-open locator for a session (Decision 5, #79). Resolves the
+    /// authoritative workspace path from discovery (`list()`, so it works for
+    /// live AND stopped sessions) rather than trusting a frontend snapshot,
+    /// then asks the transport for its editor target. Nothing sensitive or
+    /// stale crosses from JS — the command takes only ids.
+    pub async fn remote_workspace(
+        &self,
+        project_id: String,
+        session_id: String,
+    ) -> Result<remora_core::RemoteWorkspace, BridgeError> {
+        let (p, s) = parse_ids(project_id, session_id)?;
+        let source = self.resolve_for(&p)?;
+        let meta = source
+            .list()
+            .await?
+            .into_iter()
+            .find(|m| m.project_id == p && m.session_id == s)
+            .ok_or_else(|| BridgeError::SessionNotFound {
+                message: format!("session `{}_{}` not found", p.as_str(), s.as_str()),
+            })?;
+        let workspace_path = meta.workspace_path.ok_or_else(|| BridgeError::Transport {
+            message: "session has no known workspace path to open".into(),
+        })?;
+        // `workspace_path` rides in from the remote tmux env (agent/host
+        // controlled); discovery's `clean_metadata` strips only control
+        // chars, so a value like `--install-extension=evil` would otherwise
+        // reach `code`'s argv-based flag parser as a bare token. Reject it
+        // here, before it becomes a local argv token (spawn is argv-based —
+        // no shell injection — but `code` still parses a leading-dash token
+        // as a flag).
+        if workspace_path.trim().starts_with('-') {
+            return Err(BridgeError::Transport {
+                message:
+                    "session workspace path looks like a flag, refusing to pass it to an editor"
+                        .into(),
+            });
+        }
+        Ok(source.remote_workspace(&p, &s, &workspace_path).await?)
+    }
+
     /// The validated config's `terminal` preference (fresh read — the Bridge
     /// caches no config by design). A missing file is `None`, matching the
     /// empty-config convention.
@@ -775,6 +815,134 @@ mod tests {
         assert_eq!(argv, ["fake-attach", "api", "s"]);
     }
 
+    /// A source whose `list()` advertises one live session with (or without)
+    /// a `workspace_path`, and whose `remote_workspace` echoes an `Ssh`
+    /// locator (mirrors the fake's behavior). Deliberately NOT
+    /// `FakeSessionSource` — its `list()` hardcodes `workspace_path: None`.
+    struct WorkspaceSource {
+        workspace_path: Option<String>,
+    }
+    #[async_trait]
+    impl SessionSource for WorkspaceSource {
+        async fn spawn(&self, _: SpawnSpec) -> Result<SessionChannel, SourceError> {
+            unreachable!()
+        }
+        async fn attach(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+        ) -> Result<SessionChannel, SourceError> {
+            unreachable!()
+        }
+        async fn external_attach_command(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+        ) -> Result<Vec<String>, SourceError> {
+            unreachable!()
+        }
+        async fn remote_workspace(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+            workspace_path: &str,
+        ) -> Result<remora_core::RemoteWorkspace, SourceError> {
+            Ok(remora_core::RemoteWorkspace::Ssh {
+                authority: "h".into(),
+                path: workspace_path.to_string(),
+            })
+        }
+        async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
+            Ok(vec![SessionMeta {
+                project_id: pid("api"),
+                session_id: sid("fix-login"),
+                state: SessionState::Live,
+                agent: None,
+                created_at: None,
+                workspace_path: self.workspace_path.clone(),
+                workspace: None,
+                branch: None,
+            }])
+        }
+        async fn respawn(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+            _: Option<AgentId>,
+        ) -> Result<SessionChannel, SourceError> {
+            unreachable!()
+        }
+        async fn stop(&self, _: &ProjectId, _: &SessionId) -> Result<(), SourceError> {
+            unreachable!()
+        }
+        async fn remove(&self, _: &ProjectId, _: &SessionId, _: bool) -> Result<(), SourceError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_workspace_resolves_path_from_list_then_composes() {
+        // A source whose list() advertises one live ssh session with a path,
+        // and whose remote_workspace echoes an Ssh locator (the fake does this).
+        let source = Arc::new(WorkspaceSource {
+            workspace_path: Some("/w/api/fix-login".into()),
+        });
+        let bridge = bridge_with_config(source, temp_config_path("remote-ws-ok"));
+        let target = bridge
+            .remote_workspace("api".into(), "fix-login".into())
+            .await
+            .expect("locator");
+        assert!(matches!(target, remora_core::RemoteWorkspace::Ssh { .. }));
+    }
+
+    #[tokio::test]
+    async fn remote_workspace_errors_when_path_unknown() {
+        // A source whose list() session has workspace_path: None -> clear error,
+        // not a panic.
+        let source = Arc::new(WorkspaceSource {
+            workspace_path: None,
+        });
+        let bridge = bridge_with_config(source, temp_config_path("remote-ws-none"));
+        let err = bridge
+            .remote_workspace("api".into(), "fix-login".into())
+            .await
+            .expect_err("no path");
+        assert!(matches!(err, BridgeError::Transport { .. }));
+    }
+
+    /// A workspace path that looks like a CLI flag (agent/host-controlled via
+    /// `REMORA_WORKSPACE`, discovery only strips control chars) must never
+    /// reach `code`'s argv-based flag parser as a bare token — reject it
+    /// before it gets anywhere near `remote_workspace`/`launch_argv`.
+    #[tokio::test]
+    async fn remote_workspace_rejects_flag_like_path() {
+        let source = Arc::new(WorkspaceSource {
+            workspace_path: Some("--install-extension=x".into()),
+        });
+        let bridge = bridge_with_config(source, temp_config_path("remote-ws-flag"));
+        let err = bridge
+            .remote_workspace("api".into(), "fix-login".into())
+            .await
+            .expect_err("flag-like path must be rejected");
+        assert!(matches!(err, BridgeError::Transport { .. }));
+    }
+
+    /// `list()` not carrying the requested session (wrong id here) is the
+    /// `SessionNotFound` branch, distinct from the "found but no path" and
+    /// "found but path looks like a flag" branches above.
+    #[tokio::test]
+    async fn remote_workspace_session_not_found() {
+        let source = Arc::new(WorkspaceSource {
+            workspace_path: Some("/w/api/fix-login".into()),
+        });
+        let bridge = bridge_with_config(source, temp_config_path("remote-ws-notfound"));
+        let err = bridge
+            .remote_workspace("api".into(), "ghost".into())
+            .await
+            .expect_err("no such session");
+        assert!(matches!(err, BridgeError::SessionNotFound { .. }));
+    }
+
     #[tokio::test]
     async fn config_missing_file_is_empty() {
         let b = bridge_with_config(
@@ -1049,6 +1217,14 @@ mod tests {
         ) -> Result<Vec<String>, SourceError> {
             unreachable!()
         }
+        async fn remote_workspace(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+            _: &str,
+        ) -> Result<remora_core::RemoteWorkspace, SourceError> {
+            unreachable!()
+        }
         async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
             Ok(vec![
                 SessionMeta {
@@ -1270,6 +1446,14 @@ mod tests {
         ) -> Result<Vec<String>, SourceError> {
             self.inner.external_attach_command(p, s).await
         }
+        async fn remote_workspace(
+            &self,
+            p: &ProjectId,
+            s: &SessionId,
+            path: &str,
+        ) -> Result<remora_core::RemoteWorkspace, SourceError> {
+            self.inner.remote_workspace(p, s, path).await
+        }
         async fn list(&self) -> Result<Vec<remora_protocol::SessionMeta>, SourceError> {
             self.inner.list().await
         }
@@ -1363,6 +1547,14 @@ mod tests {
             _: &ProjectId,
             _: &SessionId,
         ) -> Result<Vec<String>, SourceError> {
+            unreachable!()
+        }
+        async fn remote_workspace(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+            _: &str,
+        ) -> Result<remora_core::RemoteWorkspace, SourceError> {
             unreachable!()
         }
         async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
@@ -1555,6 +1747,14 @@ mod tests {
             _: &ProjectId,
             _: &SessionId,
         ) -> Result<Vec<String>, SourceError> {
+            unreachable!()
+        }
+        async fn remote_workspace(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+            _: &str,
+        ) -> Result<remora_core::RemoteWorkspace, SourceError> {
             unreachable!()
         }
         async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
@@ -2223,6 +2423,14 @@ mod tests {
         ) -> Result<Vec<String>, SourceError> {
             log_push(&self.log, "external_attach_command");
             Ok(Vec::new())
+        }
+        async fn remote_workspace(
+            &self,
+            _: &ProjectId,
+            _: &SessionId,
+            _: &str,
+        ) -> Result<remora_core::RemoteWorkspace, SourceError> {
+            unreachable!()
         }
         async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
             Ok(Vec::new())

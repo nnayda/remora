@@ -78,8 +78,10 @@ pub struct SessionMeta {
     /// out-of-range discovered values to `None` rather than forwarding
     /// them — a non-numeric forged value would fail the whole message.
     pub created_at: Option<u64>,
-    /// Workspace (worktree) path, as advertised by the sandbox. Untrusted;
-    /// display only.
+    /// Workspace (worktree) path, as advertised by the sandbox. Untrusted
+    /// remote-supplied value. Display, plus one guarded consumer: the
+    /// editor-open flow passes it as a single argv token after rejecting
+    /// flag-like values — nothing may interpolate it into shell strings.
     pub workspace_path: Option<String>,
     /// Effective workspace mode, discovered from real sandbox state (a surviving
     /// worktree ⇒ `Worktree`). Drives display gating. `None` from an older

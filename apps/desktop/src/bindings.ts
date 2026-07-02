@@ -197,6 +197,14 @@ async configSetTerminal(terminalId: string | null) : Promise<Result<null, Bridge
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+async openInVscode(projectId: string, sessionId: string) : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("open_in_vscode", { projectId, sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 

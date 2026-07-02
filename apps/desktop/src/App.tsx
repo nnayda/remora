@@ -13,6 +13,7 @@ import {
   externalTerminalLabel,
   runCopyAttach,
   runOpenExternal,
+  runOpenInVscode,
 } from "./external-terminal";
 import { NewSessionDialog } from "./NewSessionDialog";
 import { SettingsDialog, type View as SettingsView } from "./SettingsDialog";
@@ -432,6 +433,19 @@ function App() {
       .catch(() => setNotice("Could not copy the command."));
   }
 
+  /** Open this SSH session's remote workspace in local VS Code (Remote-SSH). */
+  function onOpenVscode(node: SessionNode) {
+    setNotice(null);
+    void runOpenInVscode(
+      {
+        open: (p, s) => commands.openInVscode(p, s),
+        onError: (message) => setNotice(`Could not open VS Code: ${message}`),
+      },
+      node.projectId,
+      node.sessionId,
+    ).catch(() => setNotice("Could not open VS Code."));
+  }
+
   /** Open the remove confirm dialog for any session. A session whose removal
    * is already running in the background gets no dialog — confirming it would
    * only hit the store's busy-guard, and the row's spinner already says the
@@ -635,6 +649,7 @@ function App() {
             externalLabel={externalLabel}
             onOpenExternal={onOpenExternal}
             onCopyAttach={onCopyAttach}
+            onOpenVscode={onOpenVscode}
             onStop={onStop}
             onRemove={onRemove}
             onNewSession={openNewSession}
