@@ -18,5 +18,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "macro
 tokio-tungstenite = { workspace = true }
 toml = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints]
 workspace = true
