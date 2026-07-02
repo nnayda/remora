@@ -16,9 +16,12 @@
 //! The Noise handshake, the bridge server loop, and the `RemoteSource`
 //! transport land in later tasks.
 
+mod bridge;
 mod identity;
 mod noise;
+mod wire_error;
 
+pub use bridge::{serve_bridge, BridgeConfig, BridgeServeError};
 pub use identity::{
     provision_device, BridgeIdentity, IdentityError, PairingFile, Roster, RosterEntry,
 };
@@ -26,3 +29,4 @@ pub use noise::{
     chunk_bytes, prologue, Handshake, NoiseError, Transport, MAX_NOISE_PLAINTEXT, NOISE_PATTERN,
     PTY_CHUNK_BYTES,
 };
+pub use wire_error::{map_source_error, map_wire_error};
