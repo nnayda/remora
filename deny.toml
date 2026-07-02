@@ -10,6 +10,14 @@ yanked = "deny"
 # safe upgrade; that is upstream's to fix, and this heals automatically when
 # tauri moves off them.
 unmaintained = "workspace"
+# quick-xml 0.39.4 (transitive: wayland-scanner build-time protocol XML, zbus
+# D-Bus introspection — never attacker-controlled input here). Both advisories
+# are DoS-class and no patched release exists yet; cargo update finds nothing
+# newer. Temporary — remove when a fixed quick-xml lands (see #244).
+ignore = [
+  { id = "RUSTSEC-2026-0194", reason = "no patched quick-xml yet; trusted-input surfaces only (see #244)" },
+  { id = "RUSTSEC-2026-0195", reason = "no patched quick-xml yet; trusted-input surfaces only (see #244)" },
+]
 
 [licenses]
 version = 2
