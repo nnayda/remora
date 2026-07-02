@@ -28,6 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   negotiation and compatibility rules, the relay-mode connection sequence, and
   what a blind relay does and does not see. Fulfils ADR-0002's promise that
   third-party clients can target `remora-protocol` without us building them.
+- **Verified reproducible relay build**: the `remora-relay` container binary is
+  now confirmed bit-for-bit reproducible (two clean-cache builds → identical
+  sha256). `scripts/verify-relay-reproducible.sh` checks it and a weekly CI job
+  (`relay-reproducible.yml`) guards against regressions. The relay README
+  documents the verification, how to reproduce the image *digest* too
+  (`SOURCE_DATE_EPOCH` + BuildKit `rewrite-timestamp` via the OCI exporter), and
+  the base-image digest-refresh cadence, now automated via Dependabot's `docker`
+  ecosystem. No build change was required — the existing pinned digests,
+  `--locked`, and single-codegen-unit stripped release profile already made it
+  reproducible.
 - **Open a session in an external terminal — UI half**: session menu gains
   "Open in <terminal>" (launches the configured external terminal attached to
   the session, coexisting with the embedded one) and "Copy attach command"
