@@ -20,6 +20,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ADR-0021: relay trust model — blind relay + user-side bridge** (#68):
+  settles the relay architecture before any relay code exists. Relay mode
+  splits into a self-hostable (or Remora-hosted, paid) **blind relay** that
+  routes only end-to-end-encrypted frames — no sandbox credentials, no
+  plaintext; blindness guaranteed by cryptography, with an audit mode as a
+  regression guard against accidental metadata leakage — and a **bridge**
+  holding host config + transport creds that runs only on user hardware
+  (the desktop app by default; a headless container later for
+  laptop-asleep phone access). Devices pair by QR with a split secret
+  (relay-visible rendezvous token + relay-blind PSK mixed into an
+  IKpsk-family Noise handshake), so even a malicious relay cannot enroll
+  itself as a device; per-bridge rosters, revocation as first-class UX.
+  Corrects ARCHITECTURE.md's old relay-drives-ssh sketch and resolves two
+  VISION.md open questions (relay auth; relay configuration source). Docs
+  only — build work is sequenced in follow-up issues starting with relay
+  slice 1 (envelope + relay MVP + one E2E PTY stream, #231; then pairing
+  #232, push #233, headless bridge #234; SECURITY page #235 and
+  PROTOCOL.md #236).
 - **Per-session collapsed rail** (#184): the collapsed left sidebar now shows one
   navigable glyph per session instead of one avatar per host. Clicking a glyph
   focuses/opens that session (it used to only expand the rail). Sessions are
