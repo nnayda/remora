@@ -84,12 +84,13 @@ them, and the **bridge** (`remora-bridge`, a library) hosts a `RemoteSource`
 that drives `remora-core` end-to-end over Noise — same seam, no UI changes.
 The bridge is only ever hosted on user hardware: today it runs in-process
 inside the desktop app (dev-only loopback dogfood behind
-`REMORA_REMOTE_LOOPBACK=1`, no pairing UX yet — #232); a standalone headless
-`remora-bridge` binary for laptop-asleep access is still future work (#234).
-This is relay **slice 1**: envelope protocol + one E2E PTY stream (attach,
-list) and per-session mutual exclusion below the `SessionSource` seam, with
-dev-grade file-based provisioning — no QR pairing (#232), no push (#233), no
-headless bridge binary (#234).
+`REMORA_REMOTE_LOOPBACK=1`); a standalone headless `remora-bridge` binary for
+laptop-asleep access is still future work (#234). Relay **slice 1** (envelope
+protocol, one E2E PTY stream — attach, list — and per-session mutual exclusion
+below the `SessionSource` seam) has since been joined by real QR split-secret
+device pairing (#232) and opt-in UnifiedPush wake delivery
+([ADR-0023](adr/0023-unifiedpush-first-wake-delivery.md), #233) — only the
+standalone headless bridge binary (#234) remains open.
 
 ## Security invariants
 

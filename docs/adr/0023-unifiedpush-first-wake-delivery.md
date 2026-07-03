@@ -92,9 +92,17 @@ first line of delivery code:
   every resolved address against policy — **denying loopback, link-local
   (including `169.254.0.0/16` and its cloud-metadata callers, and IPv6
   `fe80::/10`), private ranges (RFC 1918, `fc00::/7`), and unspecified
-  addresses by default.** `allow_private_endpoints = true` opts in LAN
+  addresses by default.** `allow_private_endpoints = true` re-admits loopback
+  as well as private/ULA targets (RFC 1918, IPv6 `fc00::/7`) — for LAN
   self-hosters (an ntfy instance on the same network) who deliberately want
-  a private target.
+  one of those. Link-local/cloud-metadata addresses stay blocked regardless:
+  no config flag re-admits them. One honest asymmetry worth naming: IPv4
+  cloud-metadata (`169.254.169.254`) is link-local and so is **always**
+  blocked, but the IPv6 equivalent some clouds expose (e.g. AWS's
+  `fd00:ec2::254`) is a ULA address, not link-local — so with
+  `allow_private_endpoints = true` it is classified as an admitted private
+  target, not blocked metadata. A relay operator who opts in to LAN
+  self-hosting on a cloud-hosted relay should know that trade-off.
 - The relay **pins the checked address** on the HTTP client (reqwest
   `resolve()`) rather than letting the client re-resolve at connect time —
   closing the DNS-rebinding gap where a hostname resolves to a safe address

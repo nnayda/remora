@@ -50,7 +50,7 @@ sandbox credentials on the relay.
 Two independent version constants govern the wire, one per layer:
 
 - **[`PROTOCOL_VERSION`](../crates/remora-protocol/src/lib.rs)** (currently
-  **2**) — the session protocol: message shapes plus the id and tmux-naming
+  **4**) — the session protocol: message shapes plus the id and tmux-naming
   conventions of [ADR-0004](adr/0004-local-config-live-session-discovery.md).
   It is exchanged as the first message on a fresh session
   (`ClientMessage::Hello` / `BridgeMessage::Hello`, below), so either side can
@@ -59,7 +59,7 @@ Two independent version constants govern the wire, one per layer:
   load-bearing.
 - **`ENVELOPE_VERSION`** (currently **1**) — the relay envelope's own byte-0
   version, independent of `PROTOCOL_VERSION` (the two need not move together —
-  today they are 2 and 1). `Envelope::decode` rejects any other value, and it
+  today they are 4 and 1). `Envelope::decode` rejects any other value, and it
   is mixed into the Noise handshake prologue, so a client and bridge that
   disagree on it cannot complete a handshake.
 
@@ -307,8 +307,8 @@ touching the payload):
 | --- | --- | --- |
 | 0 | `Hello` | A device or bridge authenticating to the relay. Payload is a JSON `RelayHello`. |
 | 1 | `Data` | Opaque session payload (Noise ciphertext). |
-| 2 | `Pairing` | **Reserved** for the pairing follow-up (#232). The codec round-trips it; nothing constructs one yet. |
-| 3 | `PushTrigger` | **Reserved** for the push follow-up (#233). Same status. |
+| 2 | `Pairing` | Device pairing frame (ADR-0021, #232): carries the split-secret enrollment ceremony between a joining device and its bridge. |
+| 3 | `PushTrigger` | Bridge → relay wake request (ADR-0023, #233): an empty-payload frame asking the relay to decide whether a registered device needs a UnifiedPush wake. A device sending one is a protocol violation. |
 
 **`DeviceId`** is an opaque 32-byte routing identity. `DeviceId::ZERO`
 (all-zero) is reserved and valid **only** as the `dst` of a `Hello` frame,
@@ -406,12 +406,16 @@ consideration, not a v1 guarantee.
 
 The types above are what [relay slice 1](adr/0021-blind-relay-bridge-trust-model.md)
 (#231) shipped: the envelope protocol, the Noise session, and one end-to-end
-PTY stream (attach, list). Deliberately **not** yet specified here, and owned
-by follow-ups: QR split-secret pairing and the `Pairing` frame (#232), push
-notifications and the `PushTrigger` frame (#233), the headless bridge binary
-(#234), and the durable ciphertext-mailbox session record (#71). When those
-land, the reserved frame types and any new session messages version alongside
-`PROTOCOL_VERSION`.
+PTY stream (attach, list). Since then, QR split-secret pairing and the
+`Pairing` frame (#232) and opt-in UnifiedPush wake delivery over the
+`PushTrigger` frame ([ADR-0023](adr/0023-unifiedpush-first-wake-delivery.md),
+#233) have both landed, each with its own `PROTOCOL_VERSION` bump (this page's
+`RemoteOp`/`RemoteResult` listing above predates both and does not yet enumerate
+`ListDevices`/`RevokeDevice`/`RegisterPushEndpoint`/`PushEndpointSet` — see the
+crate doc comments for the current, normative set). Deliberately **not** yet
+specified here, and owned by follow-ups: the headless bridge binary (#234) and
+the durable ciphertext-mailbox session record (#71). When those land, any new
+frame types or session messages version alongside `PROTOCOL_VERSION`.
 
 ## See also
 

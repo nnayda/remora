@@ -2168,6 +2168,11 @@ async fn handle_request(
             }
             // Refresh the relay's view so it starts (or stops) waking this
             // device, mirroring the credential set the roster now holds.
+            // Best-effort: `reassert_roster_only` swallows a send failure (the
+            // relay connection may be down), and the roster write above already
+            // durably persisted the registration, so this still answers
+            // `PushEndpointSet` — the next successful re-assert (e.g. on
+            // reconnect) picks up the stored change.
             reassert_roster_only(deps, outbound_tx, control_seq).await;
             RemoteResult::PushEndpointSet
         }

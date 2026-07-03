@@ -36,7 +36,9 @@ pub use session::{SessionMeta, SessionState, SessionStatus, SpawnSpec, Workspace
 /// message enum (or changing a representation) is a breaking change: bump
 /// this constant and gate compatibility on it. The tmux naming and worktree
 /// conventions of ADR-0004 version alongside it. Bumped 3 → 4 for
-/// ADR-0023's push-wake slice: `RemoteOp::RegisterPushEndpoint`/
-/// `RemoteResult::PushEndpointSet`, `AssertedDevice.push`, and the
-/// `PushRegistration`/`PushTrigger` wire shapes it introduces.
+/// ADR-0023's push-wake slice: the new `RemoteOp::RegisterPushEndpoint`/
+/// `RemoteResult::PushEndpointSet` ops, `AssertedDevice.push`, and the new
+/// `PushRegistration` wire shape. `FrameType::PushTrigger` itself was already
+/// reserved (byte `3`) before this bump; what changes here is that it now
+/// carries real wake-request semantics instead of being an inert reservation.
 pub const PROTOCOL_VERSION: u32 = 4;

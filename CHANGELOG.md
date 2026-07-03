@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **UnifiedPush wake delivery** (#233, ADR-0023): when a paired device is
+  disconnected and its session needs attention, the relay can POST a generic
+  wake ("a session needs your attention" — never session content) to a
+  device-supplied UnifiedPush endpoint (e.g. an ntfy topic), behind an
+  opt-in, SSRF-hardened `[push]` relay config; see `crates/remora-relay/README.md`
+  for the config reference and ntfy quick-start.
 - **Device pairing over the relay** (#232, ADR-0021): the bridge now enrolls
   phones through a real split-secret pairing ceremony instead of the slice-1
   file-based provisioning stub, and the relay drops its static `devices` config
