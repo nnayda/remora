@@ -254,6 +254,7 @@ fn assert_devices_msg(id: u32, roster: &Roster) -> RelayControl {
             .map(|e| AssertedDevice {
                 device_id: e.device_id,
                 token: device_token_for(e),
+                push: None,
             })
             .collect(),
     }
@@ -1306,11 +1307,13 @@ async fn run_pairing(
             .map(|e| AssertedDevice {
                 device_id: e.device_id,
                 token: device_token_for(e),
+                push: None,
             })
             .collect();
         devices.push(AssertedDevice {
             device_id,
             token: relay_token.clone(),
+            push: None,
         });
         RelayControl::AssertDevices {
             id: next_control_id(control_seq.as_ref()),

@@ -775,6 +775,7 @@ mod tests {
             vec![AssertedDevice {
                 device_id: did(DEVICE),
                 token: "device-tok".to_string(),
+                push: None,
             }],
         );
         let (dh, _drx) = outbound_channel(1024);
@@ -794,6 +795,7 @@ mod tests {
             vec![AssertedDevice {
                 device_id: did(DEVICE),
                 token: "device-tok".to_string(),
+                push: None,
             }],
         );
         let device = accept(
@@ -878,6 +880,7 @@ mod tests {
             vec![AssertedDevice {
                 device_id: did(DEVICE),
                 token: "device-tok".to_string(),
+                push: None,
             }],
         );
         // Device connects.
@@ -905,6 +908,7 @@ mod tests {
                 devices: vec![AssertedDevice {
                     device_id: did(DEVICE),
                     token: "device-tok".to_string(),
+                    push: None,
                 }],
             },
             0,
@@ -932,6 +936,7 @@ mod tests {
             vec![AssertedDevice {
                 device_id: did(DEVICE),
                 token: "device-tok".to_string(),
+                push: None,
             }],
         );
         router.disconnect(&bridge);
@@ -974,6 +979,7 @@ mod tests {
             vec![AssertedDevice {
                 device_id: did(DEVICE),
                 token: "device-tok".to_string(),
+                push: None,
             }],
         );
         let (h1, _rx1) = outbound_channel(1024);
@@ -1003,6 +1009,7 @@ mod tests {
             vec![AssertedDevice {
                 device_id: did(DEVICE),
                 token: "device-tok".to_string(),
+                push: None,
             }],
         );
 
@@ -1027,6 +1034,7 @@ mod tests {
             vec![AssertedDevice {
                 device_id: did(DEVICE),
                 token: "device-tok".to_string(),
+                push: None,
             }],
         );
         let (dh, _drx) = outbound_channel(1024);
@@ -1062,6 +1070,7 @@ mod tests {
             vec![AssertedDevice {
                 device_id: did(OTHER_DEVICE),
                 token: "other-device-tok".to_string(),
+                push: None,
             }],
         );
 
@@ -1095,6 +1104,7 @@ mod tests {
             vec![AssertedDevice {
                 device_id: did(DEVICE),
                 token: "device-tok".to_string(),
+                push: None,
             }],
         );
         let (dh, _drx) = outbound_channel(1024);
@@ -1119,6 +1129,7 @@ mod tests {
             vec![AssertedDevice {
                 device_id: did(DEVICE),
                 token: "device-tok".to_string(),
+                push: None,
             }],
         );
 
@@ -1151,6 +1162,7 @@ mod tests {
             vec![AssertedDevice {
                 device_id: did(DEVICE),
                 token: "device-tok".to_string(),
+                push: None,
             }],
         );
 
@@ -1182,6 +1194,7 @@ mod tests {
             vec![AssertedDevice {
                 device_id: did(DEVICE),
                 token: "device-tok".to_string(),
+                push: None,
             }],
         );
 
@@ -1212,6 +1225,7 @@ mod tests {
             vec![AssertedDevice {
                 device_id: did(DEVICE),
                 token: "device-tok".to_string(),
+                push: None,
             }],
         );
         let (dh, _drx) = outbound_channel(1024);

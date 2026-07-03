@@ -174,6 +174,7 @@ async fn assert_device(bridge: &mut Ws) {
         devices: vec![AssertedDevice {
             device_id: did(DEVICE),
             token: "device-tok".to_string(),
+            push: None,
         }],
     };
     send_bin(bridge, control_frame(BRIDGE, &control)).await;
