@@ -167,8 +167,15 @@ pub(crate) fn start_relay_bridge(bridge: &Bridge) -> Option<PairingHandles> {
         // `serve_bridge` only returns `Err` on an unusable configuration (e.g. a
         // non-`ws` relay URL); transient relay/network failures are retried
         // internally. Log a fatal stop rather than panic.
-        if let Err(e) =
-            serve_bridge(bridge_cfg, source, commands_rx, events_tx, wake_rx, shutdown_task).await
+        if let Err(e) = serve_bridge(
+            bridge_cfg,
+            source,
+            commands_rx,
+            events_tx,
+            wake_rx,
+            shutdown_task,
+        )
+        .await
         {
             eprintln!("relay bridge stopped: {e}");
         }

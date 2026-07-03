@@ -171,8 +171,15 @@ pub async fn start_loopback(
     let (_wake, wake_rx) = wake_channel();
     let shutdown_c = shutdown.clone();
     let bridge_task = tokio::spawn(async move {
-        if let Err(e) =
-            serve_bridge(bridge_cfg, source, commands_rx, events_tx, wake_rx, shutdown_c).await
+        if let Err(e) = serve_bridge(
+            bridge_cfg,
+            source,
+            commands_rx,
+            events_tx,
+            wake_rx,
+            shutdown_c,
+        )
+        .await
         {
             eprintln!("loopback bridge stopped: {e}");
         }
