@@ -23,7 +23,8 @@ use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use remora_bridge::{
-    fingerprint, serve_bridge, BridgeConfig, BridgeEvent, BridgeIdentity, PairingCommand, Roster,
+    fingerprint, is_ws_url, serve_bridge, BridgeConfig, BridgeEvent, BridgeIdentity,
+    PairingCommand, Roster,
 };
 use remora_core::config::{Config, ConfigError};
 use remora_core::SessionSource;
@@ -97,6 +98,19 @@ pub(crate) fn start_relay_bridge(bridge: &Bridge) -> Option<PairingHandles> {
             return None;
         }
     };
+
+    // `serve_bridge` rejects a non-`ws`/`wss` relay URL, but only inside the
+    // spawned task — after we would have returned `Some(PairingHandles)` and the
+    // UI already believes the bridge is running. Reject the unusable URL up front
+    // instead, so a misconfigured relay lands in the same "not started" bucket as
+    // an identity/roster failure rather than a doomed task the UI can't cancel.
+    if !is_ws_url(&relay.relay_url) {
+        eprintln!(
+            "relay bridge not started: relay_url must be a ws:// or wss:// endpoint, got {:?}",
+            relay.relay_url
+        );
+        return None;
+    }
 
     // Durable identity (stable across runs) + the paired-device roster (persists
     // real pairings), both from the shared bridge-state layout.

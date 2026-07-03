@@ -2400,8 +2400,10 @@ fn split_preamble(frame: &[u8]) -> Option<(DeviceId, &[u8])> {
     Some((DeviceId(id), msg1))
 }
 
-/// True if `url` is a WebSocket endpoint this bridge can dial.
-fn is_ws_url(url: &str) -> bool {
+/// True if `url` is a WebSocket endpoint this bridge can dial. Public so a host
+/// (e.g. the desktop shell) can reject an unusable `relay_url` up front, before
+/// it starts a bridge task that `serve_bridge` would only fail asynchronously.
+pub fn is_ws_url(url: &str) -> bool {
     url.starts_with("ws://") || url.starts_with("wss://")
 }
 
