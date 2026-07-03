@@ -82,6 +82,14 @@ pub fn run() {
                 relay::start_relay_bridge(&app_bridge)
             };
 
+            // When a relay bridge is running, tee the output pump's session
+            // status transitions into its wake path (#233) so a hosted session
+            // going `Awaiting` push-wakes a paired device. Cheap, cloneable
+            // handle; set before the Bridge is handed to managed state.
+            if let Some(handles) = &pairing_handles {
+                app_bridge.set_wake_handle(Arc::new(handles.wake.clone()));
+            }
+
             app.manage(app_bridge);
             // Expose the pairing channels for the pairing UI's commands (Task 16,
             // #232). Managed only when a relay bridge is actually running. Before

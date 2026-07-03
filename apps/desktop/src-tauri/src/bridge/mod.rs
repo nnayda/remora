@@ -17,8 +17,10 @@ use futures_util::future::join_all;
 use remora_core::config::{Config, ConfigDocument, ConfigError, HostId};
 use remora_core::{SessionChannel, SessionLocks, SessionSource};
 
+use remora_bridge::BridgeWakeHandle;
 use remora_protocol::{
-    AgentId, ChannelInput, ChannelOutput, ProjectId, SessionId, SpawnSpec, TerminalSize,
+    AgentId, ChannelInput, ChannelOutput, ProjectId, SessionId, SessionStatus, SpawnSpec,
+    TerminalSize,
 };
 use resolve::SourceResolver;
 use tokio::sync::{mpsc, oneshot};
@@ -33,6 +35,36 @@ use output::{BridgeOutput, ChannelHandle, OutputSink};
 
 type Registry = Arc<Mutex<HashMap<u64, OpenChannel>>>;
 type Spawner = Arc<dyn Fn(Pin<Box<dyn Future<Output = ()> + Send>>) + Send + Sync>;
+
+/// The sink the output pump tees session status transitions into (#233).
+///
+/// When this device hosts a relay bridge, every `StatusChange` the pump sees is
+/// forwarded here so the bridge can push-wake a paired device on an opening
+/// `Awaiting` edge. Abstracted (rather than the pump holding the concrete
+/// [`BridgeWakeHandle`]) so the tee stays a one-liner the shell can inject a
+/// spy for, and so the pump carries no wake policy — that lives in the bridge
+/// (ADR-0023). The whole path is a no-op when relay mode is off (no handle set).
+pub trait SessionWaker: Send + Sync {
+    /// Records that `(project_id, session_id)` moved to `status`. Must never
+    /// block or fail the caller — the session path owns liveness, not this tee.
+    fn note_session_status(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        status: SessionStatus,
+    );
+}
+
+impl SessionWaker for BridgeWakeHandle {
+    fn note_session_status(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        status: SessionStatus,
+    ) {
+        BridgeWakeHandle::note_session_status(self, project_id, session_id, status);
+    }
+}
 
 struct OpenChannel {
     input: mpsc::Sender<ChannelInput>,
@@ -66,6 +98,11 @@ pub struct Bridge {
     /// (hybrid routing). Owned here so its relay/bridge tasks live for the app's
     /// lifetime. `None` — and every code path unchanged — by default.
     remote_host: Option<RemoteHost>,
+    /// The relay bridge's wake sink (#233), set at launch only when this device
+    /// hosts a bridge (`[relay]` configured). The output pump tees every
+    /// `StatusChange` here so a hosted session going `Awaiting` can push-wake a
+    /// paired device. `None` — no tee, a pure no-op — when relay mode is off.
+    wake: Option<Arc<dyn SessionWaker>>,
 }
 
 impl Bridge {
@@ -104,6 +141,7 @@ impl Bridge {
             config_mutex: tokio::sync::Mutex::new(()),
             session_locks,
             remote_host: None,
+            wake: None,
         }
     }
 
@@ -113,6 +151,14 @@ impl Bridge {
     /// bridge tasks alive for the app's lifetime.
     pub(crate) fn set_remote_host(&mut self, host: RemoteHost) {
         self.remote_host = Some(host);
+    }
+
+    /// Injects the relay bridge's wake sink (#233). Called from `lib.rs` setup
+    /// when `[relay]` is configured, before the Bridge is handed to Tauri's
+    /// managed state, so the output pump can tee session status transitions into
+    /// the hosted bridge's push-wake path. Absent (the default) → no tee.
+    pub(crate) fn set_wake_handle(&mut self, wake: Arc<dyn SessionWaker>) {
+        self.wake = Some(wake);
     }
 
     /// The wrapping resolver (carries the shared [`SessionLocks`]). Handed to the
@@ -142,7 +188,13 @@ impl Bridge {
 
     /// Register-before-spawn (7A): insert the entry, THEN launch the forward
     /// task. Self-deregister and close() are both keyed by the unique handle.
-    fn open_channel(&self, channel: SessionChannel, sink: Arc<dyn OutputSink>) -> ChannelHandle {
+    fn open_channel(
+        &self,
+        project_id: ProjectId,
+        session_id: SessionId,
+        channel: SessionChannel,
+        sink: Arc<dyn OutputSink>,
+    ) -> ChannelHandle {
         let SessionChannel { input, output } = channel;
         let handle = ChannelHandle(self.next_handle.fetch_add(1, Ordering::SeqCst));
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -155,7 +207,14 @@ impl Bridge {
         );
         let registry = Arc::clone(&self.channels);
         (self.spawn_task)(Box::pin(forward(
-            output, sink, registry, handle.0, cancel_rx,
+            output,
+            sink,
+            registry,
+            handle.0,
+            cancel_rx,
+            self.wake.clone(),
+            project_id,
+            session_id,
         )));
         handle
     }
@@ -189,8 +248,10 @@ impl Bridge {
             worktree_root,
         };
         let source = self.resolve_for(&spec.project_id)?;
+        // Capture the ids for the wake tee before `spec` moves into `spawn`.
+        let (project_id, session_id) = (spec.project_id.clone(), spec.session_id.clone());
         let channel = source.spawn(spec).await?;
-        Ok(self.open_channel(channel, sink))
+        Ok(self.open_channel(project_id, session_id, channel, sink))
     }
 
     pub async fn attach(
@@ -202,7 +263,7 @@ impl Bridge {
         let (p, s) = parse_ids(project_id, session_id)?;
         let source = self.session_source_for_attach(&p)?;
         let channel = source.attach(&p, &s).await?;
-        Ok(self.open_channel(channel, sink))
+        Ok(self.open_channel(p, s, channel, sink))
     }
 
     /// The external-attach argv for a session, composed by core (spec
@@ -299,7 +360,7 @@ impl Bridge {
             })?;
         let source = self.resolve_for(&p)?;
         let channel = source.respawn(&p, &s, agent).await?;
-        Ok(self.open_channel(channel, sink))
+        Ok(self.open_channel(p, s, channel, sink))
     }
 
     pub async fn write(&self, handle: ChannelHandle, bytes: Vec<u8>) -> Result<(), BridgeError> {
@@ -664,12 +725,16 @@ fn parse_ids(p: String, s: String) -> Result<(ProjectId, SessionId), BridgeError
 /// error) it attempts to emit `Closed` (unless `close()` raced in after the
 /// loop exited — see cancel guard below). On cancel (`close()`) it is always
 /// silent. Always self-deregisters by handle.
+#[allow(clippy::too_many_arguments)]
 async fn forward(
     mut output: mpsc::Receiver<ChannelOutput>,
     sink: Arc<dyn OutputSink>,
     registry: Registry,
     handle: u64,
     mut cancel: oneshot::Receiver<()>,
+    wake: Option<Arc<dyn SessionWaker>>,
+    project_id: ProjectId,
+    session_id: SessionId,
 ) {
     loop {
         tokio::select! {
@@ -688,6 +753,18 @@ async fn forward(
                     }
                 }
                 Some(ChannelOutput::StatusChange(status)) => {
+                    // Tee EVERY status transition to the relay bridge's wake path
+                    // (#233): the bridge owns all episode logic (open on an
+                    // `Awaiting` edge, close on any other status), so the pump
+                    // forwards them all. Non-blocking and infallible to us — it
+                    // never blocks or fails this session. This re-emission is
+                    // also the BACKSTOP for wakes missed during a >60s relay
+                    // outage: the bridge discards stale queued `Awaiting` notes
+                    // (STALE_WAKE_MAX), relying on the pump re-emitting on the
+                    // next repaint/re-attach to note the session again.
+                    if let Some(wake) = &wake {
+                        wake.note_session_status(&project_id, &session_id, status);
+                    }
                     if sink
                         .send(BridgeOutput::StatusChange { status: status.into() })
                         .is_err()
@@ -801,6 +878,134 @@ mod tests {
             tag,
             std::process::id()
         ))
+    }
+
+    /// Records every `note_session_status` the pump makes, so the tee tests can
+    /// assert on-count and payload without draining the opaque `WakeReceiver`.
+    #[derive(Default)]
+    struct SpyWaker {
+        calls: Mutex<Vec<(String, String, SessionStatus)>>,
+    }
+    impl SessionWaker for SpyWaker {
+        fn note_session_status(
+            &self,
+            project_id: &ProjectId,
+            session_id: &SessionId,
+            status: SessionStatus,
+        ) {
+            self.calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((
+                    project_id.as_str().to_owned(),
+                    session_id.as_str().to_owned(),
+                    status,
+                ));
+        }
+    }
+
+    /// Drives `forward` over `outputs`. Runs the pump concurrently and feeds it
+    /// (so it drains as we send — a bounded input channel never wedges), then
+    /// closes the channel so the pump returns on transport death and joins it.
+    async fn run_forward(
+        outputs: Vec<ChannelOutput>,
+        wake: Option<Arc<dyn SessionWaker>>,
+    ) -> mpsc::UnboundedReceiver<BridgeOutput> {
+        let (output_tx, output_rx) = mpsc::channel(16);
+        let (sink, sink_rx) = sink();
+        let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let pump = tokio::spawn(forward(
+            output_rx,
+            sink,
+            registry,
+            0,
+            cancel_rx,
+            wake,
+            ProjectId::new("api").expect("id"),
+            SessionId::new("s").expect("id"),
+        ));
+        for out in outputs {
+            output_tx.send(out).await.expect("feed output");
+        }
+        drop(output_tx); // transport death → forward returns after draining
+        pump.await.expect("pump task");
+        sink_rx
+    }
+
+    #[tokio::test]
+    async fn status_change_tees_every_transition_to_the_wake_handle() {
+        let spy = Arc::new(SpyWaker::default());
+        let sink_rx = run_forward(
+            vec![
+                ChannelOutput::StatusChange(SessionStatus::Awaiting),
+                ChannelOutput::StatusChange(SessionStatus::Working),
+            ],
+            Some(spy.clone() as Arc<dyn SessionWaker>),
+        )
+        .await;
+        // Every transition teed exactly once, in order, with the session's ids.
+        let calls = spy.calls.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            *calls,
+            vec![
+                ("api".to_owned(), "s".to_owned(), SessionStatus::Awaiting),
+                ("api".to_owned(), "s".to_owned(), SessionStatus::Working),
+            ]
+        );
+        drop(calls);
+        // The tee is additive: the status still reached the frontend sink.
+        let forwarded = drain_status_changes(sink_rx);
+        assert_eq!(
+            forwarded,
+            vec![
+                output::SessionStatusDto::Awaiting,
+                output::SessionStatusDto::Working
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn status_change_is_a_noop_when_relay_mode_is_off() {
+        // No wake handle (relay off): the pump must not panic and must still
+        // forward the status to the frontend.
+        let sink_rx = run_forward(
+            vec![ChannelOutput::StatusChange(SessionStatus::Awaiting)],
+            None,
+        )
+        .await;
+        assert_eq!(
+            drain_status_changes(sink_rx),
+            vec![output::SessionStatusDto::Awaiting]
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_tee_never_blocks_the_pump_when_the_queue_is_full() {
+        // The real handle drops on a full bounded queue (never awaits). Keep the
+        // receiver alive so nothing is drained, push far past the queue depth,
+        // and confirm the pump still drains all its output and returns — i.e.
+        // this test completing at all proves the tee never blocked.
+        let (wake, _keep_rx) = remora_bridge::wake_channel();
+        let outputs = (0..500)
+            .map(|_| ChannelOutput::StatusChange(SessionStatus::Awaiting))
+            .collect();
+        let sink_rx = run_forward(outputs, Some(Arc::new(wake))).await;
+        assert_eq!(drain_status_changes(sink_rx).len(), 500);
+    }
+
+    /// Collects the `SessionStatusDto`s a drained sink receiver carries, ignoring
+    /// the trailing `Closed` the pump emits on transport death.
+    fn drain_status_changes(
+        mut rx: mpsc::UnboundedReceiver<BridgeOutput>,
+    ) -> Vec<output::SessionStatusDto> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let BridgeOutput::StatusChange { status } = msg {
+                out.push(status);
+            }
+        }
+        out
     }
 
     #[tokio::test]

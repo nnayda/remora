@@ -44,7 +44,7 @@ use remora_bridge::{
 use remora_core::config::{Config, ConfigError};
 use remora_core::{SessionChannel, SessionSource, SourceError};
 use remora_protocol::{AgentId, ProjectId, SessionId, SessionMeta, SpawnSpec};
-use remora_relay::{serve, AuditSink, BridgeEntry, RelayConfig};
+use remora_relay::{serve, AuditSink, BridgeEntry, PushConfig, RelayConfig};
 
 use crate::bridge::resolve::SourceResolver;
 use crate::bridge::Bridge;
@@ -141,6 +141,10 @@ pub async fn start_loopback(
         handshake_timeout_secs: 10,
         max_connections: 1024,
         audit: None,
+        // Push delivery stays disabled on the dev loopback (its wake handle is
+        // dropped below): the client-side registration path is what this
+        // dogfoods, not relay-side POST delivery (ADR-0023, #233).
+        push: PushConfig::default(),
     });
     let audit = AuditSink::new(&relay_cfg)?;
     let (addr, relay_accept) = serve(relay_cfg, audit).await?;
@@ -189,12 +193,27 @@ pub async fn start_loopback(
     // and take the resulting durable `PairingFile` for the client transport.
     let pairing = drive_loopback_pairing(commands_tx, events_rx).await?;
 
+    // If `[relay] push_wake_url` is configured, the client half registers it with
+    // the bridge on connect (ADR-0023, #233) — dogfooding the whole client-side
+    // registration path over the in-process relay. Absent → registration off.
+    let push_endpoint = load_push_wake_url(&config_path);
+
     Ok(RemoteHost {
-        remote: Arc::new(RemoteSource::new(pairing)),
+        remote: Arc::new(RemoteSource::new(pairing).with_push_endpoint(push_endpoint)),
         shutdown,
         bridge_task,
         relay_accept,
     })
+}
+
+/// Reads `[relay] push_wake_url` from the config at `config_path`, tolerating a
+/// missing/unreadable/invalid file (a fresh device is valid; a config problem is
+/// already surfaced elsewhere) by yielding `None` — registration simply stays off.
+fn load_push_wake_url(config_path: &std::path::Path) -> Option<String> {
+    Config::load(config_path)
+        .ok()
+        .and_then(|c| c.relay)
+        .and_then(|r| r.push_wake_url)
 }
 
 /// Drives the ADR-0021 pairing ceremony against this run's freshly-served bridge
