@@ -187,6 +187,18 @@ impl SessionSource for ExclusiveSource {
             .await
     }
 
+    async fn remote_workspace(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        workspace_path: &str,
+    ) -> Result<crate::RemoteWorkspace, SourceError> {
+        // Lock-free passthrough: pure composition, no session side effects.
+        self.inner
+            .remote_workspace(project_id, session_id, workspace_path)
+            .await
+    }
+
     async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
         // Lock-free passthrough: listing is a read across all sessions and
         // must not stall behind a mutation on any single one.
@@ -301,6 +313,16 @@ mod tests {
         ) -> Result<Vec<String>, SourceError> {
             log_push(&self.log, "external_attach_command");
             Ok(Vec::new())
+        }
+
+        async fn remote_workspace(
+            &self,
+            _project_id: &ProjectId,
+            _session_id: &SessionId,
+            _workspace_path: &str,
+        ) -> Result<crate::RemoteWorkspace, SourceError> {
+            log_push(&self.log, "remote_workspace");
+            Err(crate::unsupported_remote_workspace())
         }
 
         async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
@@ -511,6 +533,37 @@ mod tests {
         let _ = src.attach(&project, &session).await;
 
         assert_eq!(locks.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn remote_workspace_forwards_to_inner() {
+        // Wrap a fake in ExclusiveSource; the fake returns a canned Ssh locator,
+        // so a non-error result proves the wrapper forwarded (Decision 1 guard).
+        let inner = Arc::new(crate::fake::FakeSessionSource::new());
+        inner
+            .spawn(SpawnSpec {
+                project_id: ProjectId::new("api").expect("slug"),
+                session_id: SessionId::new("fix-login").expect("slug"),
+                agent: None,
+                base: None,
+                workspace: None,
+                branch: None,
+                worktree_root: None,
+            })
+            .await
+            .expect("spawn");
+        // ExclusiveSource::new(inner, locks, host_key); SessionLocks::new()
+        // already returns an Arc. Arc<FakeSessionSource> coerces to Arc<dyn ..>.
+        let exclusive = ExclusiveSource::new(inner, SessionLocks::new(), "host");
+        let target = exclusive
+            .remote_workspace(
+                &ProjectId::new("api").expect("slug"),
+                &SessionId::new("fix-login").expect("slug"),
+                "/work/api/fix-login",
+            )
+            .await
+            .expect("forwarded");
+        assert!(matches!(target, crate::RemoteWorkspace::Ssh { .. }));
     }
 
     #[tokio::test]

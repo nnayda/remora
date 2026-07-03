@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt as _, StreamExt as _};
-use rand::RngCore as _;
+use rand::Rng as _;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::task::JoinHandle;
@@ -413,6 +413,15 @@ impl SessionSource for ScriptedSource {
         _project_id: &ProjectId,
         _session_id: &SessionId,
     ) -> Result<Vec<String>, remora_core::SourceError> {
+        Err(scripted_unsupported())
+    }
+
+    async fn remote_workspace(
+        &self,
+        _project_id: &ProjectId,
+        _session_id: &SessionId,
+        _workspace_path: &str,
+    ) -> Result<remora_core::RemoteWorkspace, remora_core::SourceError> {
         Err(scripted_unsupported())
     }
 

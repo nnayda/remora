@@ -1,0 +1,37 @@
+name: Relay reproducible build
+
+# Regression guard for the relay image's bit-for-bit reproducibility
+# (ADR-0021 / #251). The relay binary is reproducible by construction — pinned
+# base-image digests, `cargo build --release --locked`, and a single-codegen-
+# unit, stripped release profile in a fixed build path — but that only holds as
+# long as nobody introduces a non-deterministic input (a build-path-dependent
+# codegen step, a profile change, lockfile drift). This job re-verifies it.
+#
+# Scheduled weekly rather than per-PR: reproducibility rarely regresses and a
+# double image build is expensive, so this runs on a cadence that lines up with
+# the weekly Dependabot base-image digest bumps (a bump is exactly when the
+# inputs change). Trigger it by hand from the Actions tab when you need it
+# sooner — e.g. right after merging a digest bump or a release-profile change.
+
+on:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reproducible:
+    name: Relay binary is bit-for-bit reproducible
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # Builds the relay image twice from a clean cache and asserts the two
+      # extracted binaries share one sha256; exits non-zero on drift. Docker is
+      # preinstalled on the GitHub-hosted runner.
+      - name: Verify reproducible relay binary
+        run: ./scripts/verify-relay-reproducible.sh

@@ -51,7 +51,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use futures_util::stream::Stream;
 use futures_util::{SinkExt as _, StreamExt as _};
-use rand::TryRngCore as _;
+use rand::TryRng as _;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -2375,7 +2375,7 @@ async fn revoke_device(
 
 /// Fills `buf` with cryptographically secure random bytes from the OS CSPRNG.
 fn fill_random(buf: &mut [u8]) -> Result<(), BridgeError> {
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(buf)
         .map_err(|e| BridgeError::Pairing(format!("could not read random bytes: {e}")))
 }
@@ -2415,7 +2415,7 @@ fn next_backoff(current: Duration) -> Duration {
 /// Applies "equal jitter" to a backoff `base`: keep half fixed, randomize the
 /// other half, so the delay stays in `[base/2, base]` and never collapses to
 /// ~0 (which would hammer a flapping relay).
-fn jittered(base: Duration, rng: &mut impl rand::Rng) -> Duration {
+fn jittered(base: Duration, rng: &mut impl rand::RngExt) -> Duration {
     let half = base / 2;
     // `half` is at most BACKOFF_MAX/2 = 15 s, whose nanos fit comfortably in a
     // u64, so this cast never truncates.

@@ -22,7 +22,7 @@ base64 = "0.22"
 blake2 = "0.10"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 portable-pty = "0.9"
-rand = "0.9"
+rand = "0.10"
 remora-bridge = { path = "crates/remora-bridge" }
 remora-core = { path = "crates/remora-core" }
 remora-protocol = { path = "crates/remora-protocol" }
@@ -31,7 +31,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shlex = "2.0"
 # snow >= 0.9.5 pulls in the GHSA-97f8-h76h-f297 fix; never pin below 0.9.5.
-snow = "0.9.6"
+snow = "0.10.0"
 subtle = "2"
 tempfile = "3.27.0"
 thiserror = "2"
@@ -46,7 +46,7 @@ unicode-segmentation = "1"
 # bound ADR-0013 relies on); it is vte's default today, but pin it explicitly
 # so a future `default-features = false` can't silently turn osc_raw into an
 # unbounded Vec.
-vte = { version = "0.13", features = ["no_std"] }
+vte = { version = "0.14", features = ["no_std"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

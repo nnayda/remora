@@ -17,7 +17,7 @@ use std::path::Path;
 
 use base64::Engine as _;
 use blake2::{Blake2s256, Digest as _};
-use rand::TryRngCore as _;
+use rand::TryRng as _;
 use serde::{Deserialize, Serialize};
 
 use remora_protocol::DeviceId;
@@ -75,7 +75,7 @@ impl IdentityError {
 
 /// Fills `buf` with cryptographically secure random bytes from the OS CSPRNG.
 fn os_random(buf: &mut [u8]) -> Result<(), IdentityError> {
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(buf)
         .map_err(|e| IdentityError::Random(e.to_string()))
 }

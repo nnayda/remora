@@ -35,7 +35,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt as _, StreamExt as _};
-use rand::TryRngCore as _;
+use rand::TryRng as _;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -140,7 +140,7 @@ fn map_rejection(reason: PairingRejectReason) -> PairingError {
 /// per-connection routing id; 32 random bytes is never the reserved all-zero id.
 fn random_device_id() -> Result<DeviceId, PairingError> {
     let mut raw = [0u8; 32];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut raw)
         .map_err(|e| PairingError::Transport(format!("csprng error: {e}")))?;
     Ok(DeviceId(raw))

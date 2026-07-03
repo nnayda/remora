@@ -4,6 +4,7 @@ import type {
   Result,
   TerminalPreferenceDto,
 } from "./bindings";
+import type { HostTransport } from "./session-tree";
 
 /** ConfigDto.terminal as bindings project it: registry id, custom argv, or unset. */
 export type TerminalPreference = TerminalPreferenceDto | null;
@@ -73,5 +74,32 @@ export async function runCopyAttach(
   sessionId: string,
 ): Promise<void> {
   const result = await deps.copy(projectId, sessionId);
+  if (result.status === "error") deps.onError(messageOf(result.error));
+}
+
+/** VS Code Remote-SSH needs only the remote dir to exist (not a live tmux),
+ * so it works for stopped sessions too — but only over ssh. kubectl/relay and
+ * pathless sessions are handled Rust-side (backstop error). */
+export function canOpenInVscode(
+  transport: HostTransport,
+  state: "live" | "stopped",
+): boolean {
+  return transport === "ssh" && (state === "live" || state === "stopped");
+}
+
+type OpenVscodeCommand = (
+  projectId: string,
+  sessionId: string,
+) => Promise<Result<null, BridgeError>>;
+
+/** Launch flow: success is silent (the editor window is the feedback — we show
+ * no "opened" notice, so we never imply the remote folder opened when only
+ * `code` launched); any error lands in the app-level notice. */
+export async function runOpenInVscode(
+  deps: { open: OpenVscodeCommand; onError: (message: string) => void },
+  projectId: string,
+  sessionId: string,
+): Promise<void> {
+  const result = await deps.open(projectId, sessionId);
   if (result.status === "error") deps.onError(messageOf(result.error));
 }

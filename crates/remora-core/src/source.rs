@@ -5,6 +5,25 @@ use remora_protocol::{AgentId, ProjectId, SessionId, SessionMeta, SpawnSpec};
 
 use crate::{SessionChannel, SourceError};
 
+/// How a client reaches a session's workspace over the transport, so a local
+/// editor can open it. Core describes the *remote*; the desktop shell maps each
+/// variant to a concrete editor invocation (VS Code:
+/// `code --remote ssh-remote+{authority} {path}`). Editor-agnostic by design
+/// (AGENTS.md's one rule) — core never names `code` or `ssh-remote+`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteWorkspace {
+    /// Reachable over SSH at `authority` (`[user@]host[:port]`), workspace dir
+    /// `path`. `authority` may be a `~/.ssh/config` alias.
+    Ssh { authority: String, path: String },
+}
+
+/// The error every transport that cannot express a local-editor target returns
+/// from [`SessionSource::remote_workspace`]. SSH-only in v1; kubectl is a
+/// follow-up (VS Code Remote-Tunnels over `kubectl exec`).
+pub fn unsupported_remote_workspace() -> SourceError {
+    SourceError::Transport("no local-editor target for this transport — SSH sessions only".into())
+}
+
 /// One instance = one configured host (ssh, kubectl exec, or the
 /// in-process [`fake`](crate::fake)). UI code never talks to a transport
 /// directly — everything goes through this trait, which is what makes the
@@ -52,6 +71,20 @@ pub trait SessionSource: Send + Sync {
         project_id: &ProjectId,
         session_id: &SessionId,
     ) -> Result<Vec<String>, SourceError>;
+
+    /// The editor-open target for this session's workspace, or
+    /// [`unsupported_remote_workspace`] for a transport that has none
+    /// (kubectl, the relay proxy). Pure composition: `workspace_path` is
+    /// supplied by the caller (the desktop bridge resolves it from discovery),
+    /// so this performs no round-trip and no per-session locking. The ids are
+    /// passed for interface uniformity; SSH ignores them (the authority is
+    /// per-host). Never evicts, never mutates.
+    async fn remote_workspace(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        workspace_path: &str,
+    ) -> Result<RemoteWorkspace, SourceError>;
 
     /// Discovers sessions and their liveness without attaching.
     ///

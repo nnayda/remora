@@ -33,7 +33,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rand::RngCore as _;
+use rand::Rng as _;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -329,6 +329,17 @@ impl SessionSource for ResolvingSource {
     ) -> Result<Vec<String>, SourceError> {
         self.for_project(project_id)?
             .external_attach_command(project_id, session_id)
+            .await
+    }
+
+    async fn remote_workspace(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        workspace_path: &str,
+    ) -> Result<remora_core::RemoteWorkspace, SourceError> {
+        self.for_project(project_id)?
+            .remote_workspace(project_id, session_id, workspace_path)
             .await
     }
 

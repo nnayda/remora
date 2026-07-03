@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   canOpenExternal,
+  canOpenInVscode,
   externalTerminalLabel,
   runCopyAttach,
   runOpenExternal,
+  runOpenInVscode,
 } from "./external-terminal";
 
 const GHOSTTY = { id: "ghostty", name: "Ghostty" };
@@ -87,5 +89,42 @@ describe("runCopyAttach", () => {
     });
     await runCopyAttach({ copy: failing, onError }, "api", "s");
     expect(onError).toHaveBeenCalledWith("no clipboard");
+  });
+});
+
+describe("canOpenInVscode", () => {
+  it("enables only for ssh + live/stopped", () => {
+    expect(canOpenInVscode("ssh", "live")).toBe(true);
+    expect(canOpenInVscode("ssh", "stopped")).toBe(true);
+    expect(canOpenInVscode("kubectl", "live")).toBe(false);
+    expect(canOpenInVscode(null, "live")).toBe(false);
+  });
+});
+
+describe("runOpenInVscode", () => {
+  it("is silent on success", async () => {
+    const onError = vi.fn();
+    await runOpenInVscode(
+      { open: async () => ({ status: "ok", data: null }), onError },
+      "api",
+      "fix-login",
+    );
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("routes any error to onError", async () => {
+    const onError = vi.fn();
+    await runOpenInVscode(
+      {
+        open: async () => ({
+          status: "error",
+          error: { kind: "transport", message: "no code" },
+        }),
+        onError,
+      },
+      "api",
+      "fix-login",
+    );
+    expect(onError).toHaveBeenCalledWith("no code");
   });
 });

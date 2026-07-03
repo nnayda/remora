@@ -242,6 +242,17 @@ impl SessionSource for RemoteSource {
         Err(unsupported())
     }
 
+    async fn remote_workspace(
+        &self,
+        _project_id: &ProjectId,
+        _session_id: &SessionId,
+        _workspace_path: &str,
+    ) -> Result<remora_core::RemoteWorkspace, SourceError> {
+        // A relay client can't launch a local editor against the host's ssh
+        // authority; native VS Code is desktop-direct-only (slice-1 scope).
+        Err(unsupported())
+    }
+
     async fn attach(
         &self,
         project_id: &ProjectId,
