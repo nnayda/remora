@@ -42,7 +42,7 @@
 //! the same routing id (a newer task) is never evicted by an older task's stale
 //! done-signal.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -61,13 +61,14 @@ use remora_core::{sanitize, SessionSource};
 use remora_protocol::{
     validate_push_endpoint, AssertedDevice, BridgeMessage, ChannelInput, ChannelOutput,
     ClientMessage, DeviceId, DeviceInfo, Envelope, FrameType, HelloRole, PairingBridgeMsg,
-    PairingClientMsg, PairingCode, PairingRejectReason, PushRegistration, RelayControl,
-    RelayControlAck, RelayControlError, RelayHello, RemoteOp, RemoteResult, WireError,
-    PROTOCOL_VERSION,
+    PairingClientMsg, PairingCode, PairingRejectReason, ProjectId, PushRegistration, RelayControl,
+    RelayControlAck, RelayControlError, RelayHello, RemoteOp, RemoteResult, SessionId,
+    SessionStatus, WireError, PROTOCOL_VERSION,
 };
 
 use crate::identity::{fingerprint, BridgeIdentity, IdentityError, Roster, RosterEntry};
 use crate::noise::{chunk_bytes, prologue, Handshake, HandshakeKind, Transport};
+use crate::wake::{wake_targets, EpisodeKey, WakeEpisodes};
 use crate::wire_error::map_source_error;
 
 /// Standard-base64 engine for the per-pair session PSK the bridge grants a
@@ -115,6 +116,78 @@ const PEER_FRAME_QUEUE: usize = 256;
 
 /// Depth of a peer's internal PTY-event queue (pump task → peer task).
 const PEER_EVENT_QUEUE: usize = 256;
+
+/// Depth of the wake-note queue (host session pump → bridge task, #233). Small
+/// and bounded: the wake path is best-effort, so a burst that overflows this is
+/// dropped rather than allowed to back-pressure the session path.
+const WAKE_QUEUE: usize = 64;
+
+/// Number of concurrently-open `Awaiting` episodes the bridge remembers for
+/// wake de-duplication (#233). Comfortably exceeds any realistic count of
+/// simultaneously-attended sessions; overflow simply forgets the oldest, whose
+/// next `Awaiting` re-wakes.
+const WAKE_EPISODE_CAP: usize = 256;
+
+/// A session status change routed from the host's channel-output pump (#233)
+/// into the bridge task, where it is de-duplicated into wake episodes and, on
+/// an opening `Awaiting` edge, fanned out as `PushTrigger` frames.
+struct WakeNote {
+    /// The session whose status changed.
+    key: EpisodeKey,
+    /// Its new status.
+    status: SessionStatus,
+}
+
+/// The receiver half of the wake channel, handed to [`serve_bridge`]. Opaque so
+/// the internal [`WakeNote`] shape stays private to this crate's bridge task.
+pub struct WakeReceiver(mpsc::Receiver<WakeNote>);
+
+/// A cheap, cloneable handle the host uses to tell the bridge a session changed
+/// status (#233), driving the wake path without ever blocking or erroring the
+/// session it observes.
+///
+/// Obtain one with [`wake_channel`]; hand the paired [`WakeReceiver`] to
+/// [`serve_bridge`]. [`note_session_status`](Self::note_session_status) is
+/// non-blocking and callable from sync contexts, so the channel-output pump can
+/// call it inline.
+#[derive(Clone)]
+pub struct BridgeWakeHandle {
+    tx: mpsc::Sender<WakeNote>,
+}
+
+impl BridgeWakeHandle {
+    /// Records that `(project_id, session_id)` moved to `status`.
+    ///
+    /// Non-blocking and infallible to the caller: it `try_send`s onto a bounded
+    /// queue and drops the note if the queue is full or the bridge task has
+    /// stopped. The wake path is best-effort by design (ADR-0023) — a dropped
+    /// note at worst misses one push, and must never block or fail the session
+    /// path that produced it.
+    pub fn note_session_status(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        status: SessionStatus,
+    ) {
+        let note = WakeNote {
+            key: (project_id.clone(), session_id.clone()),
+            status,
+        };
+        // Drop on a full queue (64 unhandled notes) or a stopped bridge. There
+        // is no logging framework in this crate; the drop is intentional and
+        // silent, matching the crate's fire-and-forget convention (a full queue
+        // means the bridge is far behind on wakes, and the next status change
+        // supersedes this one anyway).
+        let _ = self.tx.try_send(note);
+    }
+}
+
+/// Creates the wake channel: the [`BridgeWakeHandle`] the host keeps and calls,
+/// and the [`WakeReceiver`] it hands to [`serve_bridge`].
+pub fn wake_channel() -> (BridgeWakeHandle, WakeReceiver) {
+    let (tx, rx) = mpsc::channel::<WakeNote>(WAKE_QUEUE);
+    (BridgeWakeHandle { tx }, WakeReceiver(rx))
+}
 
 /// How long a peer may take to send its E2E [`ClientMessage::Hello`] after the
 /// Noise handshake completes. A paired client that finishes the handshake then
@@ -300,6 +373,13 @@ struct PeerDeps {
     /// for this bridge process so two sessions (even on different connections)
     /// never collide on a slot key.
     next_peer_reg: AtomicU64,
+    /// Wake-episode tracker (#233), shared so the connection loop can note
+    /// status changes (opening `Awaiting` episodes → fan out `PushTrigger`s) and
+    /// a peer task can [`forget`](WakeEpisodes::forget) a session's episode when
+    /// its attached channel is torn down. Behind a plain [`Mutex`] because
+    /// [`WakeEpisodes`] is pure/sync; locks are brief and never held across an
+    /// `.await`.
+    episodes: Arc<Mutex<WakeEpisodes>>,
 }
 
 /// Deregisters a peer's [`LivePeers`] slot when the peer task returns, for any
@@ -598,6 +678,7 @@ pub async fn serve_bridge(
     source: Arc<dyn SessionSource>,
     mut commands: mpsc::Receiver<PairingCommand>,
     events: mpsc::Sender<BridgeEvent>,
+    wake: WakeReceiver,
     shutdown: CancellationToken,
 ) -> Result<(), BridgeServeError> {
     if !is_ws_url(&config.relay_url) {
@@ -614,7 +695,12 @@ pub async fn serve_bridge(
         source,
         live_peers: Arc::new(Mutex::new(HashMap::new())),
         next_peer_reg: AtomicU64::new(0),
+        episodes: Arc::new(Mutex::new(WakeEpisodes::new(WAKE_EPISODE_CAP))),
     });
+
+    // The wake-note receiver, owned here so episode state survives relay
+    // reconnects: a session still `Awaiting` across a reconnect is not re-woken.
+    let mut wake = wake.0;
 
     // Correlation ids for relay control requests, monotonic across reconnects so
     // a late reply from a dropped connection can never be mistaken for a fresh
@@ -633,6 +719,7 @@ pub async fn serve_bridge(
             &control_seq,
             &mut commands,
             &events,
+            &mut wake,
             &shutdown,
         )
         .await
@@ -666,6 +753,7 @@ async fn run_connection(
     control_seq: &Arc<AtomicU32>,
     commands: &mut mpsc::Receiver<PairingCommand>,
     events: &mpsc::Sender<BridgeEvent>,
+    wake: &mut mpsc::Receiver<WakeNote>,
     shutdown: &CancellationToken,
 ) -> ConnOutcome {
     let ws = match connect_async(&config.relay_url).await {
@@ -767,6 +855,9 @@ async fn run_connection(
     // Once the command channel closes (the desktop dropped its sender) we stop
     // selecting on it so a closed channel does not spin the loop.
     let mut commands_open = true;
+    // Same for the wake-note channel: once the host drops its `BridgeWakeHandle`
+    // we stop selecting on it (#233).
+    let mut wake_open = true;
     // Peer tasks echo their `(src, generation)` here on exit so the loop can
     // reap the dead slot promptly (see [`DoneGuard`]). Unbounded so the reap
     // never blocks a returning peer; drained synchronously by the select below.
@@ -805,6 +896,14 @@ async fn run_connection(
                 }
                 // Desktop dropped the command sender: no more commands will come.
                 None => commands_open = false,
+            },
+            note = wake.recv(), if wake_open => match note {
+                // A session changed status: de-dup into an episode and, on an
+                // opening `Awaiting` edge, fan `PushTrigger` frames out over this
+                // (live, authenticated) relay connection (#233).
+                Some(note) => handle_wake_note(note, deps, &outbound_tx).await,
+                // Host dropped its wake handle: no more notes will come.
+                None => wake_open = false,
             },
             inbound = stream.next() => match inbound {
                 None => break ConnOutcome::Disconnected,
@@ -1807,6 +1906,9 @@ async fn serve_peer(
     let (events_tx, mut events_rx) = mpsc::channel::<PeerEvent>(PEER_EVENT_QUEUE);
     let mut attach_input: Option<mpsc::Sender<ChannelInput>> = None;
     let mut has_attached = false;
+    // The session this peer is attached to, if any — its wake episode is
+    // forgotten when the channel is torn down (#233).
+    let mut attached_session: Option<EpisodeKey> = None;
 
     loop {
         tokio::select! {
@@ -1833,6 +1935,7 @@ async fn serve_peer(
                             &peer_token,
                             &mut attach_input,
                             &mut has_attached,
+                            &mut attached_session,
                             device_id,
                             &mut revoke_target,
                             &outbound_tx,
@@ -1870,8 +1973,9 @@ async fn serve_peer(
                         if let Some(tx) = &attach_input {
                             if tx.send(input).await.is_err() {
                                 // The channel died mid-send: report it and clear
-                                // the attach state.
+                                // the attach state (and forget its wake episode).
                                 attach_input = None;
+                                forget_episode(&deps, &mut attached_session);
                                 if send_msg(
                                     &mut transport,
                                     &outbound_tx,
@@ -1904,6 +2008,9 @@ async fn serve_peer(
                 }
                 Some(PeerEvent::Dead) => {
                     attach_input = None;
+                    // The attached session channel was torn down: forget its wake
+                    // episode so a later respawn's `Awaiting` wakes afresh (#233).
+                    forget_episode(&deps, &mut attached_session);
                     if send_msg(
                         &mut transport,
                         &outbound_tx,
@@ -1946,6 +2053,7 @@ async fn handle_request(
     peer_token: &CancellationToken,
     attach_input: &mut Option<mpsc::Sender<ChannelInput>>,
     has_attached: &mut bool,
+    attached_session: &mut Option<EpisodeKey>,
     requester_id: DeviceId,
     revoke_target: &mut Option<DeviceId>,
     outbound_tx: &mpsc::Sender<Message>,
@@ -1969,6 +2077,9 @@ async fn handle_request(
                 Ok(channel) => {
                     *has_attached = true;
                     *attach_input = Some(channel.input);
+                    // Remember which session this channel drives, so its episode
+                    // can be forgotten when the channel is torn down (#233).
+                    *attached_session = Some((project_id, session_id));
                     tokio::spawn(pump_output(
                         channel.output,
                         events_tx.clone(),
@@ -2214,6 +2325,80 @@ async fn send_control(
         src: bridge_id,
         dst: DeviceId::ZERO,
         payload,
+    }
+    .encode();
+    outbound_tx
+        .send(Message::Binary(frame.into()))
+        .await
+        .map_err(|_| ())
+}
+
+/// Handles one wake note (#233): record the status change, and if it opens a
+/// fresh `Awaiting` episode, fan an empty-payload `PushTrigger` frame out to
+/// every paired device that has a push registration and no live session.
+///
+/// Best-effort and non-fatal by contract: a poisoned episode lock skips the
+/// wake, and a full/closed outbound queue (the relay connection tearing down)
+/// drops the frame silently. The wake path never errors the session path.
+async fn handle_wake_note(
+    note: WakeNote,
+    deps: &Arc<PeerDeps>,
+    outbound_tx: &mpsc::Sender<Message>,
+) {
+    // Episode de-dup under a brief lock — never held across the `.await`s below.
+    let opens_episode = match deps.episodes.lock() {
+        Ok(mut episodes) => episodes.note(note.key, &note.status),
+        // A poisoned lock (a holder panicked) skips this wake; the tracker is
+        // advisory, so losing one note only risks a missed push, never a crash.
+        Err(_) => return,
+    };
+    if !opens_episode {
+        return;
+    }
+    // The devices currently holding a live Noise session, keyed by their
+    // roster-proven `device_id` — these see the change directly and are not
+    // woken. A poisoned lock skips the wake rather than waking everyone.
+    let live: HashSet<DeviceId> = match deps.live_peers.lock() {
+        Ok(map) => map.keys().copied().collect(),
+        Err(_) => return,
+    };
+    let targets = {
+        let roster = deps.roster.read().await;
+        wake_targets(&roster, &live)
+    };
+    for target in targets {
+        // Fire-and-forget: a gone writer just means the connection is tearing
+        // down, and the wake is best-effort (skip silently).
+        let _ = send_push_trigger(outbound_tx, deps.bridge_id, target).await;
+    }
+}
+
+/// Forgets `attached_session`'s wake episode (if any) and clears it, so a later
+/// respawn of the same session opens a fresh `Awaiting` episode (#233). Called
+/// from a peer task when its attached channel is torn down; a poisoned episode
+/// lock is a no-op (the tracker is advisory).
+fn forget_episode(deps: &Arc<PeerDeps>, attached_session: &mut Option<EpisodeKey>) {
+    if let Some(key) = attached_session.take() {
+        if let Ok(mut episodes) = deps.episodes.lock() {
+            episodes.forget(&key);
+        }
+    }
+}
+
+/// Enqueues an empty-payload `PushTrigger` envelope addressed to `dst` (#233).
+/// The relay routes it to the device's registered push channel; the payload is
+/// empty by design (the relay is blind — it carries no session detail).
+/// `Err(())` means the writer is gone.
+async fn send_push_trigger(
+    outbound_tx: &mpsc::Sender<Message>,
+    src: DeviceId,
+    dst: DeviceId,
+) -> Result<(), ()> {
+    let frame = Envelope {
+        frame_type: FrameType::PushTrigger,
+        src,
+        dst,
+        payload: vec![],
     }
     .encode();
     outbound_tx
@@ -2550,6 +2735,7 @@ mod tests {
             source: Arc::new(remora_core::FakeSessionSource::new()),
             live_peers: Arc::new(Mutex::new(HashMap::new())),
             next_peer_reg: AtomicU64::new(0),
+            episodes: Arc::new(Mutex::new(WakeEpisodes::new(WAKE_EPISODE_CAP))),
         });
 
         assert!(
@@ -2587,6 +2773,7 @@ mod tests {
             source: Arc::new(remora_core::FakeSessionSource::new()),
             live_peers: Arc::new(Mutex::new(HashMap::new())),
             next_peer_reg: AtomicU64::new(0),
+            episodes: Arc::new(Mutex::new(WakeEpisodes::new(WAKE_EPISODE_CAP))),
         });
         (deps, dir)
     }
@@ -2604,6 +2791,7 @@ mod tests {
         let peer_token = CancellationToken::new();
         let mut attach_input: Option<mpsc::Sender<ChannelInput>> = None;
         let mut has_attached = false;
+        let mut attached_session: Option<EpisodeKey> = None;
         let mut revoke_target: Option<DeviceId> = None;
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(4);
         let control_seq = Arc::new(AtomicU32::new(0));
@@ -2615,6 +2803,7 @@ mod tests {
             &peer_token,
             &mut attach_input,
             &mut has_attached,
+            &mut attached_session,
             requester_id,
             &mut revoke_target,
             &outbound_tx,
@@ -2742,6 +2931,216 @@ mod tests {
         );
     }
 
+    // --- Wake fan-out (#233) ------------------------------------------------
+
+    /// A roster entry with a given id and optional push registration, for the
+    /// wake-fan-out tests.
+    fn wake_entry(id: u8, push: Option<PushRegistration>) -> RosterEntry {
+        RosterEntry {
+            device_id: DeviceId([id; 32]),
+            static_pubkey: vec![id; 32],
+            psk: [0; 32],
+            relay_token: "tok".to_string(),
+            name: "d".to_string(),
+            enrolled_at: None,
+            last_connected_at: None,
+            push,
+        }
+    }
+
+    fn some_push() -> Option<PushRegistration> {
+        Some(PushRegistration::UnifiedPush {
+            endpoint: "https://ntfy.sh/t".to_string(),
+        })
+    }
+
+    /// Builds a `PeerDeps` seeded with `entries` in the roster and `live` device
+    /// ids registered as holding a live session — the two inputs the wake
+    /// fan-out reads (plus the shared episode tracker inside).
+    fn wake_test_deps(
+        entries: Vec<RosterEntry>,
+        live: &[DeviceId],
+    ) -> (Arc<PeerDeps>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live_peers: LivePeers = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut map = live_peers.lock().expect("lock");
+            for (i, id) in live.iter().enumerate() {
+                map.entry(*id)
+                    .or_default()
+                    .insert(i as u64, CancellationToken::new());
+            }
+        }
+        let deps = Arc::new(PeerDeps {
+            bridge_id: DeviceId([9u8; 32]),
+            bridge_static_priv: vec![0u8; 32],
+            bridge_static_pub: vec![0u8; 32],
+            relay_url: "ws://test".to_string(),
+            roster: Arc::new(RwLock::new(Roster { entries })),
+            roster_path: dir.path().join("roster.toml"),
+            source: Arc::new(remora_core::FakeSessionSource::new()),
+            live_peers,
+            next_peer_reg: AtomicU64::new(0),
+            episodes: Arc::new(Mutex::new(WakeEpisodes::new(WAKE_EPISODE_CAP))),
+        });
+        (deps, dir)
+    }
+
+    fn wake_note(project: &str, session: &str, status: SessionStatus) -> WakeNote {
+        WakeNote {
+            key: (
+                ProjectId::new(project).expect("project id"),
+                SessionId::new(session).expect("session id"),
+            ),
+            status,
+        }
+    }
+
+    /// Drains every queued outbound frame, returning the `dst` of each
+    /// `PushTrigger` (asserting each carries an empty payload). Non-PushTrigger
+    /// frames fail the test — the wake path must emit nothing else.
+    fn drain_push_triggers(outbound_rx: &mut mpsc::Receiver<Message>) -> Vec<DeviceId> {
+        let mut dsts = Vec::new();
+        while let Ok(msg) = outbound_rx.try_recv() {
+            let Message::Binary(bytes) = msg else {
+                panic!("expected a binary frame, got {msg:?}");
+            };
+            let env = Envelope::decode(&bytes).expect("decode envelope");
+            assert_eq!(
+                env.frame_type,
+                FrameType::PushTrigger,
+                "the wake path emits only PushTrigger frames"
+            );
+            assert!(env.payload.is_empty(), "PushTrigger payload is empty");
+            assert_eq!(env.src, DeviceId([9u8; 32]), "framed from this bridge");
+            dsts.push(env.dst);
+        }
+        dsts
+    }
+
+    #[tokio::test]
+    async fn awaiting_wakes_only_absent_push_devices_once() {
+        // Roster: A (push + offline) → woken; B (push + live) → skipped (it sees
+        // the change directly); C (no push) → skipped (nowhere to wake). A
+        // repeated Awaiting for the same session sends nothing (episode dedup).
+        let a = DeviceId([0xa0; 32]);
+        let b = DeviceId([0xb0; 32]);
+        let (deps, _dir) = wake_test_deps(
+            vec![
+                wake_entry(0xa0, some_push()),
+                wake_entry(0xb0, some_push()),
+                wake_entry(0xc0, None),
+            ],
+            &[b],
+        );
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(16);
+
+        // First Awaiting: opens the episode, fans out exactly one PushTrigger — to A.
+        handle_wake_note(
+            wake_note("proj", "sess", SessionStatus::Awaiting),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert_eq!(
+            drain_push_triggers(&mut outbound_rx),
+            vec![a],
+            "only the push-registered, offline device is woken"
+        );
+
+        // Repeated Awaiting for the same session: no duplicate wake.
+        handle_wake_note(
+            wake_note("proj", "sess", SessionStatus::Awaiting),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert!(
+            drain_push_triggers(&mut outbound_rx).is_empty(),
+            "a session already inside its Awaiting episode is not re-woken"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_awaiting_status_wakes_nobody() {
+        // A Working/Idle/Unknown transition never fans out a wake, even with a
+        // roster full of absent, push-registered devices.
+        let (deps, _dir) = wake_test_deps(
+            vec![wake_entry(0xa0, some_push()), wake_entry(0xb0, some_push())],
+            &[],
+        );
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(16);
+
+        for status in [
+            SessionStatus::Working,
+            SessionStatus::Idle,
+            SessionStatus::Unknown,
+        ] {
+            handle_wake_note(wake_note("proj", "sess", status), &deps, &outbound_tx).await;
+            assert!(
+                drain_push_triggers(&mut outbound_rx).is_empty(),
+                "{status:?} must not wake any device"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_and_reopening_an_episode_wakes_again() {
+        // Awaiting → (some non-Awaiting close) → Awaiting fans out a second wake:
+        // the second Awaiting is a fresh episode, so absent devices are re-woken.
+        let a = DeviceId([0xa0; 32]);
+        let (deps, _dir) = wake_test_deps(vec![wake_entry(0xa0, some_push())], &[]);
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(16);
+
+        handle_wake_note(
+            wake_note("proj", "sess", SessionStatus::Awaiting),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert_eq!(drain_push_triggers(&mut outbound_rx), vec![a]);
+
+        handle_wake_note(
+            wake_note("proj", "sess", SessionStatus::Working),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert!(drain_push_triggers(&mut outbound_rx).is_empty());
+
+        handle_wake_note(
+            wake_note("proj", "sess", SessionStatus::Awaiting),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert_eq!(
+            drain_push_triggers(&mut outbound_rx),
+            vec![a],
+            "a reopened episode wakes the absent device again"
+        );
+    }
+
+    #[test]
+    fn note_session_status_is_non_blocking_and_drops_when_full() {
+        // The public handle never blocks: a full queue (or a stopped bridge)
+        // silently drops the note. Fill the bounded channel, then one more note
+        // must return without panicking and without growing the queue.
+        let (handle, WakeReceiver(mut rx)) = wake_channel();
+        let project = ProjectId::new("proj").expect("project id");
+        let session = SessionId::new("sess").expect("session id");
+        for _ in 0..WAKE_QUEUE {
+            handle.note_session_status(&project, &session, SessionStatus::Awaiting);
+        }
+        // The queue is full; this extra note is dropped, not blocked.
+        handle.note_session_status(&project, &session, SessionStatus::Awaiting);
+        let mut drained = 0;
+        while rx.try_recv().is_ok() {
+            drained += 1;
+        }
+        assert_eq!(drained, WAKE_QUEUE, "the queue is bounded at WAKE_QUEUE");
+    }
+
     #[test]
     fn cancel_live_peers_cancels_only_the_target_devices_sessions() {
         // Two live sessions for one device plus one for another: revoking the
@@ -2852,6 +3251,7 @@ mod tests {
             source: Arc::new(remora_core::FakeSessionSource::new()),
             live_peers: Arc::new(Mutex::new(HashMap::new())),
             next_peer_reg: AtomicU64::new(0),
+            episodes: Arc::new(Mutex::new(WakeEpisodes::new(WAKE_EPISODE_CAP))),
         })
     }
 
@@ -3160,6 +3560,7 @@ mod tests {
             source: Arc::new(remora_core::FakeSessionSource::new()),
             live_peers: Arc::new(Mutex::new(HashMap::new())),
             next_peer_reg: AtomicU64::new(0),
+            episodes: Arc::new(Mutex::new(WakeEpisodes::new(WAKE_EPISODE_CAP))),
         })
     }
 

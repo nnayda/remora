@@ -23,8 +23,8 @@ use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use remora_bridge::{
-    fingerprint, is_ws_url, serve_bridge, BridgeConfig, BridgeEvent, BridgeIdentity,
-    PairingCommand, Roster,
+    fingerprint, is_ws_url, serve_bridge, wake_channel, BridgeConfig, BridgeEvent, BridgeIdentity,
+    BridgeWakeHandle, PairingCommand, Roster,
 };
 use remora_core::config::{Config, ConfigError};
 use remora_core::SessionSource;
@@ -63,6 +63,10 @@ pub struct PairingHandles {
     /// This bridge's own identity fingerprint (ADR-0021 D5), for the pairing UI
     /// to display. Stable for the process lifetime.
     pub bridge_fingerprint: String,
+    /// Cheap, cloneable handle the session-output pump uses to wake paired
+    /// devices when a session goes `Awaiting` (#233). Held here so its channel
+    /// stays open for the bridge's life; the pump wiring lands in a later task.
+    pub wake: BridgeWakeHandle,
     /// Cancels the bridge's serve loop on app teardown.
     pub shutdown: CancellationToken,
     /// The spawned `serve_bridge` task; kept so it lives for the app lifetime.
@@ -157,13 +161,14 @@ pub(crate) fn start_relay_bridge(bridge: &Bridge) -> Option<PairingHandles> {
 
     let (commands_tx, commands_rx) = mpsc::channel::<PairingCommand>(PAIRING_CHANNEL_DEPTH);
     let (events_tx, events_rx) = mpsc::channel::<BridgeEvent>(PAIRING_CHANNEL_DEPTH);
+    let (wake, wake_rx) = wake_channel();
     let shutdown_task = shutdown.clone();
     let task = tauri::async_runtime::spawn(async move {
         // `serve_bridge` only returns `Err` on an unusable configuration (e.g. a
         // non-`ws` relay URL); transient relay/network failures are retried
         // internally. Log a fatal stop rather than panic.
         if let Err(e) =
-            serve_bridge(bridge_cfg, source, commands_rx, events_tx, shutdown_task).await
+            serve_bridge(bridge_cfg, source, commands_rx, events_tx, wake_rx, shutdown_task).await
         {
             eprintln!("relay bridge stopped: {e}");
         }
@@ -174,6 +179,7 @@ pub(crate) fn start_relay_bridge(bridge: &Bridge) -> Option<PairingHandles> {
         events: std::sync::Mutex::new(Some(events_rx)),
         roster,
         bridge_fingerprint,
+        wake,
         shutdown,
         task,
     })

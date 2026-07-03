@@ -38,8 +38,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use remora_bridge::{
-    run_pairing, serve_bridge, BridgeConfig, BridgeEvent, BridgeIdentity, PairingCommand,
-    PairingFile, PairingProgress, RemoteSource, Roster,
+    run_pairing, serve_bridge, wake_channel, BridgeConfig, BridgeEvent, BridgeIdentity,
+    PairingCommand, PairingFile, PairingProgress, RemoteSource, Roster,
 };
 use remora_core::config::{Config, ConfigError};
 use remora_core::{SessionChannel, SessionSource, SourceError};
@@ -166,9 +166,14 @@ pub async fn start_loopback(
     // command branch) — no further commands are issued in loopback mode.
     let (commands_tx, commands_rx) = tokio::sync::mpsc::channel::<PairingCommand>(8);
     let (events_tx, events_rx) = tokio::sync::mpsc::channel::<BridgeEvent>(8);
+    // The wake path (#233) is unused on the dev loopback; drop the handle so the
+    // bridge simply disables its wake branch.
+    let (_wake, wake_rx) = wake_channel();
     let shutdown_c = shutdown.clone();
     let bridge_task = tokio::spawn(async move {
-        if let Err(e) = serve_bridge(bridge_cfg, source, commands_rx, events_tx, shutdown_c).await {
+        if let Err(e) =
+            serve_bridge(bridge_cfg, source, commands_rx, events_tx, wake_rx, shutdown_c).await
+        {
             eprintln!("loopback bridge stopped: {e}");
         }
     });
