@@ -39,8 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   roster entry. Revoking a device removes it from the roster, re-asserts the
   shrunken set to the relay, and cancels its live sessions. Per-bridge rosters,
   a single in-flight pairing window, and confirm-gated enrollment are all first
-  class. Push notifications (#233) and the standalone headless bridge (#234)
-  remain later slices.
+  class. The standalone headless bridge (#234) remains a later slice.
 - **Device pairing over the relay — desktop UI** (#232): Settings gains a
   Devices panel — the paired-device roster with this desktop's own
   fingerprint for comparison, and a per-row Revoke behind a confirm dialog.
