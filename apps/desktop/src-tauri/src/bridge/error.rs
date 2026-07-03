@@ -74,6 +74,28 @@ pub enum BridgeError {
         message: String,
         reason: DirtyReasonDto,
     },
+    /// A relay/pairing command was invoked but this device hosts no relay bridge
+    /// (no `[relay]` section, so no `PairingHandles` in managed state). The UI
+    /// shows a "relay not configured" state instead of a pairing panel.
+    RelayNotConfigured {
+        message: String,
+    },
+    /// A relay/pairing or roster operation failed inside the running bridge
+    /// (e.g. the relay link was down when opening a window, or roster storage
+    /// errored on revoke). Distinct from `RelayNotConfigured` (no bridge at all).
+    Relay {
+        message: String,
+    },
+}
+
+impl From<remora_bridge::BridgeError> for BridgeError {
+    fn from(e: remora_bridge::BridgeError) -> Self {
+        // Display already bounds/escapes any untrusted content; carry it as the
+        // frontend message. Every bridge-side pairing/roster failure maps here.
+        BridgeError::Relay {
+            message: e.to_string(),
+        }
+    }
 }
 
 impl From<SourceError> for BridgeError {

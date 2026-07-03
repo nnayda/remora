@@ -361,6 +361,65 @@ async fn config_set_terminal(
     bridge.config_set_terminal(terminal_id).await
 }
 
+// ---- Pairing + roster (ADR-0021, #232) ----
+
+use crate::bridge::pairing::{
+    DeviceInfoDto, PairingCodeDto, PairingDeviceArrived, PairingResult, PairingWindowOpened,
+    RosterChanged,
+};
+
+/// Open (or replace) this device's pairing window; returns the QR code + TTL.
+#[tauri::command]
+#[specta::specta]
+async fn pairing_open_window(
+    app: tauri::AppHandle,
+    ttl_secs: Option<u64>,
+) -> Result<PairingCodeDto, BridgeError> {
+    crate::bridge::pairing::open_window(&app, ttl_secs).await
+}
+
+/// Confirm the arrived device's fingerprint (enrol it).
+#[tauri::command]
+#[specta::specta]
+async fn pairing_confirm(app: tauri::AppHandle, device_id: String) -> Result<(), BridgeError> {
+    crate::bridge::pairing::confirm(&app, device_id).await
+}
+
+/// Reject the arrived device (grant nothing durable).
+#[tauri::command]
+#[specta::specta]
+async fn pairing_reject(app: tauri::AppHandle, device_id: String) -> Result<(), BridgeError> {
+    crate::bridge::pairing::reject(&app, device_id).await
+}
+
+/// Close the current pairing window without pairing anyone.
+#[tauri::command]
+#[specta::specta]
+async fn pairing_cancel(app: tauri::AppHandle) -> Result<(), BridgeError> {
+    crate::bridge::pairing::cancel(&app).await
+}
+
+/// List this bridge's paired devices (live roster).
+#[tauri::command]
+#[specta::specta]
+async fn list_devices(app: tauri::AppHandle) -> Result<Vec<DeviceInfoDto>, BridgeError> {
+    crate::bridge::pairing::list(&app).await
+}
+
+/// Un-pair a device (drop from roster, kick any live session).
+#[tauri::command]
+#[specta::specta]
+async fn revoke_device(app: tauri::AppHandle, device_id: String) -> Result<(), BridgeError> {
+    crate::bridge::pairing::revoke(&app, device_id).await
+}
+
+/// This bridge's own identity fingerprint (ADR-0021 D5), for the pairing UI.
+#[tauri::command]
+#[specta::specta]
+async fn bridge_fingerprint(app: tauri::AppHandle) -> Result<String, BridgeError> {
+    crate::bridge::pairing::own_fingerprint(&app)
+}
+
 /// Shared by `run()` and the bindings export test, so the command list lives once.
 pub fn builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new()
@@ -388,9 +447,22 @@ pub fn builder() -> Builder<tauri::Wry> {
             external_terminals,
             open_external_terminal,
             copy_attach_command,
-            config_set_terminal
+            config_set_terminal,
+            pairing_open_window,
+            pairing_confirm,
+            pairing_reject,
+            pairing_cancel,
+            list_devices,
+            revoke_device,
+            bridge_fingerprint
         ])
-        .events(collect_events![ConfigChanged])
+        .events(collect_events![
+            ConfigChanged,
+            PairingWindowOpened,
+            PairingDeviceArrived,
+            PairingResult,
+            RosterChanged
+        ])
 }
 
 #[cfg(test)]
