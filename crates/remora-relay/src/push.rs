@@ -1,14 +1,15 @@
-//! Push-wake policy: opt-in `[push]` config, stored registrations, and the
-//! pure wake **decision** (ADR-0023, spec Task 6).
+//! Push-wake pipeline: opt-in `[push]` config, stored registrations, the
+//! pure wake **decision**, and the SSRF-hardened **delivery** (ADR-0023).
 //!
-//! This module owns the relay's *policy* half of the push pipeline: whether a
-//! well-formed `PushTrigger` from a bridge should turn into a delivered wake,
-//! and to which endpoint. It performs **no network I/O** — the HTTP POST, the
-//! SSRF resolve-check-pin, and the global in-flight semaphore are Task 7's
-//! delivery half, which consumes the endpoint [`decide_wake`] returns on
-//! success. Keeping the decision pure and clock-injected ([`std::time::Instant`]
-//! threaded in) makes the cooldown and per-bridge budget deterministically
-//! testable without a real clock.
+//! Two halves live here. The *policy* half decides whether a well-formed
+//! `PushTrigger` from a bridge should turn into a delivered wake, and to
+//! which endpoint; keeping [`decide_wake`] pure and clock-injected
+//! ([`std::time::Instant`] threaded in) makes the cooldown and per-bridge
+//! budget deterministically testable without a real clock. The *delivery*
+//! half ([`deliver_wake`]) consumes the endpoint a successful decision
+//! returns: resolve, filter every address through the network policy
+//! ([`filter_addrs`]), pin the checked address (DNS-rebinding defense), and
+//! POST the fixed generic body behind the global in-flight semaphore.
 //!
 //! State that must outlive a single frame — the per-device last-wake instant
 //! (cooldown) and the per-bridge token bucket (budget) — lives in [`PushState`],
