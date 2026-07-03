@@ -9,6 +9,7 @@ mod channel;
 mod envelope;
 mod id;
 mod pairing;
+mod push;
 mod remote;
 mod session;
 
@@ -23,6 +24,9 @@ pub use pairing::{
     PairingBridgeMsg, PairingClientMsg, PairingCode, PairingCodeError, PairingRejectReason,
     PAIRING_CODE_VERSION,
 };
+pub use push::{
+    validate_push_endpoint, PushEndpointError, PushRegistration, MAX_PUSH_ENDPOINT_LEN,
+};
 pub use remote::{BridgeMessage, ClientMessage, DeviceInfo, RemoteOp, RemoteResult, WireError};
 pub use session::{SessionMeta, SessionState, SessionStatus, SpawnSpec, WorkspaceMode};
 
@@ -31,5 +35,8 @@ pub use session::{SessionMeta, SessionState, SessionStatus, SpawnSpec, Workspace
 /// Externally tagged serde enums reject unknown variants, so growing any
 /// message enum (or changing a representation) is a breaking change: bump
 /// this constant and gate compatibility on it. The tmux naming and worktree
-/// conventions of ADR-0004 version alongside it.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// conventions of ADR-0004 version alongside it. Bumped 3 → 4 for
+/// ADR-0023's push-wake slice: `RemoteOp::RegisterPushEndpoint`/
+/// `RemoteResult::PushEndpointSet`, `AssertedDevice.push`, and the
+/// `PushRegistration`/`PushTrigger` wire shapes it introduces.
+pub const PROTOCOL_VERSION: u32 = 4;

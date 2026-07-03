@@ -26,6 +26,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::push::PushRegistration;
+
 /// Version of the envelope wire format defined by this module.
 pub const ENVELOPE_VERSION: u8 = 1;
 
@@ -323,6 +325,12 @@ pub enum RelayControl {
 pub struct AssertedDevice {
     pub device_id: DeviceId,
     pub token: String,
+    /// The device's registered push-wake channel (ADR-0023), if any.
+    /// `#[serde(default)]` so pre-v4 asserts encoded without this field
+    /// still decode, with the device treated as having no push
+    /// registration.
+    #[serde(default)]
+    pub push: Option<PushRegistration>,
 }
 
 /// Relay→bridge acknowledgement of a [`RelayControl`] with matching `id`.
@@ -520,11 +528,32 @@ mod tests {
             devices: vec![AssertedDevice {
                 device_id: DeviceId([0x22; 32]),
                 token: "dev-tok".to_string(),
+                push: None,
             }],
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: RelayControl = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn asserted_device_push_defaults_absent() {
+        let hex = "11".repeat(32);
+        let old_shape = format!(r#"{{"device_id":"{hex}","token":"t"}}"#);
+        let decoded: AssertedDevice =
+            serde_json::from_str(&old_shape).expect("decode old (pre-push) shape");
+        assert_eq!(decoded.push, None);
+
+        let with_push = AssertedDevice {
+            device_id: DeviceId([0x11; 32]),
+            token: "t".to_string(),
+            push: Some(PushRegistration::UnifiedPush {
+                endpoint: "https://ntfy.sh/topic".to_string(),
+            }),
+        };
+        let json = serde_json::to_string(&with_push).expect("serialize");
+        let back: AssertedDevice = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, with_push);
     }
 
     #[test]
