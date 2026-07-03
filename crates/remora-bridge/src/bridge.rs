@@ -2967,6 +2967,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn register_push_endpoint_unpaired_requester_errors() {
+        // A RegisterPushEndpoint from a device id NOT in the roster is refused
+        // (#233 F5a): no roster entry is created or mutated, and nothing is
+        // asserted to the relay — even for an otherwise-valid endpoint.
+        let (deps, _dir) = push_test_deps(vec![entry(0x11, "phone")]);
+        let stranger = DeviceId([0x99; 32]);
+        let registration = Some(PushRegistration::UnifiedPush {
+            endpoint: "https://ntfy.sh/t".to_string(),
+        });
+
+        let (result, sent) = call_register_push(&deps, stranger, registration).await;
+        assert!(
+            matches!(result, RemoteResult::Error(_)),
+            "an unpaired requester is refused"
+        );
+        assert!(
+            sent.is_none(),
+            "an unpaired requester triggers no AssertDevices"
+        );
+
+        let roster = deps.roster.read().await;
+        assert_eq!(
+            roster.entries.len(),
+            1,
+            "no entry is created for a stranger"
+        );
+        assert_eq!(
+            roster
+                .find_by_device(&DeviceId([0x11; 32]))
+                .expect("paired entry present")
+                .push,
+            None,
+            "the paired device's entry is untouched"
+        );
+    }
+
     // --- Wake fan-out (#233) ------------------------------------------------
 
     /// A roster entry with a given id and optional push registration, for the
