@@ -2065,7 +2065,11 @@ async fn serve_peer(
 /// storing it (never after — the #232 relay_url gotcha), updates *only* the
 /// requesting device's roster entry, persists, and re-asserts the roster to
 /// the relay inline — unlike revoke, nothing here severs the transport, so
-/// the re-assert needs no deferral.
+/// the re-assert needs no deferral. A registration identical to the entry's
+/// current one short-circuits before the save/re-assert (#233): the client
+/// re-registers on every dial, so unchanged dials must not rewrite the roster
+/// file or re-poke the relay. If the save does fail, the in-memory mutation is
+/// rolled back so it cannot diverge from what is actually on disk.
 #[allow(clippy::too_many_arguments)]
 async fn handle_request(
     op: RemoteOp,
@@ -2159,8 +2163,24 @@ async fn handle_request(
                         message: "device not paired".to_string(),
                     });
                 };
+                // The client re-registers on every dial, so an unchanged
+                // registration is the common case: short-circuit before the
+                // roster save or relay re-assert, neither of which has
+                // anything new to do. `PushRegistration` derives `PartialEq`.
+                if registration == entry.push {
+                    return RemoteResult::PushEndpointSet;
+                }
+                let previous = entry.push.clone();
                 entry.push = registration;
                 if let Err(_e) = roster.save(&deps.roster_path) {
+                    // Persist failed: undo the in-memory mutation so it does
+                    // not diverge from disk — otherwise the next re-assert
+                    // (e.g. on reconnect) would silently carry a value that
+                    // was never durably saved (mirrors run_pairing's
+                    // save-failure rollback).
+                    if let Some(entry) = roster.find_by_device_mut(&requester_id) {
+                        entry.push = previous;
+                    }
                     return RemoteResult::Error(WireError::Transport {
                         message: "could not persist roster".to_string(),
                     });
@@ -3001,6 +3021,102 @@ mod tests {
                 .push,
             None,
             "the paired device's entry is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_push_endpoint_unchanged_is_a_noop() {
+        // Re-registering the SAME registration the entry already holds
+        // (the common case — the client re-registers on every dial) still
+        // answers `PushEndpointSet`, but must not rewrite the roster file or
+        // re-assert to the relay a second time (#233): both are no-ops for an
+        // unchanged dial.
+        let device = DeviceId([0x11; 32]);
+        let registration = Some(PushRegistration::UnifiedPush {
+            endpoint: "https://ntfy.sh/t".to_string(),
+        });
+        let (deps, _dir) = push_test_deps(vec![entry(0x11, "phone")]);
+
+        let (first, first_sent) = call_register_push(&deps, device, registration.clone()).await;
+        assert_eq!(first, RemoteResult::PushEndpointSet);
+        assert!(first_sent.is_some(), "the first registration re-asserts");
+
+        let mtime_after_first = std::fs::metadata(&deps.roster_path)
+            .expect("roster file exists after first save")
+            .modified()
+            .expect("mtime supported");
+
+        // Re-register the identical value.
+        let (second, second_sent) = call_register_push(&deps, device, registration.clone()).await;
+        assert_eq!(second, RemoteResult::PushEndpointSet);
+        assert!(
+            second_sent.is_none(),
+            "an unchanged registration sends no second AssertDevices"
+        );
+
+        let mtime_after_second = std::fs::metadata(&deps.roster_path)
+            .expect("roster file still exists")
+            .modified()
+            .expect("mtime supported");
+        assert_eq!(
+            mtime_after_first, mtime_after_second,
+            "an unchanged registration does not rewrite the roster file"
+        );
+
+        let roster = deps.roster.read().await;
+        assert_eq!(
+            roster.find_by_device(&device).expect("entry present").push,
+            registration
+        );
+    }
+
+    #[tokio::test]
+    async fn register_push_endpoint_rolls_back_on_save_failure() {
+        // If persisting the roster fails, the in-memory entry must not
+        // diverge from what is actually on disk (mirrors run_pairing's
+        // existing save-failure rollback): `entry.push` is restored to its
+        // pre-mutation value rather than left holding the unpersisted one.
+        let device = DeviceId([0x11; 32]);
+        let mut seeded = entry(0x11, "phone");
+        seeded.push = Some(PushRegistration::UnifiedPush {
+            endpoint: "https://ntfy.sh/old".to_string(),
+        });
+        // roster_path lives under a directory that does not exist, so
+        // `Roster::save` fails on the write.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bad_path = dir.path().join("missing-subdir").join("roster.toml");
+        let bad_deps = Arc::new(PeerDeps {
+            bridge_id: DeviceId([9u8; 32]),
+            bridge_static_priv: vec![0u8; 32],
+            bridge_static_pub: vec![0u8; 32],
+            relay_url: "ws://test".to_string(),
+            roster: Arc::new(RwLock::new(Roster {
+                entries: vec![seeded],
+            })),
+            roster_path: bad_path,
+            source: Arc::new(remora_core::FakeSessionSource::new()),
+            live_peers: Arc::new(Mutex::new(HashMap::new())),
+            next_peer_reg: AtomicU64::new(0),
+            episodes: Arc::new(Mutex::new(WakeEpisodes::new(WAKE_EPISODE_CAP))),
+        });
+
+        let new_registration = Some(PushRegistration::UnifiedPush {
+            endpoint: "https://ntfy.sh/new".to_string(),
+        });
+        let (result, sent) = call_register_push(&bad_deps, device, new_registration).await;
+        assert!(
+            matches!(result, RemoteResult::Error(_)),
+            "a save failure is reported as an error"
+        );
+        assert!(sent.is_none(), "a save failure never re-asserts");
+
+        let roster = bad_deps.roster.read().await;
+        assert_eq!(
+            roster.find_by_device(&device).expect("entry present").push,
+            Some(PushRegistration::UnifiedPush {
+                endpoint: "https://ntfy.sh/old".to_string(),
+            }),
+            "the in-memory entry is rolled back to its pre-mutation value"
         );
     }
 

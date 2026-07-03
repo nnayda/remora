@@ -571,8 +571,10 @@ fn handle_data_message(
 /// Handles a bridge's `PushTrigger` wake request (ADR-0023, spec Task 6).
 ///
 /// Accept rules (all violations → protocol close, same posture as before):
-/// the sender must be a **bridge**, the payload must be **empty** (v1 reserves
-/// it), and the `dst` must be in **that bridge's** asserted set (checked inside
+/// the sender must be a **bridge**, its envelope `src` must match its own
+/// permit (the same anti-spoof check [`route_frame`] applies to routed
+/// frames — #233), the payload must be **empty** (v1 reserves it), and the
+/// `dst` must be in **that bridge's** asserted set (checked inside
 /// [`Router::decide_push_wake`]). A well-formed trigger runs the wake decision;
 /// whatever the outcome — a delivered wake handed to the delivery seam, or a
 /// policy drop — the sender **continues** (a drop is never a violation).
@@ -584,6 +586,15 @@ fn dispatch_push_trigger(
 ) -> DataStep {
     // PushTrigger is bridge→relay only; a device sending one is a violation.
     if permit.role() != HelloRole::Bridge {
+        return DataStep::Close(CloseReason::Protocol);
+    }
+    // Anti-spoof: the envelope's src must be the sender's own routing id, the
+    // same invariant `Router::route` enforces for routed `Data`/`Pairing`
+    // frames. The wake decision itself is permit-driven (it never reads
+    // `envelope.src`), so a mismatched src buys nothing today — but the
+    // invariant should hold uniformly rather than only where it happens to
+    // matter yet.
+    if envelope.src != permit.routing_id() {
         return DataStep::Close(CloseReason::Protocol);
     }
     // The payload is reserved and MUST be empty in v1 (ADR-0023): E2E-encrypted
@@ -851,6 +862,63 @@ async fn close_now(ws: &mut WebSocketStream<TcpStream>, reason: CloseReason) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::BridgeEntry;
+
+    /// Registers `bridge_id` as a bridge connection and returns its
+    /// [`ConnPermit`], for tests that drive [`dispatch_push_trigger`] directly
+    /// against a real [`Router`].
+    fn bridge_permit(router: &Router, bridge_id: DeviceId) -> ConnPermit {
+        let (outbound, _rx) = outbound_channel(1_048_576);
+        let hello = RelayHello {
+            role: HelloRole::Bridge,
+            token: "bridge-tok".to_string(),
+            device_id: bridge_id,
+            routing_id: bridge_id,
+            bridge_id,
+        };
+        match router.hello(&hello, outbound).0 {
+            HelloOutcome::Accepted(permit) => permit,
+            HelloOutcome::Rejected => panic!("expected Accepted, got Rejected"),
+        }
+    }
+
+    #[test]
+    fn push_trigger_with_mismatched_src_closes() {
+        // A well-formed (bridge sender, empty payload) PushTrigger whose
+        // envelope `src` does not match the sender's own permit is a
+        // protocol violation — the same anti-spoof check `route_frame`
+        // already applies to routed Data/Pairing frames (#233).
+        let bridge_id = DeviceId([1u8; 32]);
+        let config = Arc::new(RelayConfig {
+            listen: "127.0.0.1:0".to_string(),
+            bridges: vec![BridgeEntry {
+                token: "bridge-tok".to_string(),
+                device_id: bridge_id,
+            }],
+            buffer_bytes: 1_048_576,
+            handshake_timeout_secs: 10,
+            max_connections: 1024,
+            audit: None,
+            push: crate::push::PushConfig::default(),
+        });
+        let router = Router::new(config);
+        let permit = bridge_permit(&router, bridge_id);
+        let mut push_state = ConnPushState::new();
+
+        let envelope = Envelope {
+            frame_type: FrameType::PushTrigger,
+            src: DeviceId([2u8; 32]), // spoofed: not the bridge's own routing id
+            dst: DeviceId([3u8; 32]),
+            payload: Vec::new(),
+        };
+
+        let step = dispatch_push_trigger(&router, &permit, &envelope, &mut push_state);
+        assert_eq!(
+            step,
+            DataStep::Close(CloseReason::Protocol),
+            "a mismatched src closes the connection, same as route_frame's anti-spoof check"
+        );
+    }
 
     #[test]
     fn peer_unavailable_closes_a_device_sender() {
