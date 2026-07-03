@@ -59,10 +59,11 @@ use tokio_util::sync::CancellationToken;
 
 use remora_core::{sanitize, SessionSource};
 use remora_protocol::{
-    AssertedDevice, BridgeMessage, ChannelInput, ChannelOutput, ClientMessage, DeviceId,
-    DeviceInfo, Envelope, FrameType, HelloRole, PairingBridgeMsg, PairingClientMsg, PairingCode,
-    PairingRejectReason, RelayControl, RelayControlAck, RelayControlError, RelayHello, RemoteOp,
-    RemoteResult, WireError, PROTOCOL_VERSION,
+    validate_push_endpoint, AssertedDevice, BridgeMessage, ChannelInput, ChannelOutput,
+    ClientMessage, DeviceId, DeviceInfo, Envelope, FrameType, HelloRole, PairingBridgeMsg,
+    PairingClientMsg, PairingCode, PairingRejectReason, PushRegistration, RelayControl,
+    RelayControlAck, RelayControlError, RelayHello, RemoteOp, RemoteResult, WireError,
+    PROTOCOL_VERSION,
 };
 
 use crate::identity::{fingerprint, BridgeIdentity, IdentityError, Roster, RosterEntry};
@@ -1834,6 +1835,8 @@ async fn serve_peer(
                             &mut has_attached,
                             device_id,
                             &mut revoke_target,
+                            &outbound_tx,
+                            &control_seq,
                         )
                         .await;
                         let send_ok = send_msg(
@@ -1930,6 +1933,11 @@ async fn serve_peer(
 /// `RevokeDevice` removes the target from the roster and persists it, then sets
 /// `revoke_target` so the caller can enqueue the response *before* the kick
 /// (the relay re-assert severs the transport — see [`serve_peer`]).
+/// `RegisterPushEndpoint` (ADR-0023) validates a `Some` registration before
+/// storing it (never after — the #232 relay_url gotcha), updates *only* the
+/// requesting device's roster entry, persists, and re-asserts the roster to
+/// the relay inline — unlike revoke, nothing here severs the transport, so
+/// the re-assert needs no deferral.
 #[allow(clippy::too_many_arguments)]
 async fn handle_request(
     op: RemoteOp,
@@ -1940,6 +1948,8 @@ async fn handle_request(
     has_attached: &mut bool,
     requester_id: DeviceId,
     revoke_target: &mut Option<DeviceId>,
+    outbound_tx: &mpsc::Sender<Message>,
+    control_seq: &Arc<AtomicU32>,
 ) -> RemoteResult {
     match op {
         RemoteOp::List => match deps.source.list().await {
@@ -1988,6 +1998,46 @@ async fn handle_request(
                     message: "could not persist roster".to_string(),
                 }),
             }
+        }
+        RemoteOp::RegisterPushEndpoint { registration } => {
+            // Validate before storing (the #232 relay_url gotcha): a
+            // client-controlled endpoint must be rejected before it ever
+            // lands in the roster or gets asserted to the relay, never
+            // after. `PushRegistration` is `#[non_exhaustive]`: an
+            // unrecognized future variant is refused rather than matched,
+            // so an older bridge fails safe instead of panicking.
+            if let Some(reg) = &registration {
+                let PushRegistration::UnifiedPush { endpoint } = reg else {
+                    return RemoteResult::Error(WireError::Transport {
+                        message: "unsupported push registration variant".to_string(),
+                    });
+                };
+                if let Err(e) = validate_push_endpoint(endpoint) {
+                    return RemoteResult::Error(WireError::Transport {
+                        message: format!("invalid push endpoint: {e}"),
+                    });
+                }
+            }
+            {
+                let mut roster = deps.roster.write().await;
+                let Some(entry) = roster.find_by_device_mut(&requester_id) else {
+                    // Not in the roster (already revoked/never paired): no
+                    // entry to update, and nothing to re-assert.
+                    return RemoteResult::Error(WireError::Transport {
+                        message: "device not paired".to_string(),
+                    });
+                };
+                entry.push = registration;
+                if let Err(_e) = roster.save(&deps.roster_path) {
+                    return RemoteResult::Error(WireError::Transport {
+                        message: "could not persist roster".to_string(),
+                    });
+                }
+            }
+            // Refresh the relay's view so it starts (or stops) waking this
+            // device, mirroring the credential set the roster now holds.
+            reassert_roster_only(deps, outbound_tx, control_seq).await;
+            RemoteResult::PushEndpointSet
         }
         // `RemoteOp` is `#[non_exhaustive]`: a client speaking a newer protocol
         // could ask for an op this bridge predates. Refuse it explicitly rather
@@ -2432,7 +2482,6 @@ fn jittered(base: Duration, rng: &mut impl rand::RngExt) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use remora_protocol::PushRegistration;
 
     #[test]
     fn device_info_projection_marks_self() {
@@ -2519,6 +2568,177 @@ mod tests {
                 .await
                 .expect("second remove ok"),
             "removing an absent device is an idempotent no-op (false)"
+        );
+    }
+
+    /// Builds a tempdir-backed `PeerDeps` seeded with `entries`, for
+    /// `RegisterPushEndpoint` tests that only care about the roster and the
+    /// relay re-assert, not the surrounding connection/pairing plumbing.
+    fn push_test_deps(entries: Vec<RosterEntry>) -> (Arc<PeerDeps>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("roster.toml");
+        let deps = Arc::new(PeerDeps {
+            bridge_id: DeviceId([9u8; 32]),
+            bridge_static_priv: vec![0u8; 32],
+            bridge_static_pub: vec![0u8; 32],
+            relay_url: "ws://test".to_string(),
+            roster: Arc::new(RwLock::new(Roster { entries })),
+            roster_path: path,
+            source: Arc::new(remora_core::FakeSessionSource::new()),
+            live_peers: Arc::new(Mutex::new(HashMap::new())),
+            next_peer_reg: AtomicU64::new(0),
+        });
+        (deps, dir)
+    }
+
+    /// Drives `handle_request` for one `RegisterPushEndpoint { registration }`
+    /// as `requester_id`, wiring up the plumbing args the op doesn't use
+    /// (attach/events/revoke) with inert placeholders. Returns the wire
+    /// result plus the `RelayControl` sent on `outbound_tx`, if any.
+    async fn call_register_push(
+        deps: &Arc<PeerDeps>,
+        requester_id: DeviceId,
+        registration: Option<PushRegistration>,
+    ) -> (RemoteResult, Option<RelayControl>) {
+        let (events_tx, _events_rx) = mpsc::channel::<PeerEvent>(1);
+        let peer_token = CancellationToken::new();
+        let mut attach_input: Option<mpsc::Sender<ChannelInput>> = None;
+        let mut has_attached = false;
+        let mut revoke_target: Option<DeviceId> = None;
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(4);
+        let control_seq = Arc::new(AtomicU32::new(0));
+
+        let result = handle_request(
+            RemoteOp::RegisterPushEndpoint { registration },
+            deps,
+            &events_tx,
+            &peer_token,
+            &mut attach_input,
+            &mut has_attached,
+            requester_id,
+            &mut revoke_target,
+            &outbound_tx,
+            &control_seq,
+        )
+        .await;
+
+        let sent = outbound_rx.try_recv().ok().map(|msg| {
+            let Message::Binary(bytes) = msg else {
+                panic!("expected a binary control frame");
+            };
+            let envelope = Envelope::decode(&bytes).expect("decode envelope");
+            serde_json::from_slice::<RelayControl>(&envelope.payload).expect("decode control")
+        });
+
+        (result, sent)
+    }
+
+    #[tokio::test]
+    async fn register_push_endpoint_sets_and_reasserts() {
+        // A valid `Some` registration is stored on the requester's roster
+        // entry and immediately re-asserted to the relay, carrying the new
+        // push registration alongside the device's routing credential.
+        let device = DeviceId([0x11; 32]);
+        let (deps, _dir) = push_test_deps(vec![entry(0x11, "phone")]);
+        let registration = Some(PushRegistration::UnifiedPush {
+            endpoint: "https://ntfy.sh/t".to_string(),
+        });
+
+        let (result, sent) = call_register_push(&deps, device, registration.clone()).await;
+        assert_eq!(result, RemoteResult::PushEndpointSet);
+
+        let roster = deps.roster.read().await;
+        assert_eq!(
+            roster.find_by_device(&device).expect("entry present").push,
+            registration
+        );
+        drop(roster);
+
+        match sent.expect("an AssertDevices control message was sent") {
+            RelayControl::AssertDevices { devices, .. } => {
+                let d = devices
+                    .iter()
+                    .find(|d| d.device_id == device)
+                    .expect("device present in assert");
+                assert_eq!(d.push, registration, "assert carries the new registration");
+            }
+            other => panic!("expected AssertDevices, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_push_endpoint_none_clears() {
+        // `None` clears an existing registration, and still answers
+        // `PushEndpointSet` (clearing is a successful, idempotent request).
+        let device = DeviceId([0x11; 32]);
+        let mut seeded = entry(0x11, "phone");
+        seeded.push = Some(PushRegistration::UnifiedPush {
+            endpoint: "https://ntfy.sh/old".to_string(),
+        });
+        let (deps, _dir) = push_test_deps(vec![seeded]);
+
+        let (result, _sent) = call_register_push(&deps, device, None).await;
+        assert_eq!(result, RemoteResult::PushEndpointSet);
+
+        let roster = deps.roster.read().await;
+        assert_eq!(
+            roster.find_by_device(&device).expect("entry present").push,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn register_push_endpoint_rejects_invalid() {
+        // Validation runs *before* the roster is touched (the #232
+        // relay_url gotcha): a bad endpoint is refused, never stored or
+        // asserted.
+        let device = DeviceId([0x11; 32]);
+        let (deps, _dir) = push_test_deps(vec![entry(0x11, "phone")]);
+        let bad = Some(PushRegistration::UnifiedPush {
+            endpoint: "file:///x".to_string(),
+        });
+
+        let (result, sent) = call_register_push(&deps, device, bad).await;
+        assert!(matches!(result, RemoteResult::Error(_)));
+        assert!(sent.is_none(), "an invalid endpoint is never asserted");
+
+        let roster = deps.roster.read().await;
+        assert_eq!(
+            roster.find_by_device(&device).expect("entry present").push,
+            None,
+            "roster is unchanged by a rejected endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_push_endpoint_targets_requester_only() {
+        // Two paired devices: only the requesting device's roster entry
+        // changes, never the other's.
+        let requester = DeviceId([0x11; 32]);
+        let other = DeviceId([0x22; 32]);
+        let (deps, _dir) = push_test_deps(vec![entry(0x11, "phone"), entry(0x22, "laptop")]);
+        let registration = Some(PushRegistration::UnifiedPush {
+            endpoint: "https://ntfy.sh/t".to_string(),
+        });
+
+        let (result, _sent) = call_register_push(&deps, requester, registration.clone()).await;
+        assert_eq!(result, RemoteResult::PushEndpointSet);
+
+        let roster = deps.roster.read().await;
+        assert_eq!(
+            roster
+                .find_by_device(&requester)
+                .expect("requester entry present")
+                .push,
+            registration
+        );
+        assert_eq!(
+            roster
+                .find_by_device(&other)
+                .expect("other entry present")
+                .push,
+            None,
+            "the other device's entry is untouched"
         );
     }
 
