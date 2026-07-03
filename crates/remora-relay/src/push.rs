@@ -320,16 +320,50 @@ enum AddrClass {
     Public,
 }
 
-/// Collapses an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its embedded
-/// IPv4, so `::ffff:10.0.0.1` is classified as the private `10.0.0.1` it really
-/// reaches rather than slipping through the v6 checks — a classic SSRF bypass.
+/// Collapses an IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`,
+/// deprecated but still parseable), or NAT64 well-known-prefix (`64:ff9b::a.b.c.d`,
+/// RFC 6052 `64:ff9b::/96`) IPv6 address to its embedded IPv4, so e.g.
+/// `64:ff9b::169.254.169.254` is classified as the link-local metadata address
+/// it really reaches on a NAT64 host rather than slipping through the v6 checks
+/// as an opaque "public" v6 literal — a classic SSRF bypass. Only the `/96`
+/// well-known NAT64 prefix is covered; the RFC 8215 `64:ff9b:1::/48`
+/// operator-assigned range is out of scope (no fixed embedding offset to parse
+/// generically).
 fn normalize_mapped(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None => IpAddr::V6(v6),
-        },
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                IpAddr::V4(v4)
+            } else if let Some(v4) = embedded_v4(v6) {
+                IpAddr::V4(v4)
+            } else {
+                IpAddr::V6(v6)
+            }
+        }
         v4 => v4,
+    }
+}
+
+/// Extracts the embedded IPv4 from an IPv4-compatible (`::a.b.c.d`) or NAT64
+/// well-known-prefix (`64:ff9b::a.b.c.d`) IPv6 address; `None` for anything
+/// else (including `::` and `::1`, which are not compatible-mapped forms and
+/// are already classified correctly as v6 unspecified/loopback).
+fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let seg = v6.segments();
+    let low32 =
+        |hi: u16, lo: u16| Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
+    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6] == [0, 0, 0, 0] {
+        // NAT64 `64:ff9b::/96` (RFC 6052).
+        Some(low32(seg[6], seg[7]))
+    } else if seg[0..6] == [0, 0, 0, 0, 0, 0]
+        && v6 != Ipv6Addr::UNSPECIFIED
+        && v6 != Ipv6Addr::LOCALHOST
+    {
+        // IPv4-compatible `::a.b.c.d` (deprecated form), excluding `::` and
+        // `::1` which share the all-zero-top-96-bits shape but are not this.
+        Some(low32(seg[6], seg[7]))
+    } else {
+        None
     }
 }
 
@@ -889,6 +923,79 @@ mod tests {
         assert_eq!(
             filter_addrs(&[mapped], false, &allow),
             Ok(vec![v4("10.0.0.1")])
+        );
+    }
+
+    /// An IPv4-compatible IPv6 address (`::a.b.c.d`, deprecated but still
+    /// parseable) is classified as its embedded v4 — otherwise
+    /// `::169.254.169.254` would slip through as an opaque "public" v6 literal
+    /// and reach the cloud-metadata address on a host that routes it.
+    #[test]
+    fn v4_compatible_v6_classified_as_embedded_v4() {
+        let compatible = v6("::169.254.169.254");
+        let cfg = PushConfig {
+            enabled: true,
+            allow_private_endpoints: true,
+            ..PushConfig::default()
+        };
+        // Blocked (link-local/metadata) regardless of the private-endpoints knob.
+        assert_eq!(
+            filter_addrs(&[compatible], false, &cfg),
+            Err(DropReason::PolicyInvalid)
+        );
+    }
+
+    /// A NAT64 well-known-prefix address (`64:ff9b::a.b.c.d`, RFC 6052
+    /// `64:ff9b::/96`) is classified as its embedded v4: a private target is
+    /// denied by default and admitted only with `allow_private_endpoints`, a
+    /// public target is reachable over https.
+    #[test]
+    fn nat64_v6_classified_as_embedded_v4() {
+        let private_nat64 = v6("64:ff9b::10.0.0.5");
+        let public_nat64 = v6("64:ff9b::8.8.8.8");
+
+        let deny = PushConfig {
+            enabled: true,
+            ..PushConfig::default()
+        };
+        assert_eq!(
+            filter_addrs(&[private_nat64], false, &deny),
+            Err(DropReason::PolicyInvalid),
+            "NAT64-embedded private v4 denied by default"
+        );
+
+        let allow = PushConfig {
+            enabled: true,
+            allow_private_endpoints: true,
+            ..PushConfig::default()
+        };
+        assert_eq!(
+            filter_addrs(&[private_nat64], false, &allow),
+            Ok(vec![v4("10.0.0.5")]),
+            "NAT64-embedded private v4 admitted with the knob"
+        );
+
+        assert_eq!(
+            filter_addrs(&[public_nat64], false, &deny),
+            Ok(vec![v4("8.8.8.8")]),
+            "NAT64-embedded public v4 reachable over https"
+        );
+    }
+
+    /// Regression guard: the pre-existing v4-mapped (`::ffff:a.b.c.d`) handling
+    /// must still catch a metadata target after the v4-compatible/NAT64
+    /// extension lands alongside it.
+    #[test]
+    fn v4_mapped_metadata_still_blocked() {
+        let mapped = v6("::ffff:169.254.169.254");
+        let cfg = PushConfig {
+            enabled: true,
+            allow_private_endpoints: true,
+            ..PushConfig::default()
+        };
+        assert_eq!(
+            filter_addrs(&[mapped], false, &cfg),
+            Err(DropReason::PolicyInvalid)
         );
     }
 
