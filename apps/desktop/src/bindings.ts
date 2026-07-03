@@ -198,6 +198,83 @@ async configSetTerminal(terminalId: string | null) : Promise<Result<null, Bridge
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Open (or replace) this device's pairing window; returns the QR code + TTL.
+ */
+async pairingOpenWindow(ttlSecs: number | null) : Promise<Result<PairingCodeDto, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pairing_open_window", { ttlSecs }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Confirm the arrived device's fingerprint (enrol it).
+ */
+async pairingConfirm(deviceId: string) : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pairing_confirm", { deviceId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Reject the arrived device (grant nothing durable).
+ */
+async pairingReject(deviceId: string) : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pairing_reject", { deviceId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Close the current pairing window without pairing anyone.
+ */
+async pairingCancel() : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pairing_cancel") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * List this bridge's paired devices (live roster).
+ */
+async listDevices() : Promise<Result<DeviceInfoDto[], BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_devices") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Un-pair a device (drop from roster, kick any live session).
+ */
+async revokeDevice(deviceId: string) : Promise<Result<null, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("revoke_device", { deviceId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * This bridge's own identity fingerprint (ADR-0021 D5), for the pairing UI.
+ */
+async bridgeFingerprint() : Promise<Result<string, BridgeError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("bridge_fingerprint") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async openInVscode(projectId: string, sessionId: string) : Promise<Result<null, BridgeError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("open_in_vscode", { projectId, sessionId }) };
@@ -212,9 +289,17 @@ async openInVscode(projectId: string, sessionId: string) : Promise<Result<null, 
 
 
 export const events = __makeEvents__<{
-configChanged: ConfigChanged
+configChanged: ConfigChanged,
+pairingDeviceArrived: PairingDeviceArrived,
+pairingResult: PairingResult,
+pairingWindowOpened: PairingWindowOpened,
+rosterChanged: RosterChanged
 }>({
-configChanged: "config-changed"
+configChanged: "config-changed",
+pairingDeviceArrived: "pairing-device-arrived",
+pairingResult: "pairing-result",
+pairingWindowOpened: "pairing-window-opened",
+rosterChanged: "roster-changed"
 })
 
 /** user-defined constants **/
@@ -266,7 +351,19 @@ export type BridgeError = { kind: "sessionExists"; message: string } | { kind: "
  * (uncommitted changes or commits not pushed to any remote). Carry the
  * reason so the frontend can show a targeted warning and offer `force`.
  */
-{ kind: "workspaceDirty"; message: string; reason: DirtyReasonDto }
+{ kind: "workspaceDirty"; message: string; reason: DirtyReasonDto } | 
+/**
+ * A relay/pairing command was invoked but this device hosts no relay bridge
+ * (no `[relay]` section, so no `PairingHandles` in managed state). The UI
+ * shows a "relay not configured" state instead of a pairing panel.
+ */
+{ kind: "relayNotConfigured"; message: string } | 
+/**
+ * A relay/pairing or roster operation failed inside the running bridge
+ * (e.g. the relay link was down when opening a window, or roster storage
+ * errored on revoke). Distinct from `RelayNotConfigured` (no bridge at all).
+ */
+{ kind: "relay"; message: string }
 /**
  * Streamed from a session's PTY to the frontend. Internally tagged + camelCase
  * so the generated TS is a clean discriminated union. A local bridge<->frontend
@@ -297,6 +394,12 @@ export type ConfigDto = { hosts: HostDto[]; projects: ProjectDto[]; agents: Agen
  * A detected terminal, id + display name only.
  */
 export type DetectedTerminalDto = { id: string; name: string }
+/**
+ * One paired device, for the roster view. `device_id` is the 64-hex string;
+ * `fingerprint` is the short human-comparable form (ADR-0021 D5) of the
+ * device's pinned static key.
+ */
+export type DeviceInfoDto = { deviceId: string; name: string; fingerprint: string; enrolledAt: number | null; lastConnectedAt: number | null }
 export type DirtyReasonDto = "uncommitted" | "notOnRemote" | "both"
 /**
  * The editable config plus its validation state (ADR-0006 degraded mode).
@@ -357,6 +460,42 @@ export type HostSessionsDto = { hostId: string; available: boolean; sessions: Se
  */
 export type KubectlFieldDto = { command: boolean; value: string }
 /**
+ * A freshly minted pairing code for the UI: the encoded string to render as a
+ * QR (and offer as a copyable fallback), plus the window deadline for a
+ * countdown. `code` embeds the PSK by design (ADR-0021 D1); never log it.
+ */
+export type PairingCodeDto = { 
+/**
+ * The `remora-pair:1:…` string (QR payload + copyable fallback).
+ */
+code: string; 
+/**
+ * Unix seconds the window (and this code) expire — drives the countdown.
+ */
+expiresAt: number; 
+/**
+ * The window lifetime, in seconds, it was opened for.
+ */
+ttlSecs: number }
+/**
+ * A device reached the open window and awaits the user's confirm/reject; the
+ * UI shows `fingerprint` for the human to compare against the device's screen.
+ */
+export type PairingDeviceArrived = { deviceId: string; name: string; fingerprint: string }
+/**
+ * The terminal outcome of one pairing attempt (ADR-0021).
+ */
+export type PairingOutcomeDto = { kind: "paired"; deviceId: string; name: string } | { kind: "rejected"; deviceId: string } | { kind: "expired" }
+/**
+ * A pairing attempt reached a terminal state.
+ */
+export type PairingResult = { outcome: PairingOutcomeDto }
+/**
+ * A pairing window opened; the UI shows `code` until `expires_at` (Unix
+ * seconds). `code` embeds the PSK by design (ADR-0021 D1); never log it.
+ */
+export type PairingWindowOpened = { code: string; expiresAt: number }
+/**
  * Entry ids present in each section of the document, regardless of validity —
  * the delete targets degraded-mode recovery offers. Mirrors core's
  * [`PresentIds`] field-for-field; the `From` impl below is the single place to
@@ -388,6 +527,11 @@ worktreeRoot?: string | null }
  * inputs so the form round-trips exactly what is on disk.
  */
 export type ProvisionFileDto = { path: string; content: string; mode: number | null }
+/**
+ * The roster changed (a device enrolled or was revoked); the UI re-queries
+ * `list_devices`. No payload — a ping, like [`super::commands::ConfigChanged`].
+ */
+export type RosterChanged = null
 /**
  * Result of a discovery poll: one bucket per host attempted this poll, in
  * config order. Sessions are sorted by (project_id, session_id) within each

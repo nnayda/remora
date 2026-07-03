@@ -43,24 +43,58 @@
 //! done-signal.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
+use futures_util::stream::Stream;
 use futures_util::{SinkExt as _, StreamExt as _};
-use tokio::sync::mpsc;
+use rand::TryRng as _;
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
-use remora_core::SessionSource;
+use remora_core::{sanitize, SessionSource};
 use remora_protocol::{
-    BridgeMessage, ChannelInput, ChannelOutput, ClientMessage, DeviceId, Envelope, FrameType,
-    HelloRole, RelayHello, RemoteOp, RemoteResult, WireError, PROTOCOL_VERSION,
+    AssertedDevice, BridgeMessage, ChannelInput, ChannelOutput, ClientMessage, DeviceId,
+    DeviceInfo, Envelope, FrameType, HelloRole, PairingBridgeMsg, PairingClientMsg, PairingCode,
+    PairingRejectReason, RelayControl, RelayControlAck, RelayControlError, RelayHello, RemoteOp,
+    RemoteResult, WireError, PROTOCOL_VERSION,
 };
 
-use crate::identity::{BridgeIdentity, Roster};
-use crate::noise::{chunk_bytes, prologue, Handshake, Transport};
+use crate::identity::{fingerprint, BridgeIdentity, IdentityError, Roster, RosterEntry};
+use crate::noise::{chunk_bytes, prologue, Handshake, HandshakeKind, Transport};
 use crate::wire_error::map_source_error;
+
+/// Standard-base64 engine for the per-pair session PSK the bridge grants a
+/// device ([`PairingBridgeMsg::Grant`]) — matching the encoding the identity
+/// layer uses on disk, so the device decodes it the same way.
+const B64: base64::engine::general_purpose::GeneralPurpose =
+    base64::engine::general_purpose::STANDARD;
+
+/// Upper bound on a paired device's display name, in characters. The name rides
+/// in untrusted [`PairingClientMsg::Hello`] and is rendered in the confirm
+/// dialog, so it is control-stripped and capped ([`sanitize`]) before use.
+const MAX_DEVICE_NAME_CHARS: usize = 64;
+
+/// Pending relay control requests awaiting their `RelayControlAck`/`Error`, keyed
+/// by correlation id. Shared (`Arc<Mutex>`) between the read loop (which completes
+/// waiters) and a spawned pairing task (which registers one for its assert). Each
+/// value is completed with `Ok(())` on ack or `Err(message)` on a relay error.
+type ControlWaiters = Arc<Mutex<HashMap<u32, oneshot::Sender<Result<(), String>>>>>;
+
+/// Live authenticated peer sessions, keyed by the peer's roster-proven
+/// `device_id`, so revoking a device can sever every live session that device
+/// currently holds bridge-side — the authoritative kick (ADR-0021 D6: the roster
+/// is the boundary; the relay re-assert is defense-in-depth). One device may
+/// hold several sessions at once (D16: each attach is its own connection), so
+/// each device maps to a set of `(registration id → cancellation token)`; the
+/// registration id lets a peer task deregister exactly its own slot on exit
+/// without disturbing a sibling session that reused the same `device_id`.
+type LivePeers = Arc<Mutex<HashMap<DeviceId, HashMap<u64, CancellationToken>>>>;
 
 /// Length of a [`DeviceId`], and of the plaintext identity preamble that
 /// prefixes a client's first (handshake) frame (spec D16).
@@ -87,6 +121,13 @@ const PEER_EVENT_QUEUE: usize = 256;
 /// on expiry the peer task returns and its [`DoneGuard`] reaps the slot (#231).
 const PEER_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long the bridge waits for the relay's `RelayControlAck` to its
+/// connect-time `AssertDevices` before giving up on the connection. The relay is
+/// untrusted (ADR-0021): one that accepts the socket but never acks must not
+/// wedge the bridge in the pre-serve phase forever — on expiry the attempt is
+/// treated like a failed connect (reconnect with growing backoff).
+const CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Static configuration for one [`serve_bridge`] run.
 ///
 /// Not `Debug`/`Clone`: [`BridgeIdentity`] holds a private key.
@@ -97,8 +138,13 @@ pub struct BridgeConfig {
     pub registration_token: String,
     /// This bridge's durable identity (device id + static keypair).
     pub identity: BridgeIdentity,
-    /// The paired-device roster (pinned static keys + per-pair PSKs).
-    pub roster: Roster,
+    /// The paired-device roster (pinned static keys + per-pair PSKs), shared so
+    /// pairing/revocation can mutate it live and every relay (re)connect asserts
+    /// the current set (ADR-0021 D4).
+    pub roster: Arc<RwLock<Roster>>,
+    /// Where the roster persists; every roster mutation is written back here so
+    /// a restart re-asserts the same devices.
+    pub roster_path: PathBuf,
 }
 
 /// Fatal, non-retryable error from [`serve_bridge`].
@@ -114,16 +160,202 @@ pub enum BridgeServeError {
     InvalidRelayUrl(String),
 }
 
+/// A per-command failure surfaced back to the desktop over a [`PairingCommand`]
+/// reply channel — distinct from the fatal, loop-stopping [`BridgeServeError`].
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum BridgeError {
+    /// Persisting or reading roster/identity state on disk failed.
+    #[error("identity/roster storage error: {0}")]
+    Storage(#[from] IdentityError),
+    /// No relay connection was live to carry the command (e.g. opening a pairing
+    /// window while the bridge is between reconnects).
+    #[error("no relay connection is currently established")]
+    Disconnected,
+    /// The bridge could not build a pairing code from its current state (e.g. a
+    /// non-`ws` relay URL that cannot be handed to a device).
+    #[error("cannot mint a pairing code: {0}")]
+    Pairing(String),
+}
+
+/// A control message the desktop sends into a running [`serve_bridge`] to drive
+/// the pairing ceremony and roster changes (ADR-0021 D3). `OpenWindow` mints the
+/// code and registers the relay window; `Confirm`/`Reject` route the user's
+/// decision into the in-flight pairing responder; `Revoke`/`CancelWindow`
+/// administer the roster and window.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum PairingCommand {
+    /// Open (or replace) this bridge's single pairing window for `ttl_secs`,
+    /// replying with the freshly minted [`PairingCode`] the desktop renders as a
+    /// QR / copyable string.
+    OpenWindow {
+        ttl_secs: u64,
+        reply: oneshot::Sender<Result<PairingCode, BridgeError>>,
+    },
+    /// The user confirmed the arrived device's fingerprint: the responder mints
+    /// durable credentials, asserts-before-grant, and enrols the device.
+    Confirm { device_id: DeviceId },
+    /// The user rejected the arrived device: the responder sends `Rejected` and
+    /// grants nothing durable.
+    Reject { device_id: DeviceId },
+    /// Un-pair a device: drop it from the roster, persist, and re-assert the
+    /// shrunken set so the relay kicks any live connection (ADR-0021 D6).
+    Revoke {
+        device_id: DeviceId,
+        reply: oneshot::Sender<Result<(), BridgeError>>,
+    },
+    /// Close the current pairing window without pairing anyone.
+    CancelWindow,
+}
+
+/// An event the bridge emits to the desktop over the [`serve_bridge`] event
+/// channel, mirroring pairing progress and roster changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BridgeEvent {
+    /// A pairing window opened; the desktop shows `code` until `expires_at`
+    /// (Unix seconds).
+    PairingWindowOpened { code: PairingCode, expires_at: u64 },
+    /// A device reached the open pairing window and awaits confirmation.
+    PairingDeviceArrived {
+        device_id: DeviceId,
+        name: String,
+        fingerprint: String,
+    },
+    /// A pairing attempt reached a terminal state.
+    PairingResult(PairingOutcome),
+    /// The roster changed (a device was enrolled or revoked); the desktop may
+    /// refresh its paired-devices view.
+    RosterChanged,
+}
+
+/// The terminal result of one pairing attempt (ADR-0021).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PairingOutcome {
+    /// The device was enrolled into the roster.
+    Paired { device_id: DeviceId, name: String },
+    /// The user rejected the device.
+    Rejected { device_id: DeviceId },
+    /// The pairing window expired or was cancelled before completion.
+    Expired,
+}
+
+/// Builds the [`RelayControl::AssertDevices`] message for the current roster
+/// (ADR-0021 D4): one [`AssertedDevice`] per entry, carrying the entry's stored
+/// per-device relay credential.
+fn assert_devices_msg(id: u32, roster: &Roster) -> RelayControl {
+    RelayControl::AssertDevices {
+        id,
+        devices: roster
+            .entries
+            .iter()
+            .map(|e| AssertedDevice {
+                device_id: e.device_id,
+                token: device_token_for(e),
+            })
+            .collect(),
+    }
+}
+
+/// The per-device relay credential the bridge asserts — the `relay_token` minted
+/// at pairing (Task 6) and mirrored into the device's `PairingFile.device_token`.
+fn device_token_for(entry: &RosterEntry) -> String {
+    entry.relay_token.clone()
+}
+
+/// Allocates the next control-request correlation id (wraps after `u32::MAX`,
+/// which no bridge reaches in one process lifetime).
+fn next_control_id(seq: &AtomicU32) -> u32 {
+    seq.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Shared, cheaply-clonable material every peer task needs.
 struct PeerDeps {
     /// The bridge's routing id (also its `src` on every outbound frame).
     bridge_id: DeviceId,
     /// The bridge's static private key, presented as the Noise responder.
     bridge_static_priv: Vec<u8>,
-    /// The paired-device roster (lookup by claimed identity).
-    roster: Roster,
+    /// The bridge's static public key — handed to a device in a minted
+    /// [`PairingCode`] so it can pin the bridge.
+    bridge_static_pub: Vec<u8>,
+    /// The relay endpoint devices dial, embedded into minted pairing codes.
+    relay_url: String,
+    /// The paired-device roster, shared so pairing/revocation mutate it live and
+    /// every (re)connect asserts the current set. Read under the lock per-peer.
+    roster: Arc<RwLock<Roster>>,
+    /// Where the roster persists; written back on every mutation.
+    roster_path: PathBuf,
     /// The local session source the bridge serves.
     source: Arc<dyn SessionSource>,
+    /// Live authenticated peer sessions keyed by `device_id`, so a revocation
+    /// (from a wire `RevokeDevice` or a `PairingCommand::Revoke`) can cancel
+    /// every live session that device holds. Shared across every connection and
+    /// peer task (ADR-0021 D6 bridge-side kick).
+    live_peers: LivePeers,
+    /// Monotonic source of per-session registration ids for [`LivePeers`], unique
+    /// for this bridge process so two sessions (even on different connections)
+    /// never collide on a slot key.
+    next_peer_reg: AtomicU64,
+}
+
+/// Deregisters a peer's [`LivePeers`] slot when the peer task returns, for any
+/// reason. Mirrors [`DoneGuard`]/[`CancelGuard`]: registration is RAII so a
+/// revocation kick never targets a session that has already ended.
+struct LivePeerGuard {
+    live_peers: LivePeers,
+    device_id: DeviceId,
+    reg_id: u64,
+}
+
+impl Drop for LivePeerGuard {
+    fn drop(&mut self) {
+        // A poisoned lock (a holder panicked) leaves the map unmutated; a stale
+        // token there can only over-cancel an already-returning task, never a
+        // wrong device, so it is harmless.
+        if let Ok(mut map) = self.live_peers.lock() {
+            if let Some(slots) = map.get_mut(&self.device_id) {
+                slots.remove(&self.reg_id);
+                if slots.is_empty() {
+                    map.remove(&self.device_id);
+                }
+            }
+        }
+    }
+}
+
+/// Registers `token` as `device_id`'s live session under `reg_id`, returning an
+/// RAII guard that deregisters it on drop. `None` only if the shared lock is
+/// poisoned — the caller then serves without kick-registration (the relay
+/// re-assert still revokes; the roster is the boundary).
+fn register_live_peer(
+    live_peers: &LivePeers,
+    device_id: DeviceId,
+    reg_id: u64,
+    token: CancellationToken,
+) -> Option<LivePeerGuard> {
+    let mut map = live_peers.lock().ok()?;
+    map.entry(device_id).or_default().insert(reg_id, token);
+    drop(map);
+    Some(LivePeerGuard {
+        live_peers: live_peers.clone(),
+        device_id,
+        reg_id,
+    })
+}
+
+/// Cancels every live session held by `device_id` (the bridge-side revocation
+/// kick). A no-op when the device has no live session.
+fn cancel_live_peers(device_id: &DeviceId, live_peers: &LivePeers) {
+    let Ok(map) = live_peers.lock() else {
+        return;
+    };
+    if let Some(slots) = map.get(device_id) {
+        for token in slots.values() {
+            token.cancel();
+        }
+    }
 }
 
 /// Why one connection attempt ended — drives the backoff decision.
@@ -241,6 +473,117 @@ impl Drop for DoneGuard {
     }
 }
 
+/// A confirm/reject decision the desktop routes into the running pairing task.
+///
+/// `CancelWindow` and window replacement are conveyed by *closing* the task's
+/// control channel (dropping [`PairingWindow`]), not a variant, so the task's
+/// single `recv` covers "user decided" and "window gone" uniformly.
+#[derive(Debug)]
+enum PairingCtl {
+    /// The user approved the fingerprint of the device identified by `device_id`
+    /// (the id the desktop was shown in `PairingDeviceArrived`). The responder
+    /// task drops a decision whose `device_id` does not match the device that
+    /// actually arrived, so a stale queued decision cannot cross-confirm a
+    /// different device after a window replacement.
+    Confirm { device_id: DeviceId },
+    /// The user rejected the device identified by `device_id` (see `Confirm`).
+    Reject { device_id: DeviceId },
+}
+
+/// The bridge's single in-flight pairing window (ADR-0021 D3).
+///
+/// Created by `OpenWindow` with the minted pairing secret (the handshake PSK)
+/// and the window deadline; `task` fills in once a device's first Pairing frame
+/// arrives and the responder task spawns. At most one window exists at a time.
+struct PairingWindow {
+    /// The pairing secret (PSK) for the `IKpsk2` responder handshake — the same
+    /// 32 bytes carried in the minted [`PairingCode`]'s `psk`.
+    secret: [u8; 32],
+    /// Unix seconds the window (and any unconfirmed arrival) expires; checked
+    /// lazily when a Pairing frame arrives, matching the relay's no-timers design.
+    expires_at: u64,
+    /// Generation stamped at open; echoed back on task exit for a
+    /// generation-guarded clear, so a newer window survives a stale done-signal.
+    generation: u64,
+    /// The running responder task, once a device has arrived. `None` while the
+    /// window is open but no device has connected yet.
+    task: Option<PairingTaskHandle>,
+}
+
+/// A handle to the running pairing responder task, held by [`PairingWindow`].
+struct PairingTaskHandle {
+    /// The device's routing id (envelope `src`) this task is bound to; a Pairing
+    /// frame from any other `src` while it runs is dropped (single in-flight).
+    src: DeviceId,
+    /// Subsequent inbound Pairing frames (the E2E hello, the final confirm) for
+    /// this device, forwarded from the read loop into the task.
+    frame_tx: mpsc::Sender<Vec<u8>>,
+    /// The user's confirm/reject decision, routed from a [`PairingCommand`].
+    ctl_tx: mpsc::Sender<PairingCtl>,
+}
+
+/// How a pairing task ended, from the connection loop's perspective (ADR-0021
+/// D3). The window is only *consumed* by an attempt that became user-visible;
+/// a garbage frame or failed handshake must not burn the rest of the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairingExit {
+    /// The attempt failed before anything user-visible happened — corrupt first
+    /// frame, handshake failure (e.g. a wrong-PSK probe that reached the
+    /// rendezvous window), a non-`Hello` first message, or a version mismatch.
+    /// The in-flight slot is released so a fresh handshake from the legitimate
+    /// device can start while the window is unexpired.
+    ReleasedSlot,
+    /// The ceremony reached `Pending` (the user saw the arrival): whatever the
+    /// outcome — paired, rejected, expired, post-assert failure — the window is
+    /// consumed. D3's "single completed handshake per window".
+    ConsumedWindow,
+}
+
+/// Signals a pairing task's completion (its window generation + how it ended)
+/// to the connection loop when dropped — firing on *every* exit path. Mirrors
+/// [`DoneGuard`] for the singular pairing task.
+///
+/// Defaults to [`PairingExit::ReleasedSlot`]; [`run_pairing`] flips it to
+/// `ConsumedWindow` the moment `Pending` is on the wire, so every earlier
+/// return frees the slot and every later one consumes the window.
+struct PairingDoneGuard {
+    done: mpsc::UnboundedSender<(u64, PairingExit)>,
+    generation: u64,
+    exit: PairingExit,
+}
+
+impl PairingDoneGuard {
+    /// Marks the window consumed: the attempt became user-visible (`Pending`
+    /// sent), so no further handshake may start on this window.
+    fn consume(&mut self) {
+        self.exit = PairingExit::ConsumedWindow;
+    }
+}
+
+impl Drop for PairingDoneGuard {
+    fn drop(&mut self) {
+        let _ = self.done.send((self.generation, self.exit));
+    }
+}
+
+/// Applies a pairing task's done-signal to the loop's window state. Generation-
+/// guarded (a stale signal from a replaced window is a no-op): a consumed window
+/// is dropped entirely; a released slot keeps the window (secret + deadline)
+/// alive with `task = None`, so the next Pairing frame from an unknown `src`
+/// starts a fresh handshake (see [`dispatch_pairing_frame`]).
+fn handle_pairing_done(pairing: &mut Option<PairingWindow>, generation: u64, exit: PairingExit) {
+    let Some(window) = pairing.as_mut() else {
+        return;
+    };
+    if window.generation != generation {
+        return;
+    }
+    match exit {
+        PairingExit::ConsumedWindow => *pairing = None,
+        PairingExit::ReleasedSlot => window.task = None,
+    }
+}
+
 /// Serves relay-mode sessions for `source` until `shutdown` fires.
 ///
 /// Dials `config.relay_url` outbound, announces `role=bridge`, and serves E2E
@@ -251,6 +594,8 @@ impl Drop for DoneGuard {
 pub async fn serve_bridge(
     config: BridgeConfig,
     source: Arc<dyn SessionSource>,
+    mut commands: mpsc::Receiver<PairingCommand>,
+    events: mpsc::Sender<BridgeEvent>,
     shutdown: CancellationToken,
 ) -> Result<(), BridgeServeError> {
     if !is_ws_url(&config.relay_url) {
@@ -260,16 +605,36 @@ pub async fn serve_bridge(
     let deps = Arc::new(PeerDeps {
         bridge_id: config.identity.device_id,
         bridge_static_priv: config.identity.static_keypair.private.clone(),
+        bridge_static_pub: config.identity.static_keypair.public.clone(),
+        relay_url: config.relay_url.clone(),
         roster: config.roster.clone(),
+        roster_path: config.roster_path.clone(),
         source,
+        live_peers: Arc::new(Mutex::new(HashMap::new())),
+        next_peer_reg: AtomicU64::new(0),
     });
+
+    // Correlation ids for relay control requests, monotonic across reconnects so
+    // a late reply from a dropped connection can never be mistaken for a fresh
+    // request's ack. Shared (`Arc`) so a spawned pairing task can mint ids from
+    // the same sequence as the connection loop (ADR-0021 D3 assert-before-grant).
+    let control_seq = Arc::new(AtomicU32::new(0));
 
     let mut backoff = BACKOFF_MIN;
     loop {
         if shutdown.is_cancelled() {
             return Ok(());
         }
-        match run_connection(&config, &deps, &shutdown).await {
+        match run_connection(
+            &config,
+            &deps,
+            &control_seq,
+            &mut commands,
+            &events,
+            &shutdown,
+        )
+        .await
+        {
             ConnOutcome::Shutdown => return Ok(()),
             // A fresh loss starts backoff over; a never-connected attempt keeps
             // the current (growing) delay so a down relay is not hammered.
@@ -291,11 +656,14 @@ pub async fn serve_bridge(
     }
 }
 
-/// Runs one relay connection to completion: dial, hello, then read/route until
-/// the connection drops or `shutdown` fires.
+/// Runs one relay connection to completion: dial, hello, assert the roster, then
+/// read/route until the connection drops or `shutdown` fires.
 async fn run_connection(
     config: &BridgeConfig,
     deps: &Arc<PeerDeps>,
+    control_seq: &Arc<AtomicU32>,
+    commands: &mut mpsc::Receiver<PairingCommand>,
+    events: &mpsc::Sender<BridgeEvent>,
     shutdown: &CancellationToken,
 ) -> ConnOutcome {
     let ws = match connect_async(&config.relay_url).await {
@@ -346,7 +714,57 @@ async fn run_connection(
         let _ = sink.close().await;
     });
 
+    // Assert-before-serve (ADR-0021 D4): the relay admits no device hello until
+    // it holds this bridge's device credentials, so we send `AssertDevices` for
+    // the current roster and await the matching ack before entering the serve
+    // loop. The reply rides back as an inbound Control frame, so we pump `stream`
+    // here until it arrives (only control frames can precede admission).
+    if let Some(outcome) = match assert_roster_and_await_ack(
+        &mut stream,
+        deps,
+        &outbound_tx,
+        control_seq.as_ref(),
+        shutdown,
+    )
+    .await
+    {
+        AssertPhase::Acked => None,
+        AssertPhase::Shutdown => Some(ConnOutcome::Shutdown),
+        // A relay that refuses our assertion is a config-level problem, and
+        // one that never answers is silent/hostile (ADR-0021 untrusted);
+        // both grow the backoff rather than hammer a retry that will just
+        // re-fail — the same path as a failed connect.
+        AssertPhase::Rejected | AssertPhase::TimedOut => Some(ConnOutcome::ConnectFailed),
+        AssertPhase::Disconnected => Some(ConnOutcome::Disconnected),
+    } {
+        conn_token.cancel();
+        drop(outbound_tx);
+        writer.abort();
+        return outcome;
+    }
+
     let mut peers = PeerRegistry::new();
+    // Pending relay control requests (`RegisterPairing`/`AssertDevices`/…) awaiting
+    // their `RelayControlAck`/`RelayControlError`, keyed by correlation id. Shared
+    // (`Arc<Mutex>`) because the read loop completes waiters (see [`route_control_reply`])
+    // while a spawned pairing task registers one for its assert-before-grant and
+    // awaits it (ADR-0021 D3). Locks are brief and never held across an `.await`.
+    let control_waiters: ControlWaiters = Arc::new(Mutex::new(HashMap::new()));
+    // The bridge's single in-flight pairing window (ADR-0021 D3): `None` until the
+    // desktop opens one, then the minted secret + deadline, and — once a device's
+    // first Pairing frame arrives — a handle to the running responder task. At most
+    // one exists; a second concurrent handshake is dropped.
+    let mut pairing: Option<PairingWindow> = None;
+    // Monotonic generation stamped into each pairing window, so a completed task's
+    // late done-signal can never clear a newer window that replaced it.
+    let mut pairing_generation: u64 = 0;
+    // The running pairing task echoes its window generation + exit mode here so
+    // the loop drops a consumed window or frees the slot of a pre-`Pending`
+    // failure (mirrors [`DoneGuard`] for peers; see [`handle_pairing_done`]).
+    let (pairing_done_tx, mut pairing_done_rx) = mpsc::unbounded_channel::<(u64, PairingExit)>();
+    // Once the command channel closes (the desktop dropped its sender) we stop
+    // selecting on it so a closed channel does not spin the loop.
+    let mut commands_open = true;
     // Peer tasks echo their `(src, generation)` here on exit so the loop can
     // reap the dead slot promptly (see [`DoneGuard`]). Unbounded so the reap
     // never blocks a returning peer; drained synchronously by the select below.
@@ -361,6 +779,31 @@ async fn run_connection(
                     peers.remove_if_generation(&src, generation);
                 }
             }
+            done = pairing_done_rx.recv() => {
+                // Generation-guarded (a newer `OpenWindow` survives a stale
+                // signal): consumed → drop the window; a pre-`Pending` failure
+                // → free the slot so a fresh handshake can start.
+                if let Some((generation, exit)) = done {
+                    handle_pairing_done(&mut pairing, generation, exit);
+                }
+            }
+            cmd = commands.recv(), if commands_open => match cmd {
+                Some(cmd) => {
+                    handle_command(
+                        cmd,
+                        deps,
+                        &outbound_tx,
+                        events,
+                        control_seq,
+                        &control_waiters,
+                        &mut pairing,
+                        &mut pairing_generation,
+                    )
+                    .await;
+                }
+                // Desktop dropped the command sender: no more commands will come.
+                None => commands_open = false,
+            },
             inbound = stream.next() => match inbound {
                 None => break ConnOutcome::Disconnected,
                 Some(Err(_)) => break ConnOutcome::Disconnected,
@@ -368,44 +811,152 @@ async fn run_connection(
                     dispatch_inbound(
                         bytes.as_ref(),
                         &mut peers,
+                        &control_waiters,
+                        &mut pairing,
                         deps,
                         &outbound_tx,
+                        control_seq,
+                        events,
                         &done_tx,
+                        &pairing_done_tx,
                         &conn_token,
                     );
                 }
                 Some(Ok(Message::Close(_))) => break ConnOutcome::Disconnected,
                 // Ping/Pong/Text/Frame: tungstenite answers pings itself; the
-                // bridge speaks only binary Data frames, so ignore the rest.
+                // bridge speaks only binary Data/Control frames, so ignore the rest.
                 Some(Ok(_)) => {}
             },
         }
     };
 
-    // Tear down: cancel all peers, drop their inbound queues, stop the writer.
+    // Tear down: cancel all peers and any pairing task, drop their inbound
+    // queues, stop the writer. Dropping `pairing` closes the running task's
+    // channels; `conn_token` (already a child of `shutdown`) also cancels it.
     conn_token.cancel();
     drop(peers);
+    drop(pairing);
     drop(done_tx);
+    drop(pairing_done_tx);
     drop(outbound_tx);
     writer.abort();
     outcome
 }
 
+/// The outcome of the assert-before-serve phase.
+#[derive(Debug, PartialEq, Eq)]
+enum AssertPhase {
+    /// The relay acked our `AssertDevices`; proceed to serve.
+    Acked,
+    /// The relay rejected the assertion (`RelayControlError`).
+    Rejected,
+    /// The connection dropped before the ack arrived.
+    Disconnected,
+    /// The relay never answered within [`CONTROL_ACK_TIMEOUT`]: a silent (or
+    /// malicious — ADR-0021 untrusted) relay must not wedge the pre-serve phase.
+    TimedOut,
+    /// `shutdown` fired while awaiting the ack.
+    Shutdown,
+}
+
+/// Sends `AssertDevices` for the current roster and reads inbound frames until
+/// the matching `RelayControlAck` (or error) arrives, bounded by
+/// [`CONTROL_ACK_TIMEOUT`]. Generic over the stream so the reply-pump (and the
+/// timeout) are exercised without a live socket in tests.
+async fn assert_roster_and_await_ack<S, E>(
+    stream: &mut S,
+    deps: &Arc<PeerDeps>,
+    outbound_tx: &mpsc::Sender<Message>,
+    control_seq: &AtomicU32,
+    shutdown: &CancellationToken,
+) -> AssertPhase
+where
+    S: Stream<Item = Result<Message, E>> + Unpin,
+{
+    let id = next_control_id(control_seq);
+    let msg = {
+        let roster = deps.roster.read().await;
+        assert_devices_msg(id, &roster)
+    };
+    if send_control(outbound_tx, deps.bridge_id, &msg)
+        .await
+        .is_err()
+    {
+        return AssertPhase::Disconnected;
+    }
+    // One fixed deadline for the whole wait (not per-frame): a relay trickling
+    // unrelated frames cannot keep resetting the clock.
+    let deadline = tokio::time::sleep(CONTROL_ACK_TIMEOUT);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return AssertPhase::Shutdown,
+            _ = &mut deadline => return AssertPhase::TimedOut,
+            inbound = stream.next() => match inbound {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {
+                    return AssertPhase::Disconnected
+                }
+                Some(Ok(Message::Binary(bytes))) => {
+                    match parse_control_reply(bytes.as_ref(), deps.bridge_id) {
+                        Some(ControlReply::Ack(ack)) if ack == id => return AssertPhase::Acked,
+                        Some(ControlReply::Error(eid)) if eid == id => {
+                            return AssertPhase::Rejected
+                        }
+                        // A stray/unrelated frame before the ack: keep reading
+                        // (the relay admits no device until the assert lands).
+                        _ => {}
+                    }
+                }
+                Some(Ok(_)) => {}
+            },
+        }
+    }
+}
+
 /// Routes one inbound binary frame to its peer task, spawning a new peer task
 /// for a `src` not seen before. Pure-sync: never awaits, so the read loop stays
 /// responsive across peers.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_inbound(
     bytes: &[u8],
     peers: &mut PeerRegistry,
+    control_waiters: &ControlWaiters,
+    pairing: &mut Option<PairingWindow>,
     deps: &Arc<PeerDeps>,
     outbound_tx: &mpsc::Sender<Message>,
+    control_seq: &Arc<AtomicU32>,
+    events: &mpsc::Sender<BridgeEvent>,
     done_tx: &mpsc::UnboundedSender<(DeviceId, u64)>,
+    pairing_done_tx: &mpsc::UnboundedSender<(u64, PairingExit)>,
     conn_token: &CancellationToken,
 ) {
     let envelope = match Envelope::decode(bytes) {
         Ok(e) => e,
         Err(_) => return, // malformed frame from the relay: ignore
     };
+    // A relay-terminated Control reply (an ack/error for one of our control
+    // requests) completes the matching waiter, then we are done with the frame.
+    if envelope.frame_type == FrameType::Control && envelope.dst == deps.bridge_id {
+        route_control_reply(&envelope.payload, control_waiters);
+        return;
+    }
+    // A Pairing frame addressed to us drives the single in-flight pairing window
+    // (ADR-0021 D3): its own responder task, not the per-`src` peer registry.
+    if envelope.frame_type == FrameType::Pairing && envelope.dst == deps.bridge_id {
+        dispatch_pairing_frame(
+            envelope.src,
+            envelope.payload,
+            pairing,
+            deps,
+            outbound_tx,
+            control_seq,
+            control_waiters,
+            events,
+            pairing_done_tx,
+            conn_token,
+        );
+        return;
+    }
     // The relay only forwards Data frames between adjacent peers, addressed to
     // us; anything else is not ours to serve.
     if envelope.frame_type != FrameType::Data || envelope.dst != deps.bridge_id {
@@ -442,12 +993,622 @@ fn dispatch_inbound(
             outbound_tx.clone(),
             done_tx.clone(),
             generation,
+            control_seq.clone(),
             conn_token.clone(),
         ));
     }
 }
 
+/// Routes one inbound Pairing frame into the pairing window's responder task,
+/// spawning that task on the first frame from a device (ADR-0021 D3). Pure-sync
+/// like [`dispatch_inbound`]: it never awaits.
+///
+/// - No open window, or a window past its deadline → the frame is dropped (and
+///   an expired window is cleared so a later scan sees "no window").
+/// - Window open, no device yet — including a slot freed by a pre-`Pending`
+///   failure (see [`handle_pairing_done`]) → spawn [`run_pairing`] bound to this
+///   `src`, handing it this frame as the handshake's first message.
+/// - Task already running for this `src` → forward the frame (the E2E hello,
+///   then the final confirm).
+/// - A frame from any *other* `src` while a task runs → dropped: at most one
+///   handshake is in flight, and exactly one *completed* (user-visible)
+///   handshake consumes the window (ADR-0021 D3 single-use).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_pairing_frame(
+    src: DeviceId,
+    payload: Vec<u8>,
+    pairing: &mut Option<PairingWindow>,
+    deps: &Arc<PeerDeps>,
+    outbound_tx: &mpsc::Sender<Message>,
+    control_seq: &Arc<AtomicU32>,
+    control_waiters: &ControlWaiters,
+    events: &mpsc::Sender<BridgeEvent>,
+    pairing_done_tx: &mpsc::UnboundedSender<(u64, PairingExit)>,
+    conn_token: &CancellationToken,
+) {
+    let Some(window) = pairing.as_mut() else {
+        return; // no pairing window open: nothing to pair
+    };
+    // Lazy expiry (ADR-0021 D4): a window past its deadline is closed here rather
+    // than by a background timer. Clearing it drops any running task's channels.
+    if now_secs() > window.expires_at {
+        *pairing = None;
+        return;
+    }
+
+    if let Some(task) = window.task.as_ref() {
+        // A device already arrived. Forward only frames from that same route; a
+        // second concurrent handshake (different `src`) is dropped.
+        if task.src == src {
+            let _ = task.frame_tx.try_send(payload);
+        }
+        return;
+    }
+
+    // First frame of a fresh pairing: spawn the responder task bound to `src`.
+    let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(PEER_FRAME_QUEUE);
+    let (ctl_tx, ctl_rx) = mpsc::channel::<PairingCtl>(4);
+    window.task = Some(PairingTaskHandle {
+        src,
+        frame_tx,
+        ctl_tx,
+    });
+    tokio::spawn(run_pairing(
+        PairingParams {
+            src,
+            first_frame: payload,
+            secret: window.secret,
+            expires_at: window.expires_at,
+            generation: window.generation,
+        },
+        frame_rx,
+        ctl_rx,
+        deps.clone(),
+        outbound_tx.clone(),
+        control_seq.clone(),
+        control_waiters.clone(),
+        events.clone(),
+        pairing_done_tx.clone(),
+        conn_token.clone(),
+    ));
+}
+
+/// The immutable per-attempt inputs handed to [`run_pairing`], grouped so the
+/// task's signature stays legible.
+struct PairingParams {
+    /// The device's routing id (envelope `src`); also the Noise initiator
+    /// routing id in the prologue and the `dst` of every reply frame.
+    src: DeviceId,
+    /// The device's first Pairing frame: `32-byte device identity ‖ noise msg1`,
+    /// framed exactly like the session handshake's first frame.
+    first_frame: Vec<u8>,
+    /// The window's pairing secret (the handshake PSK).
+    secret: [u8; 32],
+    /// Unix-seconds deadline shared with the window; an unconfirmed arrival
+    /// expires with it (ADR-0021 D3).
+    expires_at: u64,
+    /// The window generation echoed back on exit for a generation-guarded clear.
+    generation: u64,
+}
+
+/// The whole confirm-gated pairing ceremony for one arrived device (ADR-0021
+/// D3), run as a dedicated task off the connection loop.
+///
+/// Sequence: responder `IKpsk2` handshake (PSK = the window secret, prologue
+/// bound with [`HandshakeKind::Pairing`]) → read [`PairingClientMsg::Hello`],
+/// version-gate, emit `PairingDeviceArrived`, send `Pending` → await the user's
+/// `Confirm`/`Reject` (or window expiry) → on `Confirm`, refuse a duplicate id,
+/// else assert-before-grant, send `Grant`, await the device's `Confirm`, persist
+/// the roster entry, send `Confirmed`, `CancelPairing`, and emit `Paired`.
+///
+/// Every early return re-asserts roster-only if a pending credential was already
+/// asserted, so an unconfirmed pending device is never left in the relay's set.
+#[allow(clippy::too_many_arguments)]
+async fn run_pairing(
+    params: PairingParams,
+    mut frame_rx: mpsc::Receiver<Vec<u8>>,
+    mut ctl_rx: mpsc::Receiver<PairingCtl>,
+    deps: Arc<PeerDeps>,
+    outbound_tx: mpsc::Sender<Message>,
+    control_seq: Arc<AtomicU32>,
+    control_waiters: ControlWaiters,
+    events: mpsc::Sender<BridgeEvent>,
+    pairing_done_tx: mpsc::UnboundedSender<(u64, PairingExit)>,
+    conn_token: CancellationToken,
+) {
+    // Signal the connection loop when this task returns for any reason. Until
+    // `Pending` is on the wire the exit is `ReleasedSlot` — a garbage frame or
+    // failed handshake (e.g. a wrong-PSK probe) must not burn the window for the
+    // legitimate device; after `Pending` (user-visible arrival) every outcome
+    // consumes the window (D3's single completed handshake per window).
+    let mut done = PairingDoneGuard {
+        done: pairing_done_tx,
+        generation: params.generation,
+        exit: PairingExit::ReleasedSlot,
+    };
+
+    // --- Responder handshake. The first frame carries the device's minted
+    // identity preamble + noise msg1, exactly like the session path; the routing
+    // id is the envelope `src`. Both feed the `Pairing` prologue. ---
+    let Some((device_id, msg1)) = split_preamble(&params.first_frame) else {
+        return;
+    };
+    let bound = prologue(
+        HandshakeKind::Pairing,
+        &device_id,
+        &params.src,
+        &deps.bridge_id,
+    );
+    let Ok(mut hs) = Handshake::responder(&deps.bridge_static_priv, &params.secret, &bound) else {
+        return;
+    };
+    if hs.read_message(msg1).is_err() {
+        return;
+    }
+    let Ok(msg2) = hs.write_message(&[]) else {
+        return;
+    };
+    if send_pairing_frame(&outbound_tx, deps.bridge_id, params.src, msg2)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let Ok((mut transport, remote_static)) = hs.into_transport() else {
+        return;
+    };
+    // The pairing handshake authenticates the device's static; an empty one means
+    // snow never learned it — treat as a failed handshake.
+    if remote_static.is_empty() {
+        return;
+    }
+
+    // --- E2E hello: version-gate, then surface the device for confirmation. ---
+    let Some(hello_frame) = recv_pairing_frame(&mut frame_rx, params.expires_at, &conn_token).await
+    else {
+        return;
+    };
+    let (client_version, raw_name) = match transport.open::<PairingClientMsg>(&hello_frame) {
+        Ok(PairingClientMsg::Hello {
+            protocol_version,
+            device_name,
+        }) => (protocol_version, device_name),
+        // A decrypt failure or any non-Hello first message is a protocol
+        // violation — drop the attempt silently (no pending credential asserted).
+        _ => return,
+    };
+    if !client_version_ok(client_version) {
+        let _ = send_pairing_msg(
+            &mut transport,
+            &outbound_tx,
+            deps.bridge_id,
+            params.src,
+            &PairingBridgeMsg::Rejected {
+                reason: PairingRejectReason::VersionMismatch {
+                    bridge_min: PROTOCOL_VERSION,
+                },
+            },
+        )
+        .await;
+        return;
+    }
+    let name = sanitize(&raw_name, MAX_DEVICE_NAME_CHARS).into_string();
+    let device_fingerprint = fingerprint(&remote_static);
+    let _ = events
+        .send(BridgeEvent::PairingDeviceArrived {
+            device_id,
+            name: name.clone(),
+            fingerprint: device_fingerprint,
+        })
+        .await;
+    if send_pairing_msg(
+        &mut transport,
+        &outbound_tx,
+        deps.bridge_id,
+        params.src,
+        &PairingBridgeMsg::Pending,
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+    // The arrival is now user-visible: from here on, every exit consumes the
+    // window — no second handshake may follow a completed one (ADR-0021 D3).
+    done.consume();
+
+    // --- Await the user's decision (or window expiry). No pending credential is
+    // asserted yet, so reject/expiry here just closes with no relay cleanup. ---
+    let decision =
+        await_pairing_decision(&mut ctl_rx, &device_id, params.expires_at, &conn_token).await;
+    match decision {
+        PairingDecision::Confirm => {}
+        PairingDecision::Reject => {
+            let _ = send_pairing_msg(
+                &mut transport,
+                &outbound_tx,
+                deps.bridge_id,
+                params.src,
+                &PairingBridgeMsg::Rejected {
+                    reason: PairingRejectReason::UserRejected,
+                },
+            )
+            .await;
+            let _ = events
+                .send(BridgeEvent::PairingResult(PairingOutcome::Rejected {
+                    device_id,
+                }))
+                .await;
+            return;
+        }
+        PairingDecision::Closed => {
+            // Expiry, cancel, or window replacement: nothing durable was granted.
+            let _ = send_pairing_msg(
+                &mut transport,
+                &outbound_tx,
+                deps.bridge_id,
+                params.src,
+                &PairingBridgeMsg::Rejected {
+                    reason: PairingRejectReason::WindowClosed,
+                },
+            )
+            .await;
+            let _ = events
+                .send(BridgeEvent::PairingResult(PairingOutcome::Expired))
+                .await;
+            return;
+        }
+    }
+
+    // --- Confirm path. Refuse a duplicate id before minting anything. ---
+    if deps.roster.read().await.contains_device(&device_id) {
+        let _ = send_pairing_msg(
+            &mut transport,
+            &outbound_tx,
+            deps.bridge_id,
+            params.src,
+            &PairingBridgeMsg::Rejected {
+                reason: PairingRejectReason::DuplicateId,
+            },
+        )
+        .await;
+        let _ = events
+            .send(BridgeEvent::PairingResult(PairingOutcome::Rejected {
+                device_id,
+            }))
+            .await;
+        return;
+    }
+
+    // Mint the durable per-pair credentials the device will persist.
+    let (Ok(relay_token), Ok(session_psk)) = (next_device_token(), next_session_psk()) else {
+        return; // OS CSPRNG failure: abort before any assert
+    };
+    let entry = RosterEntry {
+        device_id,
+        static_pubkey: remote_static.clone(),
+        psk: session_psk,
+        relay_token: relay_token.clone(),
+        name: name.clone(),
+        enrolled_at: Some(now_secs()),
+        last_connected_at: None,
+    };
+
+    // Assert-before-grant (ADR-0021 D3): the relay must credential the pending
+    // device before it reconnects durably, so assert `roster ∪ pending` and await
+    // the ack. From here on, a pending credential is live in the relay's set, so
+    // every failure path re-asserts roster-only to drop it.
+    let pending_assert = {
+        let roster = deps.roster.read().await;
+        let mut devices: Vec<AssertedDevice> = roster
+            .entries
+            .iter()
+            .map(|e| AssertedDevice {
+                device_id: e.device_id,
+                token: device_token_for(e),
+            })
+            .collect();
+        devices.push(AssertedDevice {
+            device_id,
+            token: relay_token.clone(),
+        });
+        RelayControl::AssertDevices {
+            id: next_control_id(control_seq.as_ref()),
+            devices,
+        }
+    };
+    let asserted = send_control_await_ack(
+        &outbound_tx,
+        deps.bridge_id,
+        &pending_assert,
+        &control_waiters,
+        &conn_token,
+    )
+    .await;
+    if !asserted {
+        // The relay never acked (silent, errored, or the link dropped): the
+        // pending credential may or may not be live; re-assert roster-only to be
+        // sure it is dropped, then abandon the attempt.
+        reassert_roster_only(&deps, &outbound_tx, &control_seq).await;
+        let _ = events
+            .send(BridgeEvent::PairingResult(PairingOutcome::Expired))
+            .await;
+        return;
+    }
+
+    // Grant the durable credentials. If the send fails the link is gone; drop the
+    // pending credential and abandon.
+    if send_pairing_msg(
+        &mut transport,
+        &outbound_tx,
+        deps.bridge_id,
+        params.src,
+        &PairingBridgeMsg::Grant {
+            device_token: relay_token,
+            psk: B64.encode(session_psk),
+            bridge_name: None,
+        },
+    )
+    .await
+    .is_err()
+    {
+        reassert_roster_only(&deps, &outbound_tx, &control_seq).await;
+        return;
+    }
+
+    // Await the device's Confirm — only then does the roster persist (ADR-0021
+    // D3: the device shows "paired ✓" solely after our final Confirmed ack, so we
+    // must persist before sending it). If it never arrives, persist nothing and
+    // re-assert roster-only so no ghost credential lingers.
+    let confirmed = match recv_pairing_frame(&mut frame_rx, params.expires_at, &conn_token).await {
+        Some(frame) => matches!(
+            transport.open::<PairingClientMsg>(&frame),
+            Ok(PairingClientMsg::Confirm)
+        ),
+        None => false,
+    };
+    if !confirmed {
+        reassert_roster_only(&deps, &outbound_tx, &control_seq).await;
+        let _ = events
+            .send(BridgeEvent::PairingResult(PairingOutcome::Expired))
+            .await;
+        return;
+    }
+
+    // Persist the roster entry, then send the final Confirmed ack. The asserted
+    // set (roster ∪ pending) already equals the post-push roster, so no re-assert
+    // is needed on this success path.
+    {
+        let mut roster = deps.roster.write().await;
+        roster.entries.push(entry);
+        if let Err(_e) = roster.save(&deps.roster_path) {
+            // Persist failed after the device already stored its credentials: undo
+            // the in-memory push and re-assert roster-only so the relay drops the
+            // pending credential. The device (no final ack) re-pairs.
+            roster.entries.pop();
+            drop(roster);
+            reassert_roster_only(&deps, &outbound_tx, &control_seq).await;
+            let _ = events
+                .send(BridgeEvent::PairingResult(PairingOutcome::Expired))
+                .await;
+            return;
+        }
+    }
+    let _ = send_pairing_msg(
+        &mut transport,
+        &outbound_tx,
+        deps.bridge_id,
+        params.src,
+        &PairingBridgeMsg::Confirmed,
+    )
+    .await;
+    // Close the relay's window now that the single handshake completed.
+    let _ = send_control(
+        &outbound_tx,
+        deps.bridge_id,
+        &RelayControl::CancelPairing {
+            id: next_control_id(control_seq.as_ref()),
+        },
+    )
+    .await;
+    let _ = events
+        .send(BridgeEvent::PairingResult(PairingOutcome::Paired {
+            device_id,
+            name,
+        }))
+        .await;
+    let _ = events.send(BridgeEvent::RosterChanged).await;
+}
+
+/// The resolved outcome of the confirm/reject await.
+enum PairingDecision {
+    /// The user confirmed.
+    Confirm,
+    /// The user rejected.
+    Reject,
+    /// The window closed first: expiry, cancel, or replacement.
+    Closed,
+}
+
+/// Awaits the user's confirm/reject decision for the device that actually
+/// arrived (`arrived`), bounded by the window deadline and the connection token.
+/// A closed control channel (the desktop cancelled or a new window replaced this
+/// one) or the deadline both resolve to `Closed`.
+///
+/// A decision naming a *different* device — e.g. a stale `Confirm` still queued
+/// on the control channel (cap 4) from a window that was replaced before this
+/// device arrived — is dropped, and the await keeps waiting. This binds the
+/// decision to the arrived device so a queued approval can never enroll the
+/// wrong one after a window replacement.
+async fn await_pairing_decision(
+    ctl_rx: &mut mpsc::Receiver<PairingCtl>,
+    arrived: &DeviceId,
+    expires_at: u64,
+    conn_token: &CancellationToken,
+) -> PairingDecision {
+    let sleep = tokio::time::sleep(deadline_from_now(expires_at));
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = conn_token.cancelled() => return PairingDecision::Closed,
+            _ = &mut sleep => return PairingDecision::Closed,
+            ctl = ctl_rx.recv() => match ctl {
+                Some(PairingCtl::Confirm { device_id }) if &device_id == arrived => {
+                    return PairingDecision::Confirm;
+                }
+                Some(PairingCtl::Reject { device_id }) if &device_id == arrived => {
+                    return PairingDecision::Reject;
+                }
+                // A decision for a stale/different device: ignore it and keep
+                // waiting for one that matches the arrived device (or the window
+                // to close).
+                Some(_) => continue,
+                None => return PairingDecision::Closed,
+            },
+        }
+    }
+}
+
+/// Receives the next inbound Pairing frame for this attempt, bounded by the
+/// window deadline and the connection token. `None` on deadline, teardown, or a
+/// closed frame channel (window replaced/cancelled).
+async fn recv_pairing_frame(
+    frame_rx: &mut mpsc::Receiver<Vec<u8>>,
+    expires_at: u64,
+    conn_token: &CancellationToken,
+) -> Option<Vec<u8>> {
+    let sleep = tokio::time::sleep(deadline_from_now(expires_at));
+    tokio::pin!(sleep);
+    tokio::select! {
+        _ = conn_token.cancelled() => None,
+        _ = &mut sleep => None,
+        frame = frame_rx.recv() => frame,
+    }
+}
+
+/// The remaining duration until `expires_at` (Unix seconds), or zero if already
+/// past — so an expired window fires its deadline branch immediately.
+fn deadline_from_now(expires_at: u64) -> Duration {
+    Duration::from_secs(expires_at.saturating_sub(now_secs()))
+}
+
+/// Sends a [`RelayControl`] and awaits its `RelayControlAck`, registering a
+/// waiter in the shared map that the read loop completes. Returns `true` only on
+/// a matching ack; `false` on a relay error, teardown, or [`CONTROL_ACK_TIMEOUT`].
+async fn send_control_await_ack(
+    outbound_tx: &mpsc::Sender<Message>,
+    bridge_id: DeviceId,
+    control: &RelayControl,
+    control_waiters: &ControlWaiters,
+    conn_token: &CancellationToken,
+) -> bool {
+    let RelayControl::AssertDevices { id, .. } = control else {
+        // This helper is only used for AssertDevices; other control messages do
+        // not correlate an ack here.
+        return false;
+    };
+    let id = *id;
+    let (tx, rx) = oneshot::channel();
+    if let Ok(mut waiters) = control_waiters.lock() {
+        waiters.insert(id, tx);
+    } else {
+        return false;
+    }
+    if send_control(outbound_tx, bridge_id, control).await.is_err() {
+        if let Ok(mut waiters) = control_waiters.lock() {
+            waiters.remove(&id);
+        }
+        return false;
+    }
+    let acked = tokio::select! {
+        _ = conn_token.cancelled() => false,
+        _ = tokio::time::sleep(CONTROL_ACK_TIMEOUT) => false,
+        reply = rx => matches!(reply, Ok(Ok(()))),
+    };
+    if !acked {
+        if let Ok(mut waiters) = control_waiters.lock() {
+            waiters.remove(&id);
+        }
+    }
+    acked
+}
+
+/// Re-asserts the persisted roster (roster-only) so the relay drops any pending
+/// credential from an abandoned pairing. Best-effort: a dropped link cannot leave
+/// a ghost credential because the relay clears a bridge's whole set on disconnect
+/// (ADR-0021 D4).
+async fn reassert_roster_only(
+    deps: &Arc<PeerDeps>,
+    outbound_tx: &mpsc::Sender<Message>,
+    control_seq: &Arc<AtomicU32>,
+) {
+    let assert = {
+        let roster = deps.roster.read().await;
+        assert_devices_msg(next_control_id(control_seq.as_ref()), &roster)
+    };
+    let _ = send_control(outbound_tx, deps.bridge_id, &assert).await;
+}
+
+/// Whether a pairing device's advertised `protocol_version` is acceptable: it
+/// must meet the bridge's minimum ([`PROTOCOL_VERSION`]). A lower version pairs
+/// against a bridge that speaks newer wire types it cannot, so it is refused with
+/// [`PairingRejectReason::VersionMismatch`] rather than left to fail as an opaque
+/// AEAD error later (ADR-0021 D8, version preflight).
+fn client_version_ok(client_version: u32) -> bool {
+    client_version >= PROTOCOL_VERSION
+}
+
+/// Mints a fresh per-device relay token: hex of 32 OS-CSPRNG bytes.
+fn next_device_token() -> Result<String, BridgeError> {
+    let mut raw = [0u8; 32];
+    fill_random(&mut raw)?;
+    Ok(raw.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Mints a fresh per-pair session PSK: 32 OS-CSPRNG bytes.
+fn next_session_psk() -> Result<[u8; 32], BridgeError> {
+    let mut psk = [0u8; 32];
+    fill_random(&mut psk)?;
+    Ok(psk)
+}
+
+/// Wraps `payload` in a Pairing envelope (frame_type = [`FrameType::Pairing`])
+/// and enqueues it. Pairing-channel frames — the handshake response and every
+/// sealed [`PairingBridgeMsg`] — ride this, distinct from Data frames.
+async fn send_pairing_frame(
+    outbound_tx: &mpsc::Sender<Message>,
+    src: DeviceId,
+    dst: DeviceId,
+    payload: Vec<u8>,
+) -> Result<(), ()> {
+    let frame = Envelope {
+        frame_type: FrameType::Pairing,
+        src,
+        dst,
+        payload,
+    }
+    .encode();
+    outbound_tx
+        .send(Message::Binary(frame.into()))
+        .await
+        .map_err(|_| ())
+}
+
+/// Seals a [`PairingBridgeMsg`] on the pairing transport and enqueues it as a
+/// Pairing frame. `Err(())` means the peer should be abandoned (seal/send failed).
+async fn send_pairing_msg(
+    transport: &mut Transport,
+    outbound_tx: &mpsc::Sender<Message>,
+    src: DeviceId,
+    dst: DeviceId,
+    msg: &PairingBridgeMsg,
+) -> Result<(), ()> {
+    let ciphertext = transport.seal(msg).map_err(|_| ())?;
+    send_pairing_frame(outbound_tx, src, dst, ciphertext).await
+}
+
 /// One client peer's whole lifecycle: Noise handshake, E2E hello, then serve.
+#[allow(clippy::too_many_arguments)]
 async fn run_peer(
     routing_id: DeviceId,
     mut frame_rx: mpsc::Receiver<Vec<u8>>,
@@ -455,6 +1616,7 @@ async fn run_peer(
     outbound_tx: mpsc::Sender<Message>,
     done_tx: mpsc::UnboundedSender<(DeviceId, u64)>,
     generation: u64,
+    control_seq: Arc<AtomicU32>,
     conn_token: CancellationToken,
 ) {
     // Reap this peer's registry slot when the task returns for *any* reason —
@@ -465,17 +1627,22 @@ async fn run_peer(
         src: routing_id,
         generation,
     };
-    let Some(transport) =
+    // The handshake yields the roster-proven `device_id` (the authenticated
+    // identity), distinct from the relay routing id: revocation targets the
+    // device, so the serve loop keys its live-session registration by it.
+    let Some((transport, device_id)) =
         handshake(&routing_id, &mut frame_rx, &deps, &outbound_tx, &conn_token).await
     else {
         return; // any handshake / auth failure drops just this peer
     };
     serve_peer(
         routing_id,
+        device_id,
         frame_rx,
         transport,
         deps,
         outbound_tx,
+        control_seq,
         conn_token,
     )
     .await;
@@ -483,14 +1650,16 @@ async fn run_peer(
 
 /// Drives the responder side of the Noise handshake from the peer's first
 /// frame, verifying the authenticated static against the roster. Returns the
-/// established [`Transport`], or `None` to drop the peer.
+/// established [`Transport`] paired with the roster-proven `device_id` (the
+/// initiator's claimed identity, now Noise-authenticated against its pinned
+/// static), or `None` to drop the peer.
 async fn handshake(
     routing_id: &DeviceId,
     frame_rx: &mut mpsc::Receiver<Vec<u8>>,
     deps: &Arc<PeerDeps>,
     outbound_tx: &mpsc::Sender<Message>,
     conn_token: &CancellationToken,
-) -> Option<Transport> {
+) -> Option<(Transport, DeviceId)> {
     let first = tokio::select! {
         _ = conn_token.cancelled() => return None,
         f = frame_rx.recv() => f?,
@@ -499,13 +1668,24 @@ async fn handshake(
     // spec D16: 32-byte plaintext identity preamble ‖ noise msg1.
     let (initiator_identity, msg1) = split_preamble(&first)?;
 
-    // Roster lookup by claimed identity selects the PSK and pins the static.
-    let entry = deps.roster.find_by_device(&initiator_identity)?;
+    // Roster lookup by claimed identity selects the PSK and pins the static. The
+    // shared roster can be mutated by pairing/revocation, so copy out the two
+    // credentials this handshake needs and drop the read guard before awaiting.
+    let (psk, static_pubkey) = {
+        let roster = deps.roster.read().await;
+        let entry = roster.find_by_device(&initiator_identity)?;
+        (entry.psk, entry.static_pubkey.clone())
+    };
 
     // The prologue binds this exact route; a forged identity/routing yields a
     // different prologue than the honest client used, failing the handshake.
-    let bound = prologue(&initiator_identity, routing_id, &deps.bridge_id);
-    let mut hs = Handshake::responder(&deps.bridge_static_priv, &entry.psk, &bound).ok()?;
+    let bound = prologue(
+        HandshakeKind::Session,
+        &initiator_identity,
+        routing_id,
+        &deps.bridge_id,
+    );
+    let mut hs = Handshake::responder(&deps.bridge_static_priv, &psk, &bound).ok()?;
     hs.read_message(msg1).ok()?;
     let msg2 = hs.write_message(&[]).ok()?;
     send_frame(outbound_tx, deps.bridge_id, *routing_id, msg2)
@@ -516,10 +1696,10 @@ async fn handshake(
     // spec C7: the Noise-authenticated initiator static MUST equal the pinned
     // roster key. `into_transport` yields an empty vec when snow never learned
     // a remote static; treat empty OR mismatch as an auth failure.
-    if remote_static.is_empty() || remote_static != entry.static_pubkey {
+    if remote_static.is_empty() || remote_static != static_pubkey {
         return None;
     }
-    Some(transport)
+    Some((transport, initiator_identity))
 }
 
 /// Reads the peer's first post-handshake frame (its E2E hello), bounded by
@@ -544,26 +1724,36 @@ async fn recv_hello_frame(
 
 /// After a good handshake: the strict E2E hello exchange, then the serve loop
 /// (request/response + the attached PTY stream). Owns `transport` outright.
+#[allow(clippy::too_many_arguments)]
 async fn serve_peer(
     routing_id: DeviceId,
+    device_id: DeviceId,
     mut frame_rx: mpsc::Receiver<Vec<u8>>,
     mut transport: Transport,
     deps: Arc<PeerDeps>,
     outbound_tx: mpsc::Sender<Message>,
+    control_seq: Arc<AtomicU32>,
     conn_token: CancellationToken,
 ) {
     let bridge_id = deps.bridge_id;
 
     // A peer-scoped token (child of the connection token) so returning from
-    // this task — for any reason — stops the peer's pump task promptly.
+    // this task — for any reason — stops the peer's pump task promptly, and so a
+    // revocation of this `device_id` can cancel *this* session directly. As a
+    // child of `conn_token` it still fires on a connection-wide teardown.
     let peer_token = conn_token.child_token();
     let _guard = CancelGuard(peer_token.clone());
+
+    // Register this authenticated session so revoking `device_id` severs it
+    // bridge-side (ADR-0021 D6). Deregistered by the RAII guard on any exit.
+    let reg_id = deps.next_peer_reg.fetch_add(1, Ordering::Relaxed);
+    let _live_guard = register_live_peer(&deps.live_peers, device_id, reg_id, peer_token.clone());
 
     // --- E2E hello: the client's first application message must be Hello. A
     // paired client that completes the handshake but never sends it is dropped
     // once PEER_HELLO_TIMEOUT elapses, so the peer task + registry slot are
     // reaped instead of pinned forever (#231). ---
-    let Some(hello_frame) = recv_hello_frame(&mut frame_rx, &conn_token, PEER_HELLO_TIMEOUT).await
+    let Some(hello_frame) = recv_hello_frame(&mut frame_rx, &peer_token, PEER_HELLO_TIMEOUT).await
     else {
         return;
     };
@@ -593,6 +1783,18 @@ async fn serve_peer(
         return;
     }
 
+    // The session is now fully established: stamp the successful connect on the
+    // device's roster entry so ghost / re-paired entries are self-evident in
+    // `ListDevices`. Best-effort metadata — a failed persist must not drop a
+    // live session, and a since-revoked device (no entry) is simply skipped.
+    {
+        let mut roster = deps.roster.write().await;
+        if let Some(entry) = roster.find_by_device_mut(&device_id) {
+            entry.last_connected_at = Some(now_secs());
+            let _ = roster.save(&deps.roster_path);
+        }
+    }
+
     // --- Serve. `transport` is sealed/opened only here, so nonce order is the
     // send order. The peer's attached PTY stream arrives as plaintext
     // `PeerEvent`s over `events_rx`, which is always present (no `Option` in
@@ -603,7 +1805,7 @@ async fn serve_peer(
 
     loop {
         tokio::select! {
-            _ = conn_token.cancelled() => return,
+            _ = peer_token.cancelled() => return,
             frame = frame_rx.recv() => {
                 let Some(frame) = frame else { return };
                 let msg = match transport.open::<ClientMessage>(&frame) {
@@ -614,6 +1816,11 @@ async fn serve_peer(
                     // A second hello is out of protocol; ignore it.
                     ClientMessage::Hello { .. } => {}
                     ClientMessage::Request { id, op } => {
+                        // A successful `RevokeDevice` mutates the roster inside
+                        // `handle_request` but defers the *kick* to here (see
+                        // below), so the `Revoked` response is enqueued before
+                        // the relay re-assert that severs the transport.
+                        let mut revoke_target: Option<DeviceId> = None;
                         let result = handle_request(
                             op,
                             &deps,
@@ -621,9 +1828,11 @@ async fn serve_peer(
                             &peer_token,
                             &mut attach_input,
                             &mut has_attached,
+                            device_id,
+                            &mut revoke_target,
                         )
                         .await;
-                        if send_msg(
+                        let send_ok = send_msg(
                             &mut transport,
                             &outbound_tx,
                             bridge_id,
@@ -631,8 +1840,22 @@ async fn serve_peer(
                             &BridgeMessage::Response { id, result },
                         )
                         .await
-                        .is_err()
-                        {
+                        .is_ok();
+                        // Response-first, kick-after (ADR-0021 D6): the roster is
+                        // already shrunken; now sever the target's live
+                        // session(s) bridge-side and re-assert the shrunken set to
+                        // the relay. On the success path the `Revoked` response is
+                        // already on the outbound queue ahead of the re-assert, so
+                        // the requester still gets its answer. The kick runs
+                        // *regardless* of the response-send outcome: a per-peer
+                        // seal failure must not leave a revoked device asserted at
+                        // the relay with its live sessions uncancelled until the
+                        // next roster change. For a self-revoke this cancels *this*
+                        // peer — the loop returns on its next iteration.
+                        if let Some(target) = revoke_target.take() {
+                            assert_and_kick(&target, &deps, &outbound_tx, &control_seq).await;
+                        }
+                        if !send_ok {
                             return;
                         }
                     }
@@ -699,6 +1922,11 @@ async fn serve_peer(
 ///
 /// `List` runs the source list; `Attach` enforces at-most-one attach per peer,
 /// and on success installs the input sender and spawns the PTY pump task.
+/// `ListDevices` projects the roster (with `is_self` marked for `requester_id`);
+/// `RevokeDevice` removes the target from the roster and persists it, then sets
+/// `revoke_target` so the caller can enqueue the response *before* the kick
+/// (the relay re-assert severs the transport — see [`serve_peer`]).
+#[allow(clippy::too_many_arguments)]
 async fn handle_request(
     op: RemoteOp,
     deps: &Arc<PeerDeps>,
@@ -706,6 +1934,8 @@ async fn handle_request(
     peer_token: &CancellationToken,
     attach_input: &mut Option<mpsc::Sender<ChannelInput>>,
     has_attached: &mut bool,
+    requester_id: DeviceId,
+    revoke_target: &mut Option<DeviceId>,
 ) -> RemoteResult {
     match op {
         RemoteOp::List => match deps.source.list().await {
@@ -735,6 +1965,26 @@ async fn handle_request(
                 Err(e) => RemoteResult::Error(map_source_error(&e)),
             }
         }
+        RemoteOp::ListDevices => {
+            let roster = deps.roster.read().await;
+            RemoteResult::Devices(device_infos(&roster, &requester_id))
+        }
+        RemoteOp::RevokeDevice { device_id } => {
+            match revoke_from_roster(&device_id, deps).await {
+                // Removed: defer the kick so the response goes out first.
+                Ok(true) => {
+                    *revoke_target = Some(device_id);
+                    RemoteResult::Revoked
+                }
+                // Not paired: an idempotent unpair — no kick, still success.
+                Ok(false) => RemoteResult::Revoked,
+                // Persisting the shrunken roster failed: report it rather than
+                // claim a revocation the bridge did not durably record.
+                Err(_e) => RemoteResult::Error(WireError::Transport {
+                    message: "could not persist roster".to_string(),
+                }),
+            }
+        }
         // `RemoteOp` is `#[non_exhaustive]`: a client speaking a newer protocol
         // could ask for an op this bridge predates. Refuse it explicitly rather
         // than dropping the peer, so the client gets a typed answer.
@@ -742,6 +1992,61 @@ async fn handle_request(
             message: "unsupported operation".to_string(),
         }),
     }
+}
+
+/// Projects the roster into wire [`DeviceInfo`]s (ADR-0021 D6 `ListDevices`),
+/// marking the entry whose id equals `requester_id` as `is_self`. `name` is the
+/// already-sanitized roster value (scrubbed at pairing time), and `fingerprint`
+/// is derived from the pinned static key — both display-safe, no re-sanitizing.
+fn device_infos(roster: &Roster, requester_id: &DeviceId) -> Vec<DeviceInfo> {
+    roster
+        .entries
+        .iter()
+        .map(|e| DeviceInfo {
+            device_id: e.device_id,
+            name: e.name.clone(),
+            fingerprint: fingerprint(&e.static_pubkey),
+            enrolled_at: e.enrolled_at,
+            last_connected_at: e.last_connected_at,
+            is_self: e.device_id == *requester_id,
+        })
+        .collect()
+}
+
+/// Removes `device_id` from the roster and persists the shrunken set, returning
+/// whether an entry was removed (`false` = already absent, an idempotent
+/// no-op). The caller performs the kick (relay re-assert + live-session cancel)
+/// separately — see [`assert_and_kick`] — so it can order it after any response.
+async fn revoke_from_roster(
+    device_id: &DeviceId,
+    deps: &Arc<PeerDeps>,
+) -> Result<bool, BridgeError> {
+    let mut roster = deps.roster.write().await;
+    if !roster.remove_by_device(device_id) {
+        return Ok(false);
+    }
+    roster.save(&deps.roster_path)?;
+    Ok(true)
+}
+
+/// Applies the revocation kick for a device already removed from the roster
+/// (ADR-0021 D6): first the authoritative bridge-side cut — cancel every live
+/// session that device holds — then the defense-in-depth relay re-assert of the
+/// shrunken roster, which severs the device's relay connection so it cannot
+/// route or reconnect. The relay step is best-effort: a dropped link needs no
+/// re-assert because the relay clears a bridge's whole set on disconnect (D4).
+async fn assert_and_kick(
+    device_id: &DeviceId,
+    deps: &Arc<PeerDeps>,
+    outbound_tx: &mpsc::Sender<Message>,
+    control_seq: &AtomicU32,
+) {
+    cancel_live_peers(device_id, &deps.live_peers);
+    let assert = {
+        let roster = deps.roster.read().await;
+        assert_devices_msg(next_control_id(control_seq), &roster)
+    };
+    let _ = send_control(outbound_tx, deps.bridge_id, &assert).await;
 }
 
 /// Drains one attached session's output receiver, forwarding each
@@ -842,6 +2147,247 @@ async fn send_frame(
         .map_err(|_| ())
 }
 
+/// Wraps a [`RelayControl`] in a relay-terminated Control envelope (`dst` =
+/// [`DeviceId::ZERO`]) and enqueues it. `Err(())` means the writer is gone.
+async fn send_control(
+    outbound_tx: &mpsc::Sender<Message>,
+    bridge_id: DeviceId,
+    control: &RelayControl,
+) -> Result<(), ()> {
+    let payload = serde_json::to_vec(control).map_err(|_| ())?;
+    let frame = Envelope {
+        frame_type: FrameType::Control,
+        src: bridge_id,
+        dst: DeviceId::ZERO,
+        payload,
+    }
+    .encode();
+    outbound_tx
+        .send(Message::Binary(frame.into()))
+        .await
+        .map_err(|_| ())
+}
+
+/// A decoded relay-terminated control reply, carrying its correlation `id`.
+enum ControlReply {
+    /// A `RelayControlAck`.
+    Ack(u32),
+    /// A `RelayControlError`.
+    Error(u32),
+}
+
+/// Decodes a frame as a relay-terminated control reply addressed to this bridge,
+/// or `None` if it is not one. `RelayControlError` is tried first: its `message`
+/// field is absent from an ack, so an ack never mis-parses as an error, and an
+/// error (which also carries `id`) is not mistaken for an ack.
+fn parse_control_reply(bytes: &[u8], bridge_id: DeviceId) -> Option<ControlReply> {
+    let envelope = Envelope::decode(bytes).ok()?;
+    if envelope.frame_type != FrameType::Control || envelope.dst != bridge_id {
+        return None;
+    }
+    if let Ok(err) = serde_json::from_slice::<RelayControlError>(&envelope.payload) {
+        return Some(ControlReply::Error(err.id));
+    }
+    let ack = serde_json::from_slice::<RelayControlAck>(&envelope.payload).ok()?;
+    Some(ControlReply::Ack(ack.id))
+}
+
+/// Completes the pending control waiter for a relay-terminated reply payload.
+/// `RelayControlError` is tried first (see [`parse_control_reply`]).
+fn route_control_reply(payload: &[u8], control_waiters: &ControlWaiters) {
+    // A poisoned lock (a waiter-holder panicked) leaves acks unroutable; the
+    // affected awaits then time out, which the reconnect path already tolerates.
+    let Ok(mut waiters) = control_waiters.lock() else {
+        return;
+    };
+    if let Ok(err) = serde_json::from_slice::<RelayControlError>(payload) {
+        if let Some(tx) = waiters.remove(&err.id) {
+            let _ = tx.send(Err(err.message));
+        }
+        return;
+    }
+    if let Ok(ack) = serde_json::from_slice::<RelayControlAck>(payload) {
+        if let Some(tx) = waiters.remove(&ack.id) {
+            let _ = tx.send(Ok(()));
+        }
+    }
+}
+
+/// Handles one [`PairingCommand`] from the desktop: opens/replaces or cancels the
+/// pairing window, routes the user's confirm/reject decision into the running
+/// pairing task, and applies revocation.
+#[allow(clippy::too_many_arguments)]
+async fn handle_command(
+    cmd: PairingCommand,
+    deps: &Arc<PeerDeps>,
+    outbound_tx: &mpsc::Sender<Message>,
+    events: &mpsc::Sender<BridgeEvent>,
+    control_seq: &Arc<AtomicU32>,
+    control_waiters: &ControlWaiters,
+    pairing: &mut Option<PairingWindow>,
+    pairing_generation: &mut u64,
+) {
+    match cmd {
+        PairingCommand::OpenWindow { ttl_secs, reply } => {
+            let (code, rendezvous_token) = match mint_pairing_code(deps) {
+                Ok(minted) => minted,
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                    return;
+                }
+            };
+            // Open the relay's single pairing window keyed by the rendezvous
+            // token embedded in the code, so the arriving device is admitted.
+            let id = next_control_id(control_seq.as_ref());
+            let register = RelayControl::RegisterPairing {
+                id,
+                token: rendezvous_token,
+                ttl_secs,
+            };
+            // Register a waiter so the relay's ack/error is routed rather than
+            // dropped. The receiver is dropped here (fire-and-forget): the relay
+            // routes the arriving device even before this ack, so we surface the
+            // code immediately rather than gating on it.
+            let (tx, _rx) = oneshot::channel();
+            if let Ok(mut waiters) = control_waiters.lock() {
+                waiters.insert(id, tx);
+            }
+            if send_control(outbound_tx, deps.bridge_id, &register)
+                .await
+                .is_err()
+            {
+                if let Ok(mut waiters) = control_waiters.lock() {
+                    waiters.remove(&id);
+                }
+                let _ = reply.send(Err(BridgeError::Disconnected));
+                return;
+            }
+            let expires_at = now_secs().saturating_add(ttl_secs);
+            // Record the local window (secret + deadline). Replacing an existing
+            // one drops its channels, so any in-flight task exits; a fresh
+            // generation guards against its stale done-signal clearing this one.
+            *pairing_generation = pairing_generation.wrapping_add(1);
+            *pairing = Some(PairingWindow {
+                secret: code.psk,
+                expires_at,
+                generation: *pairing_generation,
+                task: None,
+            });
+            let _ = events
+                .send(BridgeEvent::PairingWindowOpened {
+                    code: code.clone(),
+                    expires_at,
+                })
+                .await;
+            let _ = reply.send(Ok(code));
+        }
+        PairingCommand::CancelWindow => {
+            // Drop local window state (closing any running task's channels), then
+            // tell the relay to drop the routing window.
+            *pairing = None;
+            let id = next_control_id(control_seq.as_ref());
+            let _ = send_control(
+                outbound_tx,
+                deps.bridge_id,
+                &RelayControl::CancelPairing { id },
+            )
+            .await;
+        }
+        PairingCommand::Confirm { device_id } => {
+            route_pairing_decision(pairing, PairingCtl::Confirm { device_id }).await;
+        }
+        PairingCommand::Reject { device_id } => {
+            route_pairing_decision(pairing, PairingCtl::Reject { device_id }).await;
+        }
+        PairingCommand::Revoke { device_id, reply } => {
+            let result = revoke_device(&device_id, deps, outbound_tx, control_seq.as_ref()).await;
+            if result.is_ok() {
+                let _ = events.send(BridgeEvent::RosterChanged).await;
+            }
+            let _ = reply.send(result);
+        }
+    }
+}
+
+/// Forwards a confirm/reject decision to the running pairing task, if any.
+///
+/// The connection loop does not know which device a running task is bound to
+/// (the arrived device id is the identity preamble on the task's first frame),
+/// so it forwards to whatever task is running and lets the task be the single
+/// arbiter: the decision carries its target `device_id` inside the [`PairingCtl`],
+/// and [`await_pairing_decision`] drops any decision whose id does not match the
+/// arrived device. A stale queued decision therefore cannot cross-confirm a
+/// different device after a window replacement.
+async fn route_pairing_decision(pairing: &mut Option<PairingWindow>, ctl: PairingCtl) {
+    if let Some(task) = pairing.as_ref().and_then(|w| w.task.as_ref()) {
+        let _ = task.ctl_tx.send(ctl).await;
+    }
+}
+
+/// Mints a fresh [`PairingCode`] for a new pairing window: a random rendezvous
+/// token (the relay routing credential) and a random `psk`, bound to this
+/// bridge's id, static public key, and relay URL. Returns the code and the
+/// rendezvous token (which the caller also hands to `RegisterPairing`).
+fn mint_pairing_code(deps: &Arc<PeerDeps>) -> Result<(PairingCode, String), BridgeError> {
+    let mut psk = [0u8; 32];
+    fill_random(&mut psk)?;
+    let mut token_raw = [0u8; 32];
+    fill_random(&mut token_raw)?;
+    let rendezvous_token: String = token_raw.iter().map(|b| format!("{b:02x}")).collect();
+
+    let bridge_key: [u8; 32] = deps
+        .bridge_static_pub
+        .clone()
+        .try_into()
+        .map_err(|_| BridgeError::Pairing("bridge static key is not 32 bytes".to_string()))?;
+
+    let code = PairingCode {
+        relay_url: Some(deps.relay_url.clone()),
+        rendezvous_token: Some(rendezvous_token.clone()),
+        mesh_addr: None,
+        psk,
+        bridge_id: deps.bridge_id,
+        bridge_key,
+        bridge_name: None,
+        min_protocol: PROTOCOL_VERSION,
+    };
+    Ok((code, rendezvous_token))
+}
+
+/// Removes `device_id` from the roster, persists the change, and kicks the
+/// device — cancelling its live session(s) bridge-side and re-asserting the
+/// shrunken set to the relay (ADR-0021 D6). A device that was not paired is a
+/// no-op success (idempotent unpair). Shares the roster-mutation and kick path
+/// with the wire `RemoteOp::RevokeDevice` handler; this desktop-driven path has
+/// no relay-response to order, so it kicks inline.
+async fn revoke_device(
+    device_id: &DeviceId,
+    deps: &Arc<PeerDeps>,
+    outbound_tx: &mpsc::Sender<Message>,
+    control_seq: &AtomicU32,
+) -> Result<(), BridgeError> {
+    if !revoke_from_roster(device_id, deps).await? {
+        return Ok(());
+    }
+    assert_and_kick(device_id, deps, outbound_tx, control_seq).await;
+    Ok(())
+}
+
+/// Fills `buf` with cryptographically secure random bytes from the OS CSPRNG.
+fn fill_random(buf: &mut [u8]) -> Result<(), BridgeError> {
+    rand::rngs::SysRng
+        .try_fill_bytes(buf)
+        .map_err(|e| BridgeError::Pairing(format!("could not read random bytes: {e}")))
+}
+
+/// Current Unix time in whole seconds (0 before the epoch, which never occurs).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Splits a client's first frame into its 32-byte identity preamble and the
 /// trailing Noise `msg1`. `None` if the frame is too short to carry a preamble.
 fn split_preamble(frame: &[u8]) -> Option<(DeviceId, &[u8])> {
@@ -854,8 +2400,10 @@ fn split_preamble(frame: &[u8]) -> Option<(DeviceId, &[u8])> {
     Some((DeviceId(id), msg1))
 }
 
-/// True if `url` is a WebSocket endpoint this bridge can dial.
-fn is_ws_url(url: &str) -> bool {
+/// True if `url` is a WebSocket endpoint this bridge can dial. Public so a host
+/// (e.g. the desktop shell) can reject an unusable `relay_url` up front, before
+/// it starts a bridge task that `serve_bridge` would only fail asynchronously.
+pub fn is_ws_url(url: &str) -> bool {
     url.starts_with("ws://") || url.starts_with("wss://")
 }
 
@@ -880,6 +2428,220 @@ fn jittered(base: Duration, rng: &mut impl rand::RngExt) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_info_projection_marks_self() {
+        let roster = Roster {
+            entries: vec![
+                RosterEntry {
+                    device_id: DeviceId([0x11; 32]),
+                    static_pubkey: vec![0xaa; 32],
+                    psk: [0; 32],
+                    name: "a".into(),
+                    enrolled_at: Some(1),
+                    last_connected_at: None,
+                    relay_token: "t".into(),
+                },
+                RosterEntry {
+                    device_id: DeviceId([0x22; 32]),
+                    static_pubkey: vec![0xbb; 32],
+                    psk: [0; 32],
+                    name: "b".into(),
+                    enrolled_at: Some(2),
+                    last_connected_at: Some(9),
+                    relay_token: "u".into(),
+                },
+            ],
+        };
+        let infos = device_infos(&roster, &DeviceId([0x22; 32]));
+        assert_eq!(infos.len(), 2);
+        assert!(!infos[0].is_self);
+        assert!(infos[1].is_self);
+        assert_eq!(infos[0].fingerprint, fingerprint(&[0xaa; 32]));
+        assert_eq!(infos[1].last_connected_at, Some(9));
+    }
+
+    fn entry(id: u8, name: &str) -> RosterEntry {
+        RosterEntry {
+            device_id: DeviceId([id; 32]),
+            static_pubkey: vec![id; 32],
+            psk: [0; 32],
+            name: name.to_string(),
+            enrolled_at: None,
+            last_connected_at: None,
+            relay_token: "tok".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_from_roster_removes_persists_and_is_idempotent() {
+        // Removing a paired device drops its entry, persists the shrunken roster
+        // to disk, and reports `true`; a second removal of the same id is an
+        // idempotent no-op reporting `false` (the wire path still answers
+        // `Revoked`, but performs no kick).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("roster.toml");
+        let deps = Arc::new(PeerDeps {
+            bridge_id: DeviceId([9u8; 32]),
+            bridge_static_priv: vec![0u8; 32],
+            bridge_static_pub: vec![0u8; 32],
+            relay_url: "ws://test".to_string(),
+            roster: Arc::new(RwLock::new(Roster {
+                entries: vec![entry(0x11, "a"), entry(0x22, "b")],
+            })),
+            roster_path: path.clone(),
+            source: Arc::new(remora_core::FakeSessionSource::new()),
+            live_peers: Arc::new(Mutex::new(HashMap::new())),
+            next_peer_reg: AtomicU64::new(0),
+        });
+
+        assert!(
+            revoke_from_roster(&DeviceId([0x11; 32]), &deps)
+                .await
+                .expect("remove ok"),
+            "removing a paired device reports true"
+        );
+        // Persisted: reloading from disk shows only the surviving device.
+        let reloaded = Roster::load(&path).expect("reload roster");
+        assert_eq!(reloaded.entries.len(), 1);
+        assert_eq!(reloaded.entries[0].device_id, DeviceId([0x22; 32]));
+
+        assert!(
+            !revoke_from_roster(&DeviceId([0x11; 32]), &deps)
+                .await
+                .expect("second remove ok"),
+            "removing an absent device is an idempotent no-op (false)"
+        );
+    }
+
+    #[test]
+    fn cancel_live_peers_cancels_only_the_target_devices_sessions() {
+        // Two live sessions for one device plus one for another: revoking the
+        // first device cancels *both* of its sessions and leaves the other's
+        // session untouched (D16: a device may hold several sessions at once).
+        let live: LivePeers = Arc::new(Mutex::new(HashMap::new()));
+        let target = DeviceId([0x11; 32]);
+        let other = DeviceId([0x22; 32]);
+
+        let t1 = CancellationToken::new();
+        let t2 = CancellationToken::new();
+        let t3 = CancellationToken::new();
+        let _g1 = register_live_peer(&live, target, 0, t1.clone()).expect("register 1");
+        let _g2 = register_live_peer(&live, target, 1, t2.clone()).expect("register 2");
+        let _g3 = register_live_peer(&live, other, 2, t3.clone()).expect("register 3");
+
+        cancel_live_peers(&target, &live);
+        assert!(t1.is_cancelled(), "target session 1 kicked");
+        assert!(t2.is_cancelled(), "target session 2 kicked");
+        assert!(!t3.is_cancelled(), "another device's session survives");
+    }
+
+    #[test]
+    fn live_peer_guard_deregisters_its_slot_on_drop() {
+        // The RAII guard removes exactly its own slot on drop, and the device
+        // key is dropped entirely once its last session ends — so a later
+        // revocation kick never targets a session that already returned.
+        let live: LivePeers = Arc::new(Mutex::new(HashMap::new()));
+        let device = DeviceId([0x33; 32]);
+        let g1 = register_live_peer(&live, device, 0, CancellationToken::new()).expect("reg 1");
+        let g2 = register_live_peer(&live, device, 1, CancellationToken::new()).expect("reg 2");
+        assert_eq!(
+            live.lock().expect("lock").get(&device).map(HashMap::len),
+            Some(2)
+        );
+        drop(g1);
+        assert_eq!(
+            live.lock().expect("lock").get(&device).map(HashMap::len),
+            Some(1),
+            "dropping one guard leaves the sibling session registered"
+        );
+        drop(g2);
+        assert!(
+            live.lock().expect("lock").get(&device).is_none(),
+            "the device key is gone once its last session ends"
+        );
+    }
+
+    #[test]
+    fn assert_devices_msg_maps_roster() {
+        // The AssertDevices payload mirrors the roster one-for-one: each entry's
+        // device id and its stored `relay_token` become one `AssertedDevice`.
+        let roster = Roster {
+            entries: vec![RosterEntry {
+                device_id: DeviceId([0x11; 32]),
+                static_pubkey: vec![0xaa; 32],
+                psk: [0xbb; 32],
+                name: "iPhone".to_string(),
+                enrolled_at: None,
+                last_connected_at: None,
+                relay_token: "tok-abc".to_string(),
+            }],
+        };
+        match assert_devices_msg(7, &roster) {
+            RelayControl::AssertDevices { id, devices } => {
+                assert_eq!(id, 7);
+                assert_eq!(devices.len(), 1);
+                assert_eq!(devices[0].device_id, DeviceId([0x11; 32]));
+                assert_eq!(devices[0].token, "tok-abc");
+            }
+            other => panic!("expected AssertDevices, got {other:?}"),
+        }
+    }
+
+    /// Minimal [`PeerDeps`] for exercising the assert phase without a socket.
+    fn assert_phase_deps() -> Arc<PeerDeps> {
+        Arc::new(PeerDeps {
+            bridge_id: DeviceId([9u8; 32]),
+            bridge_static_priv: vec![0u8; 32],
+            bridge_static_pub: vec![0u8; 32],
+            relay_url: "ws://test".to_string(),
+            roster: Arc::new(RwLock::new(Roster::default())),
+            roster_path: PathBuf::from("unused-roster.toml"),
+            source: Arc::new(remora_core::FakeSessionSource::new()),
+            live_peers: Arc::new(Mutex::new(HashMap::new())),
+            next_peer_reg: AtomicU64::new(0),
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn assert_ack_wait_times_out_on_a_silent_relay() {
+        // ADR-0021: the relay is untrusted. One that accepts the connection and
+        // our AssertDevices but never answers must not wedge the bridge in the
+        // pre-serve phase forever — the bounded wait returns TimedOut, which the
+        // caller maps to the failed-connect path (reconnect with backoff).
+        // Paused time auto-advances past CONTROL_ACK_TIMEOUT, keeping this fast.
+        let deps = assert_phase_deps();
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<Message>(8);
+        let seq = AtomicU32::new(0);
+        let shutdown = CancellationToken::new();
+        let mut silent = futures_util::stream::pending::<Result<Message, ()>>();
+        let phase =
+            assert_roster_and_await_ack(&mut silent, &deps, &outbound_tx, &seq, &shutdown).await;
+        assert_eq!(phase, AssertPhase::TimedOut);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn assert_ack_wait_completes_on_matching_ack() {
+        // The happy path through the same seam: a relay that acks the assert's
+        // correlation id completes the wait as Acked — the deadline must not
+        // fire when the reply is already queued.
+        let deps = assert_phase_deps();
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<Message>(8);
+        let seq = AtomicU32::new(0); // first next_control_id() yields 0
+        let shutdown = CancellationToken::new();
+        let ack_frame = Envelope {
+            frame_type: FrameType::Control,
+            src: DeviceId::ZERO,
+            dst: deps.bridge_id,
+            payload: serde_json::to_vec(&RelayControlAck { id: 0 }).expect("encode ack"),
+        }
+        .encode();
+        let mut replies =
+            futures_util::stream::iter(vec![Ok::<_, ()>(Message::Binary(ack_frame.into()))]);
+        let phase =
+            assert_roster_and_await_ack(&mut replies, &deps, &outbound_tx, &seq, &shutdown).await;
+        assert_eq!(phase, AssertPhase::Acked);
+    }
 
     #[test]
     fn is_ws_url_accepts_ws_and_wss_only() {
@@ -1047,5 +2809,516 @@ mod tests {
         let (id, msg1) = split_preamble(&frame).expect("with msg1");
         assert_eq!(id, DeviceId([0x11; DEVICE_ID_LEN]));
         assert_eq!(msg1, &[0x22, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn confirm_rejects_duplicate_device_id() {
+        // The confirm path calls `roster.contains_device(pending_id)` before
+        // minting anything and sends `Rejected { DuplicateId }` on a hit, so a
+        // broken/malicious client cannot shadow or resurrect another device's id
+        // (ADR-0021 D3). Substantive end-to-end coverage is Task 14's loopback;
+        // this pins the guard the responder relies on.
+        let roster = Roster {
+            entries: vec![RosterEntry {
+                device_id: DeviceId([0x11; 32]),
+                static_pubkey: vec![0xaa; 32],
+                psk: [0xbb; 32],
+                name: "existing".to_string(),
+                enrolled_at: None,
+                last_connected_at: None,
+                relay_token: "t".to_string(),
+            }],
+        };
+        // A pending device claiming the same id must be refused.
+        assert!(roster.contains_device(&DeviceId([0x11; 32])));
+        // A fresh id is not a duplicate and would be granted.
+        assert!(!roster.contains_device(&DeviceId([0x22; 32])));
+    }
+
+    #[test]
+    fn client_version_gate_requires_minimum() {
+        // A device below the bridge's minimum is refused (VersionMismatch); one at
+        // or above it is accepted.
+        assert!(!client_version_ok(PROTOCOL_VERSION - 1));
+        assert!(client_version_ok(PROTOCOL_VERSION));
+        assert!(client_version_ok(PROTOCOL_VERSION + 1));
+    }
+
+    #[test]
+    fn device_name_is_control_stripped_and_bounded() {
+        // The untrusted device name is scrubbed of control/escape bytes (the ESC
+        // and newline here) and length-capped before it reaches the confirm
+        // dialog — the same call the responder makes. The bare CSI *text* left
+        // behind after the ESC is stripped is inert (no terminal re-interprets it).
+        let cleaned = sanitize("iP\x1bhone\n", MAX_DEVICE_NAME_CHARS).into_string();
+        assert_eq!(
+            cleaned, "iPhone",
+            "the ESC and newline control bytes are dropped"
+        );
+        assert!(
+            !cleaned.contains('\x1b') && !cleaned.contains('\n'),
+            "no control bytes survive"
+        );
+
+        let long: String = "x".repeat(MAX_DEVICE_NAME_CHARS * 2);
+        let capped = sanitize(&long, MAX_DEVICE_NAME_CHARS).into_string();
+        assert!(
+            capped.chars().count() <= MAX_DEVICE_NAME_CHARS,
+            "name is capped to the bound"
+        );
+    }
+
+    #[test]
+    fn minted_credentials_are_fresh_and_sized() {
+        // The device token is 64 hex chars (32 bytes); the session PSK is 32
+        // bytes; both are freshly random, so two mints differ.
+        let t1 = next_device_token().expect("token");
+        let t2 = next_device_token().expect("token");
+        assert_eq!(t1.len(), 64, "32 bytes -> 64 hex chars");
+        assert!(t1.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(t1, t2, "each token is freshly random");
+
+        let p1 = next_session_psk().expect("psk");
+        let p2 = next_session_psk().expect("psk");
+        assert_eq!(p1.len(), 32);
+        assert_ne!(p1, p2, "each session psk is freshly random");
+    }
+
+    /// Mints a fresh X25519 static keypair the same way the identity layer does.
+    fn test_keypair() -> snow::Keypair {
+        snow::Builder::new(
+            crate::noise::NOISE_PATTERN
+                .parse()
+                .expect("noise params parse"),
+        )
+        .generate_keypair()
+        .expect("generate keypair")
+    }
+
+    /// [`PeerDeps`] with a real bridge keypair, for driving [`run_pairing`].
+    fn pairing_deps(bridge: &snow::Keypair) -> Arc<PeerDeps> {
+        Arc::new(PeerDeps {
+            bridge_id: DeviceId([9u8; 32]),
+            bridge_static_priv: bridge.private.clone(),
+            bridge_static_pub: bridge.public.clone(),
+            relay_url: "ws://test".to_string(),
+            roster: Arc::new(RwLock::new(Roster::default())),
+            roster_path: PathBuf::from("unused-roster.toml"),
+            source: Arc::new(remora_core::FakeSessionSource::new()),
+            live_peers: Arc::new(Mutex::new(HashMap::new())),
+            next_peer_reg: AtomicU64::new(0),
+        })
+    }
+
+    /// The channel bundle a spawned [`run_pairing`] is driven through in tests.
+    struct PairingHarness {
+        outbound_rx: mpsc::Receiver<Message>,
+        events_rx: mpsc::Receiver<BridgeEvent>,
+        frame_tx: mpsc::Sender<Vec<u8>>,
+        ctl_tx: mpsc::Sender<PairingCtl>,
+        done_rx: mpsc::UnboundedReceiver<(u64, PairingExit)>,
+    }
+
+    /// Spawns [`run_pairing`] for `first_frame` under generation 7 and a 60 s
+    /// deadline, returning the harness the test drives it through.
+    fn spawn_pairing(
+        deps: &Arc<PeerDeps>,
+        src: DeviceId,
+        first_frame: Vec<u8>,
+        secret: [u8; 32],
+    ) -> PairingHarness {
+        let (outbound_tx, outbound_rx) = mpsc::channel::<Message>(16);
+        let (events_tx, events_rx) = mpsc::channel::<BridgeEvent>(16);
+        let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (ctl_tx, ctl_rx) = mpsc::channel::<PairingCtl>(4);
+        let (done_tx, done_rx) = mpsc::unbounded_channel::<(u64, PairingExit)>();
+        tokio::spawn(run_pairing(
+            PairingParams {
+                src,
+                first_frame,
+                secret,
+                expires_at: now_secs() + 60,
+                generation: 7,
+            },
+            frame_rx,
+            ctl_rx,
+            deps.clone(),
+            outbound_tx,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(Mutex::new(HashMap::new())),
+            events_tx,
+            done_tx,
+            CancellationToken::new(),
+        ));
+        PairingHarness {
+            outbound_rx,
+            events_rx,
+            frame_tx,
+            ctl_tx,
+            done_rx,
+        }
+    }
+
+    /// Receives the next outbound Pairing envelope's payload, asserting routing.
+    async fn recv_pairing_payload(
+        outbound_rx: &mut mpsc::Receiver<Message>,
+        expect_dst: DeviceId,
+    ) -> Vec<u8> {
+        let msg = outbound_rx.recv().await.expect("an outbound frame");
+        let Message::Binary(bytes) = msg else {
+            panic!("expected a binary frame, got {msg:?}");
+        };
+        let env = Envelope::decode(bytes.as_ref()).expect("decode envelope");
+        assert_eq!(env.frame_type, FrameType::Pairing, "pairing frame type");
+        assert_eq!(env.dst, expect_dst, "addressed to the device's src");
+        env.payload
+    }
+
+    /// Drives the device half of the pairing handshake against a spawned
+    /// [`run_pairing`], returning the device's established transport.
+    async fn complete_device_handshake(
+        init: &mut Option<Handshake>,
+        harness: &mut PairingHarness,
+        src: DeviceId,
+    ) -> Transport {
+        let msg2 = recv_pairing_payload(&mut harness.outbound_rx, src).await;
+        let mut hs = init.take().expect("initiator present");
+        hs.read_message(&msg2).expect("read msg2");
+        let (transport, _) = hs.into_transport().expect("device transport");
+        transport
+    }
+
+    #[test]
+    fn handle_pairing_done_consumed_drops_window_released_frees_slot() {
+        let window = |task: Option<PairingTaskHandle>| PairingWindow {
+            secret: [1; 32],
+            expires_at: now_secs() + 60,
+            generation: 5,
+            task,
+        };
+        let task_handle = || {
+            let (frame_tx, _frame_rx) = mpsc::channel::<Vec<u8>>(1);
+            let (ctl_tx, _ctl_rx) = mpsc::channel::<PairingCtl>(1);
+            PairingTaskHandle {
+                src: DeviceId([2; 32]),
+                frame_tx,
+                ctl_tx,
+            }
+        };
+
+        // Consumed: the whole window is dropped.
+        let mut pairing = Some(window(Some(task_handle())));
+        handle_pairing_done(&mut pairing, 5, PairingExit::ConsumedWindow);
+        assert!(pairing.is_none(), "a consumed window is gone");
+
+        // Released: the window survives with the slot freed for a fresh attempt.
+        let mut pairing = Some(window(Some(task_handle())));
+        handle_pairing_done(&mut pairing, 5, PairingExit::ReleasedSlot);
+        let w = pairing.as_ref().expect("window survives a released slot");
+        assert!(w.task.is_none(), "the in-flight slot is freed");
+
+        // Generation guard: a stale signal (older window) is a no-op either way.
+        let mut pairing = Some(window(Some(task_handle())));
+        handle_pairing_done(&mut pairing, 4, PairingExit::ConsumedWindow);
+        assert!(pairing.is_some(), "stale consumed signal must not drop");
+        handle_pairing_done(&mut pairing, 4, PairingExit::ReleasedSlot);
+        assert!(
+            pairing.as_ref().is_some_and(|w| w.task.is_some()),
+            "stale released signal must not free the live slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn garbage_first_frame_releases_slot_and_admits_a_fresh_handshake() {
+        // Reviewer finding (fix round 1): a corrupted/garbage first frame — or a
+        // wrong-PSK probe that reached the rendezvous window — must NOT burn the
+        // window. The failed task signals ReleasedSlot; the loop frees the slot;
+        // the next Pairing frame from a fresh src starts a new handshake.
+        let bridge = test_keypair();
+        let deps = pairing_deps(&bridge);
+        let psk = [0x42u8; 32];
+        let src_a = DeviceId([0xa0; 32]);
+
+        // 32-byte preamble + garbage msg1: the responder handshake read fails.
+        let mut harness = spawn_pairing(&deps, src_a, vec![0u8; 48], psk);
+        assert_eq!(
+            harness.done_rx.recv().await,
+            Some((7, PairingExit::ReleasedSlot)),
+            "a pre-Pending handshake failure must release the slot"
+        );
+
+        // Apply the signal the way the connection loop does: window survives.
+        let mut pairing = Some(PairingWindow {
+            secret: psk,
+            expires_at: now_secs() + 60,
+            generation: 7,
+            task: None,
+        });
+        handle_pairing_done(&mut pairing, 7, PairingExit::ReleasedSlot);
+        assert!(pairing.is_some(), "the window must survive the failure");
+
+        // A fresh device's first frame is admitted: dispatch spawns a new task.
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<Message>(16);
+        let (events_tx, _events_rx) = mpsc::channel::<BridgeEvent>(16);
+        let (done_tx, _done_rx) = mpsc::unbounded_channel::<(u64, PairingExit)>();
+        let src_b = DeviceId([0xb0; 32]);
+        dispatch_pairing_frame(
+            src_b,
+            vec![0u8; 48],
+            &mut pairing,
+            &deps,
+            &outbound_tx,
+            &Arc::new(AtomicU32::new(0)),
+            &Arc::new(Mutex::new(HashMap::new())),
+            &events_tx,
+            &done_tx,
+            &CancellationToken::new(),
+        );
+        let w = pairing.as_ref().expect("window still open");
+        let task = w.task.as_ref().expect("a fresh handshake was admitted");
+        assert_eq!(task.src, src_b, "the new task binds to the fresh src");
+    }
+
+    #[tokio::test]
+    async fn version_mismatch_rejects_and_releases_the_slot() {
+        // A too-old device gets a wire Rejected{VersionMismatch}, but since the
+        // arrival never became user-visible the slot is released — a mixed fleet
+        // scanning the same QR must not dead-end the window.
+        let bridge = test_keypair();
+        let device = test_keypair();
+        let deps = pairing_deps(&bridge);
+        let psk = [0x42u8; 32];
+        let src = DeviceId([0xd0; 32]);
+        let device_id = DeviceId([0xd1; 32]);
+
+        let pro = prologue(HandshakeKind::Pairing, &device_id, &src, &deps.bridge_id);
+        let mut init = Some(
+            Handshake::initiator(&device.private, &bridge.public, &psk, &pro).expect("initiator"),
+        );
+        let msg1 = init
+            .as_mut()
+            .expect("initiator present")
+            .write_message(&[])
+            .expect("msg1");
+        let mut first = device_id.0.to_vec();
+        first.extend_from_slice(&msg1);
+
+        let mut harness = spawn_pairing(&deps, src, first, psk);
+        let mut transport = complete_device_handshake(&mut init, &mut harness, src).await;
+
+        let hello = transport
+            .seal(&PairingClientMsg::Hello {
+                protocol_version: PROTOCOL_VERSION - 1,
+                device_name: "old phone".to_string(),
+            })
+            .expect("seal hello");
+        harness.frame_tx.send(hello).await.expect("send hello");
+
+        let payload = recv_pairing_payload(&mut harness.outbound_rx, src).await;
+        let reply: PairingBridgeMsg = transport.open(&payload).expect("open reply");
+        assert!(
+            matches!(
+                reply,
+                PairingBridgeMsg::Rejected {
+                    reason: PairingRejectReason::VersionMismatch {
+                        bridge_min: PROTOCOL_VERSION
+                    }
+                }
+            ),
+            "got {reply:?}"
+        );
+        assert_eq!(
+            harness.done_rx.recv().await,
+            Some((7, PairingExit::ReleasedSlot)),
+            "a version-mismatch arrival never became user-visible: release"
+        );
+    }
+
+    #[tokio::test]
+    async fn reject_after_pending_consumes_the_window() {
+        // Once Pending is on the wire the arrival is user-visible: whatever the
+        // outcome (here: user Reject), the window is consumed — D3's single
+        // completed handshake per window.
+        let bridge = test_keypair();
+        let device = test_keypair();
+        let deps = pairing_deps(&bridge);
+        let psk = [0x42u8; 32];
+        let src = DeviceId([0xd0; 32]);
+        let device_id = DeviceId([0xd1; 32]);
+
+        let pro = prologue(HandshakeKind::Pairing, &device_id, &src, &deps.bridge_id);
+        let mut init = Some(
+            Handshake::initiator(&device.private, &bridge.public, &psk, &pro).expect("initiator"),
+        );
+        let msg1 = init
+            .as_mut()
+            .expect("initiator present")
+            .write_message(&[])
+            .expect("msg1");
+        let mut first = device_id.0.to_vec();
+        first.extend_from_slice(&msg1);
+
+        let mut harness = spawn_pairing(&deps, src, first, psk);
+        let mut transport = complete_device_handshake(&mut init, &mut harness, src).await;
+
+        let hello = transport
+            .seal(&PairingClientMsg::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                device_name: "phone".to_string(),
+            })
+            .expect("seal hello");
+        harness.frame_tx.send(hello).await.expect("send hello");
+
+        // The arrival surfaces to the desktop, then Pending reaches the device.
+        match harness.events_rx.recv().await {
+            Some(BridgeEvent::PairingDeviceArrived {
+                device_id: id,
+                name,
+                ..
+            }) => {
+                assert_eq!(id, device_id);
+                assert_eq!(name, "phone");
+            }
+            other => panic!("expected PairingDeviceArrived, got {other:?}"),
+        }
+        let payload = recv_pairing_payload(&mut harness.outbound_rx, src).await;
+        let pending: PairingBridgeMsg = transport.open(&payload).expect("open pending");
+        assert_eq!(pending, PairingBridgeMsg::Pending);
+
+        // The user rejects: wire Rejected{UserRejected}, Rejected event, consumed.
+        harness
+            .ctl_tx
+            .send(PairingCtl::Reject { device_id })
+            .await
+            .expect("send reject");
+        let payload = recv_pairing_payload(&mut harness.outbound_rx, src).await;
+        let rejected: PairingBridgeMsg = transport.open(&payload).expect("open rejected");
+        assert!(
+            matches!(
+                rejected,
+                PairingBridgeMsg::Rejected {
+                    reason: PairingRejectReason::UserRejected
+                }
+            ),
+            "got {rejected:?}"
+        );
+        match harness.events_rx.recv().await {
+            Some(BridgeEvent::PairingResult(PairingOutcome::Rejected { device_id: id })) => {
+                assert_eq!(id, device_id);
+            }
+            other => panic!("expected PairingResult(Rejected), got {other:?}"),
+        }
+        assert_eq!(
+            harness.done_rx.recv().await,
+            Some((7, PairingExit::ConsumedWindow)),
+            "a post-Pending outcome must consume the window"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_confirm_for_a_different_device_is_ignored() {
+        // Reviewer finding: a decision must bind to the device that actually
+        // arrived. A `Confirm` naming a DIFFERENT device (a stale approval still
+        // queued on the ctl channel from a replaced window) must be dropped — it
+        // must NOT enroll the device that arrived. Only the matching `Confirm`
+        // advances the ceremony.
+        let bridge = test_keypair();
+        let device = test_keypair();
+        let deps = pairing_deps(&bridge);
+        let psk = [0x42u8; 32];
+        let src = DeviceId([0xd0; 32]);
+        let device_id = DeviceId([0xd1; 32]);
+
+        let pro = prologue(HandshakeKind::Pairing, &device_id, &src, &deps.bridge_id);
+        let mut init = Some(
+            Handshake::initiator(&device.private, &bridge.public, &psk, &pro).expect("initiator"),
+        );
+        let msg1 = init
+            .as_mut()
+            .expect("initiator present")
+            .write_message(&[])
+            .expect("msg1");
+        let mut first = device_id.0.to_vec();
+        first.extend_from_slice(&msg1);
+
+        let mut harness = spawn_pairing(&deps, src, first, psk);
+        let mut transport = complete_device_handshake(&mut init, &mut harness, src).await;
+
+        let hello = transport
+            .seal(&PairingClientMsg::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                device_name: "phone".to_string(),
+            })
+            .expect("seal hello");
+        harness.frame_tx.send(hello).await.expect("send hello");
+
+        // Drain the arrival event and the Pending frame: the task is now awaiting.
+        assert!(matches!(
+            harness.events_rx.recv().await,
+            Some(BridgeEvent::PairingDeviceArrived { .. })
+        ));
+        let payload = recv_pairing_payload(&mut harness.outbound_rx, src).await;
+        let pending: PairingBridgeMsg = transport.open(&payload).expect("open pending");
+        assert_eq!(pending, PairingBridgeMsg::Pending);
+
+        // A stale Confirm for a DIFFERENT device is dropped: the task keeps
+        // awaiting, so nothing is sent and the task does not finish.
+        let other = DeviceId([0xee; 32]);
+        harness
+            .ctl_tx
+            .send(PairingCtl::Confirm { device_id: other })
+            .await
+            .expect("send stale confirm");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), harness.outbound_rx.recv())
+                .await
+                .is_err(),
+            "a stale confirm for a different device must not advance the ceremony"
+        );
+        assert!(
+            harness.done_rx.try_recv().is_err(),
+            "the task must still be pending after a mismatched confirm"
+        );
+
+        // The matching Confirm advances the ceremony: the task asserts the pending
+        // credential to the relay (the first outbound Control frame after Confirm).
+        harness
+            .ctl_tx
+            .send(PairingCtl::Confirm { device_id })
+            .await
+            .expect("send matching confirm");
+        let msg = harness.outbound_rx.recv().await.expect("an outbound frame");
+        let Message::Binary(bytes) = msg else {
+            panic!("expected a binary frame, got {msg:?}");
+        };
+        let env = Envelope::decode(bytes.as_ref()).expect("decode envelope");
+        assert_eq!(
+            env.frame_type,
+            FrameType::Control,
+            "the matching confirm drives the assert-before-grant control frame"
+        );
+        let control: RelayControl =
+            serde_json::from_slice(&env.payload).expect("decode relay control");
+        match control {
+            RelayControl::AssertDevices { devices, .. } => {
+                assert!(
+                    devices.iter().any(|d| d.device_id == device_id),
+                    "the arrived device is asserted as the pending credential"
+                );
+            }
+            other => panic!("expected AssertDevices, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deadline_from_now_saturates_at_zero_when_past() {
+        // A window already past its deadline yields a zero duration, so the
+        // pairing task's deadline branch fires immediately rather than underflow.
+        assert_eq!(deadline_from_now(0), Duration::ZERO);
+        // A future deadline yields a positive, bounded remaining duration.
+        let future = now_secs().saturating_add(60);
+        let remaining = deadline_from_now(future);
+        assert!(remaining > Duration::ZERO);
+        assert!(remaining <= Duration::from_secs(60));
     }
 }

@@ -16,6 +16,7 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::Path;
 
 use base64::Engine as _;
+use blake2::{Blake2s256, Digest as _};
 use rand::TryRng as _;
 use serde::{Deserialize, Serialize};
 
@@ -167,6 +168,18 @@ fn ensure_secret_mode(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// A short, human-comparable fingerprint of an X25519 static public key
+/// (ADR-0021 D5): `XXXX-XXXX-XXXX`, the uppercase hex of the first 6 bytes of
+/// BLAKE2s-256 over the key. 48 bits is ample for a distinguish-my-device
+/// ceremony inside a short pairing window.
+pub fn fingerprint(pubkey: &[u8]) -> String {
+    let mut hasher = Blake2s256::new();
+    hasher.update(pubkey);
+    let digest = hasher.finalize();
+    let hex: String = digest[..6].iter().map(|b| format!("{b:02X}")).collect();
+    format!("{}-{}-{}", &hex[0..4], &hex[4..8], &hex[8..12])
+}
+
 // ---------------------------------------------------------------------------
 // BridgeIdentity
 // ---------------------------------------------------------------------------
@@ -254,6 +267,16 @@ pub struct RosterEntry {
     pub static_pubkey: Vec<u8>,
     /// The `psk2` shared between this device and this bridge.
     pub psk: [u8; 32],
+    /// The per-device credential the bridge asserts to the relay; equals the
+    /// device's `PairingFile.device_token`. A CREDENTIAL field — not defaulted.
+    pub relay_token: String,
+    /// Display name from the device's `PairingHello` (ADR-0021 D5).
+    pub name: String,
+    /// Unix seconds the device was enrolled.
+    pub enrolled_at: Option<u64>,
+    /// Unix seconds of the device's most recent successful session (updated
+    /// on session establish so ghost/re-paired entries are self-evident).
+    pub last_connected_at: Option<u64>,
 }
 
 /// The set of devices paired with this bridge.
@@ -264,11 +287,23 @@ pub struct Roster {
 }
 
 /// On-disk shape of a single [`RosterEntry`] (id hex, key + psk base64).
+///
+/// `relay_token` is a credential: not `#[serde(default)]`, so a roster entry
+/// missing it is a corrupt roster, not a partial one. `name`, `enrolled_at`,
+/// and `last_connected_at` are display metadata and are defaulted, so an
+/// older roster file (or a hand-edited one) still loads.
 #[derive(Serialize, Deserialize)]
 struct RosterEntryFile {
     device_id: String,
     static_pubkey: String,
     psk: String,
+    relay_token: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    enrolled_at: Option<u64>,
+    #[serde(default)]
+    last_connected_at: Option<u64>,
 }
 
 /// On-disk shape of a [`Roster`].
@@ -305,6 +340,10 @@ impl Roster {
                 device_id,
                 static_pubkey,
                 psk,
+                relay_token: e.relay_token,
+                name: e.name,
+                enrolled_at: e.enrolled_at,
+                last_connected_at: e.last_connected_at,
             });
         }
         Ok(Roster { entries })
@@ -320,6 +359,10 @@ impl Roster {
                     device_id: e.device_id.to_string(),
                     static_pubkey: B64.encode(&e.static_pubkey),
                     psk: B64.encode(e.psk),
+                    relay_token: e.relay_token.clone(),
+                    name: e.name.clone(),
+                    enrolled_at: e.enrolled_at,
+                    last_connected_at: e.last_connected_at,
                 })
                 .collect(),
         };
@@ -331,6 +374,23 @@ impl Roster {
     pub fn find_by_device(&self, id: &DeviceId) -> Option<&RosterEntry> {
         self.entries.iter().find(|e| &e.device_id == id)
     }
+
+    /// Mutable entry for `id`, if paired (for stamping `last_connected_at`).
+    pub fn find_by_device_mut(&mut self, id: &DeviceId) -> Option<&mut RosterEntry> {
+        self.entries.iter_mut().find(|e| &e.device_id == id)
+    }
+
+    /// Whether `id` is currently paired.
+    pub fn contains_device(&self, id: &DeviceId) -> bool {
+        self.entries.iter().any(|e| &e.device_id == id)
+    }
+
+    /// Removes the entry for `id`; returns whether one was removed.
+    pub fn remove_by_device(&mut self, id: &DeviceId) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|e| &e.device_id != id);
+        self.entries.len() != before
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -340,15 +400,15 @@ impl Roster {
 /// The client-side pairing bundle — the QR payload minus the QR (spec D4).
 ///
 /// Everything a freshly provisioned device needs to reach this bridge through
-/// the relay and complete the Noise handshake: the relay endpoint + rendezvous
+/// the relay and complete the Noise handshake: the relay endpoint + device
 /// token, the bridge's id and static public key (to pin), the shared PSK, and
 /// the device's own minted id + keypair.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PairingFile {
     /// The relay endpoint (`wss://…`) to dial.
     pub relay_url: String,
-    /// The rendezvous token that pairs this device's connection to the bridge.
-    pub rendezvous_token: String,
+    /// The device's routing credential, asserted by the bridge.
+    pub device_token: String,
     /// The bridge's device id.
     pub bridge_id: DeviceId,
     /// The bridge's static public key (base64) — the device pins this.
@@ -379,49 +439,13 @@ impl PairingFile {
         let text = serde_json::to_string_pretty(self)?;
         write_secret_file(path, &text)
     }
-}
 
-// ---------------------------------------------------------------------------
-// Provisioning
-// ---------------------------------------------------------------------------
-
-/// Provisions a new device against this bridge: mints an X25519 keypair, a
-/// random device id, and a random 32-byte PSK; appends the matching
-/// [`RosterEntry`] (pinning the device's static public key) to `roster`; and
-/// returns the [`PairingFile`] the device needs.
-///
-/// This is the slice-1 pairing story. The out-of-band workflow (QR, transfer)
-/// is replaced by #232, but the material it produces — a device id, a pinned
-/// device static key, and a per-`(device, bridge)` PSK — is final.
-///
-/// The caller is responsible for persisting the mutated `roster`.
-pub fn provision_device(
-    identity: &BridgeIdentity,
-    roster: &mut Roster,
-    relay_url: &str,
-    rendezvous_token: &str,
-) -> Result<PairingFile, IdentityError> {
-    let device_keypair = generate_keypair()?;
-    let device_id = random_device_id()?;
-    let mut psk = [0u8; 32];
-    os_random(&mut psk)?;
-
-    roster.entries.push(RosterEntry {
-        device_id,
-        static_pubkey: device_keypair.public.clone(),
-        psk,
-    });
-
-    Ok(PairingFile {
-        relay_url: relay_url.to_string(),
-        rendezvous_token: rendezvous_token.to_string(),
-        bridge_id: identity.device_id,
-        bridge_static_pubkey: B64.encode(&identity.static_keypair.public),
-        psk: B64.encode(psk),
-        device_id,
-        device_private_key: B64.encode(&device_keypair.private),
-        device_public_key: B64.encode(&device_keypair.public),
-    })
+    /// Deletes this pairing file — the device-side unpinning flow (ADR-0021
+    /// D6): a client's entire trust state is this file, so removing it drops
+    /// the bridge from the device's trust set.
+    pub fn delete(path: &Path) -> Result<(), IdentityError> {
+        std::fs::remove_file(path).map_err(|e| IdentityError::io(path, e))
+    }
 }
 
 #[cfg(test)]
@@ -519,12 +543,18 @@ mod tests {
     #[test]
     fn load_tightens_a_permissive_pairing_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let id_path = dir.path().join("identity.toml");
         let pairing_path = dir.path().join("pairing.json");
 
-        let identity = BridgeIdentity::load_or_create(&id_path).expect("identity");
-        let mut roster = Roster::default();
-        let pairing = provision_device(&identity, &mut roster, "wss://r/ws", "tok").expect("prov");
+        let pairing = PairingFile {
+            relay_url: "wss://r/ws".to_string(),
+            device_token: "tok".to_string(),
+            bridge_id: DeviceId([3; 32]),
+            bridge_static_pubkey: B64.encode([0u8; 32]),
+            psk: B64.encode([0u8; 32]),
+            device_id: DeviceId([4; 32]),
+            device_private_key: B64.encode([0u8; 32]),
+            device_public_key: B64.encode([0u8; 32]),
+        };
         pairing.save(&pairing_path).expect("save pairing");
 
         std::fs::set_permissions(&pairing_path, std::fs::Permissions::from_mode(0o644))
@@ -575,11 +605,19 @@ mod tests {
                     device_id: DeviceId([0x11; 32]),
                     static_pubkey: vec![0xaa; 32],
                     psk: [0xbb; 32],
+                    name: "phone".to_string(),
+                    enrolled_at: Some(1_765_000_000),
+                    last_connected_at: Some(1_765_100_000),
+                    relay_token: "relay-tok-1".to_string(),
                 },
                 RosterEntry {
                     device_id: DeviceId([0x22; 32]),
                     static_pubkey: vec![0xcc; 32],
                     psk: [0xdd; 32],
+                    name: "laptop".to_string(),
+                    enrolled_at: None,
+                    last_connected_at: None,
+                    relay_token: "relay-tok-2".to_string(),
                 },
             ],
         };
@@ -597,87 +635,78 @@ mod tests {
     }
 
     #[test]
-    fn provision_device_round_trips_through_pairing_file() {
+    fn fingerprint_is_stable_grouped_hex() {
+        let fp = fingerprint(&[0xab; 32]);
+        // 6 bytes -> 12 hex chars in 3 groups of 4, uppercase.
+        assert_eq!(fp.len(), 14, "XXXX-XXXX-XXXX");
+        assert_eq!(fp.matches('-').count(), 2);
+        assert!(fp
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase() || c == '-'));
+        assert_eq!(fp, fingerprint(&[0xab; 32]), "deterministic");
+        assert_ne!(fp, fingerprint(&[0xac; 32]), "distinguishes keys");
+    }
+
+    #[test]
+    fn roster_entry_persists_metadata() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let id_path = dir.path().join("identity.toml");
-        let roster_path = dir.path().join("roster.toml");
-        let pairing_path = dir.path().join("pairing.json");
+        let path = dir.path().join("roster.toml");
+        let roster = Roster {
+            entries: vec![RosterEntry {
+                device_id: DeviceId([0x11; 32]),
+                static_pubkey: vec![0xaa; 32],
+                psk: [0xbb; 32],
+                name: "iPhone".to_string(),
+                enrolled_at: Some(1_765_500_000),
+                last_connected_at: None,
+                relay_token: "tok-abc".to_string(),
+            }],
+        };
+        roster.save(&path).expect("save");
+        let loaded = Roster::load(&path).expect("load");
+        assert_eq!(loaded, roster);
+        assert_eq!(loaded.entries[0].name, "iPhone");
+    }
 
-        let identity = BridgeIdentity::load_or_create(&id_path).expect("identity");
-        let mut roster = Roster::default();
-
-        let pairing = provision_device(
-            &identity,
-            &mut roster,
-            "wss://relay.example/ws",
-            "rendezvous-abc123",
-        )
-        .expect("provision");
-
-        // Persist both sides and reload from disk.
-        roster.save(&roster_path).expect("save roster");
-        pairing.save(&pairing_path).expect("save pairing");
-        assert_eq!(file_mode(&pairing_path), 0o600, "pairing file must be 0600");
-
-        let roster = Roster::load(&roster_path).expect("reload roster");
-        let pairing = PairingFile::load(&pairing_path).expect("reload pairing");
-
-        // The pairing file's bridge pubkey matches the bridge identity.
-        assert_eq!(
-            pairing.bridge_id, identity.device_id,
-            "bridge id must match identity"
-        );
-        assert_eq!(
-            B64.decode(&pairing.bridge_static_pubkey)
-                .expect("valid base64"),
-            identity.static_keypair.public,
-            "bridge pubkey must match identity"
-        );
-
-        // The device is pinned in the roster with a matching pubkey + psk.
-        let entry = roster
-            .find_by_device(&pairing.device_id)
-            .expect("device must be in roster");
-        assert_eq!(
-            entry.static_pubkey,
-            B64.decode(&pairing.device_public_key)
-                .expect("valid base64"),
-            "roster pins the device's pairing-file public key"
-        );
-        assert_eq!(
-            entry.psk.to_vec(),
-            B64.decode(&pairing.psk).expect("valid base64"),
-            "roster psk matches pairing-file psk"
-        );
-
-        // The device's own keypair is well-formed X25519 (32-byte halves).
-        assert_eq!(
-            B64.decode(&pairing.device_private_key)
-                .expect("valid base64")
-                .len(),
-            32
-        );
-        assert_eq!(
-            B64.decode(&pairing.device_public_key)
-                .expect("valid base64")
-                .len(),
-            32
+    #[test]
+    fn roster_remove_by_device() {
+        let mut roster = Roster {
+            entries: vec![RosterEntry {
+                device_id: DeviceId([0x11; 32]),
+                static_pubkey: vec![0xaa; 32],
+                psk: [0xbb; 32],
+                name: "a".to_string(),
+                enrolled_at: None,
+                last_connected_at: None,
+                relay_token: "t".to_string(),
+            }],
+        };
+        assert!(roster.contains_device(&DeviceId([0x11; 32])));
+        assert!(roster.remove_by_device(&DeviceId([0x11; 32])));
+        assert!(!roster.contains_device(&DeviceId([0x11; 32])));
+        assert!(
+            !roster.remove_by_device(&DeviceId([0x11; 32])),
+            "second remove is a no-op"
         );
     }
 
     #[test]
-    fn provisioning_twice_yields_distinct_material() {
+    fn pairing_file_delete_removes_it() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let id_path = dir.path().join("identity.toml");
-        let identity = BridgeIdentity::load_or_create(&id_path).expect("identity");
-        let mut roster = Roster::default();
-
-        let a = provision_device(&identity, &mut roster, "wss://r/ws", "tok").expect("a");
-        let b = provision_device(&identity, &mut roster, "wss://r/ws", "tok").expect("b");
-
-        assert_ne!(a.device_id, b.device_id, "device ids must differ");
-        assert_ne!(a.psk, b.psk, "psks must differ (CSPRNG, not fixed)");
-        assert_ne!(a.device_public_key, b.device_public_key);
-        assert_eq!(roster.entries.len(), 2);
+        let path = dir.path().join("pairing.json");
+        let pf = PairingFile {
+            relay_url: "wss://r/ws".to_string(),
+            device_token: "dt".to_string(),
+            bridge_id: DeviceId([1; 32]),
+            bridge_static_pubkey: B64.encode([0u8; 32]),
+            psk: B64.encode([0u8; 32]),
+            device_id: DeviceId([2; 32]),
+            device_private_key: B64.encode([0u8; 32]),
+            device_public_key: B64.encode([0u8; 32]),
+        };
+        pf.save(&path).expect("save");
+        assert!(path.exists());
+        PairingFile::delete(&path).expect("delete");
+        assert!(!path.exists());
     }
 }

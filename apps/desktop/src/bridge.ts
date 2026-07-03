@@ -6,9 +6,16 @@ import {
   type ChannelHandle,
   type ConfigDto,
   commands,
+  type DeviceInfoDto,
   type DirtyReasonDto,
   type EditableConfigDto,
+  events,
   type HostInputDto,
+  type PairingCodeDto,
+  type PairingDeviceArrived,
+  type PairingOutcomeDto,
+  type PairingResult,
+  type PairingWindowOpened,
   type ProjectInputDto,
   type Result,
   type SessionListDto,
@@ -23,9 +30,15 @@ export type {
   BridgeOutput,
   ChannelHandle,
   ConfigDto,
+  DeviceInfoDto,
   DirtyReasonDto,
   EditableConfigDto,
   HostInputDto,
+  PairingCodeDto,
+  PairingDeviceArrived,
+  PairingOutcomeDto,
+  PairingResult,
+  PairingWindowOpened,
   ProjectInputDto,
   SessionListDto,
   SessionMetaDto,
@@ -223,4 +236,83 @@ export async function removeSession(
   force: boolean,
 ): Promise<void> {
   unwrap(await commands.sessionRemove(projectId, sessionId, force));
+}
+
+/** Open (or replace) this device's pairing window; returns the QR payload and
+ * the countdown deadline. `ttlSecs` of `null` uses the bridge's default
+ * (120s). Throws `BridgeError {kind:"relayNotConfigured"}` when this device
+ * hosts no relay bridge. */
+export async function openPairingWindow(
+  ttlSecs: number | null,
+): Promise<PairingCodeDto> {
+  return unwrap(await commands.pairingOpenWindow(ttlSecs));
+}
+
+/** Confirm the arrived device's fingerprint (enrol it). */
+export async function confirmPairing(deviceId: string): Promise<void> {
+  unwrap(await commands.pairingConfirm(deviceId));
+}
+
+/** Reject the arrived device (grant nothing durable). */
+export async function rejectPairing(deviceId: string): Promise<void> {
+  unwrap(await commands.pairingReject(deviceId));
+}
+
+/** Close the current pairing window without pairing anyone. */
+export async function cancelPairing(): Promise<void> {
+  unwrap(await commands.pairingCancel());
+}
+
+/** List this bridge's paired devices (live roster). */
+export async function listDevices(): Promise<DeviceInfoDto[]> {
+  return unwrap(await commands.listDevices());
+}
+
+/** Un-pair a device (drop from roster, kick any live session). */
+export async function revokeDevice(deviceId: string): Promise<void> {
+  unwrap(await commands.revokeDevice(deviceId));
+}
+
+/** This bridge's own identity fingerprint (ADR-0021 D5), for the pairing UI. */
+export async function getBridgeFingerprint(): Promise<string> {
+  return unwrap(await commands.bridgeFingerprint());
+}
+
+/** Subscribe to a freshly (re)opened pairing window; fires with the QR
+ * payload and expiry each time `openPairingWindow` succeeds. Returns the
+ * unlisten function so the caller can clean up on unmount. */
+export function subscribePairingWindowOpened(
+  onOpened: (opened: PairingWindowOpened) => void,
+): Promise<() => void> {
+  return events.pairingWindowOpened.listen((event) => onOpened(event.payload));
+}
+
+/** Subscribe to a device reaching this device's open pairing window and
+ * awaiting confirm/reject; the UI shows `fingerprint` for the human to
+ * compare against the device's screen. Returns the unlisten function so the
+ * caller can clean up on unmount. */
+export function subscribePairingDeviceArrived(
+  onArrived: (arrived: PairingDeviceArrived) => void,
+): Promise<() => void> {
+  return events.pairingDeviceArrived.listen((event) =>
+    onArrived(event.payload),
+  );
+}
+
+/** Subscribe to a pairing attempt reaching a terminal outcome (paired,
+ * rejected, or expired — including after `cancelPairing`). Returns the
+ * unlisten function so the caller can clean up on unmount. */
+export function subscribePairingResult(
+  onResult: (result: PairingResult) => void,
+): Promise<() => void> {
+  return events.pairingResult.listen((event) => onResult(event.payload));
+}
+
+/** Subscribe to backend roster-change pings. The bridge emits `RosterChanged`
+ * on every enroll/revoke; `onChange` re-reads devices via `listDevices`.
+ * Returns the unlisten function so the caller can clean up on unmount. */
+export function subscribeRosterChanged(
+  onChange: () => void,
+): Promise<() => void> {
+  return events.rosterChanged.listen(() => onChange());
 }

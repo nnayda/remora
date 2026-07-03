@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use remora_protocol::{DeviceId, HelloRole, RelayHello};
+use remora_protocol::{DeviceId, HelloRole, RelayControl, RelayHello};
 use tokio::sync::mpsc;
 
 use crate::config::{token_matches, RelayConfig};
@@ -55,6 +55,33 @@ struct RouterState {
     /// its own device id; for a device it is its fresh per-connection routing
     /// id. Newest registration at a key wins.
     conns: HashMap<DeviceId, Registration>,
+    /// Per-bridge soft state (ADR-0021 D4): each bridge's asserted device
+    /// credentials and its single active pairing window. Keyed by bridge id;
+    /// created/refreshed on bridge hello and dropped when the bridge's
+    /// connection closes.
+    bridges: HashMap<DeviceId, BridgeState>,
+}
+
+/// Per-bridge soft state (ADR-0021 D4): the bridge's asserted device
+/// credentials and its single active pairing window. `serial` is the
+/// connection serial that owns this state, so an assert arriving on a stale
+/// (already-displaced) bridge permit is rejected rather than resurrecting a
+/// credential the current bridge connection never asserted.
+#[derive(Default)]
+struct BridgeState {
+    /// The connection serial that owns this soft state.
+    serial: u64,
+    /// device_id -> asserted token (constant-time compared on device hello).
+    asserted: HashMap<DeviceId, String>,
+    /// The active pairing window's rendezvous token + absolute expiry, if any.
+    window: Option<PairingWindow>,
+}
+
+/// A bridge's single active pairing window: a rendezvous token that admits the
+/// pairing device to routing until `expires_at` (absolute unix seconds).
+struct PairingWindow {
+    token: String,
+    expires_at: u64,
 }
 
 /// One live connection's registration.
@@ -62,6 +89,11 @@ struct Registration {
     role: HelloRole,
     /// For a device: the bridge it routes through. For a bridge: its own id.
     bridge_id: DeviceId,
+    /// The connection's authenticated device id (`hello.device_id`). For a
+    /// bridge this equals its `bridge_id`; for a device it is the identity the
+    /// bridge asserted, used to map a de-asserted device back to its live
+    /// routing id(s) for an `AssertDevices` kick.
+    device_id: DeviceId,
     /// The connection serial that owns this registration.
     serial: u64,
     outbound: OutboundHandle,
@@ -104,6 +136,23 @@ pub enum HelloOutcome {
     Rejected,
 }
 
+/// Result of [`Router::handle_control`] — a bridge's relay-terminated
+/// [`RelayControl`] message (ADR-0021 D4).
+#[derive(Debug)]
+pub enum ControlOutcome {
+    /// The control message was applied; the server replies `RelayControlAck`.
+    Ack,
+    /// The control message was rejected (e.g. it arrived on a stale bridge
+    /// connection); the server replies `RelayControlError`.
+    Error(String),
+    /// A device (not a bridge) sent a Control frame; the server closes it 4002.
+    NotBridge,
+    /// An `AssertDevices` removed devices that had live connections. The server
+    /// kicks each returned **routing id** via its kill channel (4001) and still
+    /// replies `RelayControlAck`.
+    KickDevices(Vec<DeviceId>),
+}
+
 /// Result of a [`Router::route`] decision.
 pub enum RouteOutcome {
     /// The frame was enqueued on the destination's outbound queue.
@@ -133,6 +182,7 @@ impl Router {
             state: Mutex::new(RouterState {
                 next_serial: 0,
                 conns: HashMap::new(),
+                bridges: HashMap::new(),
             }),
         })
     }
@@ -149,18 +199,43 @@ impl Router {
         hello: &RelayHello,
         outbound: OutboundHandle,
     ) -> (HelloOutcome, Option<OutboundHandle>) {
-        let Some((routing_id, bridge_id)) = self.authenticate(hello) else {
+        self.hello_at(hello, outbound, now_secs())
+    }
+
+    /// [`Router::hello`] with an injected wall-clock `now` (unix seconds), used
+    /// to evaluate pairing-window expiry deterministically in tests. Public
+    /// `hello` calls this with [`now_secs`].
+    pub fn hello_at(
+        &self,
+        hello: &RelayHello,
+        outbound: OutboundHandle,
+        now: u64,
+    ) -> (HelloOutcome, Option<OutboundHandle>) {
+        let mut state = self.lock();
+        let Some((routing_id, bridge_id)) = self.authenticate_at(&state, hello, now) else {
             return (HelloOutcome::Rejected, None);
         };
 
-        let mut state = self.lock();
         let serial = state.next_serial;
         state.next_serial += 1;
+        // A bridge starts each connection with fresh soft state owned by this
+        // serial: any credentials/window from a prior (now-displaced) connection
+        // are cleared, and a stale-serial assert on the old permit is rejected.
+        if hello.role == HelloRole::Bridge {
+            state.bridges.insert(
+                routing_id,
+                BridgeState {
+                    serial,
+                    ..BridgeState::default()
+                },
+            );
+        }
         let displaced = state.conns.insert(
             routing_id,
             Registration {
                 role: hello.role,
                 bridge_id,
+                device_id: hello.device_id,
                 serial,
                 outbound,
             },
@@ -179,9 +254,21 @@ impl Router {
 
     /// Validates a hello's token and routing-id scoping per spec D5/D16.
     ///
+    /// A **bridge** is authenticated against the static config token bound to
+    /// its device id. A **device** is authenticated against its bridge's live
+    /// soft state (ADR-0021 D4): the claimed `bridge_id` must have an active
+    /// connection whose asserted set holds a matching `(device_id, token)`, or
+    /// an unexpired pairing window whose rendezvous token matches. `now` is
+    /// wall-clock seconds, threaded in so window expiry is testable.
+    ///
     /// Returns the `(routing_id, bridge_id)` the connection registers under, or
     /// `None` if the hello must be rejected.
-    fn authenticate(&self, hello: &RelayHello) -> Option<(DeviceId, DeviceId)> {
+    fn authenticate_at(
+        &self,
+        state: &RouterState,
+        hello: &RelayHello,
+        now: u64,
+    ) -> Option<(DeviceId, DeviceId)> {
         match hello.role {
             HelloRole::Bridge => {
                 // A bridge routes under its own device id; token must match the
@@ -213,15 +300,127 @@ impl Router {
                 {
                     return None;
                 }
-                let entry =
-                    self.config.devices.iter().find(|d| {
-                        d.device_id == hello.device_id && d.bridge_id == hello.bridge_id
-                    })?;
-                if !token_matches(&hello.token, &entry.token) {
-                    return None;
+                // Bridge-asserted soft state (ADR-0021 D4): admit iff the
+                // claimed bridge is connected and either asserts this device's
+                // credential or has an unexpired pairing window matching the
+                // presented token.
+                let bridge = state.bridges.get(&hello.bridge_id)?;
+                let asserted_ok = bridge
+                    .asserted
+                    .get(&hello.device_id)
+                    .is_some_and(|expected| token_matches(&hello.token, expected));
+                let window_ok = bridge
+                    .window
+                    .as_ref()
+                    .is_some_and(|w| w.expires_at > now && token_matches(&hello.token, &w.token));
+                if asserted_ok || window_ok {
+                    Some((hello.routing_id, hello.bridge_id))
+                } else {
+                    None
                 }
-                Some((hello.routing_id, hello.bridge_id))
             }
+        }
+    }
+
+    /// Applies a bridge's relay-terminated [`RelayControl`] message (ADR-0021
+    /// D4) against its per-bridge soft state. Bridge-only; a device sender
+    /// yields [`ControlOutcome::NotBridge`].
+    pub fn handle_control(&self, permit: &ConnPermit, control: RelayControl) -> ControlOutcome {
+        self.handle_control_at(permit, control, now_secs())
+    }
+
+    /// [`Router::handle_control`] with an injected wall-clock `now` (unix
+    /// seconds) used to stamp a pairing window's absolute expiry. Public
+    /// `handle_control` calls this with [`now_secs`].
+    pub fn handle_control_at(
+        &self,
+        permit: &ConnPermit,
+        control: RelayControl,
+        now: u64,
+    ) -> ControlOutcome {
+        if permit.role != HelloRole::Bridge {
+            return ControlOutcome::NotBridge;
+        }
+        let mut state = self.lock();
+        let bridge_id = permit.routing_id;
+        // The soft state must exist and be owned by *this* bridge connection.
+        // A stale (already-displaced) permit carries an old serial and must not
+        // mutate the current connection's credentials.
+        match state.bridges.get(&bridge_id) {
+            Some(bs) if bs.serial == permit.serial => {}
+            _ => return ControlOutcome::Error("stale connection".to_string()),
+        }
+
+        match control {
+            RelayControl::RegisterPairing {
+                token, ttl_secs, ..
+            } => {
+                if let Some(bs) = state.bridges.get_mut(&bridge_id) {
+                    bs.window = Some(PairingWindow {
+                        token,
+                        expires_at: now.saturating_add(ttl_secs),
+                    });
+                }
+                ControlOutcome::Ack
+            }
+            RelayControl::CancelPairing { .. } => {
+                if let Some(bs) = state.bridges.get_mut(&bridge_id) {
+                    bs.window = None;
+                }
+                ControlOutcome::Ack
+            }
+            RelayControl::AssertDevices { devices, .. } => {
+                let new_asserted: HashMap<DeviceId, String> = devices
+                    .into_iter()
+                    .map(|d| (d.device_id, d.token))
+                    .collect();
+                // Devices in the old set but not the new one are de-asserted.
+                let removed: std::collections::HashSet<DeviceId> = {
+                    let bs = match state.bridges.get_mut(&bridge_id) {
+                        Some(bs) => bs,
+                        // Unreachable: presence + serial checked above under the
+                        // same lock, but stay total rather than panic.
+                        None => return ControlOutcome::Error("stale connection".to_string()),
+                    };
+                    let removed = bs
+                        .asserted
+                        .keys()
+                        .filter(|id| !new_asserted.contains_key(id))
+                        .copied()
+                        .collect();
+                    bs.asserted = new_asserted;
+                    removed
+                };
+                if removed.is_empty() {
+                    return ControlOutcome::Ack;
+                }
+                // Map each de-asserted device_id back to its live routing id(s)
+                // in this bridge's group, drop those registrations so they can
+                // no longer route, and hand the routing ids to the server to
+                // kick (4001).
+                let kicked: Vec<DeviceId> = state
+                    .conns
+                    .iter()
+                    .filter(|(_, reg)| {
+                        reg.role == HelloRole::Device
+                            && reg.bridge_id == bridge_id
+                            && removed.contains(&reg.device_id)
+                    })
+                    .map(|(routing_id, _)| *routing_id)
+                    .collect();
+                for routing_id in &kicked {
+                    state.conns.remove(routing_id);
+                }
+                if kicked.is_empty() {
+                    ControlOutcome::Ack
+                } else {
+                    ControlOutcome::KickDevices(kicked)
+                }
+            }
+            // `RelayControl` is `#[non_exhaustive]`: a control this relay build
+            // does not understand is rejected rather than silently accepted, so
+            // a newer bridge cannot assume an effect the relay never applied.
+            _ => ControlOutcome::Error("unsupported control".to_string()),
         }
     }
 
@@ -281,6 +480,20 @@ impl Router {
         }
     }
 
+    /// Enqueues an already-encoded frame onto `routing_id`'s outbound queue, if
+    /// that connection is still registered. Used by the server to hand a bridge
+    /// its relay-terminated `RelayControlAck`/`RelayControlError` reply (ADR-0021
+    /// D4) on the bridge's own outbound, without inspecting any payload. A frame
+    /// that would exceed the destination's byte budget is dropped (the reply is
+    /// tiny relative to the budget, and a control reply is not worth killing the
+    /// bridge over); a departed connection is a silent no-op.
+    pub fn enqueue_to(&self, routing_id: &DeviceId, raw: Vec<u8>) {
+        let state = self.lock();
+        if let Some(reg) = state.conns.get(routing_id) {
+            let _ = reg.outbound.try_enqueue(raw);
+        }
+    }
+
     /// Deregisters a connection on close — but only if the current registration
     /// at its routing key is still *this* connection's (serial match). A
     /// connection that was displaced by a newer one (4009) carries a stale
@@ -291,6 +504,18 @@ impl Router {
         if let Some(reg) = state.conns.get(&permit.routing_id) {
             if reg.serial == permit.serial {
                 state.conns.remove(&permit.routing_id);
+            }
+        }
+        // A closing bridge takes its soft state (asserted credentials + pairing
+        // window) with it, so its devices are no longer authorized to reconnect
+        // until a fresh bridge connection re-asserts them. Serial-guarded so a
+        // displaced bridge's late disconnect cannot evict its replacement's
+        // soft state.
+        if permit.role == HelloRole::Bridge {
+            if let Some(bs) = state.bridges.get(&permit.routing_id) {
+                if bs.serial == permit.serial {
+                    state.bridges.remove(&permit.routing_id);
+                }
             }
         }
     }
@@ -424,10 +649,31 @@ pub fn outbound_channel(budget: usize) -> (OutboundHandle, OutboundReceiver) {
     )
 }
 
+/// Current wall-clock time in whole seconds since the unix epoch, used to stamp
+/// and expire pairing windows. A clock before the epoch (unrepresentable in
+/// practice) folds to `0` rather than panicking.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BridgeEntry, DeviceEntry};
+    use crate::config::BridgeEntry;
+    use remora_protocol::{AssertedDevice, RelayControl};
+
+    /// Registers `devices` as `bridge`'s full asserted set at `now`.
+    fn assert_devices(
+        router: &Router,
+        bridge: &ConnPermit,
+        now: u64,
+        devices: Vec<AssertedDevice>,
+    ) -> ControlOutcome {
+        router.handle_control_at(bridge, RelayControl::AssertDevices { id: 1, devices }, now)
+    }
 
     // NOTE: the brief's `frames_before_hello_have_no_permit` case is not a test
     // here: `Router::route` takes a `&ConnPermit`, and a `ConnPermit` can only
@@ -444,8 +690,12 @@ mod tests {
         DeviceId([fill; 32])
     }
 
-    /// Config with one bridge (`BRIDGE`) and one device (`DEVICE`) bound to it,
-    /// plus a second bridge/device pair for cross-group tests.
+    /// Config with one bridge (`BRIDGE`), plus a second bridge (`OTHER_BRIDGE`)
+    /// for cross-group tests. Devices are no longer config-driven (ADR-0021
+    /// D4) — `device_hello`/`DEVICE`/`OTHER_DEVICE` below are admitted only
+    /// after their bridge asserts their credential at runtime (see
+    /// `authenticate_at`'s `HelloRole::Device` arm), so device-hello tests must
+    /// register the bridge and `assert_devices` first.
     fn config() -> Arc<RelayConfig> {
         Arc::new(RelayConfig {
             listen: "127.0.0.1:0".to_string(),
@@ -457,18 +707,6 @@ mod tests {
                 BridgeEntry {
                     token: "other-bridge-tok".to_string(),
                     device_id: did(OTHER_BRIDGE),
-                },
-            ],
-            devices: vec![
-                DeviceEntry {
-                    token: "device-tok".to_string(),
-                    device_id: did(DEVICE),
-                    bridge_id: did(BRIDGE),
-                },
-                DeviceEntry {
-                    token: "other-device-tok".to_string(),
-                    device_id: did(OTHER_DEVICE),
-                    bridge_id: did(OTHER_BRIDGE),
                 },
             ],
             buffer_bytes: 1_048_576,
@@ -518,26 +756,191 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn device_hello_wrong_token_rejected() {
+    async fn device_hello_rejected_until_asserted() {
         let router = Router::new(config());
-        let mut hello = device_hello(0x55);
-        hello.token = "wrong".to_string();
-        let (handle, _rx) = outbound_channel(1024);
-        let (outcome, displaced) = router.hello(&hello, handle);
+        // No bridge, no assertion yet: a device hello is rejected.
+        let (dh, _drx) = outbound_channel(1024);
+        let (outcome, _) = router.hello_at(&device_hello(0x55), dh, 0);
         assert!(matches!(outcome, HelloOutcome::Rejected));
-        assert!(displaced.is_none());
     }
 
     #[tokio::test]
-    async fn device_token_bound_to_other_bridge_rejected() {
-        // `DEVICE`'s token is valid only for `BRIDGE`; claiming `OTHER_BRIDGE`
-        // finds no matching (device_id, bridge_id) entry.
+    async fn asserted_device_hello_accepted() {
         let router = Router::new(config());
-        let mut hello = device_hello(0x55);
-        hello.bridge_id = did(OTHER_BRIDGE);
-        let (handle, _rx) = outbound_channel(1024);
-        let (outcome, _) = router.hello(&hello, handle);
-        assert!(matches!(outcome, HelloOutcome::Rejected));
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+            }],
+        );
+        let (dh, _drx) = outbound_channel(1024);
+        let (outcome, _) = router.hello_at(&device_hello(0x55), dh, 0);
+        assert!(matches!(outcome, HelloOutcome::Accepted(_)));
+    }
+
+    #[tokio::test]
+    async fn control_from_device_is_not_bridge() {
+        let router = Router::new(config());
+        // Register the device via an assertion first so it can connect...
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+            }],
+        );
+        let device = accept(
+            router
+                .hello_at(&device_hello(0x55), outbound_channel(1024).0, 0)
+                .0,
+        );
+        let outcome = router.handle_control_at(&device, RelayControl::CancelPairing { id: 1 }, 0);
+        assert!(matches!(outcome, ControlOutcome::NotBridge));
+    }
+
+    #[tokio::test]
+    async fn register_pairing_token_authorizes_a_device_then_replaces() {
+        let router = Router::new(config());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        // Open a window with rendezvous token "rvz", ttl 120s.
+        let out = router.handle_control_at(
+            &bridge,
+            RelayControl::RegisterPairing {
+                id: 1,
+                token: "rvz".to_string(),
+                ttl_secs: 120,
+            },
+            1000,
+        );
+        assert!(matches!(out, ControlOutcome::Ack));
+        // A device presenting the rendezvous token for this bridge is admitted.
+        let mut h = device_hello(0x60);
+        h.token = "rvz".to_string();
+        assert!(matches!(
+            router.hello_at(&h, outbound_channel(1024).0, 1000).0,
+            HelloOutcome::Accepted(_)
+        ));
+        // A second RegisterPairing replaces the first; the old token no longer works.
+        router.handle_control_at(
+            &bridge,
+            RelayControl::RegisterPairing {
+                id: 2,
+                token: "rvz2".to_string(),
+                ttl_secs: 120,
+            },
+            1001,
+        );
+        let mut h_old = device_hello(0x61);
+        h_old.token = "rvz".to_string();
+        assert!(matches!(
+            router.hello_at(&h_old, outbound_channel(1024).0, 1001).0,
+            HelloOutcome::Rejected
+        ));
+    }
+
+    #[tokio::test]
+    async fn pairing_token_expires() {
+        let router = Router::new(config());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        router.handle_control_at(
+            &bridge,
+            RelayControl::RegisterPairing {
+                id: 1,
+                token: "rvz".to_string(),
+                ttl_secs: 120,
+            },
+            1000,
+        );
+        let mut h = device_hello(0x62);
+        h.token = "rvz".to_string();
+        // now = 1000 + 121 > deadline: rejected.
+        assert!(matches!(
+            router.hello_at(&h, outbound_channel(1024).0, 1121).0,
+            HelloOutcome::Rejected
+        ));
+    }
+
+    #[tokio::test]
+    async fn deassert_returns_kick_handles() {
+        let router = Router::new(config());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+            }],
+        );
+        // Device connects.
+        let (dh, _drx) = outbound_channel(1024);
+        let _device = accept(router.hello_at(&device_hello(0x55), dh, 0).0);
+        // Re-assert WITHOUT the device: the router returns the routing id to kick.
+        let out = assert_devices(&router, &bridge, 0, vec![]);
+        match out {
+            ControlOutcome::KickDevices(ids) => assert_eq!(ids, vec![did(0x55)]),
+            other => panic!("expected KickDevices, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_serial_assert_is_dropped() {
+        // A bridge reconnects (new serial); an assert on the OLD permit must not
+        // resurrect a credential.
+        let router = Router::new(config());
+        let old = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        let _new = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0); // displaces old
+        let out = router.handle_control_at(
+            &old,
+            RelayControl::AssertDevices {
+                id: 1,
+                devices: vec![AssertedDevice {
+                    device_id: did(DEVICE),
+                    token: "device-tok".to_string(),
+                }],
+            },
+            0,
+        );
+        assert!(
+            matches!(out, ControlOutcome::Error(_)),
+            "stale-serial assert rejected"
+        );
+        // The device is NOT authorized.
+        let (dh, _drx) = outbound_channel(1024);
+        assert!(matches!(
+            router.hello_at(&device_hello(0x55), dh, 0).0,
+            HelloOutcome::Rejected
+        ));
+    }
+
+    #[tokio::test]
+    async fn bridge_disconnect_clears_soft_state() {
+        let router = Router::new(config());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+            }],
+        );
+        router.disconnect(&bridge);
+        // With the bridge gone, its device is no longer authorized.
+        let (dh, _drx) = outbound_channel(1024);
+        assert!(matches!(
+            router.hello_at(&device_hello(0x55), dh, 0).0,
+            HelloOutcome::Rejected
+        ));
     }
 
     #[tokio::test]
@@ -563,6 +966,16 @@ mod tests {
     #[tokio::test]
     async fn duplicate_routing_id_newest_wins_returns_old_handle() {
         let router = Router::new(config());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+            }],
+        );
         let (h1, _rx1) = outbound_channel(1024);
         let (outcome1, displaced1) = router.hello(&device_hello(0x55), h1);
         assert!(displaced1.is_none());
@@ -583,6 +996,15 @@ mod tests {
         let (bh, mut brx) = outbound_channel(1024);
         let bridge = accept(router.hello(&bridge_hello(), bh).0);
         assert_eq!(bridge.routing_id(), did(BRIDGE));
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+            }],
+        );
 
         let (dh, _drx) = outbound_channel(1024);
         let device = accept(router.hello(&device_hello(0x55), dh).0);
@@ -597,6 +1019,16 @@ mod tests {
     #[tokio::test]
     async fn device_to_other_device_not_allowed() {
         let router = Router::new(config());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+            }],
+        );
         let (dh, _drx) = outbound_channel(1024);
         let device = accept(router.hello(&device_hello(0x55), dh).0);
         // Address a peer that is not the device's declared bridge.
@@ -609,6 +1041,29 @@ mod tests {
     async fn bridge_to_foreign_group_device_not_allowed() {
         let router = Router::new(config());
         let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+
+        // OTHER_BRIDGE connects and asserts OTHER_DEVICE into its own group.
+        let other_bridge_hello = RelayHello {
+            role: HelloRole::Bridge,
+            token: "other-bridge-tok".to_string(),
+            device_id: did(OTHER_BRIDGE),
+            routing_id: did(OTHER_BRIDGE),
+            bridge_id: did(OTHER_BRIDGE),
+        };
+        let other_bridge = accept(
+            router
+                .hello(&other_bridge_hello, outbound_channel(1024).0)
+                .0,
+        );
+        assert_devices(
+            &router,
+            &other_bridge,
+            0,
+            vec![AssertedDevice {
+                device_id: did(OTHER_DEVICE),
+                token: "other-device-tok".to_string(),
+            }],
+        );
 
         // A device registered in OTHER_BRIDGE's group.
         let foreign_hello = RelayHello {
@@ -628,10 +1083,23 @@ mod tests {
 
     #[tokio::test]
     async fn route_to_offline_peer_is_peer_unavailable() {
-        // Device is registered but its bridge never connected.
+        // The device is registered (its bridge asserted it, then dropped): the
+        // device's registration outlives the bridge, so routing to the now-gone
+        // bridge is PeerUnavailable.
         let router = Router::new(config());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+            }],
+        );
         let (dh, _drx) = outbound_channel(1024);
         let device = accept(router.hello(&device_hello(0x55), dh).0);
+        router.disconnect(&bridge);
         let (outcome, kill) = router.route(&device, did(0x55), did(BRIDGE), vec![1]);
         assert!(matches!(outcome, RouteOutcome::PeerUnavailable));
         assert!(kill.is_none());
@@ -644,6 +1112,15 @@ mod tests {
         let (bh, _brx) = outbound_channel(100);
         let bridge = accept(router.hello(&bridge_hello(), bh).0);
         assert_eq!(bridge.routing_id(), did(BRIDGE));
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+            }],
+        );
 
         let (dh, _drx) = outbound_channel(1024);
         let device = accept(router.hello(&device_hello(0x55), dh).0);
@@ -667,6 +1144,15 @@ mod tests {
         let router = Router::new(config());
         let (bh, _brx) = outbound_channel(1024);
         let bridge = accept(router.hello(&bridge_hello(), bh).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+            }],
+        );
 
         let (dh, _drx) = outbound_channel(1024);
         let device = accept(router.hello(&device_hello(0x55), dh).0);
@@ -688,6 +1174,17 @@ mod tests {
         // Epoch guard: an old (4009-displaced) permit's late disconnect must
         // not deregister the connection that replaced it.
         let router = Router::new(config());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+            }],
+        );
+
         let (h1, _rx1) = outbound_channel(1024);
         let old = accept(router.hello(&device_hello(0x55), h1).0);
 
@@ -700,7 +1197,6 @@ mod tests {
         router.disconnect(&old);
 
         // The replacement is still registered: route bridge->device succeeds.
-        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
         let (outcome, _) = router.route(&bridge, did(BRIDGE), did(0x55), vec![1]);
         assert!(matches!(outcome, RouteOutcome::Delivered));
     }
@@ -708,6 +1204,16 @@ mod tests {
     #[tokio::test]
     async fn envelope_src_must_match_permit_routing_id() {
         let router = Router::new(config());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+            }],
+        );
         let (dh, _drx) = outbound_channel(1024);
         let device = accept(router.hello(&device_hello(0x55), dh).0);
         // Spoofed src (not the device's own routing id).

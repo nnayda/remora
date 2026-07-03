@@ -54,7 +54,7 @@ use remora_protocol::{
 };
 
 use crate::identity::PairingFile;
-use crate::noise::{chunk_bytes, prologue, Handshake, NoiseError, Transport};
+use crate::noise::{chunk_bytes, prologue, Handshake, HandshakeKind, NoiseError, Transport};
 use crate::wire_error::map_wire_error;
 
 /// Length of the plaintext identity preamble prefixing a client's first
@@ -137,7 +137,7 @@ impl RemoteSource {
         // relay's anti-spoof check requires the envelope src == routing_id. ---
         let hello = RelayHello {
             role: HelloRole::Device,
-            token: self.pairing.rendezvous_token.clone(),
+            token: self.pairing.device_token.clone(),
             device_id,
             routing_id,
             bridge_id,
@@ -155,7 +155,7 @@ impl RemoteSource {
 
         // --- Noise IKpsk2 as initiator. The prologue binds this exact route
         // (identity, routing id, bridge id); the bridge builds the same one. ---
-        let bound = prologue(&device_id, &routing_id, &bridge_id);
+        let bound = prologue(HandshakeKind::Session, &device_id, &routing_id, &bridge_id);
         let mut hs =
             Handshake::initiator(&device_priv, &bridge_pub, &psk, &bound).map_err(noise_err)?;
         let msg1 = hs.write_message(&[]).map_err(noise_err)?;
@@ -590,7 +590,7 @@ mod tests {
     fn pairing() -> PairingFile {
         PairingFile {
             relay_url: "wss://relay.example/ws".to_string(),
-            rendezvous_token: "rendezvous-tok".to_string(),
+            device_token: "device-tok".to_string(),
             bridge_id: DeviceId([0xab; 32]),
             bridge_static_pubkey: B64.encode([0u8; 32]),
             psk: B64.encode([0u8; 32]),

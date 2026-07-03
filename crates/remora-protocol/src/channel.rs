@@ -249,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_two() {
-        assert_eq!(crate::PROTOCOL_VERSION, 2);
+    fn protocol_version_is_three() {
+        assert_eq!(crate::PROTOCOL_VERSION, 3);
     }
 }

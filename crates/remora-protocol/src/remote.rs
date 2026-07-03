@@ -62,6 +62,10 @@ pub enum RemoteOp {
         project_id: ProjectId,
         session_id: SessionId,
     },
+    /// List the bridge's paired devices (ADR-0021 D6 remote revocation).
+    ListDevices,
+    /// Revoke a device from the bridge's roster by id (self-revoke = unpair).
+    RevokeDevice { device_id: crate::DeviceId },
 }
 
 /// Bridge → client, inside Noise.
@@ -91,8 +95,26 @@ pub enum RemoteResult {
     Sessions(Vec<SessionMeta>),
     /// Answers a successful [`RemoteOp::Attach`]; the channel stream follows.
     Attached,
+    /// Answers [`RemoteOp::ListDevices`].
+    Devices(Vec<DeviceInfo>),
+    /// Answers a successful [`RemoteOp::RevokeDevice`].
+    Revoked,
     /// Answers a failed request of either kind.
     Error(WireError),
+}
+
+/// One paired device, as returned by [`RemoteOp::ListDevices`]. Display-safe:
+/// `name`/`fingerprint` are the sender's already-sanitized values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    pub device_id: crate::DeviceId,
+    pub name: String,
+    /// `XXXX-XXXX-XXXX` fingerprint of the device's static key (ADR-0021 D5).
+    pub fingerprint: String,
+    pub enrolled_at: Option<u64>,
+    pub last_connected_at: Option<u64>,
+    /// True when this entry is the requesting device itself.
+    pub is_self: bool,
 }
 
 /// Stable protocol error type (spec review C15) — mirrors
@@ -284,6 +306,70 @@ mod tests {
             let back: WireError = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(variant, back);
         }
+    }
+
+    #[test]
+    fn list_devices_op_wire_format() {
+        let msg = ClientMessage::Request {
+            id: 5,
+            op: RemoteOp::ListDevices,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(json, r#"{"request":{"id":5,"op":"list_devices"}}"#);
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&json).expect("deserialize"),
+            msg
+        );
+    }
+
+    #[test]
+    fn revoke_device_op_wire_format() {
+        use crate::DeviceId;
+        let msg = ClientMessage::Request {
+            id: 6,
+            op: RemoteOp::RevokeDevice {
+                device_id: DeviceId([0xaa; 32]),
+            },
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&json).expect("deserialize"),
+            msg
+        );
+    }
+
+    #[test]
+    fn devices_result_wire_format() {
+        use crate::DeviceId;
+        let msg = BridgeMessage::Response {
+            id: 5,
+            result: RemoteResult::Devices(vec![DeviceInfo {
+                device_id: DeviceId([0xaa; 32]),
+                name: "iPhone".to_string(),
+                fingerprint: "ABCD-1234-EF56".to_string(),
+                enrolled_at: Some(1_765_500_000),
+                last_connected_at: None,
+                is_self: true,
+            }]),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<BridgeMessage>(&json).expect("deserialize"),
+            msg
+        );
+    }
+
+    #[test]
+    fn revoked_result_round_trips() {
+        let msg = BridgeMessage::Response {
+            id: 6,
+            result: RemoteResult::Revoked,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<BridgeMessage>(&json).expect("deserialize"),
+            msg
+        );
     }
 
     #[test]

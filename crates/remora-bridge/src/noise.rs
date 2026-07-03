@@ -86,19 +86,33 @@ fn noise_params() -> Result<snow::params::NoiseParams, NoiseError> {
     NOISE_PATTERN.parse().map_err(snow_err)
 }
 
-/// Context prologue mixed into the handshake hash (spec D14/D16).
+/// Which handshake a prologue is for (ADR-0021 D2 domain separation). The
+/// leading prologue byte differs, so a pairing handshake can never complete
+/// against a session responder or vice versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeKind {
+    /// A normal session attach between a paired device and the bridge.
+    Session = 0,
+    /// The first-contact pairing handshake (PSK = the QR's pairing secret).
+    Pairing = 1,
+}
+
+/// Context prologue mixed into the handshake hash (ADR-0021 D2/D14/D16).
 ///
-/// Layout: `ENVELOPE_VERSION` (1 byte) ‖ `PROTOCOL_VERSION` (big-endian u32) ‖
-/// initiator identity id (32) ‖ initiator routing id (32) ‖ responder/bridge id
-/// (32). Both halves must construct byte-identical prologues or the handshake's
-/// first AEAD check fails, so the relay cannot re-point a session at a
-/// different route or peer.
+/// Layout: `kind` (1 byte) ‖ `ENVELOPE_VERSION` (1) ‖ `PROTOCOL_VERSION`
+/// (big-endian u32) ‖ initiator identity id (32) ‖ initiator routing id (32) ‖
+/// responder/bridge id (32). Both halves must construct byte-identical
+/// prologues or the handshake's first AEAD check fails, so the relay cannot
+/// re-point a session at a different route or peer, and a pairing handshake
+/// can never complete against a session responder.
 pub fn prologue(
+    kind: HandshakeKind,
     initiator_identity: &DeviceId,
     initiator_routing: &DeviceId,
     responder: &DeviceId,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 4 + 32 * 3);
+    let mut out = Vec::with_capacity(1 + 1 + 4 + 32 * 3);
+    out.push(kind as u8);
     out.push(ENVELOPE_VERSION);
     out.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
     out.extend_from_slice(&initiator_identity.0);
@@ -287,7 +301,12 @@ mod tests {
                 client: keypair(),
                 bridge: keypair(),
                 psk: [0x5a; 32],
-                prologue: prologue(&ALICE_ID, &ALICE_ROUTING, &BRIDGE_ID),
+                prologue: prologue(
+                    HandshakeKind::Session,
+                    &ALICE_ID,
+                    &ALICE_ROUTING,
+                    &BRIDGE_ID,
+                ),
             }
         }
     }
@@ -388,12 +407,67 @@ mod tests {
         let p = Pairing::new();
         // Responder binds a prologue that differs only in the routing id.
         let other_routing = DeviceId([0x99; 32]);
-        let bridge_prologue = prologue(&ALICE_ID, &other_routing, &BRIDGE_ID);
+        let bridge_prologue = prologue(
+            HandshakeKind::Session,
+            &ALICE_ID,
+            &other_routing,
+            &BRIDGE_ID,
+        );
         let bridge = Handshake::responder(&p.bridge.private, &p.psk, &bridge_prologue)
             .expect("build responder");
         assert!(
             drive(initiator(&p), bridge).is_err(),
             "a prologue mismatch must fail the handshake"
+        );
+    }
+
+    #[test]
+    fn session_and_pairing_prologues_differ() {
+        let s = prologue(
+            HandshakeKind::Session,
+            &ALICE_ID,
+            &ALICE_ROUTING,
+            &BRIDGE_ID,
+        );
+        let p = prologue(
+            HandshakeKind::Pairing,
+            &ALICE_ID,
+            &ALICE_ROUTING,
+            &BRIDGE_ID,
+        );
+        assert_ne!(
+            s, p,
+            "domain separation: the kind byte must change the prologue"
+        );
+        assert_eq!(s[0], 0);
+        assert_eq!(p[0], 1);
+    }
+
+    #[test]
+    fn cross_kind_handshake_fails() {
+        // Initiator binds a Pairing prologue; responder binds Session — must fail.
+        let client_keys = keypair();
+        let bridge_keys = keypair();
+        let psk = [0x5a; 32];
+        let init_pro = prologue(
+            HandshakeKind::Pairing,
+            &ALICE_ID,
+            &ALICE_ROUTING,
+            &BRIDGE_ID,
+        );
+        let resp_pro = prologue(
+            HandshakeKind::Session,
+            &ALICE_ID,
+            &ALICE_ROUTING,
+            &BRIDGE_ID,
+        );
+        let initiator =
+            Handshake::initiator(&client_keys.private, &bridge_keys.public, &psk, &init_pro)
+                .expect("init");
+        let responder = Handshake::responder(&bridge_keys.private, &psk, &resp_pro).expect("resp");
+        assert!(
+            drive(initiator, responder).is_err(),
+            "cross-kind prologue must fail the handshake"
         );
     }
 

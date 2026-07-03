@@ -3,6 +3,7 @@ pub mod dto;
 pub mod editor_dto;
 pub mod error;
 pub mod output;
+pub mod pairing;
 pub mod resolve;
 
 use std::collections::HashMap;

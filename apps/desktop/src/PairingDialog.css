@@ -1,0 +1,97 @@
+/* Pairing ceremony dialog (ADR-0021 D7). Tokens only; the marine accent stays
+ * the single accent (DESIGN.md) — status here reads through prose + the mono
+ * fingerprint, not new colours. */
+
+.pairing-hint {
+  margin: 0;
+  font: var(--type-meta);
+  color: var(--text-muted);
+}
+
+/* Waiting: QR + copyable string + countdown, stacked and centred. */
+.pairing-scan {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-5);
+}
+
+/* Fixed box so the layout doesn't jump between the null placeholder and the
+ * rendered image. White plate keeps the QR scannable in either theme. */
+.pairing-qr {
+  width: 220px;
+  height: 220px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #fff;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  box-sizing: border-box;
+}
+
+.pairing-qr img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  image-rendering: pixelated;
+}
+
+/* The copyable pairing string — a machine value, so mono, and wrapped so the
+ * long code never overflows the dialog. */
+.pairing-code {
+  font-family: var(--font-mono);
+  font-size: var(--mono-sm);
+  color: var(--text-secondary);
+  word-break: break-all;
+  text-align: center;
+  max-width: 100%;
+}
+
+.pairing-countdown {
+  font: var(--type-meta);
+  color: var(--text-muted);
+}
+
+.pairing-countdown__value {
+  font-family: var(--font-mono);
+  font-size: var(--mono-sm);
+  color: var(--text-secondary);
+}
+
+/* Arrived: name + a prominent fingerprint the user compares by eye. */
+.pairing-confirm {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.pairing-device-name {
+  margin: 0;
+  font: var(--type-heading);
+  color: var(--text-primary);
+}
+
+/* The fingerprint is the security-critical value — large, mono, prominent, so
+ * the human can read it against their phone. */
+.pairing-fingerprint {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-lg);
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-primary);
+  word-break: break-all;
+  text-align: center;
+}
+
+.pairing-result {
+  margin: 0;
+  font: var(--type-body);
+  color: var(--text-secondary);
+}
+
+.pairing-result--ok {
+  color: var(--text-primary);
+}
