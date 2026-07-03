@@ -34,10 +34,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use remora_protocol::{DeviceId, HelloRole, RelayControl, RelayHello};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::config::{token_matches, RelayConfig};
-use crate::push::{decide_wake, DropReason, PushState, StoredRegistration};
+use crate::push::{decide_wake, DropReason, PushConfig, PushState, StoredRegistration};
 
 /// Sans-IO connection registry and routing authority. Cheap to clone-share via
 /// the returned [`Arc`]; all mutable state lives behind a single [`Mutex`] that
@@ -45,6 +45,11 @@ use crate::push::{decide_wake, DropReason, PushState, StoredRegistration};
 pub struct Router {
     config: Arc<RelayConfig>,
     state: Mutex<RouterState>,
+    /// Global cap on simultaneously in-flight push deliveries (ADR-0023). Shared
+    /// across every connection so a burst of wakes from many bridges cannot
+    /// collectively exhaust sockets/DNS/memory; handed to each spawned
+    /// [`crate::push::deliver_wake`], which drops rather than queues when full.
+    push_permits: Arc<Semaphore>,
 }
 
 /// Mutable registry, guarded by [`Router::state`].
@@ -212,6 +217,7 @@ pub enum RouteOutcome {
 impl Router {
     /// Builds a router bound to `config`.
     pub fn new(config: Arc<RelayConfig>) -> Arc<Router> {
+        let push_permits = Arc::new(Semaphore::new(config.push.max_in_flight));
         Arc::new(Router {
             config,
             state: Mutex::new(RouterState {
@@ -220,7 +226,19 @@ impl Router {
                 bridges: HashMap::new(),
                 push_state: PushState::default(),
             }),
+            push_permits,
         })
+    }
+
+    /// The push-wake network policy this relay was configured with (ADR-0023),
+    /// handed to a spawned [`crate::push::deliver_wake`] on a cleared decision.
+    pub fn push_config(&self) -> PushConfig {
+        self.config.push.clone()
+    }
+
+    /// A handle to the shared global in-flight semaphore for push deliveries.
+    pub fn push_permits(&self) -> Arc<Semaphore> {
+        self.push_permits.clone()
     }
 
     /// Authenticates a [`RelayHello`] and, on success, registers the

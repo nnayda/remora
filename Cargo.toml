@@ -23,6 +23,10 @@ blake2 = "0.10"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 portable-pty = "0.9"
 rand = "0.10"
+# UnifiedPush wake delivery from the relay (ADR-0023, #233). rustls-tls only —
+# no native-tls/OpenSSL — so the relay stays a small static binary; default
+# features off to drop the unused blocking client, charset, and cookies.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 remora-bridge = { path = "crates/remora-bridge" }
 remora-core = { path = "crates/remora-core" }
 remora-protocol = { path = "crates/remora-protocol" }

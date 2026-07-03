@@ -18,10 +18,24 @@
 //! bridge cannot reset a phone's cooldown by re-asserting.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use remora_protocol::{validate_push_endpoint, DeviceId, PushRegistration};
 use serde::Deserialize;
+use tokio::net::lookup_host;
+use tokio::sync::Semaphore;
+
+/// The one and only wake body — a fixed constant, identical for every wake from
+/// every bridge (ADR-0023 metadata policy: the relay learns *that* a session
+/// needs attention, never *why*, so nothing session-identifying may appear in
+/// the POST's body, headers, or URL suffix).
+const WAKE_BODY: &str = "A session needs your attention";
+
+/// Per-delivery hard deadline (connect + TLS + response). A slow or
+/// black-holing endpoint must not pin an in-flight permit indefinitely.
+const WAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Opt-in push-wake configuration, the `[push]` section of the relay's TOML
 /// (ADR-0023). Absent section = every field its default = push disabled.
@@ -263,6 +277,13 @@ pub fn decide_wake(
         return Err(DropReason::PolicyInvalid);
     }
     let cooldown = Duration::from_secs(config.device_cooldown_secs);
+    // Evict cooldown entries older than the window before consulting the map: a
+    // device past its cooldown can never block again, so its entry is dead
+    // weight. Pruning on every access keeps `last_wake` bounded on a long-lived
+    // relay instead of accreting one entry per device ever woken (Task 6 review).
+    state
+        .last_wake
+        .retain(|_, last| now.saturating_duration_since(*last) < cooldown);
     if let Some(last) = state.last_wake.get(&device_id) {
         if now.saturating_duration_since(*last) < cooldown {
             return Err(DropReason::Cooldown);
@@ -275,6 +296,260 @@ pub fn decide_wake(
     }
     state.last_wake.insert(device_id, now);
     Ok(reg.endpoint.clone())
+}
+
+// ── Delivery half (ADR-0023 SSRF policy + bounded HTTP POST, spec Task 7) ──────
+
+/// Where a resolved address sits relative to the relay's network-target policy.
+///
+/// [`AddrClass::Blocked`] addresses are refused *unconditionally* — no config
+/// flag re-admits them; they include the cloud-metadata callers
+/// (`169.254.0.0/16`, `fe80::/10`) an SSRF attacker most wants to reach.
+/// [`AddrClass::PrivateOrLoopback`] is refused by default but re-admitted by
+/// `allow_private_endpoints` (LAN self-hosters), and is the *only* class
+/// cleartext `http://` may ever target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddrClass {
+    /// Never a valid target regardless of config: unspecified, multicast,
+    /// broadcast, and link-local (incl. IPv4/IPv6 cloud-metadata ranges).
+    Blocked,
+    /// Loopback, RFC 1918 private, or IPv6 ULA (`fc00::/7`) — admitted only
+    /// with `allow_private_endpoints`.
+    PrivateOrLoopback,
+    /// A routable public address.
+    Public,
+}
+
+/// Collapses an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its embedded
+/// IPv4, so `::ffff:10.0.0.1` is classified as the private `10.0.0.1` it really
+/// reaches rather than slipping through the v6 checks — a classic SSRF bypass.
+fn normalize_mapped(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    }
+}
+
+/// `fe80::/10` — IPv6 link-local (`is_unicast_link_local` is unstable std, so
+/// the top-10-bit prefix is checked by hand).
+fn is_v6_link_local(v6: Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// `fc00::/7` — IPv6 unique-local (ULA); `is_unique_local` is unstable std, so
+/// the top-7-bit prefix is checked by hand.
+fn is_v6_unique_local(v6: Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xfe00) == 0xfc00
+}
+
+/// Classifies a (mapping-normalised) address against the target policy.
+fn classify(ip: IpAddr) -> AddrClass {
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast() || v4.is_link_local() {
+                AddrClass::Blocked
+            } else if v4.is_loopback() || v4.is_private() {
+                AddrClass::PrivateOrLoopback
+            } else {
+                AddrClass::Public
+            }
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_unspecified() || v6.is_multicast() || is_v6_link_local(v6) {
+                AddrClass::Blocked
+            } else if v6.is_loopback() || is_v6_unique_local(v6) {
+                AddrClass::PrivateOrLoopback
+            } else {
+                AddrClass::Public
+            }
+        }
+    }
+}
+
+/// Whether a single resolved address is a permissible POST target under `cfg`
+/// for the given scheme.
+fn addr_permitted(ip: IpAddr, scheme_is_http: bool, cfg: &PushConfig) -> bool {
+    let class = classify(ip);
+    let base_ok = match class {
+        AddrClass::Blocked => false,
+        AddrClass::PrivateOrLoopback => cfg.allow_private_endpoints,
+        AddrClass::Public => true,
+    };
+    if !base_ok {
+        return false;
+    }
+    if scheme_is_http {
+        // Cleartext is off by default, and even when enabled it may only reach
+        // private/loopback targets — never the public internet.
+        if !cfg.allow_http || class == AddrClass::Public {
+            return false;
+        }
+    }
+    true
+}
+
+/// Filters resolved addresses to those the policy permits, normalising
+/// IPv4-mapped IPv6 first. Pure over its inputs so the whole SSRF matrix is
+/// testable without any network I/O. An empty surviving set is
+/// [`DropReason::PolicyInvalid`] — every candidate was refused.
+pub fn filter_addrs(
+    addrs: &[IpAddr],
+    scheme_is_http: bool,
+    cfg: &PushConfig,
+) -> Result<Vec<IpAddr>, DropReason> {
+    let allowed: Vec<IpAddr> = addrs
+        .iter()
+        .copied()
+        .map(normalize_mapped)
+        .filter(|ip| addr_permitted(*ip, scheme_is_http, cfg))
+        .collect();
+    if allowed.is_empty() {
+        Err(DropReason::PolicyInvalid)
+    } else {
+        Ok(allowed)
+    }
+}
+
+/// A parsed, policy-relevant view of an endpoint URL.
+struct Target {
+    /// The URL host as written (bracketed for an IPv6 literal), used both for
+    /// DNS resolution and as the `.resolve()` pin key.
+    host: String,
+    port: u16,
+    scheme_is_http: bool,
+}
+
+/// Parses an endpoint into scheme/host/port, rejecting anything but
+/// `http`/`https` with a resolvable host and known port. Returns
+/// [`DropReason::PolicyInvalid`] on any malformed or unsupported URL.
+fn parse_target(endpoint: &str) -> Result<Target, DropReason> {
+    let url = reqwest::Url::parse(endpoint).map_err(|_| DropReason::PolicyInvalid)?;
+    let scheme_is_http = match url.scheme() {
+        "http" => true,
+        "https" => false,
+        _ => return Err(DropReason::PolicyInvalid),
+    };
+    let host = url.host_str().ok_or(DropReason::PolicyInvalid)?.to_string();
+    let port = url
+        .port_or_known_default()
+        .ok_or(DropReason::PolicyInvalid)?;
+    Ok(Target {
+        host,
+        port,
+        scheme_is_http,
+    })
+}
+
+/// Parses a URL host as an IP *literal* (so DNS is skipped), handling the
+/// bracketed `[::1]` form of an IPv6 literal. `None` for a real domain name.
+fn parse_ip_literal(host: &str) -> Option<IpAddr> {
+    if let Ok(v4) = host.parse::<Ipv4Addr>() {
+        return Some(IpAddr::V4(v4));
+    }
+    let inner = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    inner.parse::<Ipv6Addr>().ok().map(IpAddr::V6)
+}
+
+/// Resolves a target's host to candidate addresses: a literal IP skips DNS
+/// (but is still policy-filtered by the caller); a domain goes through
+/// [`lookup_host`]. An unresolvable host is [`DropReason::PolicyInvalid`].
+async fn resolve_target(target: &Target) -> Result<Vec<IpAddr>, DropReason> {
+    if let Some(ip) = parse_ip_literal(&target.host) {
+        return Ok(vec![ip]);
+    }
+    let addrs: Vec<IpAddr> = lookup_host((target.host.as_str(), target.port))
+        .await
+        .map_err(|_| DropReason::PolicyInvalid)?
+        .map(|sa| sa.ip())
+        .collect();
+    if addrs.is_empty() {
+        return Err(DropReason::PolicyInvalid);
+    }
+    Ok(addrs)
+}
+
+/// Builds a one-shot reqwest client that is pinned to `checked` for `host`
+/// (DNS-rebinding defense: the request connects to the address that *passed*
+/// the policy check, never a fresh resolution) with redirects disabled and a
+/// hard timeout, then POSTs the fixed wake body. Returns the response status;
+/// the body is ignored. Split out so the pin path is unit-testable without DNS.
+async fn post_wake_pinned(
+    endpoint: &str,
+    host: &str,
+    checked: SocketAddr,
+) -> reqwest::Result<reqwest::StatusCode> {
+    let client = reqwest::Client::builder()
+        // A redirect is an unchecked second destination (ADR-0023): refuse it.
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(WAKE_TIMEOUT)
+        // Pin the resolved+checked address for this host. reqwest ignores the
+        // port here and uses the URL's, which is what we want.
+        .resolve(host, checked)
+        .build()?;
+    let resp = client.post(endpoint).body(WAKE_BODY).send().await?;
+    Ok(resp.status())
+}
+
+/// Delivers one wake to a device-supplied endpoint under the full ADR-0023
+/// network policy: hold a global in-flight permit (drop, never queue, if none
+/// is immediately free), resolve the host ourselves, filter every resolved
+/// address against the SSRF policy, then POST to the *checked* address with the
+/// connection pinned to it. Never logs the endpoint URL — only outcomes by
+/// category (metadata policy).
+pub async fn deliver_wake(endpoint: &str, cfg: &PushConfig, permits: Arc<Semaphore>) {
+    // Bounded concurrency: take a permit immediately or drop. Queueing here
+    // would let a burst of wakes accrete unbounded tasks/sockets/DNS lookups.
+    // The permit is held for the whole delivery (resolve + connect + POST).
+    let _permit = match permits.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            eprintln!("remora-relay: push wake dropped (in_flight_full)");
+            return;
+        }
+    };
+
+    let target = match parse_target(endpoint) {
+        Ok(target) => target,
+        Err(reason) => {
+            eprintln!("remora-relay: push wake dropped ({})", reason.as_str());
+            return;
+        }
+    };
+    let addrs = match resolve_target(&target).await {
+        Ok(addrs) => addrs,
+        Err(reason) => {
+            eprintln!("remora-relay: push wake dropped ({})", reason.as_str());
+            return;
+        }
+    };
+    let checked_ip = match filter_addrs(&addrs, target.scheme_is_http, cfg) {
+        // First surviving address; pinning it closes the rebinding window.
+        Ok(mut allowed) => allowed.remove(0),
+        Err(reason) => {
+            eprintln!("remora-relay: push wake dropped ({})", reason.as_str());
+            return;
+        }
+    };
+
+    let checked = SocketAddr::new(checked_ip, target.port);
+    match post_wake_pinned(endpoint, &target.host, checked).await {
+        Ok(status) => {
+            eprintln!(
+                "remora-relay: push wake delivered (status {})",
+                status.as_u16()
+            );
+        }
+        // Transport failure only — the endpoint URL is never logged.
+        Err(_) => {
+            eprintln!("remora-relay: push wake delivery failed (transport)");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -500,5 +775,301 @@ mod tests {
         // Refill one token over a minute; device B should get exactly one wake.
         let t1 = t0 + Duration::from_secs(60);
         assert!(decide_wake(&cfg, &mut state, bridge, did(0x02), Some(&reg), false, t1).is_ok());
+    }
+
+    #[test]
+    fn stale_last_wake_entries_are_evicted() {
+        // A long-lived relay must not accrete one `last_wake` entry per device
+        // ever woken: entries past their cooldown are pruned on the next access.
+        let cfg = enabled(); // 30s cooldown, generous budget.
+        let mut state = PushState::default();
+        let reg = valid_reg();
+        let bridge = did(0xAA);
+        let t0 = Instant::now();
+        for i in 0..5u8 {
+            assert!(decide_wake(&cfg, &mut state, bridge, did(i), Some(&reg), false, t0).is_ok());
+        }
+        assert_eq!(state.last_wake.len(), 5);
+        // Long past every entry's cooldown window: one new wake evicts all the
+        // now-stale entries, leaving only the fresh one.
+        let t1 = t0 + Duration::from_secs(120);
+        assert!(decide_wake(&cfg, &mut state, bridge, did(0x99), Some(&reg), false, t1).is_ok());
+        assert_eq!(state.last_wake.len(), 1);
+    }
+
+    // ── Delivery-half tests (SSRF policy + bounded HTTP POST, Task 7) ─────────
+
+    use std::net::Ipv4Addr;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    fn v4(s: &str) -> IpAddr {
+        IpAddr::V4(s.parse::<Ipv4Addr>().expect("valid v4 literal"))
+    }
+    fn v6(s: &str) -> IpAddr {
+        IpAddr::V6(s.parse::<Ipv6Addr>().expect("valid v6 literal"))
+    }
+
+    /// Every knob-combination of `filter_addrs` over the ADR-0023 matrix.
+    #[test]
+    fn filter_addrs_policy_matrix() {
+        let metadata = v4("169.254.169.254");
+        let ll_v6 = v6("fe80::1");
+        let public = v4("8.8.8.8");
+        let loopback = v4("127.0.0.1");
+        let private_a = v4("10.0.0.5");
+        let private_b = v4("192.168.1.10");
+        let loopback_v6 = v6("::1");
+        let ula_v6 = v6("fd00::1");
+        let multicast_v6 = v6("ff02::1");
+
+        for &allow_private in &[false, true] {
+            for &scheme_is_http in &[false, true] {
+                let cfg = PushConfig {
+                    enabled: true,
+                    allow_http: true, // http gated by target class, not this alone
+                    allow_private_endpoints: allow_private,
+                    ..PushConfig::default()
+                };
+                let ok = |ip: IpAddr| filter_addrs(&[ip], scheme_is_http, &cfg).is_ok();
+
+                // Metadata / link-local: NEVER allowed, any knob, any scheme.
+                assert!(!ok(metadata), "metadata must never pass");
+                assert!(!ok(ll_v6), "v6 link-local must never pass");
+                assert!(!ok(multicast_v6), "multicast must never pass");
+
+                // Public: https always allowed; http-to-public never allowed.
+                assert_eq!(ok(public), !scheme_is_http, "public https ok, http no");
+
+                // Private / loopback: only with the knob, and (for http) only
+                // because http-to-private is the one cleartext case allowed.
+                for &p in &[loopback, private_a, private_b, loopback_v6, ula_v6] {
+                    assert_eq!(ok(p), allow_private, "private only with the knob");
+                }
+            }
+        }
+    }
+
+    /// http to a public target is refused even with `allow_http = true`.
+    #[test]
+    fn http_to_public_denied_even_with_allow_http() {
+        let cfg = PushConfig {
+            enabled: true,
+            allow_http: true,
+            allow_private_endpoints: true,
+            ..PushConfig::default()
+        };
+        assert_eq!(
+            filter_addrs(&[v4("8.8.8.8")], true, &cfg),
+            Err(DropReason::PolicyInvalid)
+        );
+    }
+
+    /// An IPv4-mapped IPv6 address is classified as its embedded v4 (bypass
+    /// defense): `::ffff:10.0.0.1` must be treated as private `10.0.0.1`.
+    #[test]
+    fn v4_mapped_v6_classified_as_embedded_v4() {
+        let mapped = v6("::ffff:10.0.0.1");
+        // Default (no private): refused.
+        let deny = PushConfig {
+            enabled: true,
+            ..PushConfig::default()
+        };
+        assert_eq!(
+            filter_addrs(&[mapped], false, &deny),
+            Err(DropReason::PolicyInvalid)
+        );
+        // With the private knob: admitted as the private v4 it really reaches.
+        let allow = PushConfig {
+            enabled: true,
+            allow_private_endpoints: true,
+            ..PushConfig::default()
+        };
+        assert_eq!(
+            filter_addrs(&[mapped], false, &allow),
+            Ok(vec![v4("10.0.0.1")])
+        );
+    }
+
+    /// Reads one HTTP/1.1 request off `sock` (method + body), then replies with
+    /// the given raw response. Minimal, test-only parse — no framework dep.
+    async fn serve_one(sock: &mut TcpStream, response: &[u8]) -> (String, String) {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 512];
+        loop {
+            let n = sock.read(&mut tmp).await.expect("read request");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&buf[..pos]).to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                let mut body = buf[pos + 4..].to_vec();
+                while body.len() < content_length {
+                    let n = sock.read(&mut tmp).await.expect("read request");
+                    if n == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&tmp[..n]);
+                }
+                let method = headers
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split(' ').next())
+                    .unwrap_or("")
+                    .to_string();
+                let _ = sock.write_all(response).await;
+                return (method, String::from_utf8_lossy(&body).to_string());
+            }
+        }
+        (String::new(), String::new())
+    }
+
+    fn allow_all_cfg() -> PushConfig {
+        PushConfig {
+            enabled: true,
+            allow_http: true,
+            allow_private_endpoints: true,
+            max_in_flight: 4,
+            ..PushConfig::default()
+        }
+    }
+
+    /// POSTs the fixed body, and a `301` response is never followed.
+    #[tokio::test]
+    async fn deliver_wake_posts_fixed_body() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let count = Arc::new(AtomicUsize::new(0));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let count_srv = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.expect("accept");
+                count_srv.fetch_add(1, SeqCst);
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let (method, body) = serve_one(
+                        &mut sock,
+                        b"HTTP/1.1 301 Moved Permanently\r\nLocation: http://127.0.0.1:9/\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await;
+                    let _ = tx.send((method, body));
+                });
+            }
+        });
+
+        let endpoint = format!("http://127.0.0.1:{}/", addr.port());
+        deliver_wake(&endpoint, &allow_all_cfg(), Arc::new(Semaphore::new(4))).await;
+
+        let (method, body) = rx.recv().await.expect("request received");
+        assert_eq!(method, "POST");
+        assert_eq!(body, WAKE_BODY);
+        // A redirect must not spawn a second request.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(count.load(SeqCst), 1, "301 must not be followed");
+    }
+
+    /// The global semaphore caps simultaneously-connected deliveries: 8 wakes,
+    /// 4 permits, a delaying listener — at most 4 sockets are ever live at once.
+    #[tokio::test]
+    async fn semaphore_bounds_inflight() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let live = Arc::new(AtomicUsize::new(0));
+        let max_live = Arc::new(AtomicUsize::new(0));
+        let (live_s, max_s) = (live.clone(), max_live.clone());
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.expect("accept");
+                let (live_s, max_s) = (live_s.clone(), max_s.clone());
+                tokio::spawn(async move {
+                    let n = live_s.fetch_add(1, SeqCst) + 1;
+                    max_s.fetch_max(n, SeqCst);
+                    // Hold the connection open (delay the response) so overlap is
+                    // observable.
+                    let mut tmp = [0u8; 512];
+                    let _ = sock.read(&mut tmp).await;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    live_s.fetch_sub(1, SeqCst);
+                });
+            }
+        });
+
+        let permits = Arc::new(Semaphore::new(4));
+        let endpoint = format!("http://127.0.0.1:{}/", addr.port());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let (p, e, cfg) = (permits.clone(), endpoint.clone(), allow_all_cfg());
+            handles.push(tokio::spawn(async move { deliver_wake(&e, &cfg, p).await }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+        assert!(
+            max_live.load(SeqCst) <= 4,
+            "at most 4 concurrent sockets, saw {}",
+            max_live.load(SeqCst)
+        );
+    }
+
+    /// The `.resolve()` pin makes delivery reach the checked address for a host
+    /// that has no real DNS record — proving the request connects to the address
+    /// that passed the check, not a re-resolution.
+    #[tokio::test]
+    async fn rebinding_pin_reaches_checked_addr() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let (method, body) =
+                serve_one(&mut sock, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+            let _ = tx.send((method, body));
+        });
+
+        // A host with no DNS record; only the pin can route it to the listener.
+        let endpoint = format!("http://localtest.example:{}/", addr.port());
+        let status = post_wake_pinned(&endpoint, "localtest.example", addr)
+            .await
+            .expect("pinned delivery succeeds");
+        assert!(status.is_success());
+        let (method, body) = rx.recv().await.expect("request received");
+        assert_eq!(method, "POST");
+        assert_eq!(body, WAKE_BODY);
+    }
+
+    /// A literal-IP endpoint is parsed and skips DNS; a bad scheme is refused.
+    #[test]
+    fn parse_target_scheme_and_literal() {
+        let t = parse_target("https://1.2.3.4:8443/topic").expect("parse literal target");
+        assert_eq!(t.host, "1.2.3.4");
+        assert_eq!(t.port, 8443);
+        assert!(!t.scheme_is_http);
+        assert_eq!(parse_ip_literal("1.2.3.4"), Some(v4("1.2.3.4")));
+        assert_eq!(parse_ip_literal("[::1]"), Some(v6("::1")));
+        assert_eq!(parse_ip_literal("ntfy.sh"), None);
+        assert_eq!(
+            parse_target("ftp://1.2.3.4/").err(),
+            Some(DropReason::PolicyInvalid)
+        );
     }
 }

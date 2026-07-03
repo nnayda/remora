@@ -516,9 +516,15 @@ fn dispatch_push_trigger(router: &Router, permit: &ConnPermit, envelope: &Envelo
         // last accept-rule violation, closed like the others.
         PushDecision::NotAsserted => DataStep::Close(CloseReason::Protocol),
         // A cleared decision resolves to the device's endpoint; hand it to the
-        // delivery seam (Task 7) and continue.
+        // bounded, SSRF-checked delivery task (Task 7) and continue. Delivery is
+        // fire-and-forget: it must never block this reader loop, and its own
+        // in-flight semaphore drops rather than queues when saturated.
         PushDecision::Deliver(endpoint) => {
-            deliver_wake(endpoint);
+            let cfg = router.push_config();
+            let permits = router.push_permits();
+            tokio::spawn(async move {
+                crate::push::deliver_wake(&endpoint, &cfg, permits).await;
+            });
             DataStep::Continue
         }
         // A dropped wake is a routine policy outcome, not a protocol violation;
@@ -528,20 +534,6 @@ fn dispatch_push_trigger(router: &Router, permit: &ConnPermit, envelope: &Envelo
             DataStep::Continue
         }
     }
-}
-
-/// Delivery seam for the push-wake HTTP POST (Task 7, #233).
-///
-/// A wake decision that clears every policy gate resolves to the target
-/// device's endpoint and hands it here. Task 7 wires the bounded, SSRF-checked
-/// HTTP POST at this boundary — global in-flight semaphore, resolve-check-pin of
-/// the destination address, redirects disabled, cleartext gated on
-/// private/loopback (ADR-0023). Until then the relay performs **no** network
-/// I/O: the endpoint is accepted and this seam is a no-op placeholder, so no
-/// device-supplied URL is logged or dialed.
-fn deliver_wake(endpoint: String) {
-    // Task 7 spawns the delivery task here; drop the resolved endpoint for now.
-    let _ = endpoint;
 }
 
 /// Routes one blind `Data`/`Pairing` envelope through [`Router::route`] and maps
