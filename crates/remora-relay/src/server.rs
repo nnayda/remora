@@ -51,6 +51,7 @@ use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 
 use crate::audit::{AuditRecord, AuditSink, CloseReason, PushEndpointWarning};
 use crate::config::RelayConfig;
+use crate::push::DropReason;
 use crate::router::{
     outbound_channel, ConnPermit, ControlOutcome, HelloOutcome, OutboundReceiver, PushDecision,
     RouteOutcome, Router,
@@ -95,6 +96,74 @@ struct ServerConn {
 struct ConnStats {
     frames_out: std::sync::atomic::AtomicU64,
     bytes_out: std::sync::atomic::AtomicU64,
+}
+
+/// Burst capacity of a connection's PushTrigger token bucket (#233 F3b): a
+/// legit bridge sends ~one trigger per `Awaiting` episode, so a small burst is
+/// ample and anything beyond it reads as a flood.
+const PUSH_TRIGGER_BURST: f64 = 10.0;
+/// Refill rate of that bucket, in tokens per second (30/min).
+const PUSH_TRIGGER_REFILL_PER_SEC: f64 = 0.5;
+/// After the first drop of a given reason, log only every Nth (#233 F3c), so a
+/// client cannot amplify stderr by flooding drops. Counters stay exact.
+const DROP_LOG_SAMPLE: u64 = 100;
+
+/// Per-connection PushTrigger state, owned by the reader loop and never shared.
+///
+/// Two jobs (#233): a token bucket that bounds inbound `PushTrigger` frames
+/// *before* they reach the global router lock (F3b), and exact per-reason drop
+/// counters that gate sampled drop logging (F3c).
+struct ConnPushState {
+    /// Available trigger tokens (fractional; refilled lazily on each check).
+    trigger_tokens: f64,
+    /// When the bucket was last refilled.
+    trigger_refill: Instant,
+    /// Exact count of each drop reason seen, keyed by its stable name, driving
+    /// the log-first-then-every-Nth sampling.
+    drop_counts: HashMap<&'static str, u64>,
+}
+
+impl ConnPushState {
+    fn new() -> ConnPushState {
+        ConnPushState {
+            trigger_tokens: PUSH_TRIGGER_BURST,
+            trigger_refill: Instant::now(),
+            drop_counts: HashMap::new(),
+        }
+    }
+
+    /// Refills by elapsed time (capped at the burst) then consumes one token,
+    /// returning whether one was available. `false` means the connection has
+    /// exceeded its PushTrigger rate and should be closed as a flood violation.
+    fn admit_trigger(&mut self, now: Instant) -> bool {
+        let elapsed = now
+            .saturating_duration_since(self.trigger_refill)
+            .as_secs_f64();
+        self.trigger_tokens =
+            (self.trigger_tokens + elapsed * PUSH_TRIGGER_REFILL_PER_SEC).min(PUSH_TRIGGER_BURST);
+        self.trigger_refill = now;
+        if self.trigger_tokens >= 1.0 {
+            self.trigger_tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Records a wake drop and logs it only on the first occurrence of its
+    /// reason and every [`DROP_LOG_SAMPLE`]th after — the counter itself stays
+    /// exact so an operator can still read the true total from a logged line.
+    fn note_drop(&mut self, reason: DropReason) {
+        let count = self.drop_counts.entry(reason.as_str()).or_insert(0);
+        *count += 1;
+        if *count == 1 || count.is_multiple_of(DROP_LOG_SAMPLE) {
+            eprintln!(
+                "remora-relay: push wake dropped ({}) [{} total on this connection]",
+                reason.as_str(),
+                count
+            );
+        }
+    }
 }
 
 /// Binds `config.listen` and serves relay connections until the returned
@@ -365,6 +434,10 @@ async fn run_connection(
     let (final_tx, final_rx) = oneshot::channel::<CloseFrame>();
     let writer = tokio::spawn(writer_task(sink, out_rx, final_rx, stats.clone()));
 
+    // Per-connection PushTrigger state (flood bucket + sampled drop counters),
+    // owned by this reader loop alone (#233 F3).
+    let mut push_state = ConnPushState::new();
+
     // Post-hello loop: `Data`/`Pairing` route blindly, a bridge's `Control`
     // frame is dispatched (D4), everything else closes the connection. The
     // reader also selects on its kill channel so another connection can shut it
@@ -376,7 +449,7 @@ async fn run_connection(
                     None => break CloseReason::Normal,
                     Some(Err(_)) => break CloseReason::Normal,
                     Some(Ok(msg)) => {
-                        match handle_data_message(msg, &router, &permit, &registrar, &audit, &mut frames_in, &mut bytes_in) {
+                        match handle_data_message(msg, &router, &permit, &registrar, &audit, &mut push_state, &mut frames_in, &mut bytes_in) {
                             DataStep::Continue => {}
                             DataStep::Close(reason) => break reason,
                         }
@@ -447,12 +520,14 @@ fn peer_unavailable_step(sender_role: HelloRole) -> DataStep {
 /// Handles one post-hello inbound message: routes a `Data`/`Pairing` frame,
 /// dispatches a bridge's `Control` frame (ADR-0021 D4), or maps anything else to
 /// a close reason.
+#[allow(clippy::too_many_arguments)]
 fn handle_data_message(
     msg: Message,
-    router: &Router,
+    router: &Arc<Router>,
     permit: &ConnPermit,
     registrar: &Mutex<Registrar>,
     audit: &AuditSink,
+    push_state: &mut ConnPushState,
     frames_in: &mut u64,
     bytes_in: &mut u64,
 ) -> DataStep {
@@ -487,7 +562,7 @@ fn handle_data_message(
         // `PushTrigger` is a bridge→relay wake request (ADR-0023): empty-payload,
         // header-only. The relay validates the accept rules and runs the wake
         // decision; a policy drop is routine, only a rule violation closes.
-        FrameType::PushTrigger => dispatch_push_trigger(router, permit, &envelope),
+        FrameType::PushTrigger => dispatch_push_trigger(router, permit, &envelope, push_state),
         // A second Hello post-hello is a protocol violation.
         FrameType::Hello => DataStep::Close(CloseReason::Protocol),
     }
@@ -501,7 +576,12 @@ fn handle_data_message(
 /// [`Router::decide_push_wake`]). A well-formed trigger runs the wake decision;
 /// whatever the outcome — a delivered wake handed to the delivery seam, or a
 /// policy drop — the sender **continues** (a drop is never a violation).
-fn dispatch_push_trigger(router: &Router, permit: &ConnPermit, envelope: &Envelope) -> DataStep {
+fn dispatch_push_trigger(
+    router: &Arc<Router>,
+    permit: &ConnPermit,
+    envelope: &Envelope,
+    push_state: &mut ConnPushState,
+) -> DataStep {
     // PushTrigger is bridge→relay only; a device sending one is a violation.
     if permit.role() != HelloRole::Bridge {
         return DataStep::Close(CloseReason::Protocol);
@@ -509,6 +589,13 @@ fn dispatch_push_trigger(router: &Router, permit: &ConnPermit, envelope: &Envelo
     // The payload is reserved and MUST be empty in v1 (ADR-0023): E2E-encrypted
     // wake payloads are a future follow-up, so a non-empty one is malformed.
     if !envelope.payload.is_empty() {
+        return DataStep::Close(CloseReason::Protocol);
+    }
+    // Per-connection flood bound (#233 F3b), checked *before* the global router
+    // lock: a legit bridge sends ~one trigger per `Awaiting` episode, so beyond
+    // a small burst we close the connection as a protocol/flood violation
+    // rather than let a trigger flood serialize the router mutex.
+    if !push_state.admit_trigger(Instant::now()) {
         return DataStep::Close(CloseReason::Protocol);
     }
     match router.decide_push_wake(permit, envelope.dst) {
@@ -519,18 +606,30 @@ fn dispatch_push_trigger(router: &Router, permit: &ConnPermit, envelope: &Envelo
         // bounded, SSRF-checked delivery task (Task 7) and continue. Delivery is
         // fire-and-forget: it must never block this reader loop, and its own
         // in-flight semaphore drops rather than queues when saturated.
-        PushDecision::Deliver(endpoint) => {
+        PushDecision::Deliver {
+            endpoint,
+            device_id,
+            stamped,
+        } => {
             let cfg = router.push_config();
             let permits = router.push_permits();
+            let router = router.clone();
             tokio::spawn(async move {
-                crate::push::deliver_wake(&endpoint, &cfg, permits).await;
+                // On a final delivery failure (or no free permit), revoke the
+                // cooldown stamp so this missed wake does not suppress the next
+                // one; compare-and-clear leaves a newer wake's stamp intact
+                // (#233 F2). The lock inside is taken briefly, never across the
+                // delivery await.
+                if !crate::push::deliver_wake(&endpoint, &cfg, permits).await {
+                    router.revoke_wake_stamp(device_id, stamped);
+                }
             });
             DataStep::Continue
         }
         // A dropped wake is a routine policy outcome, not a protocol violation;
-        // count/log it and continue.
+        // count it exactly and log it sampled (#233 F3c), then continue.
         PushDecision::Drop(reason) => {
-            eprintln!("remora-relay: push wake dropped ({})", reason.as_str());
+            push_state.note_drop(reason);
             DataStep::Continue
         }
     }
@@ -767,5 +866,40 @@ mod tests {
         // A bridge addressing a departed device is routine (D3 fresh routing
         // ids): drop the undeliverable frame, never tear down the bridge.
         assert_eq!(peer_unavailable_step(HelloRole::Bridge), DataStep::Continue);
+    }
+
+    #[test]
+    fn push_trigger_bucket_admits_a_burst_then_closes() {
+        // The per-connection PushTrigger bucket (#233 F3b) admits up to its
+        // burst at one instant and refuses the next — the reader closes on a
+        // refusal, so a trigger flood cannot serialize the router lock.
+        let mut ps = ConnPushState::new();
+        let now = Instant::now();
+        for i in 0..(PUSH_TRIGGER_BURST as usize) {
+            assert!(
+                ps.admit_trigger(now),
+                "trigger {i} within the burst is admitted"
+            );
+        }
+        assert!(
+            !ps.admit_trigger(now),
+            "the frame past the burst is refused (connection closes)"
+        );
+    }
+
+    #[test]
+    fn push_trigger_bucket_refills_over_time() {
+        // Drain the burst, then advancing the clock refills tokens at the
+        // configured rate so a well-behaved bridge is never wedged.
+        let mut ps = ConnPushState::new();
+        let t0 = Instant::now();
+        for _ in 0..(PUSH_TRIGGER_BURST as usize) {
+            assert!(ps.admit_trigger(t0));
+        }
+        assert!(!ps.admit_trigger(t0), "bucket empty at t0");
+        // 0.5 tokens/sec: two seconds later exactly one token is available.
+        let t1 = t0 + Duration::from_secs(2);
+        assert!(ps.admit_trigger(t1), "one token refilled after 2s");
+        assert!(!ps.admit_trigger(t1), "but only one");
     }
 }

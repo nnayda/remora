@@ -245,7 +245,33 @@ impl PushState {
             false
         }
     }
+
+    /// Compare-and-clears the cooldown stamp for `device`: removes its
+    /// `last_wake` entry **iff** it still equals `stamped` (the exact instant a
+    /// particular wake charged). Returns whether it cleared.
+    ///
+    /// Used when a delivery ultimately fails (#233 F2): the wake never reached
+    /// the phone, so its cooldown stamp must not suppress the next attempt. The
+    /// compare-and-clear guard means a *newer* legitimate wake — which replaced
+    /// the stamp with a different instant — is never clobbered by a late revoke
+    /// from an older, failed delivery. The spent budget token is intentionally
+    /// left spent (it refills within a minute; not refunding it keeps a
+    /// failure-loop from becoming a free unbounded retry).
+    pub fn revoke_wake(&mut self, device: DeviceId, stamped: Instant) -> bool {
+        if self.last_wake.get(&device) == Some(&stamped) {
+            self.last_wake.remove(&device);
+            true
+        } else {
+            false
+        }
+    }
 }
+
+/// Once `last_wake` exceeds this many entries, a successful stamp also prunes
+/// the map of entries past their cooldown window. A per-device cooldown key is
+/// tiny, so this bounds the map on a long-lived relay without pruning on the
+/// cheap (budget-denied) flood path (#233 F3a).
+const LAST_WAKE_PRUNE_THRESHOLD: usize = 1024;
 
 /// Decides whether a well-formed `PushTrigger` should deliver a wake, and to
 /// which endpoint — the pure policy core (ADR-0023, spec Task 6).
@@ -278,13 +304,11 @@ pub fn decide_wake(
         return Err(DropReason::PolicyInvalid);
     }
     let cooldown = Duration::from_secs(config.device_cooldown_secs);
-    // Evict cooldown entries older than the window before consulting the map: a
-    // device past its cooldown can never block again, so its entry is dead
-    // weight. Pruning on every access keeps `last_wake` bounded on a long-lived
-    // relay instead of accreting one entry per device ever woken (Task 6 review).
-    state
-        .last_wake
-        .retain(|_, last| now.saturating_duration_since(*last) < cooldown);
+    // Consult the stamp directly, *without* a full prune first (#233 F3a): a
+    // stale (past-window) entry has elapsed >= cooldown, so it can never falsely
+    // block. The O(n) `retain` used to run here on every PushTrigger — including
+    // the cheap budget-denied flood path — which let a bridge amplify work under
+    // the router lock. Pruning is now deferred to the success path below.
     if let Some(last) = state.last_wake.get(&device_id) {
         if now.saturating_duration_since(*last) < cooldown {
             return Err(DropReason::Cooldown);
@@ -294,6 +318,14 @@ pub fn decide_wake(
     // earlier gate, so a cooldown/no-endpoint drop never drains the budget.
     if !state.take_bridge_token(bridge_id, config, now) {
         return Err(DropReason::BridgeBudget);
+    }
+    // Success path only (never on a drop): once the map has grown past the
+    // threshold, evict entries past their cooldown window before stamping, so a
+    // long-lived relay stays bounded without charging the flood path for it.
+    if state.last_wake.len() > LAST_WAKE_PRUNE_THRESHOLD {
+        state
+            .last_wake
+            .retain(|_, last| now.saturating_duration_since(*last) < cooldown);
     }
     state.last_wake.insert(device_id, now);
     Ok(reg.endpoint.clone())
@@ -305,20 +337,92 @@ pub fn decide_wake(
 ///
 /// [`AddrClass::Blocked`] addresses are refused *unconditionally* — no config
 /// flag re-admits them; they include the cloud-metadata callers
-/// (`169.254.0.0/16`, `fe80::/10`) an SSRF attacker most wants to reach.
-/// [`AddrClass::PrivateOrLoopback`] is refused by default but re-admitted by
-/// `allow_private_endpoints` (LAN self-hosters), and is the *only* class
-/// cleartext `http://` may ever target.
+/// (`169.254.0.0/16`, `fe80::/10`) an SSRF attacker most wants to reach, plus
+/// the never-legitimate documentation/benchmarking/reserved ranges and the
+/// tunneled-v4 IPv6 embeddings (6to4, Teredo). [`AddrClass::PrivateOrLoopback`]
+/// is refused by default but re-admitted by `allow_private_endpoints` (LAN
+/// self-hosters), and is the *only* class cleartext `http://` may ever target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AddrClass {
     /// Never a valid target regardless of config: unspecified, multicast,
-    /// broadcast, and link-local (incl. IPv4/IPv6 cloud-metadata ranges).
+    /// broadcast, link-local (incl. IPv4/IPv6 cloud-metadata ranges), the
+    /// documentation/benchmarking/reserved v4 ranges, and the 6to4/Teredo v6
+    /// tunnel prefixes.
     Blocked,
-    /// Loopback, RFC 1918 private, or IPv6 ULA (`fc00::/7`) — admitted only
-    /// with `allow_private_endpoints`.
+    /// Reaches the local host or private space — loopback, `0.0.0.0/8` (routes
+    /// to localhost on Linux), RFC 1918 private, CGNAT (`100.64.0.0/10`), or
+    /// IPv6 ULA (`fc00::/7`). Admitted only with `allow_private_endpoints`.
     PrivateOrLoopback,
     /// A routable public address.
     Public,
+}
+
+/// `100.64.0.0/10` — carrier-grade NAT / RFC 6598 shared address space. Reaches
+/// the same private/CGNAT plane as RFC 1918, so it is governed by the same knob.
+fn is_v4_cgnat(o: [u8; 4]) -> bool {
+    o[0] == 100 && (o[1] & 0xc0) == 64
+}
+
+/// The three RFC 5737 documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`,
+/// `203.0.113.0/24`, TEST-NET-1/2/3) — never a legitimate push target.
+fn is_v4_test_net(o: [u8; 4]) -> bool {
+    matches!(
+        (o[0], o[1], o[2]),
+        (192, 0, 2) | (198, 51, 100) | (203, 0, 113)
+    )
+}
+
+/// `198.18.0.0/15` — RFC 2544 benchmarking range; never a legitimate target.
+fn is_v4_benchmarking(o: [u8; 4]) -> bool {
+    o[0] == 198 && (o[1] & 0xfe) == 18
+}
+
+/// `240.0.0.0/4` — reserved (former class E); never a legitimate target.
+fn is_v4_reserved(o: [u8; 4]) -> bool {
+    o[0] >= 240
+}
+
+/// `2002::/16` — 6to4, an IPv6 prefix that tunnels an embedded IPv4. We block
+/// the whole prefix outright rather than decode the embedding: no UnifiedPush
+/// distributor lives behind 6to4, and decoding the inner v4 to re-run the v4
+/// policy is complexity a legitimate target never needs.
+fn is_v6_6to4(v6: Ipv6Addr) -> bool {
+    v6.segments()[0] == 0x2002
+}
+
+/// `2001:0::/32` — Teredo, an IPv6 prefix tunnelling an embedded (XOR-obfuscated)
+/// IPv4. Blocked outright for the same reason as 6to4: no push server lives
+/// there, and decoding the XORed embedding is not worth the SSRF surface.
+fn is_v6_teredo(v6: Ipv6Addr) -> bool {
+    let seg = v6.segments();
+    seg[0] == 0x2001 && seg[1] == 0x0000
+}
+
+/// Classifies a (mapping-normalised) IPv4 address against the target policy.
+fn classify_v4(v4: Ipv4Addr) -> AddrClass {
+    let o = v4.octets();
+    // Exact `0.0.0.0` is the unspecified address — always blocked.
+    if v4.is_unspecified() {
+        return AddrClass::Blocked;
+    }
+    // Never-legitimate ranges, blocked regardless of any config flag.
+    if v4.is_multicast()
+        || v4.is_broadcast()
+        || v4.is_link_local()
+        || is_v4_test_net(o)
+        || is_v4_benchmarking(o)
+        || is_v4_reserved(o)
+    {
+        return AddrClass::Blocked;
+    }
+    // Reaches the local host / private plane — governed by allow_private_endpoints.
+    // `0.0.0.0/8` (minus the exact `0.0.0.0` blocked above) routes to the local
+    // host on Linux, so `0.0.0.1` reaches the same place loopback does; classify
+    // it with loopback so one knob governs both consistently.
+    if o[0] == 0 || v4.is_loopback() || v4.is_private() || is_v4_cgnat(o) {
+        return AddrClass::PrivateOrLoopback;
+    }
+    AddrClass::Public
 }
 
 /// Collapses an IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`,
@@ -383,17 +487,14 @@ fn is_v6_unique_local(v6: Ipv6Addr) -> bool {
 /// Classifies a (mapping-normalised) address against the target policy.
 fn classify(ip: IpAddr) -> AddrClass {
     match ip {
-        IpAddr::V4(v4) => {
-            if v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast() || v4.is_link_local() {
-                AddrClass::Blocked
-            } else if v4.is_loopback() || v4.is_private() {
-                AddrClass::PrivateOrLoopback
-            } else {
-                AddrClass::Public
-            }
-        }
+        IpAddr::V4(v4) => classify_v4(v4),
         IpAddr::V6(v6) => {
-            if v6.is_unspecified() || v6.is_multicast() || is_v6_link_local(v6) {
+            if v6.is_unspecified()
+                || v6.is_multicast()
+                || is_v6_link_local(v6)
+                || is_v6_6to4(v6)
+                || is_v6_teredo(v6)
+            {
                 AddrClass::Blocked
             } else if v6.is_loopback() || is_v6_unique_local(v6) {
                 AddrClass::PrivateOrLoopback
@@ -531,36 +632,41 @@ async fn post_wake_pinned(
     Ok(resp.status())
 }
 
-/// Delivers one wake to a device-supplied endpoint under the full ADR-0023
-/// network policy: hold a global in-flight permit (drop, never queue, if none
-/// is immediately free), resolve the host ourselves, filter every resolved
-/// address against the SSRF policy, then POST to the *checked* address with the
-/// connection pinned to it. Never logs the endpoint URL — only outcomes by
-/// category (metadata policy).
-pub async fn deliver_wake(endpoint: &str, cfg: &PushConfig, permits: Arc<Semaphore>) {
-    // Bounded concurrency: take a permit immediately or drop. Queueing here
-    // would let a burst of wakes accrete unbounded tasks/sockets/DNS lookups.
-    // The permit is held for the whole delivery (resolve + connect + POST).
-    let _permit = match permits.try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            eprintln!("remora-relay: push wake dropped (in_flight_full)");
-            return;
-        }
-    };
+/// Delay before the single retry of a transiently-failed delivery (#233 F2a).
+/// The in-flight permit is held across this sleep, so the global concurrency
+/// cap still bounds retrying deliveries.
+const WAKE_RETRY_DELAY: Duration = Duration::from_secs(5);
 
+/// The outcome of one delivery attempt, driving whether a retry is worthwhile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attempt {
+    /// A 2xx response — the wake was delivered.
+    Delivered,
+    /// A transient failure (DNS/resolution error, connect/timeout, or a 5xx):
+    /// worth one retry.
+    Transient,
+    /// A non-transient failure (malformed URL, SSRF filter reject, or a 4xx):
+    /// retrying cannot help, so give up immediately.
+    Permanent,
+}
+
+/// One resolve → filter → pinned-POST attempt. Never logs the endpoint URL —
+/// only outcomes by category (metadata policy).
+async fn attempt_delivery(endpoint: &str, cfg: &PushConfig) -> Attempt {
     let target = match parse_target(endpoint) {
         Ok(target) => target,
         Err(reason) => {
             eprintln!("remora-relay: push wake dropped ({})", reason.as_str());
-            return;
+            return Attempt::Permanent;
         }
     };
     let addrs = match resolve_target(&target).await {
         Ok(addrs) => addrs,
-        Err(reason) => {
-            eprintln!("remora-relay: push wake dropped ({})", reason.as_str());
-            return;
+        // A resolution failure is transient (DNS blip, offline distributor);
+        // worth one retry rather than losing the wake outright.
+        Err(_) => {
+            eprintln!("remora-relay: push wake delivery failed (resolve)");
+            return Attempt::Transient;
         }
     };
     let checked_ip = match filter_addrs(&addrs, target.scheme_is_http, cfg) {
@@ -568,21 +674,75 @@ pub async fn deliver_wake(endpoint: &str, cfg: &PushConfig, permits: Arc<Semapho
         Ok(mut allowed) => allowed.remove(0),
         Err(reason) => {
             eprintln!("remora-relay: push wake dropped ({})", reason.as_str());
-            return;
+            return Attempt::Permanent;
         }
     };
 
     let checked = SocketAddr::new(checked_ip, target.port);
     match post_wake_pinned(endpoint, &target.host, checked).await {
-        Ok(status) => {
+        Ok(status) if status.is_success() => {
             eprintln!(
                 "remora-relay: push wake delivered (status {})",
                 status.as_u16()
             );
+            Attempt::Delivered
         }
-        // Transport failure only — the endpoint URL is never logged.
+        // 5xx is a server-side blip — retry once. 4xx (and any other non-2xx)
+        // is the endpoint refusing this request; retrying will not change it.
+        Ok(status) if status.is_server_error() => {
+            eprintln!(
+                "remora-relay: push wake delivery failed (status {})",
+                status.as_u16()
+            );
+            Attempt::Transient
+        }
+        Ok(status) => {
+            eprintln!(
+                "remora-relay: push wake dropped (status {})",
+                status.as_u16()
+            );
+            Attempt::Permanent
+        }
+        // Transport failure (connect/timeout) — transient, retry once. The
+        // endpoint URL is never logged.
         Err(_) => {
             eprintln!("remora-relay: push wake delivery failed (transport)");
+            Attempt::Transient
+        }
+    }
+}
+
+/// Delivers one wake to a device-supplied endpoint under the full ADR-0023
+/// network policy: hold a global in-flight permit (drop, never queue, if none
+/// is immediately free), resolve the host ourselves, filter every resolved
+/// address against the SSRF policy, then POST to the *checked* address with the
+/// connection pinned to it. On a transient failure (DNS, connect/timeout, 5xx)
+/// it retries **once** after [`WAKE_RETRY_DELAY`], still holding the permit;
+/// non-transient failures (SSRF reject, 4xx) do not retry.
+///
+/// Returns whether the wake was ultimately delivered (a 2xx). `false` — a final
+/// failure or an unavailable permit — is the caller's signal to revoke the
+/// device's cooldown stamp so the missed wake is not suppressed (#233 F2).
+pub async fn deliver_wake(endpoint: &str, cfg: &PushConfig, permits: Arc<Semaphore>) -> bool {
+    // Bounded concurrency: take a permit immediately or drop. Queueing here
+    // would let a burst of wakes accrete unbounded tasks/sockets/DNS lookups.
+    // The permit is held for the whole delivery (resolve + connect + POST), and
+    // across the single retry below.
+    let _permit = match permits.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            eprintln!("remora-relay: push wake dropped (in_flight_full)");
+            return false;
+        }
+    };
+
+    match attempt_delivery(endpoint, cfg).await {
+        Attempt::Delivered => true,
+        Attempt::Permanent => false,
+        Attempt::Transient => {
+            // One retry after a short delay, still under the held permit.
+            tokio::time::sleep(WAKE_RETRY_DELAY).await;
+            matches!(attempt_delivery(endpoint, cfg).await, Attempt::Delivered)
         }
     }
 }
@@ -812,24 +972,67 @@ mod tests {
         assert!(decide_wake(&cfg, &mut state, bridge, did(0x02), Some(&reg), false, t1).is_ok());
     }
 
+    fn did32(fill: u32) -> DeviceId {
+        let mut b = [0u8; 32];
+        b[..4].copy_from_slice(&fill.to_be_bytes());
+        DeviceId(b)
+    }
+
     #[test]
-    fn stale_last_wake_entries_are_evicted() {
-        // A long-lived relay must not accrete one `last_wake` entry per device
-        // ever woken: entries past their cooldown are pruned on the next access.
-        let cfg = enabled(); // 30s cooldown, generous budget.
+    fn last_wake_prunes_only_once_past_the_threshold() {
+        // Pruning is deferred to the success path and only kicks in once the map
+        // has grown past the threshold (#233 F3a) — the cheap flood path never
+        // pays for it. Fill past the threshold at t0, then a single later wake
+        // (with every earlier entry now stale) sweeps them, leaving only itself.
+        let cfg = PushConfig {
+            enabled: true,
+            // Generous per-bridge budget so distinct devices all clear the gate.
+            per_bridge_per_minute: u32::MAX,
+            device_cooldown_secs: 30,
+            ..PushConfig::default()
+        };
         let mut state = PushState::default();
         let reg = valid_reg();
         let bridge = did(0xAA);
         let t0 = Instant::now();
-        for i in 0..5u8 {
-            assert!(decide_wake(&cfg, &mut state, bridge, did(i), Some(&reg), false, t0).is_ok());
+        let n = (LAST_WAKE_PRUNE_THRESHOLD + 1) as u32;
+        for i in 0..n {
+            assert!(decide_wake(&cfg, &mut state, bridge, did32(i), Some(&reg), false, t0).is_ok());
         }
-        assert_eq!(state.last_wake.len(), 5);
-        // Long past every entry's cooldown window: one new wake evicts all the
-        // now-stale entries, leaving only the fresh one.
+        // No prune yet (all stamped at t0, none stale): the map holds them all.
+        assert_eq!(state.last_wake.len(), n as usize);
+        // Long past every entry's cooldown: the next success is over-threshold,
+        // so it prunes the now-stale entries before stamping — leaving one.
         let t1 = t0 + Duration::from_secs(120);
-        assert!(decide_wake(&cfg, &mut state, bridge, did(0x99), Some(&reg), false, t1).is_ok());
+        assert!(decide_wake(&cfg, &mut state, bridge, did32(n), Some(&reg), false, t1).is_ok());
         assert_eq!(state.last_wake.len(), 1);
+    }
+
+    #[test]
+    fn revoke_wake_compare_and_clear() {
+        // A failed delivery's revoke (#233 F2) clears the stamp iff it still
+        // equals the instant that wake charged, so the next wake is admitted;
+        // a newer stamp is never clobbered by a stale revoke.
+        let cfg = enabled(); // 30s cooldown, generous budget.
+        let mut state = PushState::default();
+        let reg = valid_reg();
+        let bridge = did(0xAA);
+        let device = did(0x22);
+        let t0 = Instant::now();
+        assert!(decide_wake(&cfg, &mut state, bridge, device, Some(&reg), false, t0).is_ok());
+        // Same instant would be Cooldown; revoke the stamp, then it is admitted.
+        assert!(
+            state.revoke_wake(device, t0),
+            "the current stamp is cleared"
+        );
+        assert!(decide_wake(&cfg, &mut state, bridge, device, Some(&reg), false, t0).is_ok());
+        // A stale revoke (wrong instant) is a no-op and leaves the fresh stamp.
+        assert!(!state.revoke_wake(device, t0 - Duration::from_secs(1)));
+        assert_eq!(
+            decide_wake(&cfg, &mut state, bridge, device, Some(&reg), false, t0),
+            Err(DropReason::Cooldown),
+            "the fresh stamp survives a stale revoke"
+        );
     }
 
     // ── Delivery-half tests (SSRF policy + bounded HTTP POST, Task 7) ─────────
@@ -1000,6 +1203,64 @@ mod tests {
         );
     }
 
+    /// The special-range extensions (#233 F1): `0.0.0.0/8` and CGNAT are the
+    /// private class (denied by default, admitted with the knob); TEST-NET,
+    /// benchmarking, reserved v4, and 6to4/Teredo v6 are blocked always.
+    #[test]
+    fn special_ranges_classification() {
+        let deny = PushConfig {
+            enabled: true,
+            ..PushConfig::default()
+        };
+        let allow = PushConfig {
+            enabled: true,
+            allow_private_endpoints: true,
+            ..PushConfig::default()
+        };
+        // Blocked-always: no knob, https, ever admits them.
+        for s in [
+            "192.0.2.1",    // TEST-NET-1
+            "198.51.100.1", // TEST-NET-2
+            "203.0.113.1",  // TEST-NET-3
+            "198.18.0.1",   // benchmarking
+            "198.19.255.1",
+            "240.0.0.1", // reserved
+        ] {
+            assert_eq!(
+                filter_addrs(&[v4(s)], false, &allow),
+                Err(DropReason::PolicyInvalid),
+                "{s} must be blocked regardless of allow_private_endpoints"
+            );
+        }
+        for s in ["2002::1", "2001:0::1"] {
+            assert_eq!(
+                filter_addrs(&[v6(s)], false, &allow),
+                Err(DropReason::PolicyInvalid),
+                "{s} (tunnelled v4 embedding) must be blocked always"
+            );
+        }
+
+        // Exact 0.0.0.0 stays blocked (unspecified); the rest of 0.0.0.0/8 and
+        // CGNAT are private-class: denied by default, admitted with the knob.
+        assert_eq!(
+            filter_addrs(&[v4("0.0.0.0")], false, &allow),
+            Err(DropReason::PolicyInvalid),
+            "0.0.0.0 is unspecified — blocked even with the knob"
+        );
+        for s in ["0.0.0.1", "100.64.0.1", "100.127.255.254"] {
+            assert_eq!(
+                filter_addrs(&[v4(s)], false, &deny),
+                Err(DropReason::PolicyInvalid),
+                "{s} is private-class — denied by default"
+            );
+            assert_eq!(
+                filter_addrs(&[v4(s)], false, &allow),
+                Ok(vec![v4(s)]),
+                "{s} is private-class — admitted with allow_private_endpoints"
+            );
+        }
+    }
+
     /// Reads one HTTP/1.1 request off `sock` (method + body), then replies with
     /// the given raw response. Minimal, test-only parse — no framework dep.
     async fn serve_one(sock: &mut TcpStream, response: &[u8]) -> (String, String) {
@@ -1087,6 +1348,76 @@ mod tests {
         // A redirect must not spawn a second request.
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(count.load(SeqCst), 1, "301 must not be followed");
+    }
+
+    /// A transient 5xx is retried exactly once (#233 F2a): a listener that
+    /// answers `500` then `200` receives exactly two requests, and the wake is
+    /// reported delivered. (Real 5s retry delay — hence the single retry.)
+    #[tokio::test]
+    async fn transient_failure_retries_once_then_succeeds() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_srv = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.expect("accept");
+                let n = count_srv.fetch_add(1, SeqCst);
+                // First request 500 (transient), second 200.
+                let response: &[u8] = if n == 0 {
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                };
+                tokio::spawn(async move {
+                    let _ = serve_one(&mut sock, response).await;
+                });
+            }
+        });
+
+        let endpoint = format!("http://127.0.0.1:{}/", addr.port());
+        let delivered =
+            deliver_wake(&endpoint, &allow_all_cfg(), Arc::new(Semaphore::new(4))).await;
+        assert!(delivered, "the retry's 200 counts as delivered");
+        assert_eq!(
+            count.load(SeqCst),
+            2,
+            "one 500 then one 200 — exactly two requests"
+        );
+    }
+
+    /// A non-transient 4xx is not retried (#233 F2a): a listener that answers
+    /// `404` receives exactly one request, and the wake is reported failed.
+    #[tokio::test]
+    async fn non_transient_failure_is_not_retried() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_srv = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.expect("accept");
+                count_srv.fetch_add(1, SeqCst);
+                tokio::spawn(async move {
+                    let _ = serve_one(
+                        &mut sock,
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await;
+                });
+            }
+        });
+
+        let endpoint = format!("http://127.0.0.1:{}/", addr.port());
+        let delivered =
+            deliver_wake(&endpoint, &allow_all_cfg(), Arc::new(Semaphore::new(4))).await;
+        assert!(!delivered, "a 4xx is a final failure");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(count.load(SeqCst), 1, "a 4xx is never retried");
     }
 
     /// The global semaphore caps simultaneously-connected deliveries: 8 wakes,

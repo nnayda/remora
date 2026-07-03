@@ -186,8 +186,15 @@ pub enum PushDecision {
     /// server closes the **sender** with `CloseReason::Protocol`.
     NotAsserted,
     /// A wake should be delivered to this endpoint URL. The server hands it to
-    /// the delivery seam (Task 7) and the sender continues.
-    Deliver(String),
+    /// the delivery seam (Task 7) and the sender continues. `device_id` and
+    /// `stamped` (the instant this wake charged the cooldown) let the delivery
+    /// task compare-and-clear the stamp if delivery ultimately fails, so a
+    /// missed wake is not suppressed by its own cooldown (#233 F2).
+    Deliver {
+        endpoint: String,
+        device_id: DeviceId,
+        stamped: std::time::Instant,
+    },
     /// The wake was dropped for this policy reason — never a protocol
     /// violation; the sender continues. Counted/logged for observability.
     Drop(DropReason),
@@ -550,9 +557,25 @@ impl Router {
             dst_connected,
             now,
         ) {
-            Ok(endpoint) => PushDecision::Deliver(endpoint),
+            // `now` is exactly the instant `decide_wake` stamped into the
+            // cooldown, so it is the compare key a later revoke uses.
+            Ok(endpoint) => PushDecision::Deliver {
+                endpoint,
+                device_id: dst,
+                stamped: now,
+            },
             Err(reason) => PushDecision::Drop(reason),
         }
+    }
+
+    /// Compare-and-clears the cooldown stamp for `device` if it still equals
+    /// `stamped` (#233 F2). Called by a delivery task when the wake ultimately
+    /// failed to reach the phone, so the missed wake is not suppressed for the
+    /// full cooldown; a newer legitimate wake's stamp differs and is untouched.
+    /// Takes the router lock briefly and never holds it across an `.await`.
+    pub fn revoke_wake_stamp(&self, device: DeviceId, stamped: std::time::Instant) {
+        let mut state = self.lock();
+        state.push_state.revoke_wake(device, stamped);
     }
 
     /// Routes one decoded `Data` envelope from a registered connection.
@@ -1526,7 +1549,7 @@ mod tests {
         // dst asserted, valid endpoint, not connected, push enabled → deliver.
         let out = router.decide_push_wake_at(&bridge, did(DEVICE), std::time::Instant::now());
         match out {
-            PushDecision::Deliver(endpoint) => assert_eq!(endpoint, "https://ntfy.sh/topic"),
+            PushDecision::Deliver { endpoint, .. } => assert_eq!(endpoint, "https://ntfy.sh/topic"),
             other => panic!("expected Deliver, got {other:?}"),
         }
     }
@@ -1545,7 +1568,7 @@ mod tests {
         // First wake delivers and stamps the device cooldown.
         assert!(matches!(
             router.decide_push_wake_at(&bridge, did(DEVICE), t0),
-            PushDecision::Deliver(_)
+            PushDecision::Deliver { .. }
         ));
         // Re-assert the SAME device: this replaces the bridge's stored
         // registration but MUST NOT reset the surviving cooldown.
@@ -1558,6 +1581,65 @@ mod tests {
         // A wake at the same instant is still inside the cooldown window.
         assert!(matches!(
             router.decide_push_wake_at(&bridge, did(DEVICE), t0),
+            PushDecision::Drop(DropReason::Cooldown)
+        ));
+    }
+
+    #[tokio::test]
+    async fn revoke_wake_stamp_reopens_cooldown_for_a_failed_delivery() {
+        // A delivery that ultimately failed revokes its cooldown stamp, so a
+        // subsequent decision for the same device — even at the same instant —
+        // is admitted again rather than suppressed by a wake that never landed.
+        let router = Router::new(config_push_enabled());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![asserted_with_push(DEVICE, "https://ntfy.sh/topic")],
+        );
+        let t0 = std::time::Instant::now();
+        let stamped = match router.decide_push_wake_at(&bridge, did(DEVICE), t0) {
+            PushDecision::Deliver { stamped, .. } => stamped,
+            other => panic!("expected Deliver, got {other:?}"),
+        };
+        // Without a revoke, the same instant would be Cooldown; after the revoke
+        // the stamp is gone and the wake is admitted again.
+        router.revoke_wake_stamp(did(DEVICE), stamped);
+        assert!(matches!(
+            router.decide_push_wake_at(&bridge, did(DEVICE), t0),
+            PushDecision::Deliver { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn revoke_wake_stamp_never_clobbers_a_newer_stamp() {
+        // A late revoke from an old, failed delivery must not clear a newer
+        // legitimate wake's stamp (compare-and-clear on the exact instant).
+        let router = Router::new(config_push_enabled());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![asserted_with_push(DEVICE, "https://ntfy.sh/topic")],
+        );
+        let t0 = std::time::Instant::now();
+        let stamped_old = match router.decide_push_wake_at(&bridge, did(DEVICE), t0) {
+            PushDecision::Deliver { stamped, .. } => stamped,
+            other => panic!("expected Deliver, got {other:?}"),
+        };
+        // Past the cooldown, a fresh wake stamps a *newer* instant.
+        let t2 = t0 + std::time::Duration::from_secs(31);
+        assert!(matches!(
+            router.decide_push_wake_at(&bridge, did(DEVICE), t2),
+            PushDecision::Deliver { .. }
+        ));
+        // A late revoke of the OLD stamp is a no-op: the newer stamp survives,
+        // so a wake at t2 is still suppressed by cooldown.
+        router.revoke_wake_stamp(did(DEVICE), stamped_old);
+        assert!(matches!(
+            router.decide_push_wake_at(&bridge, did(DEVICE), t2),
             PushDecision::Drop(DropReason::Cooldown)
         ));
     }
