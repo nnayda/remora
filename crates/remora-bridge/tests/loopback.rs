@@ -214,6 +214,7 @@ impl Harness {
             name: "loopback test device".to_string(),
             enrolled_at: None,
             last_connected_at: None,
+            push: None,
         });
         // Provision against a placeholder URL; the real one is stamped in once
         // the relay's ephemeral port is known.

@@ -254,7 +254,7 @@ fn assert_devices_msg(id: u32, roster: &Roster) -> RelayControl {
             .map(|e| AssertedDevice {
                 device_id: e.device_id,
                 token: device_token_for(e),
-                push: None,
+                push: e.push.clone(),
             })
             .collect(),
     }
@@ -1293,6 +1293,7 @@ async fn run_pairing(
         name: name.clone(),
         enrolled_at: Some(now_secs()),
         last_connected_at: None,
+        push: None,
     };
 
     // Assert-before-grant (ADR-0021 D3): the relay must credential the pending
@@ -1307,13 +1308,13 @@ async fn run_pairing(
             .map(|e| AssertedDevice {
                 device_id: e.device_id,
                 token: device_token_for(e),
-                push: None,
+                push: e.push.clone(),
             })
             .collect();
         devices.push(AssertedDevice {
             device_id,
             token: relay_token.clone(),
-            push: None,
+            push: entry.push.clone(),
         });
         RelayControl::AssertDevices {
             id: next_control_id(control_seq.as_ref()),
@@ -2431,6 +2432,7 @@ fn jittered(base: Duration, rng: &mut impl rand::RngExt) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remora_protocol::PushRegistration;
 
     #[test]
     fn device_info_projection_marks_self() {
@@ -2444,6 +2446,7 @@ mod tests {
                     enrolled_at: Some(1),
                     last_connected_at: None,
                     relay_token: "t".into(),
+                    push: None,
                 },
                 RosterEntry {
                     device_id: DeviceId([0x22; 32]),
@@ -2453,6 +2456,7 @@ mod tests {
                     enrolled_at: Some(2),
                     last_connected_at: Some(9),
                     relay_token: "u".into(),
+                    push: None,
                 },
             ],
         };
@@ -2473,6 +2477,7 @@ mod tests {
             enrolled_at: None,
             last_connected_at: None,
             relay_token: "tok".to_string(),
+            push: None,
         }
     }
 
@@ -2568,24 +2573,48 @@ mod tests {
     #[test]
     fn assert_devices_msg_maps_roster() {
         // The AssertDevices payload mirrors the roster one-for-one: each entry's
-        // device id and its stored `relay_token` become one `AssertedDevice`.
+        // device id, its stored `relay_token`, and its `push` registration
+        // become one `AssertedDevice`.
         let roster = Roster {
-            entries: vec![RosterEntry {
-                device_id: DeviceId([0x11; 32]),
-                static_pubkey: vec![0xaa; 32],
-                psk: [0xbb; 32],
-                name: "iPhone".to_string(),
-                enrolled_at: None,
-                last_connected_at: None,
-                relay_token: "tok-abc".to_string(),
-            }],
+            entries: vec![
+                RosterEntry {
+                    device_id: DeviceId([0x11; 32]),
+                    static_pubkey: vec![0xaa; 32],
+                    psk: [0xbb; 32],
+                    name: "iPhone".to_string(),
+                    enrolled_at: None,
+                    last_connected_at: None,
+                    relay_token: "tok-abc".to_string(),
+                    push: Some(PushRegistration::UnifiedPush {
+                        endpoint: "https://ntfy.sh/topic".to_string(),
+                    }),
+                },
+                RosterEntry {
+                    device_id: DeviceId([0x22; 32]),
+                    static_pubkey: vec![0xcc; 32],
+                    psk: [0xdd; 32],
+                    name: "laptop".to_string(),
+                    enrolled_at: None,
+                    last_connected_at: None,
+                    relay_token: "tok-def".to_string(),
+                    push: None,
+                },
+            ],
         };
         match assert_devices_msg(7, &roster) {
             RelayControl::AssertDevices { id, devices } => {
                 assert_eq!(id, 7);
-                assert_eq!(devices.len(), 1);
+                assert_eq!(devices.len(), 2);
                 assert_eq!(devices[0].device_id, DeviceId([0x11; 32]));
                 assert_eq!(devices[0].token, "tok-abc");
+                assert_eq!(
+                    devices[0].push,
+                    Some(PushRegistration::UnifiedPush {
+                        endpoint: "https://ntfy.sh/topic".to_string(),
+                    }),
+                    "the entry's push registration maps through"
+                );
+                assert_eq!(devices[1].push, None, "no push registration stays None");
             }
             other => panic!("expected AssertDevices, got {other:?}"),
         }
@@ -2830,6 +2859,7 @@ mod tests {
                 enrolled_at: None,
                 last_connected_at: None,
                 relay_token: "t".to_string(),
+                push: None,
             }],
         };
         // A pending device claiming the same id must be refused.

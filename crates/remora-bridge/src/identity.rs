@@ -20,7 +20,7 @@ use blake2::{Blake2s256, Digest as _};
 use rand::TryRng as _;
 use serde::{Deserialize, Serialize};
 
-use remora_protocol::DeviceId;
+use remora_protocol::{DeviceId, PushRegistration};
 
 /// Noise pattern the bridge and its clients speak. The bridge is the responder
 /// with a known static key; `psk2` binds each session to the paired device's
@@ -277,6 +277,10 @@ pub struct RosterEntry {
     /// Unix seconds of the device's most recent successful session (updated
     /// on session establish so ghost/re-paired entries are self-evident).
     pub last_connected_at: Option<u64>,
+    /// The device's registered push-wake channel (ADR-0023), if any. Set via
+    /// `RemoteOp::RegisterPushEndpoint` (Task 4); a freshly enrolled device
+    /// starts with `None`.
+    pub push: Option<PushRegistration>,
 }
 
 /// The set of devices paired with this bridge.
@@ -290,8 +294,8 @@ pub struct Roster {
 ///
 /// `relay_token` is a credential: not `#[serde(default)]`, so a roster entry
 /// missing it is a corrupt roster, not a partial one. `name`, `enrolled_at`,
-/// and `last_connected_at` are display metadata and are defaulted, so an
-/// older roster file (or a hand-edited one) still loads.
+/// `last_connected_at`, and `push` are display/optional metadata and are
+/// defaulted, so an older roster file (or a hand-edited one) still loads.
 #[derive(Serialize, Deserialize)]
 struct RosterEntryFile {
     device_id: String,
@@ -304,6 +308,8 @@ struct RosterEntryFile {
     enrolled_at: Option<u64>,
     #[serde(default)]
     last_connected_at: Option<u64>,
+    #[serde(default)]
+    push: Option<PushRegistration>,
 }
 
 /// On-disk shape of a [`Roster`].
@@ -344,6 +350,7 @@ impl Roster {
                 name: e.name,
                 enrolled_at: e.enrolled_at,
                 last_connected_at: e.last_connected_at,
+                push: e.push,
             });
         }
         Ok(Roster { entries })
@@ -363,6 +370,7 @@ impl Roster {
                     name: e.name.clone(),
                     enrolled_at: e.enrolled_at,
                     last_connected_at: e.last_connected_at,
+                    push: e.push.clone(),
                 })
                 .collect(),
         };
@@ -609,6 +617,9 @@ mod tests {
                     enrolled_at: Some(1_765_000_000),
                     last_connected_at: Some(1_765_100_000),
                     relay_token: "relay-tok-1".to_string(),
+                    push: Some(PushRegistration::UnifiedPush {
+                        endpoint: "https://ntfy.sh/topic".to_string(),
+                    }),
                 },
                 RosterEntry {
                     device_id: DeviceId([0x22; 32]),
@@ -618,6 +629,7 @@ mod tests {
                     enrolled_at: None,
                     last_connected_at: None,
                     relay_token: "relay-tok-2".to_string(),
+                    push: None,
                 },
             ],
         };
@@ -631,7 +643,40 @@ mod tests {
             .find_by_device(&DeviceId([0x22; 32]))
             .expect("find second device");
         assert_eq!(found.psk, [0xdd; 32]);
+        assert_eq!(found.push, None);
+        let with_push = loaded
+            .find_by_device(&DeviceId([0x11; 32]))
+            .expect("find first device");
+        assert_eq!(
+            with_push.push,
+            Some(PushRegistration::UnifiedPush {
+                endpoint: "https://ntfy.sh/topic".to_string(),
+            })
+        );
         assert!(loaded.find_by_device(&DeviceId([0x99; 32])).is_none());
+    }
+
+    #[test]
+    fn roster_entry_without_push_field_loads_as_none() {
+        // Old on-disk roster files predate `push`; `#[serde(default)]` on
+        // `RosterEntryFile::push` means a hand-written entry missing the
+        // field still loads, with the device treated as unregistered for
+        // push (not a corrupt-roster error).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("roster.toml");
+        let text = format!(
+            "[[entry]]\ndevice_id = \"{}\"\nstatic_pubkey = \"{}\"\npsk = \"{}\"\nrelay_token = \"tok-old\"\nname = \"oldphone\"\n",
+            DeviceId([0x33; 32]),
+            B64.encode([0xaa; 32]),
+            B64.encode([0xbb; 32]),
+        );
+        std::fs::write(&path, text).expect("write old-format roster");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("set mode");
+
+        let loaded = Roster::load(&path).expect("load old-format roster");
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].push, None);
+        assert_eq!(loaded.entries[0].name, "oldphone");
     }
 
     #[test]
@@ -660,6 +705,7 @@ mod tests {
                 enrolled_at: Some(1_765_500_000),
                 last_connected_at: None,
                 relay_token: "tok-abc".to_string(),
+                push: None,
             }],
         };
         roster.save(&path).expect("save");
@@ -679,6 +725,7 @@ mod tests {
                 enrolled_at: None,
                 last_connected_at: None,
                 relay_token: "t".to_string(),
+                push: None,
             }],
         };
         assert!(roster.contains_device(&DeviceId([0x11; 32])));
