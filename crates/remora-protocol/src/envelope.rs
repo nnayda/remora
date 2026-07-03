@@ -26,6 +26,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::push::PushRegistration;
+
 /// Version of the envelope wire format defined by this module.
 pub const ENVELOPE_VERSION: u8 = 1;
 
@@ -133,19 +135,21 @@ impl From<DeviceId> for String {
 }
 
 /// Envelope frame kind (ADR-0021). The relay dispatches on this byte without
-/// touching the payload; `Pairing` and `PushTrigger` frames are reserved for
-/// the pairing and push follow-ups (#232, #233) — this codec accepts and
-/// round-trips them, but nothing in this crate constructs or interprets one
-/// yet.
+/// touching the payload. `Pairing` (#232) and `PushTrigger` (#233, ADR-0023)
+/// both now carry real, constructed-and-interpreted traffic — this crate is
+/// not merely round-tripping them as reserved bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameType {
     /// Hello/auth frame: a device or bridge introducing itself to the relay.
     Hello = 0,
     /// Opaque session-protocol payload (Noise ciphertext in practice).
     Data = 1,
-    /// Reserved for the pairing follow-up (#232).
+    /// Device pairing frame (ADR-0021, #232): the split-secret enrollment
+    /// ceremony between a joining device and its bridge.
     Pairing = 2,
-    /// Reserved for the push-notification follow-up (#233).
+    /// Bridge→relay push-wake request (ADR-0023, #233): empty-payload,
+    /// asking the relay to decide whether a registered device needs a
+    /// UnifiedPush wake. Only a bridge may send one.
     PushTrigger = 3,
     /// Bridge→relay control plane (ADR-0021 D4): pairing-window lifecycle and
     /// device-credential assertion. Relay-visible JSON like [`RelayHello`]; only
@@ -323,6 +327,12 @@ pub enum RelayControl {
 pub struct AssertedDevice {
     pub device_id: DeviceId,
     pub token: String,
+    /// The device's registered push-wake channel (ADR-0023), if any.
+    /// `#[serde(default)]` so pre-v4 asserts encoded without this field
+    /// still decode, with the device treated as having no push
+    /// registration.
+    #[serde(default)]
+    pub push: Option<PushRegistration>,
 }
 
 /// Relay→bridge acknowledgement of a [`RelayControl`] with matching `id`.
@@ -520,11 +530,32 @@ mod tests {
             devices: vec![AssertedDevice {
                 device_id: DeviceId([0x22; 32]),
                 token: "dev-tok".to_string(),
+                push: None,
             }],
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: RelayControl = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn asserted_device_push_defaults_absent() {
+        let hex = "11".repeat(32);
+        let old_shape = format!(r#"{{"device_id":"{hex}","token":"t"}}"#);
+        let decoded: AssertedDevice =
+            serde_json::from_str(&old_shape).expect("decode old (pre-push) shape");
+        assert_eq!(decoded.push, None);
+
+        let with_push = AssertedDevice {
+            device_id: DeviceId([0x11; 32]),
+            token: "t".to_string(),
+            push: Some(PushRegistration::UnifiedPush {
+                endpoint: "https://ntfy.sh/topic".to_string(),
+            }),
+        };
+        let json = serde_json::to_string(&with_push).expect("serialize");
+        let back: AssertedDevice = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, with_push);
     }
 
     #[test]

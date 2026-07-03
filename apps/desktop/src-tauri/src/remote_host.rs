@@ -38,13 +38,13 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use remora_bridge::{
-    run_pairing, serve_bridge, BridgeConfig, BridgeEvent, BridgeIdentity, PairingCommand,
-    PairingFile, PairingProgress, RemoteSource, Roster,
+    run_pairing, serve_bridge, wake_channel, BridgeConfig, BridgeEvent, BridgeIdentity,
+    BridgeWakeHandle, PairingCommand, PairingFile, PairingProgress, RemoteSource, Roster,
 };
 use remora_core::config::{Config, ConfigError};
 use remora_core::{SessionChannel, SessionSource, SourceError};
 use remora_protocol::{AgentId, ProjectId, SessionId, SessionMeta, SpawnSpec};
-use remora_relay::{serve, AuditSink, BridgeEntry, RelayConfig};
+use remora_relay::{serve, AuditSink, BridgeEntry, PushConfig, RelayConfig};
 
 use crate::bridge::resolve::SourceResolver;
 use crate::bridge::Bridge;
@@ -72,6 +72,12 @@ fn loopback_enabled_value(value: Option<&str>) -> bool {
 pub struct RemoteHost {
     /// The client transport the Bridge's `attach` routes through.
     pub remote: Arc<dyn SessionSource>,
+    /// Cheap, cloneable handle the desktop's output pump tees session status
+    /// transitions into, so a session driven through the loopback can push-wake
+    /// the (self) device over the in-process relay (#233). Held here so the
+    /// wake channel stays open for the loopback's life; `lib.rs` clones it into
+    /// the Bridge via `set_wake_handle`.
+    pub wake: BridgeWakeHandle,
     shutdown: CancellationToken,
     bridge_task: JoinHandle<()>,
     relay_accept: JoinHandle<()>,
@@ -92,8 +98,10 @@ impl RemoteHost {
     /// Bridge routing test inject a `RemoteHost` without standing up a relay.
     #[cfg(test)]
     pub(crate) fn stub_for_test(remote: Arc<dyn SessionSource>) -> RemoteHost {
+        let (wake, _wake_rx) = wake_channel();
         RemoteHost {
             remote,
+            wake,
             shutdown: CancellationToken::new(),
             bridge_task: tokio::spawn(async {}),
             relay_accept: tokio::spawn(async {}),
@@ -131,6 +139,11 @@ pub async fn start_loopback(
     let registration_token = random_token();
     let bridge_id = identity.device_id;
 
+    // If `[relay] push_wake_url` is configured, the client half registers it with
+    // the bridge on connect (ADR-0023, #233) — dogfooding the whole client-side
+    // registration path over the in-process relay. Absent → registration off.
+    let push_endpoint = load_push_wake_url(&config_path);
+
     let relay_cfg = Arc::new(RelayConfig {
         listen: "127.0.0.1:0".to_string(),
         bridges: vec![BridgeEntry {
@@ -141,6 +154,20 @@ pub async fn start_loopback(
         handshake_timeout_secs: 10,
         max_connections: 1024,
         audit: None,
+        // Enable in-process relay delivery when a push endpoint is configured, so
+        // `REMORA_REMOTE_LOOPBACK=1` + `[relay] push_wake_url` dogfoods a real
+        // end-to-end POST (spec Goal 5, ADR-0023). ntfy.sh is public https, so the
+        // default network policy (no http, no private targets) suffices.
+        //
+        // M3 dogfooder note (#233): a session ATTACHED through the loopback keeps
+        // the self-device in the relay's `live_peers` (it is dialed in), so the
+        // wake is *dropped as connected* for that session. Only a *direct*-spawned
+        // session can demo a delivered wake — and the loopback's hybrid routing
+        // keeps `spawn` on the direct path, so that is the default. Registration
+        // happens on the client's dial, so attach through the loopback at least
+        // once first to register the endpoint, then drive a direct-spawned session
+        // to `Awaiting` to see the POST.
+        push: loopback_push_config(push_endpoint.as_deref()),
     });
     let audit = AuditSink::new(&relay_cfg)?;
     let (addr, relay_accept) = serve(relay_cfg, audit).await?;
@@ -166,9 +193,23 @@ pub async fn start_loopback(
     // command branch) — no further commands are issued in loopback mode.
     let (commands_tx, commands_rx) = tokio::sync::mpsc::channel::<PairingCommand>(8);
     let (events_tx, events_rx) = tokio::sync::mpsc::channel::<BridgeEvent>(8);
+    // Keep the wake handle (#233): `lib.rs` clones it into the Bridge via
+    // `set_wake_handle` so the output pump tees session status transitions into
+    // this loopback's push path — the in-process relay then delivers the wake
+    // when a push endpoint is configured (see `loopback_push_config` above).
+    let (wake, wake_rx) = wake_channel();
     let shutdown_c = shutdown.clone();
     let bridge_task = tokio::spawn(async move {
-        if let Err(e) = serve_bridge(bridge_cfg, source, commands_rx, events_tx, shutdown_c).await {
+        if let Err(e) = serve_bridge(
+            bridge_cfg,
+            source,
+            commands_rx,
+            events_tx,
+            wake_rx,
+            shutdown_c,
+        )
+        .await
+        {
             eprintln!("loopback bridge stopped: {e}");
         }
     });
@@ -178,11 +219,33 @@ pub async fn start_loopback(
     let pairing = drive_loopback_pairing(commands_tx, events_rx).await?;
 
     Ok(RemoteHost {
-        remote: Arc::new(RemoteSource::new(pairing)),
+        remote: Arc::new(RemoteSource::new(pairing).with_push_endpoint(push_endpoint)),
+        wake,
         shutdown,
         bridge_task,
         relay_accept,
     })
+}
+
+/// Builds the in-process relay's [`PushConfig`] for the dev loopback: delivery is
+/// enabled exactly when a `[relay] push_wake_url` is configured, so the loopback
+/// dogfoods a real end-to-end POST without a separate config step (ADR-0023,
+/// #233). Everything else keeps the default policy (ntfy.sh is public https).
+fn loopback_push_config(push_endpoint: Option<&str>) -> PushConfig {
+    PushConfig {
+        enabled: push_endpoint.is_some(),
+        ..Default::default()
+    }
+}
+
+/// Reads `[relay] push_wake_url` from the config at `config_path`, tolerating a
+/// missing/unreadable/invalid file (a fresh device is valid; a config problem is
+/// already surfaced elsewhere) by yielding `None` — registration simply stays off.
+fn load_push_wake_url(config_path: &std::path::Path) -> Option<String> {
+    Config::load(config_path)
+        .ok()
+        .and_then(|c| c.relay)
+        .and_then(|r| r.push_wake_url)
 }
 
 /// Drives the ADR-0021 pairing ceremony against this run's freshly-served bridge
@@ -406,6 +469,22 @@ mod tests {
         assert!(!loopback_enabled_value(Some("true")));
         assert!(!loopback_enabled_value(Some(" 1")));
         assert!(!loopback_enabled_value(None));
+    }
+
+    #[test]
+    fn loopback_push_enabled_reflects_endpoint_presence() {
+        // A configured push endpoint enables in-process relay delivery so the
+        // loopback can dogfood a real POST (#233); absent leaves it disabled.
+        assert!(loopback_push_config(Some("https://ntfy.sh/remora-demo")).enabled);
+        assert!(!loopback_push_config(None).enabled);
+        // Everything else stays at the default policy.
+        assert_eq!(
+            PushConfig {
+                enabled: false,
+                ..loopback_push_config(Some("https://ntfy.sh/remora-demo"))
+            },
+            PushConfig::default(),
+        );
     }
 
     #[test]

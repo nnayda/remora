@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 futures-util = { workspace = true }
 remora-protocol = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 subtle = { workspace = true }

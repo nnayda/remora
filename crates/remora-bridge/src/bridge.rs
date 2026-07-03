@@ -42,11 +42,11 @@
 //! the same routing id (a newer task) is never evicted by an older task's stale
 //! done-signal.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use futures_util::stream::Stream;
@@ -59,14 +59,16 @@ use tokio_util::sync::CancellationToken;
 
 use remora_core::{sanitize, SessionSource};
 use remora_protocol::{
-    AssertedDevice, BridgeMessage, ChannelInput, ChannelOutput, ClientMessage, DeviceId,
-    DeviceInfo, Envelope, FrameType, HelloRole, PairingBridgeMsg, PairingClientMsg, PairingCode,
-    PairingRejectReason, RelayControl, RelayControlAck, RelayControlError, RelayHello, RemoteOp,
-    RemoteResult, WireError, PROTOCOL_VERSION,
+    validate_push_endpoint, AssertedDevice, BridgeMessage, ChannelInput, ChannelOutput,
+    ClientMessage, DeviceId, DeviceInfo, Envelope, FrameType, HelloRole, PairingBridgeMsg,
+    PairingClientMsg, PairingCode, PairingRejectReason, ProjectId, PushRegistration, RelayControl,
+    RelayControlAck, RelayControlError, RelayHello, RemoteOp, RemoteResult, SessionId,
+    SessionStatus, WireError, PROTOCOL_VERSION,
 };
 
 use crate::identity::{fingerprint, BridgeIdentity, IdentityError, Roster, RosterEntry};
 use crate::noise::{chunk_bytes, prologue, Handshake, HandshakeKind, Transport};
+use crate::wake::{wake_targets, EpisodeKey, WakeEpisodes};
 use crate::wire_error::map_source_error;
 
 /// Standard-base64 engine for the per-pair session PSK the bridge grants a
@@ -114,6 +116,99 @@ const PEER_FRAME_QUEUE: usize = 256;
 
 /// Depth of a peer's internal PTY-event queue (pump task → peer task).
 const PEER_EVENT_QUEUE: usize = 256;
+
+/// Depth of the wake-note queue (host session pump → bridge task, #233). Small
+/// and bounded: the wake path is best-effort, so a burst that overflows this is
+/// dropped rather than allowed to back-pressure the session path.
+const WAKE_QUEUE: usize = 64;
+
+/// Number of concurrently-open `Awaiting` episodes the bridge remembers for
+/// wake de-duplication (#233). Comfortably exceeds any realistic count of
+/// simultaneously-attended sessions; overflow simply forgets the oldest, whose
+/// next `Awaiting` re-wakes.
+const WAKE_EPISODE_CAP: usize = 256;
+
+/// Oldest age a queued `Awaiting` [`WakeNote`] may have and still be allowed to
+/// open an episode / fire a `PushTrigger` (#233 stale-wake fix).
+///
+/// The wake channel's [`WakeReceiver`] survives relay reconnects, and its
+/// sender (`try_send`) never blocks — so while the relay is down, notes pile
+/// up in the bounded queue (capacity [`WAKE_QUEUE`]) instead of being dropped.
+/// On reconnect they replay in FIFO order. Without this guard, an `Awaiting`
+/// note stamped minutes ago (before the outage) would still open a fresh
+/// episode and push a device *after* the session had already been resolved
+/// (attended, closed, or replaced) during the outage. Discarding a stale
+/// `Awaiting` note is safe: it opens no episode, so a later repaint/re-attach
+/// re-emission will note the session again if it is genuinely still awaiting.
+/// Non-`Awaiting` notes are never discarded for staleness — closing an episode
+/// is always safe and keeps de-dup state honest regardless of age.
+const STALE_WAKE_MAX: Duration = Duration::from_secs(60);
+
+/// A session status change routed from the host's channel-output pump (#233)
+/// into the bridge task, where it is de-duplicated into wake episodes and, on
+/// an opening `Awaiting` edge, fanned out as `PushTrigger` frames.
+struct WakeNote {
+    /// The session whose status changed.
+    key: EpisodeKey,
+    /// Its new status.
+    status: SessionStatus,
+    /// When this note was queued ([`BridgeWakeHandle::note_session_status`]
+    /// send time), used to discard stale replayed `Awaiting` notes after a
+    /// relay reconnect (see [`STALE_WAKE_MAX`]).
+    at: Instant,
+}
+
+/// The receiver half of the wake channel, handed to [`serve_bridge`]. Opaque so
+/// the internal [`WakeNote`] shape stays private to this crate's bridge task.
+pub struct WakeReceiver(mpsc::Receiver<WakeNote>);
+
+/// A cheap, cloneable handle the host uses to tell the bridge a session changed
+/// status (#233), driving the wake path without ever blocking or erroring the
+/// session it observes.
+///
+/// Obtain one with [`wake_channel`]; hand the paired [`WakeReceiver`] to
+/// [`serve_bridge`]. [`note_session_status`](Self::note_session_status) is
+/// non-blocking and callable from sync contexts, so the channel-output pump can
+/// call it inline.
+#[derive(Clone)]
+pub struct BridgeWakeHandle {
+    tx: mpsc::Sender<WakeNote>,
+}
+
+impl BridgeWakeHandle {
+    /// Records that `(project_id, session_id)` moved to `status`.
+    ///
+    /// Non-blocking and infallible to the caller: it `try_send`s onto a bounded
+    /// queue and drops the note if the queue is full or the bridge task has
+    /// stopped. The wake path is best-effort by design (ADR-0023) — a dropped
+    /// note at worst misses one push, and must never block or fail the session
+    /// path that produced it.
+    pub fn note_session_status(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        status: SessionStatus,
+    ) {
+        let note = WakeNote {
+            key: (project_id.clone(), session_id.clone()),
+            status,
+            at: Instant::now(),
+        };
+        // Drop on a full queue (64 unhandled notes) or a stopped bridge. There
+        // is no logging framework in this crate; the drop is intentional and
+        // silent, matching the crate's fire-and-forget convention (a full queue
+        // means the bridge is far behind on wakes, and the next status change
+        // supersedes this one anyway).
+        let _ = self.tx.try_send(note);
+    }
+}
+
+/// Creates the wake channel: the [`BridgeWakeHandle`] the host keeps and calls,
+/// and the [`WakeReceiver`] it hands to [`serve_bridge`].
+pub fn wake_channel() -> (BridgeWakeHandle, WakeReceiver) {
+    let (tx, rx) = mpsc::channel::<WakeNote>(WAKE_QUEUE);
+    (BridgeWakeHandle { tx }, WakeReceiver(rx))
+}
 
 /// How long a peer may take to send its E2E [`ClientMessage::Hello`] after the
 /// Noise handshake completes. A paired client that finishes the handshake then
@@ -254,6 +349,7 @@ fn assert_devices_msg(id: u32, roster: &Roster) -> RelayControl {
             .map(|e| AssertedDevice {
                 device_id: e.device_id,
                 token: device_token_for(e),
+                push: e.push.clone(),
             })
             .collect(),
     }
@@ -298,6 +394,13 @@ struct PeerDeps {
     /// for this bridge process so two sessions (even on different connections)
     /// never collide on a slot key.
     next_peer_reg: AtomicU64,
+    /// Wake-episode tracker (#233), shared so the connection loop can note
+    /// status changes (opening `Awaiting` episodes → fan out `PushTrigger`s) and
+    /// a peer task can [`forget`](WakeEpisodes::forget) a session's episode when
+    /// its attached channel is torn down. Behind a plain [`Mutex`] because
+    /// [`WakeEpisodes`] is pure/sync; locks are brief and never held across an
+    /// `.await`.
+    episodes: Arc<Mutex<WakeEpisodes>>,
 }
 
 /// Deregisters a peer's [`LivePeers`] slot when the peer task returns, for any
@@ -596,6 +699,7 @@ pub async fn serve_bridge(
     source: Arc<dyn SessionSource>,
     mut commands: mpsc::Receiver<PairingCommand>,
     events: mpsc::Sender<BridgeEvent>,
+    wake: WakeReceiver,
     shutdown: CancellationToken,
 ) -> Result<(), BridgeServeError> {
     if !is_ws_url(&config.relay_url) {
@@ -612,7 +716,12 @@ pub async fn serve_bridge(
         source,
         live_peers: Arc::new(Mutex::new(HashMap::new())),
         next_peer_reg: AtomicU64::new(0),
+        episodes: Arc::new(Mutex::new(WakeEpisodes::new(WAKE_EPISODE_CAP))),
     });
+
+    // The wake-note receiver, owned here so episode state survives relay
+    // reconnects: a session still `Awaiting` across a reconnect is not re-woken.
+    let mut wake = wake.0;
 
     // Correlation ids for relay control requests, monotonic across reconnects so
     // a late reply from a dropped connection can never be mistaken for a fresh
@@ -631,6 +740,7 @@ pub async fn serve_bridge(
             &control_seq,
             &mut commands,
             &events,
+            &mut wake,
             &shutdown,
         )
         .await
@@ -664,6 +774,7 @@ async fn run_connection(
     control_seq: &Arc<AtomicU32>,
     commands: &mut mpsc::Receiver<PairingCommand>,
     events: &mpsc::Sender<BridgeEvent>,
+    wake: &mut mpsc::Receiver<WakeNote>,
     shutdown: &CancellationToken,
 ) -> ConnOutcome {
     let ws = match connect_async(&config.relay_url).await {
@@ -765,6 +876,9 @@ async fn run_connection(
     // Once the command channel closes (the desktop dropped its sender) we stop
     // selecting on it so a closed channel does not spin the loop.
     let mut commands_open = true;
+    // Same for the wake-note channel: once the host drops its `BridgeWakeHandle`
+    // we stop selecting on it (#233).
+    let mut wake_open = true;
     // Peer tasks echo their `(src, generation)` here on exit so the loop can
     // reap the dead slot promptly (see [`DoneGuard`]). Unbounded so the reap
     // never blocks a returning peer; drained synchronously by the select below.
@@ -803,6 +917,14 @@ async fn run_connection(
                 }
                 // Desktop dropped the command sender: no more commands will come.
                 None => commands_open = false,
+            },
+            note = wake.recv(), if wake_open => match note {
+                // A session changed status: de-dup into an episode and, on an
+                // opening `Awaiting` edge, fan `PushTrigger` frames out over this
+                // (live, authenticated) relay connection (#233).
+                Some(note) => handle_wake_note(note, deps, &outbound_tx).await,
+                // Host dropped its wake handle: no more notes will come.
+                None => wake_open = false,
             },
             inbound = stream.next() => match inbound {
                 None => break ConnOutcome::Disconnected,
@@ -1292,6 +1414,7 @@ async fn run_pairing(
         name: name.clone(),
         enrolled_at: Some(now_secs()),
         last_connected_at: None,
+        push: None,
     };
 
     // Assert-before-grant (ADR-0021 D3): the relay must credential the pending
@@ -1306,11 +1429,13 @@ async fn run_pairing(
             .map(|e| AssertedDevice {
                 device_id: e.device_id,
                 token: device_token_for(e),
+                push: e.push.clone(),
             })
             .collect();
         devices.push(AssertedDevice {
             device_id,
             token: relay_token.clone(),
+            push: entry.push.clone(),
         });
         RelayControl::AssertDevices {
             id: next_control_id(control_seq.as_ref()),
@@ -1802,6 +1927,9 @@ async fn serve_peer(
     let (events_tx, mut events_rx) = mpsc::channel::<PeerEvent>(PEER_EVENT_QUEUE);
     let mut attach_input: Option<mpsc::Sender<ChannelInput>> = None;
     let mut has_attached = false;
+    // The session this peer is attached to, if any — its wake episode is
+    // forgotten when the channel is torn down (#233).
+    let mut attached_session: Option<EpisodeKey> = None;
 
     loop {
         tokio::select! {
@@ -1828,8 +1956,11 @@ async fn serve_peer(
                             &peer_token,
                             &mut attach_input,
                             &mut has_attached,
+                            &mut attached_session,
                             device_id,
                             &mut revoke_target,
+                            &outbound_tx,
+                            &control_seq,
                         )
                         .await;
                         let send_ok = send_msg(
@@ -1863,8 +1994,9 @@ async fn serve_peer(
                         if let Some(tx) = &attach_input {
                             if tx.send(input).await.is_err() {
                                 // The channel died mid-send: report it and clear
-                                // the attach state.
+                                // the attach state (and forget its wake episode).
                                 attach_input = None;
+                                forget_episode(&deps, &mut attached_session);
                                 if send_msg(
                                     &mut transport,
                                     &outbound_tx,
@@ -1897,6 +2029,9 @@ async fn serve_peer(
                 }
                 Some(PeerEvent::Dead) => {
                     attach_input = None;
+                    // The attached session channel was torn down: forget its wake
+                    // episode so a later respawn's `Awaiting` wakes afresh (#233).
+                    forget_episode(&deps, &mut attached_session);
                     if send_msg(
                         &mut transport,
                         &outbound_tx,
@@ -1926,6 +2061,15 @@ async fn serve_peer(
 /// `RevokeDevice` removes the target from the roster and persists it, then sets
 /// `revoke_target` so the caller can enqueue the response *before* the kick
 /// (the relay re-assert severs the transport — see [`serve_peer`]).
+/// `RegisterPushEndpoint` (ADR-0023) validates a `Some` registration before
+/// storing it (never after — the #232 relay_url gotcha), updates *only* the
+/// requesting device's roster entry, persists, and re-asserts the roster to
+/// the relay inline — unlike revoke, nothing here severs the transport, so
+/// the re-assert needs no deferral. A registration identical to the entry's
+/// current one short-circuits before the save/re-assert (#233): the client
+/// re-registers on every dial, so unchanged dials must not rewrite the roster
+/// file or re-poke the relay. If the save does fail, the in-memory mutation is
+/// rolled back so it cannot diverge from what is actually on disk.
 #[allow(clippy::too_many_arguments)]
 async fn handle_request(
     op: RemoteOp,
@@ -1934,8 +2078,11 @@ async fn handle_request(
     peer_token: &CancellationToken,
     attach_input: &mut Option<mpsc::Sender<ChannelInput>>,
     has_attached: &mut bool,
+    attached_session: &mut Option<EpisodeKey>,
     requester_id: DeviceId,
     revoke_target: &mut Option<DeviceId>,
+    outbound_tx: &mpsc::Sender<Message>,
+    control_seq: &Arc<AtomicU32>,
 ) -> RemoteResult {
     match op {
         RemoteOp::List => match deps.source.list().await {
@@ -1955,6 +2102,9 @@ async fn handle_request(
                 Ok(channel) => {
                     *has_attached = true;
                     *attach_input = Some(channel.input);
+                    // Remember which session this channel drives, so its episode
+                    // can be forgotten when the channel is torn down (#233).
+                    *attached_session = Some((project_id, session_id));
                     tokio::spawn(pump_output(
                         channel.output,
                         events_tx.clone(),
@@ -1984,6 +2134,67 @@ async fn handle_request(
                     message: "could not persist roster".to_string(),
                 }),
             }
+        }
+        RemoteOp::RegisterPushEndpoint { registration } => {
+            // Validate before storing (the #232 relay_url gotcha): a
+            // client-controlled endpoint must be rejected before it ever
+            // lands in the roster or gets asserted to the relay, never
+            // after. `PushRegistration` is `#[non_exhaustive]`: an
+            // unrecognized future variant is refused rather than matched,
+            // so an older bridge fails safe instead of panicking.
+            if let Some(reg) = &registration {
+                let PushRegistration::UnifiedPush { endpoint } = reg else {
+                    return RemoteResult::Error(WireError::Transport {
+                        message: "unsupported push registration variant".to_string(),
+                    });
+                };
+                if let Err(e) = validate_push_endpoint(endpoint) {
+                    return RemoteResult::Error(WireError::Transport {
+                        message: format!("invalid push endpoint: {e}"),
+                    });
+                }
+            }
+            {
+                let mut roster = deps.roster.write().await;
+                let Some(entry) = roster.find_by_device_mut(&requester_id) else {
+                    // Not in the roster (already revoked/never paired): no
+                    // entry to update, and nothing to re-assert.
+                    return RemoteResult::Error(WireError::Transport {
+                        message: "device not paired".to_string(),
+                    });
+                };
+                // The client re-registers on every dial, so an unchanged
+                // registration is the common case: short-circuit before the
+                // roster save or relay re-assert, neither of which has
+                // anything new to do. `PushRegistration` derives `PartialEq`.
+                if registration == entry.push {
+                    return RemoteResult::PushEndpointSet;
+                }
+                let previous = entry.push.clone();
+                entry.push = registration;
+                if let Err(_e) = roster.save(&deps.roster_path) {
+                    // Persist failed: undo the in-memory mutation so it does
+                    // not diverge from disk — otherwise the next re-assert
+                    // (e.g. on reconnect) would silently carry a value that
+                    // was never durably saved (mirrors run_pairing's
+                    // save-failure rollback).
+                    if let Some(entry) = roster.find_by_device_mut(&requester_id) {
+                        entry.push = previous;
+                    }
+                    return RemoteResult::Error(WireError::Transport {
+                        message: "could not persist roster".to_string(),
+                    });
+                }
+            }
+            // Refresh the relay's view so it starts (or stops) waking this
+            // device, mirroring the credential set the roster now holds.
+            // Best-effort: `reassert_roster_only` swallows a send failure (the
+            // relay connection may be down), and the roster write above already
+            // durably persisted the registration, so this still answers
+            // `PushEndpointSet` — the next successful re-assert (e.g. on
+            // reconnect) picks up the stored change.
+            reassert_roster_only(deps, outbound_tx, control_seq).await;
+            RemoteResult::PushEndpointSet
         }
         // `RemoteOp` is `#[non_exhaustive]`: a client speaking a newer protocol
         // could ask for an op this bridge predates. Refuse it explicitly rather
@@ -2160,6 +2371,90 @@ async fn send_control(
         src: bridge_id,
         dst: DeviceId::ZERO,
         payload,
+    }
+    .encode();
+    outbound_tx
+        .send(Message::Binary(frame.into()))
+        .await
+        .map_err(|_| ())
+}
+
+/// Handles one wake note (#233): record the status change, and if it opens a
+/// fresh `Awaiting` episode, fan an empty-payload `PushTrigger` frame out to
+/// every paired device that has a push registration and no live session.
+///
+/// Best-effort and non-fatal by contract: a poisoned episode lock skips the
+/// wake, and a full/closed outbound queue (the relay connection tearing down)
+/// drops the frame silently. The wake path never errors the session path.
+async fn handle_wake_note(
+    note: WakeNote,
+    deps: &Arc<PeerDeps>,
+    outbound_tx: &mpsc::Sender<Message>,
+) {
+    // Discard a stale replayed `Awaiting` note (queued before a relay outage,
+    // delivered only once the connection recovers): opening an episode for it
+    // now could push a device for a session already resolved during the
+    // outage. Do this before any episode bookkeeping, so a stale note leaves
+    // no trace — a later repaint/re-attach re-notes if still awaiting (see
+    // `STALE_WAKE_MAX`). Non-`Awaiting` notes always proceed: closing an
+    // episode is always safe, regardless of age.
+    if note.status == SessionStatus::Awaiting && note.at.elapsed() > STALE_WAKE_MAX {
+        return;
+    }
+    // Episode de-dup under a brief lock — never held across the `.await`s below.
+    let opens_episode = match deps.episodes.lock() {
+        Ok(mut episodes) => episodes.note(note.key, &note.status),
+        // A poisoned lock (a holder panicked) skips this wake; the tracker is
+        // advisory, so losing one note only risks a missed push, never a crash.
+        Err(_) => return,
+    };
+    if !opens_episode {
+        return;
+    }
+    // The devices currently holding a live Noise session, keyed by their
+    // roster-proven `device_id` — these see the change directly and are not
+    // woken. A poisoned lock skips the wake rather than waking everyone.
+    let live: HashSet<DeviceId> = match deps.live_peers.lock() {
+        Ok(map) => map.keys().copied().collect(),
+        Err(_) => return,
+    };
+    let targets = {
+        let roster = deps.roster.read().await;
+        wake_targets(&roster, &live)
+    };
+    for target in targets {
+        // Fire-and-forget: a gone writer just means the connection is tearing
+        // down, and the wake is best-effort (skip silently).
+        let _ = send_push_trigger(outbound_tx, deps.bridge_id, target).await;
+    }
+}
+
+/// Forgets `attached_session`'s wake episode (if any) and clears it, so a later
+/// respawn of the same session opens a fresh `Awaiting` episode (#233). Called
+/// from a peer task when its attached channel is torn down; a poisoned episode
+/// lock is a no-op (the tracker is advisory).
+fn forget_episode(deps: &Arc<PeerDeps>, attached_session: &mut Option<EpisodeKey>) {
+    if let Some(key) = attached_session.take() {
+        if let Ok(mut episodes) = deps.episodes.lock() {
+            episodes.forget(&key);
+        }
+    }
+}
+
+/// Enqueues an empty-payload `PushTrigger` envelope addressed to `dst` (#233).
+/// The relay routes it to the device's registered push channel; the payload is
+/// empty by design (the relay is blind — it carries no session detail).
+/// `Err(())` means the writer is gone.
+async fn send_push_trigger(
+    outbound_tx: &mpsc::Sender<Message>,
+    src: DeviceId,
+    dst: DeviceId,
+) -> Result<(), ()> {
+    let frame = Envelope {
+        frame_type: FrameType::PushTrigger,
+        src,
+        dst,
+        payload: vec![],
     }
     .encode();
     outbound_tx
@@ -2441,6 +2736,7 @@ mod tests {
                     enrolled_at: Some(1),
                     last_connected_at: None,
                     relay_token: "t".into(),
+                    push: None,
                 },
                 RosterEntry {
                     device_id: DeviceId([0x22; 32]),
@@ -2450,6 +2746,7 @@ mod tests {
                     enrolled_at: Some(2),
                     last_connected_at: Some(9),
                     relay_token: "u".into(),
+                    push: None,
                 },
             ],
         };
@@ -2470,6 +2767,7 @@ mod tests {
             enrolled_at: None,
             last_connected_at: None,
             relay_token: "tok".to_string(),
+            push: None,
         }
     }
 
@@ -2493,6 +2791,7 @@ mod tests {
             source: Arc::new(remora_core::FakeSessionSource::new()),
             live_peers: Arc::new(Mutex::new(HashMap::new())),
             next_peer_reg: AtomicU64::new(0),
+            episodes: Arc::new(Mutex::new(WakeEpisodes::new(WAKE_EPISODE_CAP))),
         });
 
         assert!(
@@ -2512,6 +2811,609 @@ mod tests {
                 .expect("second remove ok"),
             "removing an absent device is an idempotent no-op (false)"
         );
+    }
+
+    /// Builds a tempdir-backed `PeerDeps` seeded with `entries`, for
+    /// `RegisterPushEndpoint` tests that only care about the roster and the
+    /// relay re-assert, not the surrounding connection/pairing plumbing.
+    fn push_test_deps(entries: Vec<RosterEntry>) -> (Arc<PeerDeps>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("roster.toml");
+        let deps = Arc::new(PeerDeps {
+            bridge_id: DeviceId([9u8; 32]),
+            bridge_static_priv: vec![0u8; 32],
+            bridge_static_pub: vec![0u8; 32],
+            relay_url: "ws://test".to_string(),
+            roster: Arc::new(RwLock::new(Roster { entries })),
+            roster_path: path,
+            source: Arc::new(remora_core::FakeSessionSource::new()),
+            live_peers: Arc::new(Mutex::new(HashMap::new())),
+            next_peer_reg: AtomicU64::new(0),
+            episodes: Arc::new(Mutex::new(WakeEpisodes::new(WAKE_EPISODE_CAP))),
+        });
+        (deps, dir)
+    }
+
+    /// Drives `handle_request` for one `RegisterPushEndpoint { registration }`
+    /// as `requester_id`, wiring up the plumbing args the op doesn't use
+    /// (attach/events/revoke) with inert placeholders. Returns the wire
+    /// result plus the `RelayControl` sent on `outbound_tx`, if any.
+    async fn call_register_push(
+        deps: &Arc<PeerDeps>,
+        requester_id: DeviceId,
+        registration: Option<PushRegistration>,
+    ) -> (RemoteResult, Option<RelayControl>) {
+        let (events_tx, _events_rx) = mpsc::channel::<PeerEvent>(1);
+        let peer_token = CancellationToken::new();
+        let mut attach_input: Option<mpsc::Sender<ChannelInput>> = None;
+        let mut has_attached = false;
+        let mut attached_session: Option<EpisodeKey> = None;
+        let mut revoke_target: Option<DeviceId> = None;
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(4);
+        let control_seq = Arc::new(AtomicU32::new(0));
+
+        let result = handle_request(
+            RemoteOp::RegisterPushEndpoint { registration },
+            deps,
+            &events_tx,
+            &peer_token,
+            &mut attach_input,
+            &mut has_attached,
+            &mut attached_session,
+            requester_id,
+            &mut revoke_target,
+            &outbound_tx,
+            &control_seq,
+        )
+        .await;
+
+        let sent = outbound_rx.try_recv().ok().map(|msg| {
+            let Message::Binary(bytes) = msg else {
+                panic!("expected a binary control frame");
+            };
+            let envelope = Envelope::decode(&bytes).expect("decode envelope");
+            serde_json::from_slice::<RelayControl>(&envelope.payload).expect("decode control")
+        });
+
+        (result, sent)
+    }
+
+    #[tokio::test]
+    async fn register_push_endpoint_sets_and_reasserts() {
+        // A valid `Some` registration is stored on the requester's roster
+        // entry and immediately re-asserted to the relay, carrying the new
+        // push registration alongside the device's routing credential.
+        let device = DeviceId([0x11; 32]);
+        let (deps, _dir) = push_test_deps(vec![entry(0x11, "phone")]);
+        let registration = Some(PushRegistration::UnifiedPush {
+            endpoint: "https://ntfy.sh/t".to_string(),
+        });
+
+        let (result, sent) = call_register_push(&deps, device, registration.clone()).await;
+        assert_eq!(result, RemoteResult::PushEndpointSet);
+
+        let roster = deps.roster.read().await;
+        assert_eq!(
+            roster.find_by_device(&device).expect("entry present").push,
+            registration
+        );
+        drop(roster);
+
+        match sent.expect("an AssertDevices control message was sent") {
+            RelayControl::AssertDevices { devices, .. } => {
+                let d = devices
+                    .iter()
+                    .find(|d| d.device_id == device)
+                    .expect("device present in assert");
+                assert_eq!(d.push, registration, "assert carries the new registration");
+            }
+            other => panic!("expected AssertDevices, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_push_endpoint_none_clears() {
+        // `None` clears an existing registration, and still answers
+        // `PushEndpointSet` (clearing is a successful, idempotent request).
+        let device = DeviceId([0x11; 32]);
+        let mut seeded = entry(0x11, "phone");
+        seeded.push = Some(PushRegistration::UnifiedPush {
+            endpoint: "https://ntfy.sh/old".to_string(),
+        });
+        let (deps, _dir) = push_test_deps(vec![seeded]);
+
+        let (result, _sent) = call_register_push(&deps, device, None).await;
+        assert_eq!(result, RemoteResult::PushEndpointSet);
+
+        let roster = deps.roster.read().await;
+        assert_eq!(
+            roster.find_by_device(&device).expect("entry present").push,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn register_push_endpoint_rejects_invalid() {
+        // Validation runs *before* the roster is touched (the #232
+        // relay_url gotcha): a bad endpoint is refused, never stored or
+        // asserted.
+        let device = DeviceId([0x11; 32]);
+        let (deps, _dir) = push_test_deps(vec![entry(0x11, "phone")]);
+        let bad = Some(PushRegistration::UnifiedPush {
+            endpoint: "file:///x".to_string(),
+        });
+
+        let (result, sent) = call_register_push(&deps, device, bad).await;
+        assert!(matches!(result, RemoteResult::Error(_)));
+        assert!(sent.is_none(), "an invalid endpoint is never asserted");
+
+        let roster = deps.roster.read().await;
+        assert_eq!(
+            roster.find_by_device(&device).expect("entry present").push,
+            None,
+            "roster is unchanged by a rejected endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_push_endpoint_targets_requester_only() {
+        // Two paired devices: only the requesting device's roster entry
+        // changes, never the other's.
+        let requester = DeviceId([0x11; 32]);
+        let other = DeviceId([0x22; 32]);
+        let (deps, _dir) = push_test_deps(vec![entry(0x11, "phone"), entry(0x22, "laptop")]);
+        let registration = Some(PushRegistration::UnifiedPush {
+            endpoint: "https://ntfy.sh/t".to_string(),
+        });
+
+        let (result, _sent) = call_register_push(&deps, requester, registration.clone()).await;
+        assert_eq!(result, RemoteResult::PushEndpointSet);
+
+        let roster = deps.roster.read().await;
+        assert_eq!(
+            roster
+                .find_by_device(&requester)
+                .expect("requester entry present")
+                .push,
+            registration
+        );
+        assert_eq!(
+            roster
+                .find_by_device(&other)
+                .expect("other entry present")
+                .push,
+            None,
+            "the other device's entry is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_push_endpoint_unpaired_requester_errors() {
+        // A RegisterPushEndpoint from a device id NOT in the roster is refused
+        // (#233 F5a): no roster entry is created or mutated, and nothing is
+        // asserted to the relay — even for an otherwise-valid endpoint.
+        let (deps, _dir) = push_test_deps(vec![entry(0x11, "phone")]);
+        let stranger = DeviceId([0x99; 32]);
+        let registration = Some(PushRegistration::UnifiedPush {
+            endpoint: "https://ntfy.sh/t".to_string(),
+        });
+
+        let (result, sent) = call_register_push(&deps, stranger, registration).await;
+        assert!(
+            matches!(result, RemoteResult::Error(_)),
+            "an unpaired requester is refused"
+        );
+        assert!(
+            sent.is_none(),
+            "an unpaired requester triggers no AssertDevices"
+        );
+
+        let roster = deps.roster.read().await;
+        assert_eq!(
+            roster.entries.len(),
+            1,
+            "no entry is created for a stranger"
+        );
+        assert_eq!(
+            roster
+                .find_by_device(&DeviceId([0x11; 32]))
+                .expect("paired entry present")
+                .push,
+            None,
+            "the paired device's entry is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_push_endpoint_unchanged_is_a_noop() {
+        // Re-registering the SAME registration the entry already holds
+        // (the common case — the client re-registers on every dial) still
+        // answers `PushEndpointSet`, but must not rewrite the roster file or
+        // re-assert to the relay a second time (#233): both are no-ops for an
+        // unchanged dial.
+        let device = DeviceId([0x11; 32]);
+        let registration = Some(PushRegistration::UnifiedPush {
+            endpoint: "https://ntfy.sh/t".to_string(),
+        });
+        let (deps, _dir) = push_test_deps(vec![entry(0x11, "phone")]);
+
+        let (first, first_sent) = call_register_push(&deps, device, registration.clone()).await;
+        assert_eq!(first, RemoteResult::PushEndpointSet);
+        assert!(first_sent.is_some(), "the first registration re-asserts");
+
+        let mtime_after_first = std::fs::metadata(&deps.roster_path)
+            .expect("roster file exists after first save")
+            .modified()
+            .expect("mtime supported");
+
+        // Re-register the identical value.
+        let (second, second_sent) = call_register_push(&deps, device, registration.clone()).await;
+        assert_eq!(second, RemoteResult::PushEndpointSet);
+        assert!(
+            second_sent.is_none(),
+            "an unchanged registration sends no second AssertDevices"
+        );
+
+        let mtime_after_second = std::fs::metadata(&deps.roster_path)
+            .expect("roster file still exists")
+            .modified()
+            .expect("mtime supported");
+        assert_eq!(
+            mtime_after_first, mtime_after_second,
+            "an unchanged registration does not rewrite the roster file"
+        );
+
+        let roster = deps.roster.read().await;
+        assert_eq!(
+            roster.find_by_device(&device).expect("entry present").push,
+            registration
+        );
+    }
+
+    #[tokio::test]
+    async fn register_push_endpoint_rolls_back_on_save_failure() {
+        // If persisting the roster fails, the in-memory entry must not
+        // diverge from what is actually on disk (mirrors run_pairing's
+        // existing save-failure rollback): `entry.push` is restored to its
+        // pre-mutation value rather than left holding the unpersisted one.
+        let device = DeviceId([0x11; 32]);
+        let mut seeded = entry(0x11, "phone");
+        seeded.push = Some(PushRegistration::UnifiedPush {
+            endpoint: "https://ntfy.sh/old".to_string(),
+        });
+        // roster_path lives under a directory that does not exist, so
+        // `Roster::save` fails on the write.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bad_path = dir.path().join("missing-subdir").join("roster.toml");
+        let bad_deps = Arc::new(PeerDeps {
+            bridge_id: DeviceId([9u8; 32]),
+            bridge_static_priv: vec![0u8; 32],
+            bridge_static_pub: vec![0u8; 32],
+            relay_url: "ws://test".to_string(),
+            roster: Arc::new(RwLock::new(Roster {
+                entries: vec![seeded],
+            })),
+            roster_path: bad_path,
+            source: Arc::new(remora_core::FakeSessionSource::new()),
+            live_peers: Arc::new(Mutex::new(HashMap::new())),
+            next_peer_reg: AtomicU64::new(0),
+            episodes: Arc::new(Mutex::new(WakeEpisodes::new(WAKE_EPISODE_CAP))),
+        });
+
+        let new_registration = Some(PushRegistration::UnifiedPush {
+            endpoint: "https://ntfy.sh/new".to_string(),
+        });
+        let (result, sent) = call_register_push(&bad_deps, device, new_registration).await;
+        assert!(
+            matches!(result, RemoteResult::Error(_)),
+            "a save failure is reported as an error"
+        );
+        assert!(sent.is_none(), "a save failure never re-asserts");
+
+        let roster = bad_deps.roster.read().await;
+        assert_eq!(
+            roster.find_by_device(&device).expect("entry present").push,
+            Some(PushRegistration::UnifiedPush {
+                endpoint: "https://ntfy.sh/old".to_string(),
+            }),
+            "the in-memory entry is rolled back to its pre-mutation value"
+        );
+    }
+
+    // --- Wake fan-out (#233) ------------------------------------------------
+
+    /// A roster entry with a given id and optional push registration, for the
+    /// wake-fan-out tests.
+    fn wake_entry(id: u8, push: Option<PushRegistration>) -> RosterEntry {
+        RosterEntry {
+            device_id: DeviceId([id; 32]),
+            static_pubkey: vec![id; 32],
+            psk: [0; 32],
+            relay_token: "tok".to_string(),
+            name: "d".to_string(),
+            enrolled_at: None,
+            last_connected_at: None,
+            push,
+        }
+    }
+
+    fn some_push() -> Option<PushRegistration> {
+        Some(PushRegistration::UnifiedPush {
+            endpoint: "https://ntfy.sh/t".to_string(),
+        })
+    }
+
+    /// Builds a `PeerDeps` seeded with `entries` in the roster and `live` device
+    /// ids registered as holding a live session — the two inputs the wake
+    /// fan-out reads (plus the shared episode tracker inside).
+    fn wake_test_deps(
+        entries: Vec<RosterEntry>,
+        live: &[DeviceId],
+    ) -> (Arc<PeerDeps>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live_peers: LivePeers = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut map = live_peers.lock().expect("lock");
+            for (i, id) in live.iter().enumerate() {
+                map.entry(*id)
+                    .or_default()
+                    .insert(i as u64, CancellationToken::new());
+            }
+        }
+        let deps = Arc::new(PeerDeps {
+            bridge_id: DeviceId([9u8; 32]),
+            bridge_static_priv: vec![0u8; 32],
+            bridge_static_pub: vec![0u8; 32],
+            relay_url: "ws://test".to_string(),
+            roster: Arc::new(RwLock::new(Roster { entries })),
+            roster_path: dir.path().join("roster.toml"),
+            source: Arc::new(remora_core::FakeSessionSource::new()),
+            live_peers,
+            next_peer_reg: AtomicU64::new(0),
+            episodes: Arc::new(Mutex::new(WakeEpisodes::new(WAKE_EPISODE_CAP))),
+        });
+        (deps, dir)
+    }
+
+    fn wake_note(project: &str, session: &str, status: SessionStatus) -> WakeNote {
+        wake_note_at(project, session, status, Instant::now())
+    }
+
+    /// Like [`wake_note`] but with an explicit `at`, so tests can construct a
+    /// backdated note (`Instant::now() - Duration::from_secs(..)`) to exercise
+    /// the stale-`Awaiting`-discard path (#233) without sleeping.
+    fn wake_note_at(project: &str, session: &str, status: SessionStatus, at: Instant) -> WakeNote {
+        WakeNote {
+            key: (
+                ProjectId::new(project).expect("project id"),
+                SessionId::new(session).expect("session id"),
+            ),
+            status,
+            at,
+        }
+    }
+
+    /// Drains every queued outbound frame, returning the `dst` of each
+    /// `PushTrigger` (asserting each carries an empty payload). Non-PushTrigger
+    /// frames fail the test — the wake path must emit nothing else.
+    fn drain_push_triggers(outbound_rx: &mut mpsc::Receiver<Message>) -> Vec<DeviceId> {
+        let mut dsts = Vec::new();
+        while let Ok(msg) = outbound_rx.try_recv() {
+            let Message::Binary(bytes) = msg else {
+                panic!("expected a binary frame, got {msg:?}");
+            };
+            let env = Envelope::decode(&bytes).expect("decode envelope");
+            assert_eq!(
+                env.frame_type,
+                FrameType::PushTrigger,
+                "the wake path emits only PushTrigger frames"
+            );
+            assert!(env.payload.is_empty(), "PushTrigger payload is empty");
+            assert_eq!(env.src, DeviceId([9u8; 32]), "framed from this bridge");
+            dsts.push(env.dst);
+        }
+        dsts
+    }
+
+    #[tokio::test]
+    async fn awaiting_wakes_only_absent_push_devices_once() {
+        // Roster: A (push + offline) → woken; B (push + live) → skipped (it sees
+        // the change directly); C (no push) → skipped (nowhere to wake). A
+        // repeated Awaiting for the same session sends nothing (episode dedup).
+        let a = DeviceId([0xa0; 32]);
+        let b = DeviceId([0xb0; 32]);
+        let (deps, _dir) = wake_test_deps(
+            vec![
+                wake_entry(0xa0, some_push()),
+                wake_entry(0xb0, some_push()),
+                wake_entry(0xc0, None),
+            ],
+            &[b],
+        );
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(16);
+
+        // First Awaiting: opens the episode, fans out exactly one PushTrigger — to A.
+        handle_wake_note(
+            wake_note("proj", "sess", SessionStatus::Awaiting),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert_eq!(
+            drain_push_triggers(&mut outbound_rx),
+            vec![a],
+            "only the push-registered, offline device is woken"
+        );
+
+        // Repeated Awaiting for the same session: no duplicate wake.
+        handle_wake_note(
+            wake_note("proj", "sess", SessionStatus::Awaiting),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert!(
+            drain_push_triggers(&mut outbound_rx).is_empty(),
+            "a session already inside its Awaiting episode is not re-woken"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_awaiting_status_wakes_nobody() {
+        // A Working/Idle/Unknown transition never fans out a wake, even with a
+        // roster full of absent, push-registered devices.
+        let (deps, _dir) = wake_test_deps(
+            vec![wake_entry(0xa0, some_push()), wake_entry(0xb0, some_push())],
+            &[],
+        );
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(16);
+
+        for status in [
+            SessionStatus::Working,
+            SessionStatus::Idle,
+            SessionStatus::Unknown,
+        ] {
+            handle_wake_note(wake_note("proj", "sess", status), &deps, &outbound_tx).await;
+            assert!(
+                drain_push_triggers(&mut outbound_rx).is_empty(),
+                "{status:?} must not wake any device"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_and_reopening_an_episode_wakes_again() {
+        // Awaiting → (some non-Awaiting close) → Awaiting fans out a second wake:
+        // the second Awaiting is a fresh episode, so absent devices are re-woken.
+        let a = DeviceId([0xa0; 32]);
+        let (deps, _dir) = wake_test_deps(vec![wake_entry(0xa0, some_push())], &[]);
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(16);
+
+        handle_wake_note(
+            wake_note("proj", "sess", SessionStatus::Awaiting),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert_eq!(drain_push_triggers(&mut outbound_rx), vec![a]);
+
+        handle_wake_note(
+            wake_note("proj", "sess", SessionStatus::Working),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert!(drain_push_triggers(&mut outbound_rx).is_empty());
+
+        handle_wake_note(
+            wake_note("proj", "sess", SessionStatus::Awaiting),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert_eq!(
+            drain_push_triggers(&mut outbound_rx),
+            vec![a],
+            "a reopened episode wakes the absent device again"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_awaiting_note_is_discarded_but_a_fresh_one_still_wakes() {
+        // Simulates a relay outage: an `Awaiting` note queued minutes ago (older
+        // than STALE_WAKE_MAX) is replayed on reconnect. It must be discarded
+        // outright — no episode opened, no PushTrigger — because the session may
+        // already have been resolved during the outage. Proof that no episode
+        // was opened: a subsequent *fresh* `Awaiting` note for the same key still
+        // fires (if the stale note had opened the episode, the fresh one would
+        // be deduped into silence).
+        let a = DeviceId([0xa0; 32]);
+        let (deps, _dir) = wake_test_deps(vec![wake_entry(0xa0, some_push())], &[]);
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(16);
+
+        let stale_at = Instant::now() - (STALE_WAKE_MAX + Duration::from_secs(1));
+        handle_wake_note(
+            wake_note_at("proj", "sess", SessionStatus::Awaiting, stale_at),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert!(
+            drain_push_triggers(&mut outbound_rx).is_empty(),
+            "a stale replayed Awaiting note must not wake anyone"
+        );
+
+        handle_wake_note(
+            wake_note("proj", "sess", SessionStatus::Awaiting),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert_eq!(
+            drain_push_triggers(&mut outbound_rx),
+            vec![a],
+            "a fresh Awaiting still wakes — proving the stale note opened no episode"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_non_awaiting_note_still_closes_an_open_episode() {
+        // A non-`Awaiting` note is always processed regardless of age: closing
+        // an episode is always safe and keeps de-dup state honest. Open an
+        // episode with a fresh Awaiting, close it with a *stale* Working note,
+        // then a fresh Awaiting must re-wake (proving the close took effect).
+        let a = DeviceId([0xa0; 32]);
+        let (deps, _dir) = wake_test_deps(vec![wake_entry(0xa0, some_push())], &[]);
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(16);
+
+        handle_wake_note(
+            wake_note("proj", "sess", SessionStatus::Awaiting),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert_eq!(drain_push_triggers(&mut outbound_rx), vec![a]);
+
+        let stale_at = Instant::now() - (STALE_WAKE_MAX + Duration::from_secs(1));
+        handle_wake_note(
+            wake_note_at("proj", "sess", SessionStatus::Working, stale_at),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert!(drain_push_triggers(&mut outbound_rx).is_empty());
+
+        handle_wake_note(
+            wake_note("proj", "sess", SessionStatus::Awaiting),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert_eq!(
+            drain_push_triggers(&mut outbound_rx),
+            vec![a],
+            "the stale non-Awaiting note still closed the episode, so this re-wakes"
+        );
+    }
+
+    #[test]
+    fn note_session_status_is_non_blocking_and_drops_when_full() {
+        // The public handle never blocks: a full queue (or a stopped bridge)
+        // silently drops the note. Fill the bounded channel, then one more note
+        // must return without panicking and without growing the queue.
+        let (handle, WakeReceiver(mut rx)) = wake_channel();
+        let project = ProjectId::new("proj").expect("project id");
+        let session = SessionId::new("sess").expect("session id");
+        for _ in 0..WAKE_QUEUE {
+            handle.note_session_status(&project, &session, SessionStatus::Awaiting);
+        }
+        // The queue is full; this extra note is dropped, not blocked.
+        handle.note_session_status(&project, &session, SessionStatus::Awaiting);
+        let mut drained = 0;
+        while rx.try_recv().is_ok() {
+            drained += 1;
+        }
+        assert_eq!(drained, WAKE_QUEUE, "the queue is bounded at WAKE_QUEUE");
     }
 
     #[test]
@@ -2565,24 +3467,48 @@ mod tests {
     #[test]
     fn assert_devices_msg_maps_roster() {
         // The AssertDevices payload mirrors the roster one-for-one: each entry's
-        // device id and its stored `relay_token` become one `AssertedDevice`.
+        // device id, its stored `relay_token`, and its `push` registration
+        // become one `AssertedDevice`.
         let roster = Roster {
-            entries: vec![RosterEntry {
-                device_id: DeviceId([0x11; 32]),
-                static_pubkey: vec![0xaa; 32],
-                psk: [0xbb; 32],
-                name: "iPhone".to_string(),
-                enrolled_at: None,
-                last_connected_at: None,
-                relay_token: "tok-abc".to_string(),
-            }],
+            entries: vec![
+                RosterEntry {
+                    device_id: DeviceId([0x11; 32]),
+                    static_pubkey: vec![0xaa; 32],
+                    psk: [0xbb; 32],
+                    name: "iPhone".to_string(),
+                    enrolled_at: None,
+                    last_connected_at: None,
+                    relay_token: "tok-abc".to_string(),
+                    push: Some(PushRegistration::UnifiedPush {
+                        endpoint: "https://ntfy.sh/topic".to_string(),
+                    }),
+                },
+                RosterEntry {
+                    device_id: DeviceId([0x22; 32]),
+                    static_pubkey: vec![0xcc; 32],
+                    psk: [0xdd; 32],
+                    name: "laptop".to_string(),
+                    enrolled_at: None,
+                    last_connected_at: None,
+                    relay_token: "tok-def".to_string(),
+                    push: None,
+                },
+            ],
         };
         match assert_devices_msg(7, &roster) {
             RelayControl::AssertDevices { id, devices } => {
                 assert_eq!(id, 7);
-                assert_eq!(devices.len(), 1);
+                assert_eq!(devices.len(), 2);
                 assert_eq!(devices[0].device_id, DeviceId([0x11; 32]));
                 assert_eq!(devices[0].token, "tok-abc");
+                assert_eq!(
+                    devices[0].push,
+                    Some(PushRegistration::UnifiedPush {
+                        endpoint: "https://ntfy.sh/topic".to_string(),
+                    }),
+                    "the entry's push registration maps through"
+                );
+                assert_eq!(devices[1].push, None, "no push registration stays None");
             }
             other => panic!("expected AssertDevices, got {other:?}"),
         }
@@ -2600,6 +3526,7 @@ mod tests {
             source: Arc::new(remora_core::FakeSessionSource::new()),
             live_peers: Arc::new(Mutex::new(HashMap::new())),
             next_peer_reg: AtomicU64::new(0),
+            episodes: Arc::new(Mutex::new(WakeEpisodes::new(WAKE_EPISODE_CAP))),
         })
     }
 
@@ -2827,6 +3754,7 @@ mod tests {
                 enrolled_at: None,
                 last_connected_at: None,
                 relay_token: "t".to_string(),
+                push: None,
             }],
         };
         // A pending device claiming the same id must be refused.
@@ -2907,6 +3835,7 @@ mod tests {
             source: Arc::new(remora_core::FakeSessionSource::new()),
             live_peers: Arc::new(Mutex::new(HashMap::new())),
             next_peer_reg: AtomicU64::new(0),
+            episodes: Arc::new(Mutex::new(WakeEpisodes::new(WAKE_EPISODE_CAP))),
         })
     }
 

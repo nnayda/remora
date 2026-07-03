@@ -54,6 +54,12 @@ pub fn run() {
             let loopback_active = if remote_host::loopback_enabled() {
                 match tauri::async_runtime::block_on(remote_host::start_loopback(&app_bridge)) {
                     Ok(host) => {
+                        // Tee the output pump's status transitions into the
+                        // loopback's wake path (#233) so a session going
+                        // `Awaiting` push-wakes the (self) device over the
+                        // in-process relay. Clone the handle before the host
+                        // moves into managed state.
+                        app_bridge.set_wake_handle(Arc::new(host.wake.clone()));
                         app_bridge.set_remote_host(host);
                         eprintln!(
                             "REMORA_REMOTE_LOOPBACK=1: attach routes through the loopback bridge"
@@ -81,6 +87,14 @@ pub fn run() {
             } else {
                 relay::start_relay_bridge(&app_bridge)
             };
+
+            // When a relay bridge is running, tee the output pump's session
+            // status transitions into its wake path (#233) so a hosted session
+            // going `Awaiting` push-wakes a paired device. Cheap, cloneable
+            // handle; set before the Bridge is handed to managed state.
+            if let Some(handles) = &pairing_handles {
+                app_bridge.set_wake_handle(Arc::new(handles.wake.clone()));
+            }
 
             app.manage(app_bridge);
             // Expose the pairing channels for the pairing UI's commands (Task 16,

@@ -49,8 +49,8 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use remora_core::{SessionChannel, SessionSource, SourceError};
 use remora_protocol::{
     AgentId, BridgeMessage, ChannelInput, ChannelOutput, ClientMessage, DeviceId, Envelope,
-    FrameType, HelloRole, ProjectId, RelayHello, RemoteOp, RemoteResult, SessionId, SessionMeta,
-    SpawnSpec, PROTOCOL_VERSION,
+    FrameType, HelloRole, ProjectId, PushRegistration, RelayHello, RemoteOp, RemoteResult,
+    SessionId, SessionMeta, SpawnSpec, PROTOCOL_VERSION,
 };
 
 use crate::identity::PairingFile;
@@ -81,13 +81,29 @@ type KeyMaterial = (Vec<u8>, Vec<u8>, [u8; 32]);
 /// the E2E wire through the relay.
 pub struct RemoteSource {
     pairing: PairingFile,
+    /// Optional push-wake endpoint this client registers with its bridge once
+    /// per connect (ADR-0023, #233). `None` = this client wants no push wakes,
+    /// so [`dial`](RemoteSource::dial) skips registration entirely.
+    push_endpoint: Option<String>,
 }
 
 impl RemoteSource {
     /// Binds a source to `pairing`. One `RemoteSource` per pairing file — the
     /// session identity is `(bridge, session)`, never a bare session id.
     pub fn new(pairing: PairingFile) -> RemoteSource {
-        RemoteSource { pairing }
+        RemoteSource {
+            pairing,
+            push_endpoint: None,
+        }
+    }
+
+    /// Sets the push-wake endpoint this client registers with its bridge on
+    /// every connect (ADR-0023, #233). `None` leaves registration off. The URL
+    /// is the caller's already-config-validated `[relay] push_wake_url`; the
+    /// bridge re-validates it before storing (defense in depth).
+    pub fn with_push_endpoint(mut self, endpoint: Option<String>) -> RemoteSource {
+        self.push_endpoint = endpoint;
+        self
     }
 
     /// This source's bridge id — the routing target for every connection.
@@ -204,13 +220,24 @@ impl RemoteSource {
             }
         }
 
-        Ok(Conn {
+        let mut conn = Conn {
             sink,
             stream,
             transport,
             routing_id,
             bridge_id,
-        })
+        };
+
+        // Register this client's push-wake endpoint once per connect (ADR-0023,
+        // #233), after the hello and before any request — independent of whether
+        // this dial goes on to attach. Best-effort: a failed/errored registration
+        // must never break the connection (a client that can't register a wake
+        // endpoint can still list/attach), so it is logged and swallowed.
+        if let Some(endpoint) = self.push_endpoint.clone() {
+            conn.register_push_endpoint(endpoint).await;
+        }
+
+        Ok(conn)
     }
 }
 
@@ -401,6 +428,40 @@ impl Conn {
         self.transport
             .open::<BridgeMessage>(&payload)
             .map_err(noise_err)
+    }
+
+    /// Registers `endpoint` as this client's push-wake target (ADR-0023, #233):
+    /// sends one `RegisterPushEndpoint` request and drains its response so the
+    /// connection's request/response cadence stays honest for the request that
+    /// follows on this same dial.
+    ///
+    /// Best-effort by contract: every failure (send, read, rejection) is logged
+    /// and swallowed — registration must never break the connection. A send or
+    /// read error here means the connection is already broken, and the caller's
+    /// subsequent request surfaces that as its own typed error.
+    async fn register_push_endpoint(&mut self, endpoint: String) {
+        let id = rand::random::<u32>();
+        let request = ClientMessage::Request {
+            id,
+            op: RemoteOp::RegisterPushEndpoint {
+                registration: Some(PushRegistration::UnifiedPush { endpoint }),
+            },
+        };
+        if let Err(e) = self.send(&request).await {
+            eprintln!("push-endpoint registration send failed (continuing): {e}");
+            return;
+        }
+        match self.recv().await {
+            Ok(BridgeMessage::Response { id: got, result }) if got == id => match result {
+                RemoteResult::PushEndpointSet => {}
+                RemoteResult::Error(w) => {
+                    eprintln!("push-endpoint registration rejected by bridge: {w:?}")
+                }
+                other => eprintln!("push-endpoint registration: unexpected result {other:?}"),
+            },
+            Ok(other) => eprintln!("push-endpoint registration: unexpected reply {other:?}"),
+            Err(e) => eprintln!("push-endpoint registration read failed (continuing): {e}"),
+        }
     }
 }
 

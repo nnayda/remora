@@ -123,6 +123,53 @@ fn role_str(role: HelloRole) -> &'static str {
     }
 }
 
+/// An assert-time warning that a bridge asserted a device push endpoint that
+/// failed syntax validation (ADR-0023). Unlike [`AuditRecord`] this is *not* a
+/// connection-close event — it is emitted while the bridge stays live, because
+/// a policy-invalid endpoint is stored-but-flagged (the `AssertDevices` still
+/// ACKs) and only dropped at delivery time. Logging it here lets an operator
+/// see the misconfiguration at assert time, not at the first missed wake. The
+/// endpoint URL itself is deliberately **not** recorded (device-supplied,
+/// potentially sensitive) — only that some endpoint for this device failed and
+/// why (the validator's category).
+#[derive(Debug, Serialize)]
+pub struct PushEndpointWarning {
+    /// Wall-clock time, seconds since the Unix epoch.
+    pub ts_unix: u64,
+    /// Discriminator so a JSONL consumer can tell this apart from an
+    /// [`AuditRecord`] line. Always `"push_endpoint_invalid"`.
+    pub event: &'static str,
+    /// The asserting bridge's routing id (hex).
+    pub bridge_id: String,
+    /// The device the invalid endpoint was asserted for (hex).
+    pub device_id: String,
+    /// The validation-failure category (from `PushEndpointError`'s display),
+    /// never the endpoint URL.
+    pub reason: String,
+}
+
+impl PushEndpointWarning {
+    /// Builds a warning, stamping `ts_unix` from the current wall clock.
+    pub fn new(bridge_id: DeviceId, device_id: DeviceId, reason: String) -> PushEndpointWarning {
+        PushEndpointWarning {
+            ts_unix: now_unix(),
+            event: "push_endpoint_invalid",
+            bridge_id: bridge_id.to_string(),
+            device_id: device_id.to_string(),
+            reason,
+        }
+    }
+}
+
+/// Current wall-clock time in whole seconds since the Unix epoch (folds a
+/// pre-epoch clock to `0` rather than panicking).
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// JSONL audit sink. Cheap to clone-share via the [`std::sync::Arc`]
 /// [`AuditSink::new`] returns; disabled sinks record nothing.
 pub struct AuditSink {
@@ -154,15 +201,28 @@ impl AuditSink {
         Ok(std::sync::Arc::new(AuditSink { file }))
     }
 
-    /// Appends one record as a JSON line. A no-op when audit is disabled. A
-    /// serialization or write error is dropped rather than propagated: audit is
-    /// observability, and a failed record must never take down a live routing
-    /// path.
+    /// Appends one connection-close record as a JSON line. A no-op when audit
+    /// is disabled. A serialization or write error is dropped rather than
+    /// propagated: audit is observability, and a failed record must never take
+    /// down a live routing path.
     pub fn record(&self, record: &AuditRecord) {
+        self.append_line(record);
+    }
+
+    /// Appends one assert-time push-endpoint warning (ADR-0023) as a JSON line.
+    /// Same no-op-when-disabled, never-propagate-errors contract as [`record`].
+    pub fn record_push_warning(&self, warning: &PushEndpointWarning) {
+        self.append_line(warning);
+    }
+
+    /// Serializes `value` to one JSON line and appends it under the file lock.
+    /// Shared by every audit surface so JSONL framing (one object per line) and
+    /// the swallow-errors policy live in exactly one place.
+    fn append_line<T: Serialize>(&self, value: &T) {
         let Some(file) = &self.file else {
             return;
         };
-        let Ok(mut line) = serde_json::to_string(record) else {
+        let Ok(mut line) = serde_json::to_string(value) else {
             return;
         };
         line.push('\n');
@@ -203,6 +263,7 @@ mod tests {
             handshake_timeout_secs: 10,
             max_connections: 1024,
             audit: Some(crate::config::AuditConfig { path: path.clone() }),
+            push: crate::config::PushConfig::default(),
         };
         let sink = AuditSink::new(&config).expect("audit sink");
 
@@ -231,5 +292,38 @@ mod tests {
             contents.lines().count() >= 2,
             "record must append a new line"
         );
+    }
+
+    #[test]
+    fn push_endpoint_warning_is_appended_as_a_json_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.log");
+        let config = RelayConfig {
+            listen: "127.0.0.1:0".to_string(),
+            bridges: Vec::new(),
+            buffer_bytes: 1 << 20,
+            handshake_timeout_secs: 10,
+            max_connections: 1024,
+            audit: Some(crate::config::AuditConfig { path: path.clone() }),
+            push: crate::config::PushConfig::default(),
+        };
+        let sink = AuditSink::new(&config).expect("audit sink");
+
+        sink.record_push_warning(&PushEndpointWarning::new(
+            DeviceId([0x11; 32]),
+            DeviceId([0x22; 32]),
+            "unsupported URL scheme: expected http or https".to_string(),
+        ));
+
+        let contents = std::fs::read_to_string(&path).expect("read audit file");
+        let line = contents.lines().next().expect("one line");
+        let value: serde_json::Value = serde_json::from_str(line).expect("valid json");
+        assert_eq!(value["event"], "push_endpoint_invalid");
+        assert_eq!(value["bridge_id"], DeviceId([0x11; 32]).to_string());
+        assert_eq!(value["device_id"], DeviceId([0x22; 32]).to_string());
+        assert!(value["reason"].is_string());
+        assert!(value["ts_unix"].is_u64());
+        // The endpoint URL itself must never be recorded.
+        assert!(value.get("endpoint").is_none(), "no endpoint URL in audit");
     }
 }

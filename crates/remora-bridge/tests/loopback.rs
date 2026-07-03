@@ -41,9 +41,9 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
 use remora_bridge::{
-    prologue, run_pairing, serve_bridge, BridgeConfig, BridgeEvent, BridgeIdentity, Handshake,
-    HandshakeKind, PairingCommand, PairingError, PairingFile, PairingOutcome, PairingProgress,
-    RemoteSource, Roster, RosterEntry, Transport, NOISE_PATTERN,
+    prologue, run_pairing, serve_bridge, wake_channel, BridgeConfig, BridgeEvent, BridgeIdentity,
+    Handshake, HandshakeKind, PairingCommand, PairingError, PairingFile, PairingOutcome,
+    PairingProgress, RemoteSource, Roster, RosterEntry, Transport, NOISE_PATTERN,
 };
 use remora_core::{
     ExclusiveSource, FakeSessionSource, SessionChannel, SessionLocks, SessionSource,
@@ -54,7 +54,7 @@ use remora_protocol::{
     RelayHello, RemoteOp, RemoteResult, SessionId, SessionMeta, SessionState, SessionStatus,
     SpawnSpec, PROTOCOL_VERSION,
 };
-use remora_relay::{serve, AuditSink, BridgeEntry, RelayConfig};
+use remora_relay::{serve, AuditSink, BridgeEntry, PushConfig, RelayConfig};
 
 /// Fixed test tokens. Real deployments mint random ones; the loopback proof
 /// only needs the relay config, bridge, and client to agree on a value.
@@ -182,6 +182,9 @@ struct Harness {
     _commands_tx: mpsc::Sender<PairingCommand>,
     /// Held so the bridge's event sender always has a live receiver.
     _events_rx: mpsc::Receiver<BridgeEvent>,
+    /// Held open so the bridge's wake branch (#233) never observes a closed
+    /// channel; the wake path is otherwise unexercised in the loopback tests.
+    _wake_handle: remora_bridge::BridgeWakeHandle,
 }
 
 impl Harness {
@@ -214,6 +217,7 @@ impl Harness {
             name: "loopback test device".to_string(),
             enrolled_at: None,
             last_connected_at: None,
+            push: None,
         });
         // Provision against a placeholder URL; the real one is stamped in once
         // the relay's ephemeral port is known.
@@ -241,6 +245,7 @@ impl Harness {
             handshake_timeout_secs: 10,
             max_connections: 1024,
             audit: None,
+            push: PushConfig::default(),
         });
         let relay = Relay::start(config0);
         let addr = relay.addr;
@@ -255,6 +260,7 @@ impl Harness {
             handshake_timeout_secs: 10,
             max_connections: 1024,
             audit: None,
+            push: PushConfig::default(),
         });
 
         if !opts.include_in_roster {
@@ -283,6 +289,9 @@ impl Harness {
         // bridge's command branch never spuriously closes, and drain events.
         let (commands_tx, commands_rx) = mpsc::channel::<PairingCommand>(8);
         let (events_tx, events_rx) = mpsc::channel::<BridgeEvent>(8);
+        // The wake path (#233) is unused here; hold the handle so its channel
+        // stays open (a dropped handle just closes the bridge's wake branch).
+        let (wake_handle, wake_rx) = wake_channel();
         let shutdown_c = shutdown.clone();
         let bridge_task = tokio::spawn(async move {
             let _ = serve_bridge(
@@ -290,6 +299,7 @@ impl Harness {
                 bridge_source,
                 commands_rx,
                 events_tx,
+                wake_rx,
                 shutdown_c,
             )
             .await;
@@ -305,6 +315,7 @@ impl Harness {
             bridge_task,
             _commands_tx: commands_tx,
             _events_rx: events_rx,
+            _wake_handle: wake_handle,
         }
     }
 
@@ -1101,6 +1112,8 @@ struct PairingHarness {
     events_rx: mpsc::Receiver<BridgeEvent>,
     shutdown: CancellationToken,
     bridge_task: JoinHandle<()>,
+    /// Held open so the bridge's wake branch (#233) stays live; unexercised here.
+    _wake_handle: remora_bridge::BridgeWakeHandle,
     _dir: tempfile::TempDir,
 }
 
@@ -1125,6 +1138,7 @@ impl PairingHarness {
             handshake_timeout_secs: 10,
             max_connections: 1024,
             audit: None,
+            push: PushConfig::default(),
         });
         let relay = Relay::start(config0);
         let relay_url = format!("ws://{}", relay.addr);
@@ -1144,6 +1158,7 @@ impl PairingHarness {
         ));
         let (commands_tx, commands_rx) = mpsc::channel::<PairingCommand>(8);
         let (events_tx, events_rx) = mpsc::channel::<BridgeEvent>(32);
+        let (wake_handle, wake_rx) = wake_channel();
         let shutdown_c = shutdown.clone();
         let bridge_task = tokio::spawn(async move {
             let _ = serve_bridge(
@@ -1151,6 +1166,7 @@ impl PairingHarness {
                 bridge_source,
                 commands_rx,
                 events_tx,
+                wake_rx,
                 shutdown_c,
             )
             .await;
@@ -1163,6 +1179,7 @@ impl PairingHarness {
             events_rx,
             shutdown,
             bridge_task,
+            _wake_handle: wake_handle,
             _dir: dir,
         }
     }

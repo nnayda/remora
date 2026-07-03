@@ -33,6 +33,7 @@ the old one rather than editing history (see
 | [0020](0020-launch-time-hook-injection.md) | Launch-time hook injection: `Agent.provision` + inline `--settings` | Accepted |
 | [0021](0021-blind-relay-bridge-trust-model.md) | Split relay mode into a blind relay and a user-side bridge, paired end-to-end | Accepted |
 | [0022](0022-sticky-awaiting-status.md) | `awaiting` is sticky: exits only via marker, user input, or teardown | Accepted |
+| [0023](0023-unifiedpush-first-wake-delivery.md) | Deliver v1 wake pushes over UnifiedPush, direct from the relay | Accepted |
 
 ## Statuses
 

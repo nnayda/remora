@@ -19,11 +19,12 @@ mod identity;
 mod noise;
 mod pairing_client;
 mod remote_source;
+mod wake;
 mod wire_error;
 
 pub use bridge::{
-    is_ws_url, serve_bridge, BridgeConfig, BridgeError, BridgeEvent, BridgeServeError,
-    PairingCommand, PairingOutcome,
+    is_ws_url, serve_bridge, wake_channel, BridgeConfig, BridgeError, BridgeEvent,
+    BridgeServeError, BridgeWakeHandle, PairingCommand, PairingOutcome, WakeReceiver,
 };
 pub use identity::{fingerprint, BridgeIdentity, IdentityError, PairingFile, Roster, RosterEntry};
 pub use noise::{

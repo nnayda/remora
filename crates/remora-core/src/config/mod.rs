@@ -119,6 +119,14 @@ pub struct RelayConfigSection {
     pub relay_url: String,
     /// The relay-issued bridge registration token that proves admission.
     pub registration_token: String,
+    /// Optional push-wake endpoint this device registers with its bridge
+    /// (ADR-0023, #233): a UnifiedPush distributor URL (e.g. an ntfy topic) the
+    /// relay POSTs a generic wake to when a hosted session goes `Awaiting`.
+    /// Absent means this device wants no push wakes. Syntax is validated at
+    /// config load (`validate_push_endpoint`); the relay owns delivery-time
+    /// SSRF policy.
+    #[serde(default)]
+    pub push_wake_url: Option<String>,
 }
 
 /// A configured host: a transport plus its connection details (ADR-0004).
@@ -329,6 +337,13 @@ pub enum ValidationIssue {
     InvalidProvision {
         agent: AgentId,
         reason: &'static str,
+    },
+    #[error("relay: `{field}` {reason}")]
+    InvalidRelayField {
+        field: &'static str,
+        // Dynamic (carries the underlying `PushEndpointError` message), unlike
+        // the `&'static str` reasons above.
+        reason: String,
     },
 }
 
@@ -971,6 +986,20 @@ impl Config {
             }
         }
 
+        // Validate the optional push-wake endpoint before it is ever stored or
+        // asserted to the relay (mirrors the bridge's validate-before-store rule
+        // for a client-supplied endpoint; the relay_url itself is a `ws`/`wss`
+        // dial validated at serve time, so only `push_wake_url` — an `http(s)`
+        // URL — is checked here). Syntax only: SSRF policy is the relay's.
+        if let Some(url) = raw.relay.as_ref().and_then(|r| r.push_wake_url.as_deref()) {
+            if let Err(e) = remora_protocol::validate_push_endpoint(url) {
+                issues.push(ValidationIssue::InvalidRelayField {
+                    field: "push_wake_url",
+                    reason: format!("is not a valid push endpoint: {e}"),
+                });
+            }
+        }
+
         let config = Config {
             hosts,
             projects: raw.projects,
@@ -1110,6 +1139,49 @@ mod tests {
         )
         .expect_err("unknown relay field");
         assert!(err.to_string().contains("reg_token"), "{err}");
+    }
+
+    #[test]
+    fn parses_relay_push_wake_url() {
+        let toml = r#"
+            [relay]
+            relay_url = "wss://relay.example/ws"
+            registration_token = "reg-tok"
+            push_wake_url = "https://ntfy.sh/my-topic"
+        "#;
+        let config = Config::from_toml_str(toml).expect("parse");
+        let relay = config.relay.expect("relay section present");
+        assert_eq!(
+            relay.push_wake_url.as_deref(),
+            Some("https://ntfy.sh/my-topic")
+        );
+    }
+
+    #[test]
+    fn relay_push_wake_url_absent_is_none() {
+        // The field is optional (`#[serde(default)]`): a relay section without
+        // it is valid and leaves the endpoint unset.
+        let toml = r#"
+            [relay]
+            relay_url = "wss://relay.example/ws"
+            registration_token = "reg-tok"
+        "#;
+        let config = Config::from_toml_str(toml).expect("parse");
+        let relay = config.relay.expect("relay section present");
+        assert!(relay.push_wake_url.is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_relay_push_wake_url() {
+        // A syntactically bad push endpoint fails config validation with a
+        // message that names the field and explains the problem.
+        let issues = issues_of(
+            "[relay]\nrelay_url = \"ws://r/ws\"\nregistration_token = \"t\"\npush_wake_url = \"ftp://nope/x\"\n",
+        );
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        let msg = issues[0].to_string();
+        assert!(msg.contains("push_wake_url"), "names the field: {msg}");
+        assert!(msg.contains("scheme"), "explains the problem: {msg}");
     }
 
     #[test]

@@ -18,7 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ChannelInput, ChannelOutput, ProjectId, SessionId, SessionMeta};
+use crate::{ChannelInput, ChannelOutput, ProjectId, PushRegistration, SessionId, SessionMeta};
 
 /// Client → bridge, inside Noise.
 ///
@@ -66,6 +66,15 @@ pub enum RemoteOp {
     ListDevices,
     /// Revoke a device from the bridge's roster by id (self-revoke = unpair).
     RevokeDevice { device_id: crate::DeviceId },
+    /// Register (or, with `None`, clear) this device's push-wake endpoint
+    /// (ADR-0023). Bridge-asserted: the requesting device tells its own
+    /// bridge, which persists the registration in the device's roster entry
+    /// and forwards it to the relay in every subsequent
+    /// [`crate::RelayControl::AssertDevices`] via
+    /// [`crate::AssertedDevice::push`].
+    RegisterPushEndpoint {
+        registration: Option<PushRegistration>,
+    },
 }
 
 /// Bridge → client, inside Noise.
@@ -99,6 +108,8 @@ pub enum RemoteResult {
     Devices(Vec<DeviceInfo>),
     /// Answers a successful [`RemoteOp::RevokeDevice`].
     Revoked,
+    /// Answers a successful [`RemoteOp::RegisterPushEndpoint`] (ADR-0023).
+    PushEndpointSet,
     /// Answers a failed request of either kind.
     Error(WireError),
 }
@@ -364,6 +375,51 @@ mod tests {
         let msg = BridgeMessage::Response {
             id: 6,
             result: RemoteResult::Revoked,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<BridgeMessage>(&json).expect("deserialize"),
+            msg
+        );
+    }
+
+    #[test]
+    fn register_push_endpoint_round_trips() {
+        let msg = ClientMessage::Request {
+            id: 8,
+            op: RemoteOp::RegisterPushEndpoint {
+                registration: Some(PushRegistration::UnifiedPush {
+                    endpoint: "https://ntfy.sh/topic".to_string(),
+                }),
+            },
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"request":{"id":8,"op":{"register_push_endpoint":{"registration":{"unified_push":{"endpoint":"https://ntfy.sh/topic"}}}}}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&json).expect("deserialize"),
+            msg
+        );
+
+        // `None` clears an existing registration.
+        let clear = ClientMessage::Request {
+            id: 9,
+            op: RemoteOp::RegisterPushEndpoint { registration: None },
+        };
+        let json = serde_json::to_string(&clear).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&json).expect("deserialize"),
+            clear
+        );
+    }
+
+    #[test]
+    fn push_endpoint_set_round_trips() {
+        let msg = BridgeMessage::Response {
+            id: 8,
+            result: RemoteResult::PushEndpointSet,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         assert_eq!(

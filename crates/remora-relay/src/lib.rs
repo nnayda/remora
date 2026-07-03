@@ -10,18 +10,22 @@
 //!
 //! This module provides the relay's config surface ([`config`]), the sans-IO
 //! [`router`] core (registry, hello auth, adjacency routing, byte budgets), the
-//! opt-in [`audit`] log, and the [`server`] that binds the WebSocket listener
-//! and drives the router (#231).
+//! opt-in [`audit`] log, the opt-in [`push`] wake pipeline (ADR-0023: stored
+//! registrations, the pure wake decision, and the SSRF-guarded HTTP delivery
+//! that acts on it), and the [`server`] that binds the WebSocket listener and
+//! drives the router (#231).
 
 mod audit;
 mod config;
+mod push;
 mod router;
 mod server;
 
-pub use audit::{AuditRecord, AuditSink, CloseReason};
+pub use audit::{AuditRecord, AuditSink, CloseReason, PushEndpointWarning};
 pub use config::{AuditConfig, BridgeEntry, RelayConfig, RelayConfigError};
+pub use push::{decide_wake, DropReason, PushConfig, PushState, StoredRegistration};
 pub use router::{
     outbound_channel, ConnPermit, ControlOutcome, HelloOutcome, OutboundFrame, OutboundHandle,
-    OutboundReceiver, RouteOutcome, Router,
+    OutboundReceiver, PushDecision, RouteOutcome, Router,
 };
 pub use server::serve;

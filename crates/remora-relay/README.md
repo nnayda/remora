@@ -16,8 +16,10 @@ side-channel over an interactive PTY stream).
 
 This document covers self-hosting the relay: config reference, the container
 image, and operational posture. It is not the wire protocol spec (see
-[docs/adr/0021-blind-relay-bridge-trust-model.md](../../docs/adr/0021-blind-relay-bridge-trust-model.md)
-and the tracked follow-up PROTOCOL.md, #236) and not the pairing flow (#232).
+[docs/PROTOCOL.md](../../docs/PROTOCOL.md) and
+[docs/adr/0021-blind-relay-bridge-trust-model.md](../../docs/adr/0021-blind-relay-bridge-trust-model.md))
+and not the pairing flow (ADR-0021, #232 — the roster this relay routes
+against is asserted by each bridge, never configured here).
 
 ## Running it
 
@@ -55,26 +57,32 @@ max_connections = 1024        # optional; this is the default
 token = "<bridge-registration-token>"
 device_id = "<64-hex-char device id the token identifies as>"
 
-[[devices]]
-token = "<device-token>"
-device_id = "<64-hex-char device id>"
-bridge_id = "<64-hex-char device id of the bridge this device routes through>"
-
 [audit]
 path = "/var/log/remora-relay/audit.log"  # omit this table to disable audit mode
+
+[push]
+enabled = false                     # optional; this is the default (push wakes off)
+allow_http = false                  # optional; this is the default
+allow_private_endpoints = false     # optional; this is the default
+device_cooldown_secs = 30           # optional; this is the default
+per_bridge_per_minute = 10          # optional; this is the default
+max_in_flight = 32                  # optional; this is the default
 ```
 
 - **`listen`** — the address the WebSocket server binds, e.g.
   `"127.0.0.1:9440"` for loopback-only or `"0.0.0.0:9440"` behind a reverse
   proxy.
-- **`bridges`** / **`devices`** — the admission list. **Closed by default**:
-  omit either list (or the whole file's `[[bridges]]`/`[[devices]]` tables)
-  and nothing in that role can register — there is no implicit open mode. A
-  bridge entry's token admits exactly the `device_id` it names, nothing else
-  (a token is not a capability that can be reused for a different identity).
-  A device entry's token is scoped to one `(device_id, bridge_id)` pair — the
-  same device paired with two bridges needs two entries, and revoking one
-  never affects the other. Token comparison is constant-time.
+- **`bridges`** — the *only* static admission list this file holds, and it
+  admits bridges only. **Closed by default**: omit `[[bridges]]` entirely and
+  no bridge can register — there is no implicit open mode. A bridge entry's
+  token admits exactly the `device_id` it names, nothing else (a token is not
+  a capability that can be reused for a different identity). Token comparison
+  is constant-time. Devices are **not** configured here at all (ADR-0021 D4):
+  a device authenticates against its own bridge's live, asserted roster
+  (`AssertDevices`, sent by the bridge on every connect and every roster
+  change) rather than any static relay-side list — there is no `[[devices]]`
+  table to fill in. Pairing/revoking a device is entirely a bridge-side
+  operation; see [Token rotation and revocation](#token-rotation-and-revocation).
 - **`buffer_bytes`** — per-connection outbound buffer cap, in bytes (default
   1 MiB / `1048576`). This is the relay's load-shedding knob: because Noise
   transport nonces require strictly ordered, lossless delivery, the relay
@@ -98,6 +106,38 @@ path = "/var/log/remora-relay/audit.log"  # omit this table to disable audit mod
   or firewall that does per-source limiting if that is a concern.
 - **`audit`** — opt-in; see [Audit mode](#audit-mode) below. Omitting the
   `[audit]` table disables it entirely (the default).
+- **`push`** — opt-in push-wake delivery ([ADR-0023](../../docs/adr/0023-unifiedpush-first-wake-delivery.md));
+  see [Push wake (opt-in)](#push-wake-opt-in) below. Omitting the `[push]`
+  table, or any key inside it, falls back to its default — an absent table is
+  identical to every field set to its default (push disabled).
+  - **`enabled`** — master switch (default `false`). `false` means a
+    well-formed `PushTrigger` from a bridge is still accepted (never a
+    protocol violation) but never produces a delivered wake.
+  - **`allow_http`** — admit cleartext `http://` endpoints (default `false`).
+    Even when `true`, cleartext is only ever allowed to a private/loopback
+    target — never to the public internet.
+  - **`allow_private_endpoints`** — admit endpoints that resolve to loopback,
+    RFC 1918 private, IPv6 ULA (`fc00::/7`), deprecated IPv6 site-local
+    (`fec0::/10`), CGNAT (`100.64.0.0/10`), or
+    `0.0.0.0/8` (which routes to the local host on Linux) addresses (default
+    `false`), for LAN self-hosters (an ntfy instance on the same network).
+    Link-local and cloud-metadata addresses (`169.254.0.0/16`, IPv6
+    `fe80::/10`) are blocked unconditionally — no flag re-admits them — as are
+    the documentation (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`),
+    benchmarking (`198.18.0.0/15`), reserved (`240.0.0.0/4`), tunnelled-v4
+    IPv6 (6to4 `2002::/16`, Teredo `2001:0::/32`), and the non-routable IPv6
+    identifier prefixes — documentation (`2001:db8::/32`) and ORCHID/ORCHIDv2
+    (`2001:10::/28`, `2001:20::/28`) — where no legitimate push target lives.
+  - **`device_cooldown_secs`** — minimum seconds between two delivered wakes
+    for the *same device* (default `30`; `0` disables the cooldown), so one
+    flapping session cannot spam one phone.
+  - **`per_bridge_per_minute`** — token-bucket budget of delivered wakes per
+    *bridge* per minute (default `10`; `0` blocks every wake from that
+    bridge), so one compromised or buggy bridge cannot spam the relay's
+    outbound path.
+  - **`max_in_flight`** — global cap on simultaneously in-flight deliveries
+    (default `32`). A wake that cannot immediately take a permit is dropped,
+    never queued.
 
 Device IDs are 32-byte values written as 64 lowercase hex characters.
 
@@ -118,7 +158,7 @@ The relay's WebSocket close code on every teardown is one of:
 | Code | Reason | Meaning |
 | --- | --- | --- |
 | `1000` | normal | Peer closed cleanly, or the socket reached EOF. |
-| `4001` | auth_failure | The hello's token didn't match a configured `bridges`/`devices` entry (or none is configured — closed by default). |
+| `4001` | auth_failure | A bridge's hello token didn't match a configured `bridges` entry (or none is configured — closed by default); or a device's hello didn't match its claimed bridge's live asserted roster or an open pairing window. |
 | `4002` | protocol | A malformed frame, an illegal frame type for the connection's state, or an envelope `src`/`dst` adjacency violation. |
 | `4004` | peer_gone | The envelope's destination device isn't currently registered with the relay. Sent only to a **device** sender whose bridge is gone (it has nothing left to do). A **bridge** addressing a departed device is routine — under D3 a device reconnects with a fresh routing id, so its old id goes offline on every reconnect — so the relay drops that undeliverable frame and keeps the bridge connection up rather than tearing down every other device's session on it. |
 | `4008` | buffer_overflow | This connection's outbound buffer exceeded `buffer_bytes`; it was shed as a slow consumer. The frame's *sender* is unaffected — only the slow destination is killed. |
@@ -149,16 +189,65 @@ regression guard against accidental leakage in this codebase, not an
 operator-facing security audit trail — a malicious relay operator can
 already see the same metadata live, on or off.
 
+## Push wake (opt-in)
+
+Off by default. When `[push] enabled = true`, the relay can wake a paired
+device with a UnifiedPush notification when a session it owns needs
+attention and no live connection is currently reaching it — see
+[ADR-0023](../../docs/adr/0023-unifiedpush-first-wake-delivery.md) for the
+full design and the network-target (SSRF) policy `allow_http` and
+`allow_private_endpoints` gate.
+
+**ntfy quick-start** — the fastest way to see a real wake on a real phone,
+using [ntfy](https://ntfy.sh) as the UnifiedPush distributor:
+
+1. Pick an unguessable topic name and set it as this device's push endpoint —
+   in the desktop app's config, `[relay] push_wake_url =
+   "https://ntfy.sh/<your-topic>"` (a device-level setting, not this relay's
+   config).
+2. Install the ntfy app (iOS/Android) and subscribe to the same topic.
+3. On the relay, set `enabled = true` under `[push]` in `relay.toml` and
+   restart the relay.
+4. Leave the paired session idle without a connected device watching it; when
+   it next needs attention, the relay POSTs a wake and the phone buzzes.
+
+**Residual risk, named plainly:** the endpoint is a URL the *device* supplies
+and the relay POSTs to unauthenticated — this is a bounded server-side request
+forgery surface, not a theoretical one. Put concretely: an authenticated bridge
+can make the relay a **low-rate outbound-POST reflector** to a public HTTPS URL,
+bounded on every axis — a fixed constant body (no attacker-chosen bytes), the
+resolve-check-pin network policy, redirects disabled, proxies disabled (so no
+`HTTP_PROXY`/`ALL_PROXY` can re-resolve the host past the address filter and
+pin), the deny-list, and the
+per-device cooldown / per-bridge budget / global in-flight caps. Read those as
+*bounds*, not elimination — named, and accepted. The push provider
+(ntfy.sh, or whatever distributor the endpoint points at) learns *that* a
+Remora session needed attention and *when* — never *why*: no session name,
+branch, host, agent identity, or bridge identity ever appears in the request.
+A relay (malicious or compromised) can also *forge* a wake to any registered
+endpoint; per ADR-0021's framing, forging buys an attacker attention timing,
+never session content. One more asymmetry worth knowing if you run
+`allow_private_endpoints = true` on a cloud-hosted relay: IPv4 cloud-metadata
+(`169.254.169.254`) is link-local and always blocked, but some clouds' IPv6
+metadata equivalent (e.g. AWS's `fd00:ec2::254`) is a ULA address, so it is
+reachable once that flag is on.
+
 ## Token rotation and revocation
 
-There is no admin API and no hot-reload. To rotate or revoke a token: edit
-`relay.toml` (remove or replace the `[[bridges]]`/`[[devices]]` entry) and
-restart the process. Connections already routing under a removed token stay
-up until they next disconnect or are killed by the operator (e.g. `docker
-restart`); there is no live-kick of an already-admitted connection today. Per
-ADR-0021, the relay's admission list is defense-in-depth — the actual trust
-boundary is the bridge's device roster and its own revocation flow, which
-takes effect independent of the relay.
+There is no admin API and no hot-reload for **bridge** tokens: to rotate or
+revoke one, edit `relay.toml` (remove or replace the `[[bridges]]` entry) and
+restart the process. A bridge connection already routing under a removed
+token stays up until it next disconnects or is killed by the operator (e.g.
+`docker restart`); there is no live-kick of an already-admitted connection
+today.
+
+**Device** tokens are never in `relay.toml` at all (ADR-0021 D4) — pairing and
+revocation are bridge-side operations (the desktop's Devices panel, or a
+future headless-bridge equivalent) that take effect the moment the bridge next
+asserts its roster to the relay, independent of a relay restart. Per
+ADR-0021, this relay's `[[bridges]]` list is defense-in-depth on top of that —
+the actual trust boundary for *devices* is the bridge's own roster and
+revocation flow.
 
 ## Reproducible builds
 
@@ -218,6 +307,9 @@ weekly reproducibility job re-verifies the build after each bump.
 - [ADR-0021](../../docs/adr/0021-blind-relay-bridge-trust-model.md) — the
   trust model this crate implements (blind relay / user-side bridge split,
   metadata policy, threat model).
+- [ADR-0023](../../docs/adr/0023-unifiedpush-first-wake-delivery.md) — the
+  `[push]` wake-delivery design (registration, wake decision, SSRF policy)
+  this crate's `push` module implements.
 - [remora-protocol](../remora-protocol) — the envelope frame types this crate
   routes.
 - `crates/remora-relay/tests/` — integration coverage for hello auth,
