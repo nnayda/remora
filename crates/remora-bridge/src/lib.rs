@@ -8,11 +8,11 @@
 //! paired device needs to reach and authenticate to this bridge.
 //!
 //! Device ids, pinned static keys, and a per-`(device, bridge)` PSK are the
-//! final pairing semantics; the real out-of-band pairing ceremony (QR
-//! display, confirm-gated enrollment) is #232's build.
-//!
-//! The Noise handshake, the bridge server loop, and the `RemoteSource`
-//! transport land in later tasks.
+//! pairing semantics. The out-of-band pairing ceremony (QR display,
+//! confirm-gated enrollment) is driven by [`run_pairing`]; the `IKpsk2` Noise
+//! handshake ([`Handshake`], [`HandshakeKind`]), the bridge server loop
+//! ([`serve_bridge`]), and the [`RemoteSource`] transport are all implemented
+//! here.
 
 mod bridge;
 mod identity;
