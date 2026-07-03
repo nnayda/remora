@@ -91,12 +91,20 @@ first line of delivery code:
 - Before every POST, the relay resolves the endpoint host itself and checks
   every resolved address against policy — **denying loopback, link-local
   (including `169.254.0.0/16` and its cloud-metadata callers, and IPv6
-  `fe80::/10`), private ranges (RFC 1918, `fc00::/7`), and unspecified
-  addresses by default.** `allow_private_endpoints = true` re-admits loopback
-  as well as private/ULA targets (RFC 1918, IPv6 `fc00::/7`) — for LAN
-  self-hosters (an ntfy instance on the same network) who deliberately want
-  one of those. Link-local/cloud-metadata addresses stay blocked regardless:
-  no config flag re-admits them. One honest asymmetry worth naming: IPv4
+  `fe80::/10`), private ranges (RFC 1918, `fc00::/7`), CGNAT shared space
+  (`100.64.0.0/10`), the whole `0.0.0.0/8` (which routes to the local host on
+  Linux, so `0.0.0.1` reaches the same place loopback does), and unspecified
+  addresses by default.** A second tier is blocked *unconditionally*, since no
+  legitimate push target ever lives there: the RFC 5737 documentation ranges
+  (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`), RFC 2544 benchmarking
+  (`198.18.0.0/15`), reserved space (`240.0.0.0/4`), and the tunnelled-v4 IPv6
+  prefixes 6to4 (`2002::/16`) and Teredo (`2001:0::/32`) — blocked whole rather
+  than decoding their embedded (for Teredo, XOR-obfuscated) v4, which buys an
+  SSRF surface a real target never needs. `allow_private_endpoints = true`
+  re-admits loopback as well as private/ULA/CGNAT and `0.0.0.0/8` targets — for
+  LAN self-hosters (an ntfy instance on the same network) who deliberately want
+  one of those. Link-local/cloud-metadata and the unconditional tier stay
+  blocked regardless: no config flag re-admits them. One honest asymmetry worth naming: IPv4
   cloud-metadata (`169.254.169.254`) is link-local and so is **always**
   blocked, but the IPv6 equivalent some clouds expose (e.g. AWS's
   `fd00:ec2::254`) is a ULA address, not link-local — so with
@@ -194,6 +202,14 @@ Easier:
 
 Harder, and what we are committed to:
 
+- **The relay becomes a low-rate outbound-POST reflector.** With push enabled,
+  an authenticated bridge can cause the relay to POST a fixed constant body to
+  a public HTTPS URL its device supplied — a bounded server-side-request-forgery
+  surface, not a theoretical one. It is bounded on every axis: a fixed constant
+  body (no attacker-chosen bytes), the resolve-check-pin + deny-list network
+  policy above, the per-device cooldown, the per-bridge token-bucket budget, and
+  the global in-flight concurrency cap. Named, and accepted, as a bounded
+  reflector — not eliminated.
 - **v1 wakes only fire for sessions with an open desktop tab** — the tee's
   accepted gap. A session a disconnected device was driving, or one no
   desktop ever opened, gets no wake until #234's bridge-side watcher lands.

@@ -65,7 +65,9 @@ pub struct PairingHandles {
     pub bridge_fingerprint: String,
     /// Cheap, cloneable handle the session-output pump uses to wake paired
     /// devices when a session goes `Awaiting` (#233). Held here so its channel
-    /// stays open for the bridge's life; the pump wiring lands in a later task.
+    /// stays open for the bridge's life; `lib.rs` installs it on the app bridge
+    /// via `set_wake_handle`, so the session-output pump tees every status
+    /// transition into this wake path.
     pub wake: BridgeWakeHandle,
     /// Cancels the bridge's serve loop on app teardown.
     pub shutdown: CancellationToken,

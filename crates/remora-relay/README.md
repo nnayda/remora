@@ -117,10 +117,15 @@ max_in_flight = 32                  # optional; this is the default
     Even when `true`, cleartext is only ever allowed to a private/loopback
     target — never to the public internet.
   - **`allow_private_endpoints`** — admit endpoints that resolve to loopback,
-    RFC 1918 private, or IPv6 ULA (`fc00::/7`) addresses (default `false`),
-    for LAN self-hosters (an ntfy instance on the same network). Link-local
-    and cloud-metadata addresses (`169.254.0.0/16`, IPv6 `fe80::/10`) are
-    blocked unconditionally — no flag re-admits them.
+    RFC 1918 private, IPv6 ULA (`fc00::/7`), CGNAT (`100.64.0.0/10`), or
+    `0.0.0.0/8` (which routes to the local host on Linux) addresses (default
+    `false`), for LAN self-hosters (an ntfy instance on the same network).
+    Link-local and cloud-metadata addresses (`169.254.0.0/16`, IPv6
+    `fe80::/10`) are blocked unconditionally — no flag re-admits them — as are
+    the documentation (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`),
+    benchmarking (`198.18.0.0/15`), reserved (`240.0.0.0/4`), and tunnelled-v4
+    IPv6 (6to4 `2002::/16`, Teredo `2001:0::/32`) ranges, where no legitimate
+    push target lives.
   - **`device_cooldown_secs`** — minimum seconds between two delivered wakes
     for the *same device* (default `30`; `0` disables the cooldown), so one
     flapping session cannot spam one phone.
@@ -206,9 +211,12 @@ using [ntfy](https://ntfy.sh) as the UnifiedPush distributor:
 
 **Residual risk, named plainly:** the endpoint is a URL the *device* supplies
 and the relay POSTs to unauthenticated — this is a bounded server-side request
-forgery surface, not a theoretical one. The bounds are the policy above
-(resolve-check-pin, redirects disabled, the deny-list, cooldown/budget/
-in-flight caps); read them as *bounds*, not elimination. The push provider
+forgery surface, not a theoretical one. Put concretely: an authenticated bridge
+can make the relay a **low-rate outbound-POST reflector** to a public HTTPS URL,
+bounded on every axis — a fixed constant body (no attacker-chosen bytes), the
+resolve-check-pin network policy, redirects disabled, the deny-list, and the
+per-device cooldown / per-bridge budget / global in-flight caps. Read those as
+*bounds*, not elimination — named, and accepted. The push provider
 (ntfy.sh, or whatever distributor the endpoint points at) learns *that* a
 Remora session needed attention and *when* — never *why*: no session name,
 branch, host, agent identity, or bridge identity ever appears in the request.
