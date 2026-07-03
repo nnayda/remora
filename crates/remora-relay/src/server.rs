@@ -49,11 +49,11 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 
-use crate::audit::{AuditRecord, AuditSink, CloseReason};
+use crate::audit::{AuditRecord, AuditSink, CloseReason, PushEndpointWarning};
 use crate::config::RelayConfig;
 use crate::router::{
-    outbound_channel, ConnPermit, ControlOutcome, HelloOutcome, OutboundReceiver, RouteOutcome,
-    Router,
+    outbound_channel, ConnPermit, ControlOutcome, HelloOutcome, OutboundReceiver, PushDecision,
+    RouteOutcome, Router,
 };
 
 /// The largest inbound WebSocket message the relay accepts: a full envelope
@@ -376,7 +376,7 @@ async fn run_connection(
                     None => break CloseReason::Normal,
                     Some(Err(_)) => break CloseReason::Normal,
                     Some(Ok(msg)) => {
-                        match handle_data_message(msg, &router, &permit, &registrar, &mut frames_in, &mut bytes_in) {
+                        match handle_data_message(msg, &router, &permit, &registrar, &audit, &mut frames_in, &mut bytes_in) {
                             DataStep::Continue => {}
                             DataStep::Close(reason) => break reason,
                         }
@@ -452,6 +452,7 @@ fn handle_data_message(
     router: &Router,
     permit: &ConnPermit,
     registrar: &Mutex<Registrar>,
+    audit: &AuditSink,
     frames_in: &mut u64,
     bytes_in: &mut u64,
 ) -> DataStep {
@@ -482,10 +483,65 @@ fn handle_data_message(
         ),
         // `Control` is a bridge→relay message the relay terminates (ADR-0021 D4):
         // it is the only frame whose JSON the relay decodes.
-        FrameType::Control => dispatch_control(router, permit, registrar, &envelope.payload),
-        // Hello-again and PushTrigger post-hello are protocol violations.
-        FrameType::Hello | FrameType::PushTrigger => DataStep::Close(CloseReason::Protocol),
+        FrameType::Control => dispatch_control(router, permit, registrar, audit, &envelope.payload),
+        // `PushTrigger` is a bridge→relay wake request (ADR-0023): empty-payload,
+        // header-only. The relay validates the accept rules and runs the wake
+        // decision; a policy drop is routine, only a rule violation closes.
+        FrameType::PushTrigger => dispatch_push_trigger(router, permit, &envelope),
+        // A second Hello post-hello is a protocol violation.
+        FrameType::Hello => DataStep::Close(CloseReason::Protocol),
     }
+}
+
+/// Handles a bridge's `PushTrigger` wake request (ADR-0023, spec Task 6).
+///
+/// Accept rules (all violations → protocol close, same posture as before):
+/// the sender must be a **bridge**, the payload must be **empty** (v1 reserves
+/// it), and the `dst` must be in **that bridge's** asserted set (checked inside
+/// [`Router::decide_push_wake`]). A well-formed trigger runs the wake decision;
+/// whatever the outcome — a delivered wake handed to the delivery seam, or a
+/// policy drop — the sender **continues** (a drop is never a violation).
+fn dispatch_push_trigger(router: &Router, permit: &ConnPermit, envelope: &Envelope) -> DataStep {
+    // PushTrigger is bridge→relay only; a device sending one is a violation.
+    if permit.role() != HelloRole::Bridge {
+        return DataStep::Close(CloseReason::Protocol);
+    }
+    // The payload is reserved and MUST be empty in v1 (ADR-0023): E2E-encrypted
+    // wake payloads are a future follow-up, so a non-empty one is malformed.
+    if !envelope.payload.is_empty() {
+        return DataStep::Close(CloseReason::Protocol);
+    }
+    match router.decide_push_wake(permit, envelope.dst) {
+        // dst not asserted by this bridge (or a stale/non-bridge permit): the
+        // last accept-rule violation, closed like the others.
+        PushDecision::NotAsserted => DataStep::Close(CloseReason::Protocol),
+        // A cleared decision resolves to the device's endpoint; hand it to the
+        // delivery seam (Task 7) and continue.
+        PushDecision::Deliver(endpoint) => {
+            deliver_wake(endpoint);
+            DataStep::Continue
+        }
+        // A dropped wake is a routine policy outcome, not a protocol violation;
+        // count/log it and continue.
+        PushDecision::Drop(reason) => {
+            eprintln!("remora-relay: push wake dropped ({})", reason.as_str());
+            DataStep::Continue
+        }
+    }
+}
+
+/// Delivery seam for the push-wake HTTP POST (Task 7, #233).
+///
+/// A wake decision that clears every policy gate resolves to the target
+/// device's endpoint and hands it here. Task 7 wires the bounded, SSRF-checked
+/// HTTP POST at this boundary — global in-flight semaphore, resolve-check-pin of
+/// the destination address, redirects disabled, cleartext gated on
+/// private/loopback (ADR-0023). Until then the relay performs **no** network
+/// I/O: the endpoint is accepted and this seam is a no-op placeholder, so no
+/// device-supplied URL is logged or dialed.
+fn deliver_wake(endpoint: String) {
+    // Task 7 spawns the delivery task here; drop the resolved endpoint for now.
+    let _ = endpoint;
 }
 
 /// Routes one blind `Data`/`Pairing` envelope through [`Router::route`] and maps
@@ -530,6 +586,7 @@ fn dispatch_control(
     router: &Router,
     permit: &ConnPermit,
     registrar: &Mutex<Registrar>,
+    audit: &AuditSink,
     payload: &[u8],
 ) -> DataStep {
     // Control is bridge→relay only; a device sending one is a protocol error.
@@ -554,13 +611,32 @@ fn dispatch_control(
         }
         // Unreachable — the bridge role was checked above — but stay total.
         ControlOutcome::NotBridge => DataStep::Close(CloseReason::Protocol),
-        ControlOutcome::KickDevices(routing_ids) => {
+        ControlOutcome::Asserted {
+            kicked,
+            invalid_push,
+        } => {
+            // A push endpoint that failed syntax validation is stored-but-flagged
+            // (ADR-0023): log + audit it at assert time so the operator sees the
+            // misconfiguration now, not at the first missed wake. The assert
+            // still ACKs — one bad endpoint never kicks the bridge's other
+            // devices.
+            for (device_id, reason) in &invalid_push {
+                eprintln!(
+                    "remora-relay: bridge {} asserted an invalid push endpoint for device {device_id} ({reason})",
+                    permit.routing_id()
+                );
+                audit.record_push_warning(&PushEndpointWarning::new(
+                    permit.routing_id(),
+                    *device_id,
+                    reason.clone(),
+                ));
+            }
             // De-asserted devices with live connections are kicked by routing id
             // via the registrar kill channel (4001), then the assert is still
             // acked so the bridge learns its roster change was applied.
             {
                 let reg = registrar.lock().unwrap_or_else(|p| p.into_inner());
-                for routing_id in &routing_ids {
+                for routing_id in &kicked {
                     if let Some(conn) = reg.conns.get(routing_id) {
                         let _ = conn.kill.send(CloseReason::AuthFailure);
                     }

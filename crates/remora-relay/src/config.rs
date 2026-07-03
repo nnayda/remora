@@ -12,6 +12,8 @@ use remora_protocol::DeviceId;
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
 
+pub use crate::push::PushConfig;
+
 /// Top-level relay config, deserialized from TOML.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct RelayConfig {
@@ -45,6 +47,10 @@ pub struct RelayConfig {
     /// Opt-in audit log config. `None` = audit mode disabled (the default).
     #[serde(default)]
     pub audit: Option<AuditConfig>,
+    /// Opt-in push-wake policy (ADR-0023). An absent `[push]` section = every
+    /// field its default = push delivery disabled.
+    #[serde(default)]
+    pub push: PushConfig,
 }
 
 fn default_buffer_bytes() -> usize {
@@ -150,6 +156,54 @@ mod tests {
                 path: "/var/log/remora-relay/audit.log".into(),
             })
         );
+        // No [push] section: every push field is its default (disabled).
+        assert_eq!(config.push, PushConfig::default());
+        assert!(!config.push.enabled);
+    }
+
+    #[test]
+    fn parses_full_push_section() {
+        let toml = r#"
+            listen = "127.0.0.1:9440"
+
+            [push]
+            enabled = true
+            allow_http = true
+            allow_private_endpoints = true
+            device_cooldown_secs = 5
+            per_bridge_per_minute = 100
+            max_in_flight = 8
+        "#;
+        let config = RelayConfig::from_toml_str(toml).expect("valid config parses");
+        assert_eq!(
+            config.push,
+            PushConfig {
+                enabled: true,
+                allow_http: true,
+                allow_private_endpoints: true,
+                device_cooldown_secs: 5,
+                per_bridge_per_minute: 100,
+                max_in_flight: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn partial_push_section_fills_defaults() {
+        // Only `enabled` is set; every other field falls back to its default.
+        let toml = r#"
+            listen = "127.0.0.1:9440"
+
+            [push]
+            enabled = true
+        "#;
+        let config = RelayConfig::from_toml_str(toml).expect("valid config parses");
+        assert!(config.push.enabled, "the one set field is honoured");
+        assert!(!config.push.allow_http);
+        assert!(!config.push.allow_private_endpoints);
+        assert_eq!(config.push.device_cooldown_secs, 30);
+        assert_eq!(config.push.per_bridge_per_minute, 10);
+        assert_eq!(config.push.max_in_flight, 32);
     }
 
     #[test]
@@ -166,6 +220,7 @@ mod tests {
         assert_eq!(config.handshake_timeout_secs, 10);
         assert_eq!(config.max_connections, 1024);
         assert_eq!(config.audit, None);
+        assert_eq!(config.push, PushConfig::default());
     }
 
     #[test]

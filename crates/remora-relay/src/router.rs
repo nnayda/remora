@@ -37,6 +37,7 @@ use remora_protocol::{DeviceId, HelloRole, RelayControl, RelayHello};
 use tokio::sync::mpsc;
 
 use crate::config::{token_matches, RelayConfig};
+use crate::push::{decide_wake, DropReason, PushState, StoredRegistration};
 
 /// Sans-IO connection registry and routing authority. Cheap to clone-share via
 /// the returned [`Arc`]; all mutable state lives behind a single [`Mutex`] that
@@ -60,6 +61,12 @@ struct RouterState {
     /// created/refreshed on bridge hello and dropped when the bridge's
     /// connection closes.
     bridges: HashMap<DeviceId, BridgeState>,
+    /// Push-wake budgeting state (ADR-0023): per-device cooldowns and
+    /// per-bridge token buckets. Deliberately owned here, **outside**
+    /// [`BridgeState`], so a bridge's `AssertDevices` (which replaces its
+    /// `asserted`/`push` maps) never resets a device's cooldown — a bridge
+    /// cannot clear a phone's rate limit by re-asserting.
+    push_state: PushState,
 }
 
 /// Per-bridge soft state (ADR-0021 D4): the bridge's asserted device
@@ -73,6 +80,10 @@ struct BridgeState {
     serial: u64,
     /// device_id -> asserted token (constant-time compared on device hello).
     asserted: HashMap<DeviceId, String>,
+    /// device_id -> asserted push registration (ADR-0023), for the subset of
+    /// asserted devices that carry one. Replaced wholesale on each
+    /// `AssertDevices`, alongside `asserted`.
+    push: HashMap<DeviceId, StoredRegistration>,
     /// The active pairing window's rendezvous token + absolute expiry, if any.
     window: Option<PairingWindow>,
 }
@@ -147,10 +158,34 @@ pub enum ControlOutcome {
     Error(String),
     /// A device (not a bridge) sent a Control frame; the server closes it 4002.
     NotBridge,
-    /// An `AssertDevices` removed devices that had live connections. The server
-    /// kicks each returned **routing id** via its kill channel (4001) and still
-    /// replies `RelayControlAck`.
-    KickDevices(Vec<DeviceId>),
+    /// An `AssertDevices` was applied. The server replies `RelayControlAck`, and:
+    /// - kicks each **routing id** in `kicked` via its kill channel (4001):
+    ///   these are de-asserted devices that still had live connections;
+    /// - logs + audits each entry in `invalid_push`: a `(device_id, reason)`
+    ///   for an asserted push endpoint that failed syntax validation. Such an
+    ///   endpoint is stored-but-flagged (dropped at delivery time as
+    ///   [`DropReason::PolicyInvalid`]); the assert still ACKs, so one bad
+    ///   endpoint never kicks the bridge's other, correct devices (ADR-0023).
+    Asserted {
+        kicked: Vec<DeviceId>,
+        invalid_push: Vec<(DeviceId, String)>,
+    },
+}
+
+/// Result of [`Router::decide_push_wake`] — the relay's reaction to a
+/// well-formed `PushTrigger` from a bridge (ADR-0023, spec Task 6).
+#[derive(Debug)]
+pub enum PushDecision {
+    /// The `dst` device is not in the sending bridge's asserted set (or the
+    /// permit is stale / not a bridge). This is an accept-rule violation: the
+    /// server closes the **sender** with `CloseReason::Protocol`.
+    NotAsserted,
+    /// A wake should be delivered to this endpoint URL. The server hands it to
+    /// the delivery seam (Task 7) and the sender continues.
+    Deliver(String),
+    /// The wake was dropped for this policy reason — never a protocol
+    /// violation; the sender continues. Counted/logged for observability.
+    Drop(DropReason),
 }
 
 /// Result of a [`Router::route`] decision.
@@ -183,6 +218,7 @@ impl Router {
                 next_serial: 0,
                 conns: HashMap::new(),
                 bridges: HashMap::new(),
+                push_state: PushState::default(),
             }),
         })
     }
@@ -370,10 +406,25 @@ impl Router {
                 ControlOutcome::Ack
             }
             RelayControl::AssertDevices { devices, .. } => {
-                let new_asserted: HashMap<DeviceId, String> = devices
-                    .into_iter()
-                    .map(|d| (d.device_id, d.token))
-                    .collect();
+                // Build the replacement routing-credential and push-registration
+                // maps in lockstep, caching each endpoint's syntax verdict
+                // (ADR-0023). A flagged endpoint is stored, not rejected, and
+                // surfaced in `invalid_push` for the server to log + audit — the
+                // assert still ACKs so one bad endpoint never kicks this bridge's
+                // other, correctly-configured devices.
+                let mut new_asserted: HashMap<DeviceId, String> = HashMap::new();
+                let mut new_push: HashMap<DeviceId, StoredRegistration> = HashMap::new();
+                let mut invalid_push: Vec<(DeviceId, String)> = Vec::new();
+                for d in devices {
+                    if let Some(reg) = &d.push {
+                        let stored = StoredRegistration::from_registration(reg);
+                        if let Some(reason) = stored.invalid_reason() {
+                            invalid_push.push((d.device_id, reason.to_string()));
+                        }
+                        new_push.insert(d.device_id, stored);
+                    }
+                    new_asserted.insert(d.device_id, d.token);
+                }
                 // Devices in the old set but not the new one are de-asserted.
                 let removed: std::collections::HashSet<DeviceId> = {
                     let bs = match state.bridges.get_mut(&bridge_id) {
@@ -389,15 +440,14 @@ impl Router {
                         .copied()
                         .collect();
                     bs.asserted = new_asserted;
+                    bs.push = new_push;
                     removed
                 };
-                if removed.is_empty() {
-                    return ControlOutcome::Ack;
-                }
                 // Map each de-asserted device_id back to its live routing id(s)
                 // in this bridge's group, drop those registrations so they can
                 // no longer route, and hand the routing ids to the server to
-                // kick (4001).
+                // kick (4001). Note `push_state` (cooldowns/budgets) is *not*
+                // touched here — it survives re-asserts by design.
                 let kicked: Vec<DeviceId> = state
                     .conns
                     .iter()
@@ -411,16 +461,79 @@ impl Router {
                 for routing_id in &kicked {
                     state.conns.remove(routing_id);
                 }
-                if kicked.is_empty() {
-                    ControlOutcome::Ack
-                } else {
-                    ControlOutcome::KickDevices(kicked)
+                ControlOutcome::Asserted {
+                    kicked,
+                    invalid_push,
                 }
             }
             // `RelayControl` is `#[non_exhaustive]`: a control this relay build
             // does not understand is rejected rather than silently accepted, so
             // a newer bridge cannot assume an effect the relay never applied.
             _ => ControlOutcome::Error("unsupported control".to_string()),
+        }
+    }
+
+    /// Decides whether a well-formed `PushTrigger` from `permit`'s bridge,
+    /// targeting device `dst`, should deliver a wake (ADR-0023, spec Task 6).
+    ///
+    /// Enforces the last accept rule the server cannot check alone — `dst` must
+    /// be in **this** bridge's asserted set — then runs the pure
+    /// [`decide_wake`] policy against the relay's live state (push config,
+    /// whether `dst` is currently connected, and the surviving cooldown/budget
+    /// [`PushState`]). A non-bridge or stale permit, or an unasserted `dst`,
+    /// yields [`PushDecision::NotAsserted`] (an accept-rule violation the server
+    /// maps to a protocol close); every other result is a routine deliver/drop.
+    pub fn decide_push_wake(&self, permit: &ConnPermit, dst: DeviceId) -> PushDecision {
+        self.decide_push_wake_at(permit, dst, std::time::Instant::now())
+    }
+
+    /// [`Router::decide_push_wake`] with an injected `now`, so the cooldown and
+    /// per-bridge budget are deterministic in tests. Public `decide_push_wake`
+    /// calls this with [`std::time::Instant::now`].
+    pub fn decide_push_wake_at(
+        &self,
+        permit: &ConnPermit,
+        dst: DeviceId,
+        now: std::time::Instant,
+    ) -> PushDecision {
+        // Push triggers are bridge→relay only; a device sender is an accept-rule
+        // violation. (The server already gates on role, but stay total.)
+        if permit.role != HelloRole::Bridge {
+            return PushDecision::NotAsserted;
+        }
+        let mut state = self.lock();
+        let bridge_id = permit.routing_id;
+
+        // Gather everything the decision needs from the registry, then release
+        // the immutable borrows before mutating `push_state`.
+        let (registration, dst_asserted) = match state.bridges.get(&bridge_id) {
+            // The soft state must be owned by *this* bridge connection; a stale
+            // permit must not drive a wake against the current connection's set.
+            Some(bs) if bs.serial == permit.serial => {
+                (bs.push.get(&dst).cloned(), bs.asserted.contains_key(&dst))
+            }
+            _ => return PushDecision::NotAsserted,
+        };
+        if !dst_asserted {
+            return PushDecision::NotAsserted;
+        }
+        // The target "currently has a live relay connection" (DstConnected) iff a
+        // device registration for `dst` exists in this bridge's group.
+        let dst_connected = state.conns.values().any(|reg| {
+            reg.role == HelloRole::Device && reg.bridge_id == bridge_id && reg.device_id == dst
+        });
+
+        match decide_wake(
+            &self.config.push,
+            &mut state.push_state,
+            bridge_id,
+            dst,
+            registration.as_ref(),
+            dst_connected,
+            now,
+        ) {
+            Ok(endpoint) => PushDecision::Deliver(endpoint),
+            Err(reason) => PushDecision::Drop(reason),
         }
     }
 
@@ -663,7 +776,7 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::config::BridgeEntry;
-    use remora_protocol::{AssertedDevice, RelayControl};
+    use remora_protocol::{AssertedDevice, PushRegistration, RelayControl};
 
     /// Registers `devices` as `bridge`'s full asserted set at `now`.
     fn assert_devices(
@@ -713,7 +826,21 @@ mod tests {
             handshake_timeout_secs: 10,
             max_connections: 1024,
             audit: None,
+            push: crate::push::PushConfig::default(),
         })
+    }
+
+    /// [`config`] with push delivery enabled (and a generous per-bridge budget),
+    /// for the wake-decision tests.
+    fn config_push_enabled() -> Arc<RelayConfig> {
+        let mut cfg = (*config()).clone();
+        cfg.push = crate::push::PushConfig {
+            enabled: true,
+            per_bridge_per_minute: 60,
+            device_cooldown_secs: 30,
+            ..crate::push::PushConfig::default()
+        };
+        Arc::new(cfg)
     }
 
     fn bridge_hello() -> RelayHello {
@@ -889,8 +1016,8 @@ mod tests {
         // Re-assert WITHOUT the device: the router returns the routing id to kick.
         let out = assert_devices(&router, &bridge, 0, vec![]);
         match out {
-            ControlOutcome::KickDevices(ids) => assert_eq!(ids, vec![did(0x55)]),
-            other => panic!("expected KickDevices, got {other:?}"),
+            ControlOutcome::Asserted { kicked, .. } => assert_eq!(kicked, vec![did(0x55)]),
+            other => panic!("expected Asserted, got {other:?}"),
         }
     }
 
@@ -1234,5 +1361,186 @@ mod tests {
         let (outcome, kill) = router.route(&device, did(0x77), did(BRIDGE), vec![1]);
         assert!(matches!(outcome, RouteOutcome::NotAllowed));
         assert!(kill.is_none());
+    }
+
+    // ---- Push-wake decision (ADR-0023, spec Task 6) ----
+
+    /// An asserted device credential carrying a `UnifiedPush` endpoint.
+    fn asserted_with_push(device: u8, endpoint: &str) -> AssertedDevice {
+        AssertedDevice {
+            device_id: did(device),
+            token: "device-tok".to_string(),
+            push: Some(PushRegistration::UnifiedPush {
+                endpoint: endpoint.to_string(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn push_trigger_unasserted_dst_is_not_asserted() {
+        let router = Router::new(config_push_enabled());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![asserted_with_push(DEVICE, "https://ntfy.sh/x")],
+        );
+        // A dst that is not in the bridge's asserted set is an accept-rule
+        // violation, regardless of push config.
+        let out = router.decide_push_wake_at(&bridge, did(0x99), std::time::Instant::now());
+        assert!(matches!(out, PushDecision::NotAsserted));
+    }
+
+    #[tokio::test]
+    async fn push_trigger_from_non_bridge_is_not_asserted() {
+        let router = Router::new(config_push_enabled());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![asserted_with_push(DEVICE, "https://ntfy.sh/x")],
+        );
+        let device = accept(
+            router
+                .hello_at(&device_hello(0x55), outbound_channel(1024).0, 0)
+                .0,
+        );
+        // A device permit can never drive a wake decision.
+        let out = router.decide_push_wake_at(&device, did(DEVICE), std::time::Instant::now());
+        assert!(matches!(out, PushDecision::NotAsserted));
+    }
+
+    #[tokio::test]
+    async fn push_trigger_disabled_config_drops_disabled() {
+        // Default config has push disabled: a well-formed trigger is accepted
+        // (never NotAsserted here) but dropped Disabled.
+        let router = Router::new(config());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![asserted_with_push(DEVICE, "https://ntfy.sh/x")],
+        );
+        let out = router.decide_push_wake_at(&bridge, did(DEVICE), std::time::Instant::now());
+        assert!(matches!(out, PushDecision::Drop(DropReason::Disabled)));
+    }
+
+    #[tokio::test]
+    async fn push_trigger_no_endpoint_drops() {
+        let router = Router::new(config_push_enabled());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        // Assert the device WITHOUT a push registration.
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+                push: None,
+            }],
+        );
+        let out = router.decide_push_wake_at(&bridge, did(DEVICE), std::time::Instant::now());
+        assert!(matches!(out, PushDecision::Drop(DropReason::NoEndpoint)));
+    }
+
+    #[tokio::test]
+    async fn push_trigger_dst_connected_drops() {
+        let router = Router::new(config_push_enabled());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![asserted_with_push(DEVICE, "https://ntfy.sh/x")],
+        );
+        // The target device is currently connected: no wake needed.
+        let _device = accept(
+            router
+                .hello_at(&device_hello(0x55), outbound_channel(1024).0, 0)
+                .0,
+        );
+        let out = router.decide_push_wake_at(&bridge, did(DEVICE), std::time::Instant::now());
+        assert!(matches!(out, PushDecision::Drop(DropReason::DstConnected)));
+    }
+
+    #[tokio::test]
+    async fn push_trigger_policy_invalid_endpoint_drops_and_is_surfaced() {
+        let router = Router::new(config_push_enabled());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        // A syntactically invalid endpoint: assert still ACKs, endpoint flagged.
+        let out = assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![asserted_with_push(DEVICE, "file:///etc/passwd")],
+        );
+        match out {
+            ControlOutcome::Asserted {
+                kicked,
+                invalid_push,
+            } => {
+                assert!(kicked.is_empty());
+                assert_eq!(invalid_push.len(), 1, "the bad endpoint is surfaced");
+                assert_eq!(invalid_push[0].0, did(DEVICE));
+                assert!(!invalid_push[0].1.is_empty(), "reason present");
+            }
+            other => panic!("expected Asserted, got {other:?}"),
+        }
+        // Delivery-time verdict is PolicyInvalid.
+        let out = router.decide_push_wake_at(&bridge, did(DEVICE), std::time::Instant::now());
+        assert!(matches!(out, PushDecision::Drop(DropReason::PolicyInvalid)));
+    }
+
+    #[tokio::test]
+    async fn push_trigger_delivers_endpoint() {
+        let router = Router::new(config_push_enabled());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![asserted_with_push(DEVICE, "https://ntfy.sh/topic")],
+        );
+        // dst asserted, valid endpoint, not connected, push enabled → deliver.
+        let out = router.decide_push_wake_at(&bridge, did(DEVICE), std::time::Instant::now());
+        match out {
+            PushDecision::Deliver(endpoint) => assert_eq!(endpoint, "https://ntfy.sh/topic"),
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cooldown_survives_reassert() {
+        let router = Router::new(config_push_enabled());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![asserted_with_push(DEVICE, "https://ntfy.sh/topic")],
+        );
+        let t0 = std::time::Instant::now();
+        // First wake delivers and stamps the device cooldown.
+        assert!(matches!(
+            router.decide_push_wake_at(&bridge, did(DEVICE), t0),
+            PushDecision::Deliver(_)
+        ));
+        // Re-assert the SAME device: this replaces the bridge's stored
+        // registration but MUST NOT reset the surviving cooldown.
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![asserted_with_push(DEVICE, "https://ntfy.sh/topic")],
+        );
+        // A wake at the same instant is still inside the cooldown window.
+        assert!(matches!(
+            router.decide_push_wake_at(&bridge, did(DEVICE), t0),
+            PushDecision::Drop(DropReason::Cooldown)
+        ));
     }
 }

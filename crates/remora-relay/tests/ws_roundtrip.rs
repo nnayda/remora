@@ -14,7 +14,7 @@ use remora_protocol::{
     AssertedDevice, DeviceId, Envelope, FrameType, HelloRole, RelayControl, RelayControlAck,
     RelayHello,
 };
-use remora_relay::{serve, AuditConfig, AuditSink, BridgeEntry, RelayConfig};
+use remora_relay::{serve, AuditConfig, AuditSink, BridgeEntry, PushConfig, RelayConfig};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
@@ -40,6 +40,7 @@ fn base_config(audit: Option<AuditConfig>) -> Arc<RelayConfig> {
         handshake_timeout_secs: 10,
         max_connections: 1024,
         audit,
+        push: PushConfig::default(),
     })
 }
 
@@ -98,6 +99,19 @@ fn frame(frame_type: FrameType, src: u8, dst: u8) -> Vec<u8> {
         src: did(src),
         dst: did(dst),
         payload: b"x".to_vec(),
+    }
+    .encode()
+}
+
+/// A bridge→relay [`FrameType::PushTrigger`] frame from `src` addressed to the
+/// device `dst` to wake, carrying `payload` (v1 requires it empty; tests pass a
+/// non-empty one to exercise the malformed path).
+fn push_trigger_frame(src: u8, dst: u8, payload: &[u8]) -> Vec<u8> {
+    Envelope {
+        frame_type: FrameType::PushTrigger,
+        src: did(src),
+        dst: did(dst),
+        payload: payload.to_vec(),
     }
     .encode()
 }
@@ -318,6 +332,55 @@ async fn hello_or_push_trigger_after_hello_closed_4002() {
     )
     .await;
     expect_close(&mut device, 4002).await;
+}
+
+#[tokio::test]
+async fn bridge_push_trigger_wellformed_continues() {
+    // A bridge sends a well-formed (empty-payload, asserted-dst) PushTrigger.
+    // With push disabled by default the wake is dropped, but a drop is never a
+    // protocol violation: the bridge stays connected. Prove it by driving a
+    // follow-up Control that still gets acked on the same connection.
+    let url = start(base_config(None)).await;
+    let mut bridge = bridge_with_asserted_device(&url).await;
+
+    send_bin(&mut bridge, push_trigger_frame(BRIDGE, DEVICE, b"")).await;
+
+    // The connection survived: a second AssertDevices (id 2) is dispatched and
+    // answered.
+    let control = RelayControl::AssertDevices {
+        id: 2,
+        devices: vec![AssertedDevice {
+            device_id: did(DEVICE),
+            token: "device-tok".to_string(),
+            push: None,
+        }],
+    };
+    send_bin(&mut bridge, control_frame(BRIDGE, &control)).await;
+    let bytes = recv_bin(&mut bridge).await;
+    let envelope = Envelope::decode(&bytes).expect("decode control reply");
+    let ack: RelayControlAck = serde_json::from_slice(&envelope.payload).expect("decode ack");
+    assert_eq!(ack.id, 2, "bridge still live after a dropped push trigger");
+}
+
+#[tokio::test]
+async fn bridge_push_trigger_nonempty_payload_closed_4002() {
+    // The v1 PushTrigger payload is reserved and must be empty; a non-empty one
+    // is malformed → protocol close.
+    let url = start(base_config(None)).await;
+    let mut bridge = bridge_with_asserted_device(&url).await;
+    send_bin(&mut bridge, push_trigger_frame(BRIDGE, DEVICE, b"payload")).await;
+    expect_close(&mut bridge, 4002).await;
+}
+
+#[tokio::test]
+async fn bridge_push_trigger_unasserted_dst_closed_4002() {
+    // A PushTrigger whose dst is not in the bridge's asserted set is an
+    // accept-rule violation → protocol close.
+    let url = start(base_config(None)).await;
+    let mut bridge = bridge_with_asserted_device(&url).await;
+    // 0x99 was never asserted.
+    send_bin(&mut bridge, push_trigger_frame(BRIDGE, 0x99, b"")).await;
+    expect_close(&mut bridge, 4002).await;
 }
 
 #[tokio::test]

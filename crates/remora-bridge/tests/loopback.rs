@@ -54,7 +54,7 @@ use remora_protocol::{
     RelayHello, RemoteOp, RemoteResult, SessionId, SessionMeta, SessionState, SessionStatus,
     SpawnSpec, PROTOCOL_VERSION,
 };
-use remora_relay::{serve, AuditSink, BridgeEntry, RelayConfig};
+use remora_relay::{serve, AuditSink, BridgeEntry, PushConfig, RelayConfig};
 
 /// Fixed test tokens. Real deployments mint random ones; the loopback proof
 /// only needs the relay config, bridge, and client to agree on a value.
@@ -245,6 +245,7 @@ impl Harness {
             handshake_timeout_secs: 10,
             max_connections: 1024,
             audit: None,
+            push: PushConfig::default(),
         });
         let relay = Relay::start(config0);
         let addr = relay.addr;
@@ -259,6 +260,7 @@ impl Harness {
             handshake_timeout_secs: 10,
             max_connections: 1024,
             audit: None,
+            push: PushConfig::default(),
         });
 
         if !opts.include_in_roster {
@@ -1136,6 +1138,7 @@ impl PairingHarness {
             handshake_timeout_secs: 10,
             max_connections: 1024,
             audit: None,
+            push: PushConfig::default(),
         });
         let relay = Relay::start(config0);
         let relay_url = format!("ws://{}", relay.addr);
