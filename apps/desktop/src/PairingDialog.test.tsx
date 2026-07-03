@@ -262,4 +262,37 @@ describe("PairingDialog — close mid-window", () => {
     expect(b.cancelPairing).not.toHaveBeenCalled();
     expect(onClose).toHaveBeenCalledOnce();
   });
+
+  it("cancels the just-opened window when it resolves after unmount", async () => {
+    // Hold the open unresolved so the dialog stays in the "opening" phase —
+    // the window where Close never sees an "open" phase to cancel.
+    let resolveOpen!: (dto: {
+      code: string;
+      expiresAt: number;
+      ttlSecs: number;
+    }) => void;
+    b.openPairingWindow.mockReturnValue(
+      new Promise((resolve) => {
+        resolveOpen = resolve;
+      }),
+    );
+
+    const { unmount } = render(<PairingDialog onClose={() => {}} />);
+    // Advance the mount effect to the awaited openPairingWindow call.
+    await act(async () => {});
+    expect(b.openPairingWindow).toHaveBeenCalledOnce();
+    expect(b.cancelPairing).not.toHaveBeenCalled();
+
+    // Close during "opening" unmounts the dialog (cleanup sets live = false)
+    // before the window finishes opening.
+    unmount();
+
+    // The bridge now reports the window as open — after the dialog is gone.
+    await act(async () => {
+      resolveOpen({ code: CODE, expiresAt: nowSecs() + 120, ttlSecs: 120 });
+    });
+
+    // The post-await guard cancels it rather than leaking it until its TTL.
+    expect(b.cancelPairing).toHaveBeenCalledOnce();
+  });
 });

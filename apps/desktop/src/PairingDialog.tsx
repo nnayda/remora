@@ -122,7 +122,14 @@ export function PairingDialog({ onClose }: { onClose: () => void }) {
         if (failed) throw (failed as PromiseRejectedResult).reason;
 
         const dto = await openPairingWindow(null);
-        if (!live) return;
+        if (!live) {
+          // The dialog unmounted while the open was in flight (e.g. Close
+          // clicked during the "opening" phase). The window is now live on the
+          // bridge but handleClose never saw an "open" phase to cancel, so
+          // cancel it here or it lingers until its TTL expires.
+          void cancelPairing();
+          return;
+        }
         // The window-opened event carries the same values and may already have
         // landed; only seed the open phase if we're still waiting.
         setPhase((prev) =>
