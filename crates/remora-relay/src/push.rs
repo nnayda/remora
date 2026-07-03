@@ -229,6 +229,19 @@ impl PushState {
             return false;
         }
         let refill_per_sec = capacity / 60.0;
+        // Symmetric guard to `last_wake`'s prune (#233 C3): once the bucket map
+        // grows past the same threshold, drop buckets that would be fully
+        // refilled *and* have sat idle for a few minutes — recreating one yields
+        // an identical full bucket, so this can never change a decision. Bridge
+        // ids are config-bounded today, but the symmetric guard is one line of
+        // resilience against an unbounded key source.
+        if self.buckets.len() > PRUNE_THRESHOLD {
+            self.buckets.retain(|_, b| {
+                let idle = now.saturating_duration_since(b.last_refill);
+                let refilled = (b.tokens + idle.as_secs_f64() * refill_per_sec).min(capacity);
+                !(refilled >= capacity && idle >= BUCKET_STALE_AFTER)
+            });
+        }
         let bucket = self.buckets.entry(bridge_id).or_insert(TokenBucket {
             tokens: capacity,
             last_refill: now,
@@ -267,11 +280,16 @@ impl PushState {
     }
 }
 
-/// Once `last_wake` exceeds this many entries, a successful stamp also prunes
-/// the map of entries past their cooldown window. A per-device cooldown key is
-/// tiny, so this bounds the map on a long-lived relay without pruning on the
-/// cheap (budget-denied) flood path (#233 F3a).
-const LAST_WAKE_PRUNE_THRESHOLD: usize = 1024;
+/// Once either [`PushState`] map exceeds this many entries, the next mutation
+/// also prunes stale entries. Both keys (a per-device cooldown instant, a
+/// per-bridge token bucket) are tiny, so this bounds the maps on a long-lived
+/// relay without pruning on the cheap (budget-denied) flood path (#233 F3a/C3).
+const PRUNE_THRESHOLD: usize = 1024;
+
+/// A token bucket is prunable only once it has been idle at least this long
+/// (and would be fully refilled) — recreating it then yields an identical full
+/// bucket, so dropping it never changes a wake decision (#233 C3).
+const BUCKET_STALE_AFTER: Duration = Duration::from_secs(300);
 
 /// Decides whether a well-formed `PushTrigger` should deliver a wake, and to
 /// which endpoint — the pure policy core (ADR-0023, spec Task 6).
@@ -322,7 +340,7 @@ pub fn decide_wake(
     // Success path only (never on a drop): once the map has grown past the
     // threshold, evict entries past their cooldown window before stamping, so a
     // long-lived relay stays bounded without charging the flood path for it.
-    if state.last_wake.len() > LAST_WAKE_PRUNE_THRESHOLD {
+    if state.last_wake.len() > PRUNE_THRESHOLD {
         state
             .last_wake
             .retain(|_, last| now.saturating_duration_since(*last) < cooldown);
@@ -346,12 +364,14 @@ pub fn decide_wake(
 enum AddrClass {
     /// Never a valid target regardless of config: unspecified, multicast,
     /// broadcast, link-local (incl. IPv4/IPv6 cloud-metadata ranges), the
-    /// documentation/benchmarking/reserved v4 ranges, and the 6to4/Teredo v6
-    /// tunnel prefixes.
+    /// documentation/benchmarking/reserved v4 ranges, the 6to4/Teredo v6
+    /// tunnel prefixes, and the v6 documentation (`2001:db8::/32`) and
+    /// ORCHID/ORCHIDv2 (`2001:10::/28`, `2001:20::/28`) prefixes.
     Blocked,
     /// Reaches the local host or private space — loopback, `0.0.0.0/8` (routes
-    /// to localhost on Linux), RFC 1918 private, CGNAT (`100.64.0.0/10`), or
-    /// IPv6 ULA (`fc00::/7`). Admitted only with `allow_private_endpoints`.
+    /// to localhost on Linux), RFC 1918 private, CGNAT (`100.64.0.0/10`), IPv6
+    /// ULA (`fc00::/7`), or deprecated IPv6 site-local (`fec0::/10`). Admitted
+    /// only with `allow_private_endpoints`.
     PrivateOrLoopback,
     /// A routable public address.
     Public,
@@ -484,6 +504,29 @@ fn is_v6_unique_local(v6: Ipv6Addr) -> bool {
     (v6.segments()[0] & 0xfe00) == 0xfc00
 }
 
+/// `fec0::/10` — deprecated IPv6 site-local (RFC 3879), still routable inside
+/// some legacy networks. It reaches a private plane just like ULA, so it is the
+/// private class — governed by `allow_private_endpoints`, mirroring the v4
+/// private policy rather than being treated as public.
+fn is_v6_site_local(v6: Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xffc0) == 0xfec0
+}
+
+/// `2001:db8::/32` — RFC 3849 documentation prefix; never a legitimate target,
+/// blocked unconditionally (the v6 mirror of the v4 TEST-NET ranges).
+fn is_v6_documentation(v6: Ipv6Addr) -> bool {
+    let seg = v6.segments();
+    seg[0] == 0x2001 && seg[1] == 0x0db8
+}
+
+/// `2001:10::/28` (ORCHID, RFC 4843, deprecated) and `2001:20::/28` (ORCHIDv2,
+/// RFC 7343) — non-routable cryptographic-hash identifiers, not real endpoints;
+/// blocked unconditionally.
+fn is_v6_orchid(v6: Ipv6Addr) -> bool {
+    let seg = v6.segments();
+    seg[0] == 0x2001 && matches!(seg[1] & 0xfff0, 0x0010 | 0x0020)
+}
+
 /// Classifies a (mapping-normalised) address against the target policy.
 fn classify(ip: IpAddr) -> AddrClass {
     match ip {
@@ -494,9 +537,11 @@ fn classify(ip: IpAddr) -> AddrClass {
                 || is_v6_link_local(v6)
                 || is_v6_6to4(v6)
                 || is_v6_teredo(v6)
+                || is_v6_documentation(v6)
+                || is_v6_orchid(v6)
             {
                 AddrClass::Blocked
-            } else if v6.is_loopback() || is_v6_unique_local(v6) {
+            } else if v6.is_loopback() || is_v6_unique_local(v6) || is_v6_site_local(v6) {
                 AddrClass::PrivateOrLoopback
             } else {
                 AddrClass::Public
@@ -568,6 +613,13 @@ fn parse_target(endpoint: &str) -> Result<Target, DropReason> {
         "https" => false,
         _ => return Err(DropReason::PolicyInvalid),
     };
+    // Defense-in-depth (#233 C5): reject embedded userinfo (`user:pass@host`).
+    // Assert-time validation already rejects it, but the delivery path must not
+    // trust that — credentials in the URL are never a legitimate wake endpoint
+    // and can confuse host parsing.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(DropReason::PolicyInvalid);
+    }
     let host = url.host_str().ok_or(DropReason::PolicyInvalid)?.to_string();
     let port = url
         .port_or_known_default()
@@ -624,6 +676,14 @@ async fn post_wake_pinned(
         // A redirect is an unchecked second destination (ADR-0023): refuse it.
         .redirect(reqwest::redirect::Policy::none())
         .timeout(WAKE_TIMEOUT)
+        // Forbid proxies on this security-sensitive client (#233 C1). reqwest
+        // honours HTTP_PROXY/HTTPS_PROXY/ALL_PROXY from the environment by
+        // default; a proxy would re-resolve the endpoint host at its own end,
+        // bypassing BOTH the SSRF address filter and the `.resolve()` rebinding
+        // pin below (the request would go to the proxy, not the checked
+        // address). Delivery must always connect straight to the address that
+        // passed the policy check, so no_proxy() is load-bearing, not cosmetic.
+        .no_proxy()
         // Pin the resolved+checked address for this host. reqwest ignores the
         // port here and uses the URL's, which is what we want.
         .resolve(host, checked)
@@ -633,8 +693,9 @@ async fn post_wake_pinned(
 }
 
 /// Delay before the single retry of a transiently-failed delivery (#233 F2a).
-/// The in-flight permit is held across this sleep, so the global concurrency
-/// cap still bounds retrying deliveries.
+/// The in-flight permit is **dropped** across this sleep (#233 C4) — a backoff
+/// doing no I/O must not pin global delivery capacity — and a fresh permit is
+/// acquired for the retry itself.
 const WAKE_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// The outcome of one delivery attempt, driving whether a retry is worthwhile.
@@ -717,18 +778,19 @@ async fn attempt_delivery(endpoint: &str, cfg: &PushConfig) -> Attempt {
 /// is immediately free), resolve the host ourselves, filter every resolved
 /// address against the SSRF policy, then POST to the *checked* address with the
 /// connection pinned to it. On a transient failure (DNS, connect/timeout, 5xx)
-/// it retries **once** after [`WAKE_RETRY_DELAY`], still holding the permit;
-/// non-transient failures (SSRF reject, 4xx) do not retry.
+/// it retries **once** after [`WAKE_RETRY_DELAY`]; the permit is released during
+/// that backoff and a fresh one is acquired for the retry (#233 C4).
+/// Non-transient failures (SSRF reject, 4xx) do not retry.
 ///
 /// Returns whether the wake was ultimately delivered (a 2xx). `false` — a final
-/// failure or an unavailable permit — is the caller's signal to revoke the
-/// device's cooldown stamp so the missed wake is not suppressed (#233 F2).
+/// failure or an unavailable permit (on the first attempt *or* the retry) — is
+/// the caller's signal to revoke the device's cooldown stamp so the missed wake
+/// is not suppressed (#233 F2).
 pub async fn deliver_wake(endpoint: &str, cfg: &PushConfig, permits: Arc<Semaphore>) -> bool {
     // Bounded concurrency: take a permit immediately or drop. Queueing here
     // would let a burst of wakes accrete unbounded tasks/sockets/DNS lookups.
-    // The permit is held for the whole delivery (resolve + connect + POST), and
-    // across the single retry below.
-    let _permit = match permits.try_acquire_owned() {
+    // The permit is held for one delivery attempt (resolve + connect + POST).
+    let permit = match permits.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             eprintln!("remora-relay: push wake dropped (in_flight_full)");
@@ -740,8 +802,20 @@ pub async fn deliver_wake(endpoint: &str, cfg: &PushConfig, permits: Arc<Semapho
         Attempt::Delivered => true,
         Attempt::Permanent => false,
         Attempt::Transient => {
-            // One retry after a short delay, still under the held permit.
+            // Drop the permit before the backoff (#233 C4): a 5s sleep doing no
+            // I/O must not pin a global delivery slot. Sleep, then acquire a
+            // *fresh* permit for the retry; if none is free now, take the same
+            // final-failure path an exhausted first attempt would — the caller
+            // revokes the cooldown stamp so the wake isn't wrongly suppressed.
+            drop(permit);
             tokio::time::sleep(WAKE_RETRY_DELAY).await;
+            let _retry_permit = match permits.try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    eprintln!("remora-relay: push wake dropped (in_flight_full)");
+                    return false;
+                }
+            };
             matches!(attempt_delivery(endpoint, cfg).await, Attempt::Delivered)
         }
     }
@@ -995,7 +1069,7 @@ mod tests {
         let reg = valid_reg();
         let bridge = did(0xAA);
         let t0 = Instant::now();
-        let n = (LAST_WAKE_PRUNE_THRESHOLD + 1) as u32;
+        let n = (PRUNE_THRESHOLD + 1) as u32;
         for i in 0..n {
             assert!(decide_wake(&cfg, &mut state, bridge, did32(i), Some(&reg), false, t0).is_ok());
         }
@@ -1006,6 +1080,34 @@ mod tests {
         let t1 = t0 + Duration::from_secs(120);
         assert!(decide_wake(&cfg, &mut state, bridge, did32(n), Some(&reg), false, t1).is_ok());
         assert_eq!(state.last_wake.len(), 1);
+    }
+
+    #[test]
+    fn buckets_prune_only_once_past_the_threshold() {
+        // The per-bridge bucket map gets the same bounded-growth guard as
+        // last_wake (#233 C3): fill past the threshold at t0, then a single
+        // later take — with every earlier bucket now fully refilled and long
+        // idle — sweeps them all, leaving only the new one.
+        let cfg = PushConfig {
+            enabled: true,
+            per_bridge_per_minute: 60, // refills to full within a second of idle
+            device_cooldown_secs: 30,
+            ..PushConfig::default()
+        };
+        let mut state = PushState::default();
+        let t0 = Instant::now();
+        let n = (PRUNE_THRESHOLD + 1) as u32;
+        for i in 0..n {
+            assert!(state.take_bridge_token(did32(i), &cfg, t0));
+        }
+        // No prune during the fill: the guard fires only once len is already
+        // past the threshold at the *start* of a take.
+        assert_eq!(state.buckets.len(), n as usize);
+        // Well past BUCKET_STALE_AFTER: every earlier bucket is full + idle, so
+        // the next take prunes them before inserting its own — leaving one.
+        let t1 = t0 + BUCKET_STALE_AFTER + Duration::from_secs(1);
+        assert!(state.take_bridge_token(did32(n), &cfg, t1));
+        assert_eq!(state.buckets.len(), 1);
     }
 
     #[test]
@@ -1239,6 +1341,28 @@ mod tests {
                 "{s} (tunnelled v4 embedding) must be blocked always"
             );
         }
+        // v6 documentation (`2001:db8::/32`) and ORCHID/ORCHIDv2
+        // (`2001:10::/28`, `2001:20::/28`): non-routable identifiers, blocked
+        // unconditionally — the v6 mirror of the v4 doc/reserved tier (#233 C2).
+        for s in ["2001:db8::1", "2001:10::1", "2001:20::1"] {
+            assert_eq!(
+                filter_addrs(&[v6(s)], false, &allow),
+                Err(DropReason::PolicyInvalid),
+                "{s} must be blocked regardless of allow_private_endpoints"
+            );
+        }
+        // `fec0::/10` deprecated site-local is the private class: denied by
+        // default, admitted with the knob (mirrors the v4 private policy).
+        assert_eq!(
+            filter_addrs(&[v6("fec0::1")], false, &deny),
+            Err(DropReason::PolicyInvalid),
+            "fec0::/10 site-local denied by default"
+        );
+        assert_eq!(
+            filter_addrs(&[v6("fec0::1")], false, &allow),
+            Ok(vec![v6("fec0::1")]),
+            "fec0::/10 site-local admitted with allow_private_endpoints"
+        );
 
         // Exact 0.0.0.0 stays blocked (unspecified); the rest of 0.0.0.0/8 and
         // CGNAT are private-class: denied by default, admitted with the knob.
@@ -1388,6 +1512,57 @@ mod tests {
         );
     }
 
+    /// The in-flight permit is released during the retry backoff (#233 C4): a
+    /// transient first attempt drops the permit before its 5s sleep, so with a
+    /// single-permit semaphore another caller can take it mid-backoff — and the
+    /// retry, finding no permit free, takes the final-failure path (returns
+    /// `false`, no second request).
+    #[tokio::test]
+    async fn retry_releases_permit_during_backoff() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_srv = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.expect("accept");
+                count_srv.fetch_add(1, SeqCst);
+                tokio::spawn(async move {
+                    // Always 500 (transient) so a retry *would* run if a permit
+                    // were free.
+                    let _ = serve_one(
+                        &mut sock,
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await;
+                });
+            }
+        });
+
+        let permits = Arc::new(Semaphore::new(1));
+        let endpoint = format!("http://127.0.0.1:{}/", addr.port());
+        let (p, e, cfg) = (permits.clone(), endpoint.clone(), allow_all_cfg());
+        let handle = tokio::spawn(async move { deliver_wake(&e, &cfg, p).await });
+
+        // Let the first attempt finish (fast on loopback) and enter the 5s
+        // backoff, by which point the permit has been dropped.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _held = match permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => panic!("the permit must be free during the retry backoff"),
+        };
+
+        let delivered = handle.await.expect("join delivery task");
+        assert!(!delivered, "retry could not get a permit — final failure");
+        assert_eq!(
+            count.load(SeqCst),
+            1,
+            "no second request: the retry never ran"
+        );
+    }
+
     /// A non-transient 4xx is not retried (#233 F2a): a listener that answers
     /// `404` receives exactly one request, and the wake is reported failed.
     #[tokio::test]
@@ -1509,6 +1684,22 @@ mod tests {
         assert_eq!(
             parse_target("ftp://1.2.3.4/").err(),
             Some(DropReason::PolicyInvalid)
+        );
+    }
+
+    /// Userinfo in the URL is rejected outright (#233 C5) — defense-in-depth on
+    /// top of the assert-time validation that also rejects it.
+    #[test]
+    fn parse_target_rejects_userinfo() {
+        assert_eq!(
+            parse_target("https://user:pass@ntfy.sh/topic").err(),
+            Some(DropReason::PolicyInvalid),
+            "user:pass@ userinfo is refused"
+        );
+        assert_eq!(
+            parse_target("https://user@ntfy.sh/topic").err(),
+            Some(DropReason::PolicyInvalid),
+            "bare user@ userinfo is refused"
         );
     }
 }

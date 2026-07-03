@@ -91,17 +91,21 @@ first line of delivery code:
 - Before every POST, the relay resolves the endpoint host itself and checks
   every resolved address against policy — **denying loopback, link-local
   (including `169.254.0.0/16` and its cloud-metadata callers, and IPv6
-  `fe80::/10`), private ranges (RFC 1918, `fc00::/7`), CGNAT shared space
+  `fe80::/10`), private ranges (RFC 1918, IPv6 ULA `fc00::/7`, and deprecated
+  IPv6 site-local `fec0::/10`), CGNAT shared space
   (`100.64.0.0/10`), the whole `0.0.0.0/8` (which routes to the local host on
   Linux, so `0.0.0.1` reaches the same place loopback does), and unspecified
   addresses by default.** A second tier is blocked *unconditionally*, since no
   legitimate push target ever lives there: the RFC 5737 documentation ranges
   (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`), RFC 2544 benchmarking
-  (`198.18.0.0/15`), reserved space (`240.0.0.0/4`), and the tunnelled-v4 IPv6
+  (`198.18.0.0/15`), reserved space (`240.0.0.0/4`), the tunnelled-v4 IPv6
   prefixes 6to4 (`2002::/16`) and Teredo (`2001:0::/32`) — blocked whole rather
   than decoding their embedded (for Teredo, XOR-obfuscated) v4, which buys an
-  SSRF surface a real target never needs. `allow_private_endpoints = true`
-  re-admits loopback as well as private/ULA/CGNAT and `0.0.0.0/8` targets — for
+  SSRF surface a real target never needs — and the non-routable IPv6 identifier
+  prefixes: documentation (`2001:db8::/32`) and ORCHID/ORCHIDv2
+  (`2001:10::/28`, `2001:20::/28`). `allow_private_endpoints = true`
+  re-admits loopback as well as private/ULA/CGNAT/site-local and `0.0.0.0/8`
+  targets — for
   LAN self-hosters (an ntfy instance on the same network) who deliberately want
   one of those. Link-local/cloud-metadata and the unconditional tier stay
   blocked regardless: no config flag re-admits them. One honest asymmetry worth naming: IPv4
@@ -114,7 +118,12 @@ first line of delivery code:
 - The relay **pins the checked address** on the HTTP client (reqwest
   `resolve()`) rather than letting the client re-resolve at connect time —
   closing the DNS-rebinding gap where a hostname resolves to a safe address
-  during the check and an unsafe one microseconds later.
+  during the check and an unsafe one microseconds later. The delivery client
+  also **disables proxies** (`no_proxy()`): reqwest otherwise honours
+  `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` from the environment, and a proxy would
+  re-resolve the endpoint host at its own end — bypassing both the address
+  filter and this pin — so delivery must always connect straight to the checked
+  address.
 - Redirects are disabled outright; a redirect is an unchecked second
   destination.
 - `allow_http = true` admits cleartext `http://` **only when the resolved
