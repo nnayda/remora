@@ -46,7 +46,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use futures_util::stream::Stream;
@@ -128,6 +128,22 @@ const WAKE_QUEUE: usize = 64;
 /// next `Awaiting` re-wakes.
 const WAKE_EPISODE_CAP: usize = 256;
 
+/// Oldest age a queued `Awaiting` [`WakeNote`] may have and still be allowed to
+/// open an episode / fire a `PushTrigger` (#233 stale-wake fix).
+///
+/// The wake channel's [`WakeReceiver`] survives relay reconnects, and its
+/// sender (`try_send`) never blocks — so while the relay is down, notes pile
+/// up in the bounded queue (capacity [`WAKE_QUEUE`]) instead of being dropped.
+/// On reconnect they replay in FIFO order. Without this guard, an `Awaiting`
+/// note stamped minutes ago (before the outage) would still open a fresh
+/// episode and push a device *after* the session had already been resolved
+/// (attended, closed, or replaced) during the outage. Discarding a stale
+/// `Awaiting` note is safe: it opens no episode, so a later repaint/re-attach
+/// re-emission will note the session again if it is genuinely still awaiting.
+/// Non-`Awaiting` notes are never discarded for staleness — closing an episode
+/// is always safe and keeps de-dup state honest regardless of age.
+const STALE_WAKE_MAX: Duration = Duration::from_secs(60);
+
 /// A session status change routed from the host's channel-output pump (#233)
 /// into the bridge task, where it is de-duplicated into wake episodes and, on
 /// an opening `Awaiting` edge, fanned out as `PushTrigger` frames.
@@ -136,6 +152,10 @@ struct WakeNote {
     key: EpisodeKey,
     /// Its new status.
     status: SessionStatus,
+    /// When this note was queued ([`BridgeWakeHandle::note_session_status`]
+    /// send time), used to discard stale replayed `Awaiting` notes after a
+    /// relay reconnect (see [`STALE_WAKE_MAX`]).
+    at: Instant,
 }
 
 /// The receiver half of the wake channel, handed to [`serve_bridge`]. Opaque so
@@ -172,6 +192,7 @@ impl BridgeWakeHandle {
         let note = WakeNote {
             key: (project_id.clone(), session_id.clone()),
             status,
+            at: Instant::now(),
         };
         // Drop on a full queue (64 unhandled notes) or a stopped bridge. There
         // is no logging framework in this crate; the drop is intentional and
@@ -2345,6 +2366,16 @@ async fn handle_wake_note(
     deps: &Arc<PeerDeps>,
     outbound_tx: &mpsc::Sender<Message>,
 ) {
+    // Discard a stale replayed `Awaiting` note (queued before a relay outage,
+    // delivered only once the connection recovers): opening an episode for it
+    // now could push a device for a session already resolved during the
+    // outage. Do this before any episode bookkeeping, so a stale note leaves
+    // no trace — a later repaint/re-attach re-notes if still awaiting (see
+    // `STALE_WAKE_MAX`). Non-`Awaiting` notes always proceed: closing an
+    // episode is always safe, regardless of age.
+    if note.status == SessionStatus::Awaiting && note.at.elapsed() > STALE_WAKE_MAX {
+        return;
+    }
     // Episode de-dup under a brief lock — never held across the `.await`s below.
     let opens_episode = match deps.episodes.lock() {
         Ok(mut episodes) => episodes.note(note.key, &note.status),
@@ -2987,12 +3018,20 @@ mod tests {
     }
 
     fn wake_note(project: &str, session: &str, status: SessionStatus) -> WakeNote {
+        wake_note_at(project, session, status, Instant::now())
+    }
+
+    /// Like [`wake_note`] but with an explicit `at`, so tests can construct a
+    /// backdated note (`Instant::now() - Duration::from_secs(..)`) to exercise
+    /// the stale-`Awaiting`-discard path (#233) without sleeping.
+    fn wake_note_at(project: &str, session: &str, status: SessionStatus, at: Instant) -> WakeNote {
         WakeNote {
             key: (
                 ProjectId::new(project).expect("project id"),
                 SessionId::new(session).expect("session id"),
             ),
             status,
+            at,
         }
     }
 
@@ -3118,6 +3157,84 @@ mod tests {
             drain_push_triggers(&mut outbound_rx),
             vec![a],
             "a reopened episode wakes the absent device again"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_awaiting_note_is_discarded_but_a_fresh_one_still_wakes() {
+        // Simulates a relay outage: an `Awaiting` note queued minutes ago (older
+        // than STALE_WAKE_MAX) is replayed on reconnect. It must be discarded
+        // outright — no episode opened, no PushTrigger — because the session may
+        // already have been resolved during the outage. Proof that no episode
+        // was opened: a subsequent *fresh* `Awaiting` note for the same key still
+        // fires (if the stale note had opened the episode, the fresh one would
+        // be deduped into silence).
+        let a = DeviceId([0xa0; 32]);
+        let (deps, _dir) = wake_test_deps(vec![wake_entry(0xa0, some_push())], &[]);
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(16);
+
+        let stale_at = Instant::now() - (STALE_WAKE_MAX + Duration::from_secs(1));
+        handle_wake_note(
+            wake_note_at("proj", "sess", SessionStatus::Awaiting, stale_at),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert!(
+            drain_push_triggers(&mut outbound_rx).is_empty(),
+            "a stale replayed Awaiting note must not wake anyone"
+        );
+
+        handle_wake_note(
+            wake_note("proj", "sess", SessionStatus::Awaiting),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert_eq!(
+            drain_push_triggers(&mut outbound_rx),
+            vec![a],
+            "a fresh Awaiting still wakes — proving the stale note opened no episode"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_non_awaiting_note_still_closes_an_open_episode() {
+        // A non-`Awaiting` note is always processed regardless of age: closing
+        // an episode is always safe and keeps de-dup state honest. Open an
+        // episode with a fresh Awaiting, close it with a *stale* Working note,
+        // then a fresh Awaiting must re-wake (proving the close took effect).
+        let a = DeviceId([0xa0; 32]);
+        let (deps, _dir) = wake_test_deps(vec![wake_entry(0xa0, some_push())], &[]);
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(16);
+
+        handle_wake_note(
+            wake_note("proj", "sess", SessionStatus::Awaiting),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert_eq!(drain_push_triggers(&mut outbound_rx), vec![a]);
+
+        let stale_at = Instant::now() - (STALE_WAKE_MAX + Duration::from_secs(1));
+        handle_wake_note(
+            wake_note_at("proj", "sess", SessionStatus::Working, stale_at),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert!(drain_push_triggers(&mut outbound_rx).is_empty());
+
+        handle_wake_note(
+            wake_note("proj", "sess", SessionStatus::Awaiting),
+            &deps,
+            &outbound_tx,
+        )
+        .await;
+        assert_eq!(
+            drain_push_triggers(&mut outbound_rx),
+            vec![a],
+            "the stale non-Awaiting note still closed the episode, so this re-wakes"
         );
     }
 
