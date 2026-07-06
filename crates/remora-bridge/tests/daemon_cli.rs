@@ -267,6 +267,40 @@ fn ctl_against_dead_daemon_is_a_clear_error() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("daemon not running"));
 }
 
+// G11: identity/roster files written by one host (the desktop uses the same
+// library paths) load in the headless daemon's state dir — the file-move
+// migration contract (spec D2).
+#[test]
+fn migrated_identity_files_load_verbatim() {
+    let desktop = tempfile::tempdir().expect("desktop dir");
+    let headless = tempfile::tempdir().expect("headless dir");
+
+    // "Desktop" writes identity via the same lib call it really uses.
+    let init = Command::new(BIN)
+        .args(["init", "--state-dir"])
+        .arg(desktop.path())
+        .output()
+        .expect("init");
+    assert!(init.status.success());
+    let original = String::from_utf8_lossy(&init.stdout).to_string();
+
+    // The migration: move (not copy) the identity file.
+    std::fs::rename(
+        desktop.path().join("bridge_identity.toml"),
+        headless.path().join("bridge_identity.toml"),
+    )
+    .expect("move identity");
+
+    // Headless init loads the moved identity — same device_id, same fingerprint.
+    let again = Command::new(BIN)
+        .args(["init", "--state-dir"])
+        .arg(headless.path())
+        .output()
+        .expect("init again");
+    assert!(again.status.success());
+    assert_eq!(original, String::from_utf8_lossy(&again.stdout));
+}
+
 /// Send SIGTERM without unsafe: /bin/kill is universally present.
 fn kill_term(pid: u32) {
     let ok = Command::new("kill")
