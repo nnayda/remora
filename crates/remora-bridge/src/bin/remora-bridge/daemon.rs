@@ -125,11 +125,13 @@ pub async fn run_serve(config_path: PathBuf, state_dir: PathBuf) -> Result<(), S
     let (health_tx, health_rx) = watch::channel(BridgeHealth::Starting);
     let (commands_tx, commands_rx) = mpsc::channel::<PairingCommand>(PAIRING_CHANNEL_DEPTH);
     let (events_tx, events_rx) = mpsc::channel::<BridgeEvent>(PAIRING_CHANNEL_DEPTH);
-    // The push-pipeline wake path (#233) is a desktop feature driven by the
-    // session-output pump; the headless daemon runs no such pump, so it hands
-    // `serve_bridge` a wake receiver whose sole sender is dropped here. The
-    // bridge treats a closed wake channel as "no wakes ever" (a no-op branch),
-    // exactly the shape we want.
+    // KNOWN GAP: the push-pipeline wake path (#233) is fed by the desktop's
+    // session-output pump (bridge/mod.rs wires `wake.note_session_status`);
+    // the headless daemon has no such pump, so nothing ever sends on
+    // `_wake_handle` (it stays alive to the end of run_serve, unused) and
+    // the bridge's wake arm simply never fires — disconnected phones get no
+    // PushTrigger from a headless bridge yet. Tracked as a #234 follow-up
+    // issue.
     let (_wake_handle, wake_rx) = wake_channel();
     let shutdown = CancellationToken::new();
 
@@ -261,7 +263,9 @@ async fn wait_for_shutdown_signal() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("remora-bridge: cannot install SIGTERM handler: {e}");
-            // Fall back to Ctrl-C only.
+            // Fall back to Ctrl-C only: in this mode a SIGTERM takes the
+            // process default (immediate kill), forgoing the clean-shutdown
+            // guarantee (socket cleanup, exit 0) for SIGTERM.
             let _ = tokio::signal::ctrl_c().await;
             return;
         }
