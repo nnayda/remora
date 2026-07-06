@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Headless `remora-bridge` binary** (#234, ADR-0021): `serve` daemon with a
+  hardened Unix ctl socket, `init`/`pair`/`devices`/`revoke`/`status`/
+  `fingerprint` CLI (copy-paste pairing code, confirm-gated enrollment that
+  fails closed on a dropped session, client-side window deadline), relay
+  health reporting that distinguishes rejection from outage, and a lifetime
+  identity lock preventing two bridge processes from silently sharing one
+  bridge identity.
 - **Bridge health watch** (#234, spec D8): `serve_bridge` now publishes coarse
   relay-connection health over a `watch` channel (`BridgeHealth`), so an
   operator surface can distinguish healthy, relay-unreachable, and
