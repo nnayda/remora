@@ -3752,11 +3752,28 @@ mod tests {
         ));
         // First failed connect must surface as Reconnecting with attempts >= 1.
         health_rx.changed().await.expect("health update");
-        assert!(
-            matches!(*health_rx.borrow(), BridgeHealth::Reconnecting { attempts, .. } if attempts >= 1),
-            "got {:?}",
-            *health_rx.borrow()
-        );
+        let (first_since, first_attempts) = match *health_rx.borrow_and_update() {
+            BridgeHealth::Reconnecting { since, attempts } if attempts >= 1 => (since, attempts),
+            ref other => panic!("expected Reconnecting after a failed dial, got {other:?}"),
+        };
+        // The next failed attempt grows `attempts` but keeps the SAME `since`:
+        // consecutive failures share one outage anchor (spec D8). Under paused
+        // time coalescing may batch several attempts per observation, so assert
+        // growth (not an exact count) against an unchanged anchor.
+        health_rx.changed().await.expect("second health update");
+        match *health_rx.borrow() {
+            BridgeHealth::Reconnecting { since, attempts } => {
+                assert_eq!(
+                    since, first_since,
+                    "consecutive attempts share the outage anchor"
+                );
+                assert!(
+                    attempts > first_attempts,
+                    "attempts must grow across failures ({attempts} vs {first_attempts})"
+                );
+            }
+            ref other => panic!("expected Reconnecting on the next failure, got {other:?}"),
+        }
         shutdown.cancel();
         task.await
             .expect("join")

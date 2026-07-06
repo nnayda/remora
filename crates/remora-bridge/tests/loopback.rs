@@ -185,6 +185,8 @@ struct Harness {
     /// Held open so the bridge's wake branch (#233) never observes a closed
     /// channel; the wake path is otherwise unexercised in the loopback tests.
     _wake_handle: remora_bridge::BridgeWakeHandle,
+    /// The bridge's health watch (spec D8, #234), observed by the health tests.
+    health: tokio::sync::watch::Receiver<BridgeHealth>,
 }
 
 impl Harness {
@@ -268,6 +270,7 @@ impl Harness {
         }
 
         let shutdown = CancellationToken::new();
+        let (health_tx, health_rx) = tokio::sync::watch::channel(BridgeHealth::Starting);
         let bridge_cfg = BridgeConfig {
             relay_url,
             registration_token: BRIDGE_TOKEN.to_string(),
@@ -276,7 +279,7 @@ impl Harness {
             // A never-written path: these tests never mutate the roster (Task 14
             // drives the pairing/revocation ceremony that persists it).
             roster_path: dir.path().join("bridge_roster.toml"),
-            health: tokio::sync::watch::channel(BridgeHealth::Starting).0,
+            health: health_tx,
         };
         // The bridge serves through the same per-session-locked seam the desktop
         // uses (ADR-0021 D7): wrap the source in an ExclusiveSource.
@@ -317,6 +320,7 @@ impl Harness {
             _commands_tx: commands_tx,
             _events_rx: events_rx,
             _wake_handle: wake_handle,
+            health: health_rx,
         }
     }
 
@@ -954,6 +958,125 @@ async fn bridge_reconnects_after_relay_restart() {
     assert_eq!(recv_bytes(&mut fresh).await, b"[fake attach api_one]\r\n");
     fresh.send_bytes(b"back".to_vec()).await.expect("send");
     assert_eq!(recv_bytes(&mut fresh).await, b"back");
+}
+
+/// Health watch across a real reconnect cycle (spec D8, #234): a successful
+/// bridge⇄relay registration publishes `Connected`; killing the relay drives
+/// `Reconnecting` whose `attempts` grow across one outage while its `since`
+/// anchor stays put; a successful reconnect then RESETS the outage state, so
+/// the next relay death starts a fresh anchor with `attempts` back at 1
+/// (never continuing the previous outage's count).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_publishes_connected_and_resets_outage_across_reconnect() {
+    let fake = Arc::new(FakeSessionSource::new());
+    let mut harness = Harness::with_source(fake).await;
+    let mut health = harness.health.clone();
+
+    // --- Phase 1: initial registration reaches Connected. ---
+    let connected_since = {
+        let value = tokio::time::timeout(
+            READY_TIMEOUT,
+            health.wait_for(|h| matches!(h, BridgeHealth::Connected { .. })),
+        )
+        .await
+        .expect("health should reach Connected within the ready timeout")
+        .expect("health channel open");
+        match *value {
+            BridgeHealth::Connected { since } => since,
+            ref other => unreachable!("wait_for matched Connected, got {other:?}"),
+        }
+    };
+
+    // --- Phase 2: kill the relay; the established connection drops. The first
+    // publication of this outage must be Reconnecting with attempts == 1.
+    // Watch coalescing cannot skip it: the next publication (a failed redial)
+    // is at least ~100 ms of jittered backoff away, while this observer is
+    // already awaiting.
+    harness.relay.kill();
+    tokio::time::timeout(RECV_TIMEOUT, health.changed())
+        .await
+        .expect("health should change promptly after the relay dies")
+        .expect("health channel open");
+    let (outage1_since, mut seen_attempts) = match *health.borrow_and_update() {
+        BridgeHealth::Reconnecting { since, attempts } => (since, attempts),
+        ref other => panic!("expected Reconnecting after relay death, got {other:?}"),
+    };
+    assert_eq!(
+        seen_attempts, 1,
+        "a fresh outage starts counting attempts at 1"
+    );
+    assert!(
+        outage1_since >= connected_since,
+        "outage anchor ({outage1_since}) must not predate the connection ({connected_since})"
+    );
+
+    // --- Phase 3: let the outage deepen (failed redials against the dead
+    // port). Every subsequent Reconnecting shares the SAME since anchor while
+    // attempts grow — driving attempts >= 2 makes the later reset observable.
+    while seen_attempts < 2 {
+        tokio::time::timeout(RECV_TIMEOUT, health.changed())
+            .await
+            .expect("next failed redial should publish within the backoff window")
+            .expect("health channel open");
+        match *health.borrow_and_update() {
+            BridgeHealth::Reconnecting { since, attempts } => {
+                assert_eq!(
+                    since, outage1_since,
+                    "consecutive failed attempts share one outage anchor"
+                );
+                assert!(
+                    attempts > seen_attempts,
+                    "attempts must grow monotonically ({attempts} vs {seen_attempts})"
+                );
+                seen_attempts = attempts;
+            }
+            ref other => panic!("expected Reconnecting during the outage, got {other:?}"),
+        }
+    }
+
+    // --- Phase 4: restart the relay on the same port; the bridge's backoff
+    // redial re-registers and publishes Connected again.
+    harness.relay = Relay::start(harness.relay_config.clone());
+    let reconnected_since = {
+        let value = tokio::time::timeout(
+            READY_TIMEOUT,
+            health.wait_for(|h| matches!(h, BridgeHealth::Connected { .. })),
+        )
+        .await
+        .expect("health should return to Connected after the relay restart")
+        .expect("health channel open");
+        match *value {
+            BridgeHealth::Connected { since } => since,
+            ref other => unreachable!("wait_for matched Connected, got {other:?}"),
+        }
+    };
+
+    // --- Phase 5: a second relay death starts a FRESH outage: attempts is
+    // back at 1 (it was >= 2 before the reconnect — the reset is real, not a
+    // continuation), and the anchor is re-taken at/after the reconnection.
+    harness.relay.kill();
+    tokio::time::timeout(RECV_TIMEOUT, health.changed())
+        .await
+        .expect("health should change promptly after the second relay death")
+        .expect("health channel open");
+    match *health.borrow_and_update() {
+        BridgeHealth::Reconnecting { since, attempts } => {
+            assert_eq!(
+                attempts, 1,
+                "a successful reconnect resets the attempt counter"
+            );
+            assert!(
+                since >= reconnected_since,
+                "second outage anchor ({since}) must be fresh — at/after the \
+                 reconnection ({reconnected_since}), not the first outage's \
+                 ({outage1_since})"
+            );
+        }
+        ref other => panic!("expected Reconnecting after the second relay death, got {other:?}"),
+    }
+
+    // Clean shutdown keeps the loop's exit path honest.
+    harness.shutdown.cancel();
 }
 
 /// A single large PTY burst is chunked by the bridge and reassembled in order by
