@@ -159,6 +159,8 @@ pub(crate) fn start_relay_bridge(bridge: &Bridge) -> Option<PairingHandles> {
         identity,
         roster: roster.clone(),
         roster_path,
+        // The desktop drops the receiver for now; #282 will consume it.
+        health: tokio::sync::watch::channel(remora_bridge::BridgeHealth::Starting).0,
     };
 
     let (commands_tx, commands_rx) = mpsc::channel::<PairingCommand>(PAIRING_CHANNEL_DEPTH);

@@ -223,6 +223,38 @@ const PEER_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// treated like a failed connect (reconnect with growing backoff).
 const CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Coarse relay-connection health, published over a `watch` channel so an
+/// operator surface (`remora-bridge status`, later the desktop Settings panel
+/// — #282) can distinguish "healthy", "relay unreachable", and "relay refused
+/// us" (spec D8, #234). Timestamps are Unix seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BridgeHealth {
+    /// `serve_bridge` has not completed a connection attempt yet.
+    Starting,
+    /// Registered and serving; `since` is when the assert ack landed.
+    Connected { since: u64 },
+    /// Between connections (dial failed or connection dropped); `since` is
+    /// anchored at the first failure of this outage, `attempts` counts
+    /// consecutive failed attempts.
+    Reconnecting { since: u64, attempts: u32 },
+    /// The relay explicitly refused this bridge's registration/assertion —
+    /// a config-level problem (`registration_token` / relay `BridgeEntry`),
+    /// not an outage. Kept distinct so a wrong token never reads as
+    /// "network flake" (spec D8).
+    ///
+    /// # Limitation: only *assert-stage* rejection is diagnosable
+    ///
+    /// This is published when the relay admits the bridge hello but answers our
+    /// `AssertDevices` with a `RelayControlError` (see [`AssertPhase::Rejected`]).
+    /// A bad `registration_token` is caught earlier, at the *hello* stage — but
+    /// there the untrusted relay simply closes the socket (ADR-0021: it owes an
+    /// unknown peer no diagnostic), which is indistinguishable from an outage and
+    /// so reads as [`BridgeHealth::Reconnecting`]. Assert-stage rejection is the
+    /// one the relay names, hence the one surfaced as `Rejected`.
+    Rejected { at: u64, detail: String },
+}
+
 /// Static configuration for one [`serve_bridge`] run.
 ///
 /// Not `Debug`/`Clone`: [`BridgeIdentity`] holds a private key.
@@ -240,6 +272,9 @@ pub struct BridgeConfig {
     /// Where the roster persists; every roster mutation is written back here so
     /// a restart re-asserts the same devices.
     pub roster_path: PathBuf,
+    /// Publishes coarse connection health (spec D8). The caller keeps the
+    /// matching `watch::Receiver`; a dropped receiver is harmless.
+    pub health: tokio::sync::watch::Sender<BridgeHealth>,
 }
 
 /// Fatal, non-retryable error from [`serve_bridge`].
@@ -469,6 +504,10 @@ enum ConnOutcome {
     Disconnected,
     /// The dial or relay-hello never succeeded: keep growing backoff.
     ConnectFailed,
+    /// The relay explicitly refused the assertion (config-level, spec D8):
+    /// carries an operator-facing `detail`. Grows the backoff like a failed
+    /// connect, but is surfaced distinctly as [`BridgeHealth::Rejected`].
+    Rejected { detail: String },
 }
 
 /// A plaintext event from a peer's PTY pump task into its peer task.
@@ -730,6 +769,14 @@ pub async fn serve_bridge(
     let control_seq = Arc::new(AtomicU32::new(0));
 
     let mut backoff = BACKOFF_MIN;
+    // Outage tracking for the health channel (spec D8), owned by the outer loop
+    // since `run_connection` (which publishes `Connected`) cannot see it:
+    // `outage_since` anchors at the first failure of a run of failures,
+    // `attempts` counts consecutive failed attempts. Both reset on a successful
+    // connection (`Connected` is published inside `run_connection`; the reset
+    // happens here when the *next* failure re-anchors from `None`).
+    let mut outage_since: Option<u64> = None;
+    let mut attempts: u32 = 0;
     loop {
         if shutdown.is_cancelled() {
             return Ok(());
@@ -746,10 +793,38 @@ pub async fn serve_bridge(
         .await
         {
             ConnOutcome::Shutdown => return Ok(()),
-            // A fresh loss starts backoff over; a never-connected attempt keeps
-            // the current (growing) delay so a down relay is not hammered.
-            ConnOutcome::Disconnected => backoff = BACKOFF_MIN,
-            ConnOutcome::ConnectFailed => {}
+            // A fresh loss starts backoff over. It also means we HAD connected,
+            // so the previous outage (if any) is over: re-anchor this new one.
+            ConnOutcome::Disconnected => {
+                backoff = BACKOFF_MIN;
+                outage_since = None;
+                attempts = 1;
+                let since = *outage_since.get_or_insert_with(now_secs);
+                let _ = config
+                    .health
+                    .send(BridgeHealth::Reconnecting { since, attempts });
+            }
+            // A never-connected attempt keeps the current (growing) delay so a
+            // down relay is not hammered; extend the current outage.
+            ConnOutcome::ConnectFailed => {
+                attempts = attempts.saturating_add(1);
+                let since = *outage_since.get_or_insert_with(now_secs);
+                let _ = config
+                    .health
+                    .send(BridgeHealth::Reconnecting { since, attempts });
+            }
+            // The relay named a config-level rejection: surface it distinctly so
+            // a wrong token never reads as a network flake (spec D8). Backoff
+            // still grows (same as a failed connect) since retrying an unchanged
+            // config just re-fails.
+            ConnOutcome::Rejected { detail } => {
+                attempts = attempts.saturating_add(1);
+                outage_since.get_or_insert_with(now_secs);
+                let _ = config.health.send(BridgeHealth::Rejected {
+                    at: now_secs(),
+                    detail,
+                });
+            }
         }
         if shutdown.is_cancelled() {
             return Ok(());
@@ -830,29 +905,28 @@ async fn run_connection(
     // the current roster and await the matching ack before entering the serve
     // loop. The reply rides back as an inbound Control frame, so we pump `stream`
     // here until it arrives (only control frames can precede admission).
-    if let Some(outcome) = match assert_roster_and_await_ack(
-        &mut stream,
-        deps,
-        &outbound_tx,
-        control_seq.as_ref(),
-        shutdown,
-    )
-    .await
-    {
-        AssertPhase::Acked => None,
-        AssertPhase::Shutdown => Some(ConnOutcome::Shutdown),
-        // A relay that refuses our assertion is a config-level problem, and
-        // one that never answers is silent/hostile (ADR-0021 untrusted);
-        // both grow the backoff rather than hammer a retry that will just
-        // re-fail — the same path as a failed connect.
-        AssertPhase::Rejected | AssertPhase::TimedOut => Some(ConnOutcome::ConnectFailed),
-        AssertPhase::Disconnected => Some(ConnOutcome::Disconnected),
-    } {
+    if let Some(outcome) = assert_phase_to_outcome(
+        assert_roster_and_await_ack(
+            &mut stream,
+            deps,
+            &outbound_tx,
+            control_seq.as_ref(),
+            shutdown,
+        )
+        .await,
+    ) {
         conn_token.cancel();
         drop(outbound_tx);
         writer.abort();
         return outcome;
     }
+
+    // The assert acked: we are registered and serving. Publish `Connected` here
+    // (the outer loop, which tracks outage anchors, cannot see this fall-through
+    // — spec D8). A dropped receiver makes this a harmless no-op.
+    let _ = config
+        .health
+        .send(BridgeHealth::Connected { since: now_secs() });
 
     let mut peers = PeerRegistry::new();
     // Pending relay control requests (`RegisterPairing`/`AssertDevices`/…) awaiting
@@ -979,6 +1053,25 @@ enum AssertPhase {
     TimedOut,
     /// `shutdown` fired while awaiting the ack.
     Shutdown,
+}
+
+/// Maps the assert-before-serve outcome to the connection outcome that drives
+/// the reconnect/health decision, or `None` to proceed into the serve loop.
+///
+/// A relay that refuses our assertion is a config-level problem, surfaced
+/// distinctly (spec D8) so a wrong token never reads as an outage; one that
+/// never answers is silent/hostile (ADR-0021 untrusted) and reads as a failed
+/// connect. Both grow the backoff.
+fn assert_phase_to_outcome(phase: AssertPhase) -> Option<ConnOutcome> {
+    match phase {
+        AssertPhase::Acked => None,
+        AssertPhase::Shutdown => Some(ConnOutcome::Shutdown),
+        AssertPhase::Rejected => Some(ConnOutcome::Rejected {
+            detail: "relay rejected registration (check [relay] registration_token and the relay's BridgeEntry device_id)".to_string(),
+        }),
+        AssertPhase::TimedOut => Some(ConnOutcome::ConnectFailed),
+        AssertPhase::Disconnected => Some(ConnOutcome::Disconnected),
+    }
 }
 
 /// Sends `AssertDevices` for the current roster and reads inbound frames until
@@ -3568,6 +3661,106 @@ mod tests {
         let phase =
             assert_roster_and_await_ack(&mut replies, &deps, &outbound_tx, &seq, &shutdown).await;
         assert_eq!(phase, AssertPhase::Acked);
+    }
+
+    /// G14b (spec D8): the *diagnosable* rejection seam. A relay that admits the
+    /// bridge hello but answers `AssertDevices` with a `RelayControlError` for
+    /// our correlation id is a config-level refusal — the assert phase returns
+    /// `Rejected`, which `run_connection` maps to `ConnOutcome::Rejected` and the
+    /// outer loop publishes as `BridgeHealth::Rejected` (kept distinct from an
+    /// outage). This is asserted at the assert stage rather than end-to-end
+    /// because a *hello*-stage bad token is closed silently by the untrusted
+    /// relay (ADR-0021) and so is indistinguishable from an outage — see the
+    /// limitation on [`BridgeHealth::Rejected`].
+    #[tokio::test(start_paused = true)]
+    async fn assert_ack_wait_reports_rejected_on_control_error() {
+        let deps = assert_phase_deps();
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<Message>(8);
+        let seq = AtomicU32::new(0); // first next_control_id() yields 0
+        let shutdown = CancellationToken::new();
+        let err_frame = Envelope {
+            frame_type: FrameType::Control,
+            src: DeviceId::ZERO,
+            dst: deps.bridge_id,
+            payload: serde_json::to_vec(&RelayControlError {
+                id: 0,
+                message: "unknown bridge token".to_string(),
+            })
+            .expect("encode error"),
+        }
+        .encode();
+        let mut replies =
+            futures_util::stream::iter(vec![Ok::<_, ()>(Message::Binary(err_frame.into()))]);
+        let phase =
+            assert_roster_and_await_ack(&mut replies, &deps, &outbound_tx, &seq, &shutdown).await;
+        assert_eq!(phase, AssertPhase::Rejected);
+    }
+
+    /// The assert-phase → `ConnOutcome` mapping the outer loop reads to publish
+    /// health: a rejected assertion becomes `ConnOutcome::Rejected` (its
+    /// operator-facing `detail` names the token/BridgeEntry to check), never
+    /// collapsing into the `ConnectFailed` outage path (spec D8).
+    #[test]
+    fn assert_phase_maps_to_conn_outcome() {
+        assert!(matches!(
+            assert_phase_to_outcome(AssertPhase::Rejected),
+            Some(ConnOutcome::Rejected { detail }) if detail.contains("registration_token")
+        ));
+        assert!(matches!(
+            assert_phase_to_outcome(AssertPhase::TimedOut),
+            Some(ConnOutcome::ConnectFailed)
+        ));
+        assert!(matches!(
+            assert_phase_to_outcome(AssertPhase::Disconnected),
+            Some(ConnOutcome::Disconnected)
+        ));
+        assert!(matches!(
+            assert_phase_to_outcome(AssertPhase::Shutdown),
+            Some(ConnOutcome::Shutdown)
+        ));
+        assert!(assert_phase_to_outcome(AssertPhase::Acked).is_none());
+    }
+
+    /// G14 (spec D8): serving against an unreachable relay drives health to
+    /// `Reconnecting`; shutdown then leaves the loop cleanly (`Ok`).
+    #[tokio::test(start_paused = true)]
+    async fn health_reports_reconnecting_when_relay_unreachable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let identity = BridgeIdentity::load_or_create(&dir.path().join("id.toml")).expect("id");
+        let (health_tx, mut health_rx) = tokio::sync::watch::channel(BridgeHealth::Starting);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let (evt_tx, _evt_rx) = mpsc::channel(1);
+        // The wake path is unused here; hold the handle so its channel stays open.
+        let (_wake_handle, wake_rx) = wake_channel();
+        let shutdown = CancellationToken::new();
+        let cfg = BridgeConfig {
+            // Nothing listens here: connect fails immediately, loop backs off.
+            relay_url: "ws://127.0.0.1:1".into(),
+            registration_token: "tok".into(),
+            identity,
+            roster: Arc::new(RwLock::new(Roster::default())),
+            roster_path: dir.path().join("roster.toml"),
+            health: health_tx,
+        };
+        let task = tokio::spawn(serve_bridge(
+            cfg,
+            Arc::new(remora_core::FakeSessionSource::new()),
+            cmd_rx,
+            evt_tx,
+            wake_rx,
+            shutdown.clone(),
+        ));
+        // First failed connect must surface as Reconnecting with attempts >= 1.
+        health_rx.changed().await.expect("health update");
+        assert!(
+            matches!(*health_rx.borrow(), BridgeHealth::Reconnecting { attempts, .. } if attempts >= 1),
+            "got {:?}",
+            *health_rx.borrow()
+        );
+        shutdown.cancel();
+        task.await
+            .expect("join")
+            .expect("serve_bridge Ok on shutdown");
     }
 
     #[test]

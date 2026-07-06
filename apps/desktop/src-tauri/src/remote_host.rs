@@ -183,6 +183,8 @@ pub async fn start_loopback(
         identity,
         roster: Arc::new(tokio::sync::RwLock::new(roster)),
         roster_path: crate::bridge_state::roster_path(&config_path),
+        // The desktop drops the receiver for now; #282 will consume it.
+        health: tokio::sync::watch::channel(remora_bridge::BridgeHealth::Starting).0,
     };
     // Thread the pairing command/event channels through `serve_bridge` and drive
     // the real ceremony over them (below). Once pairing completes we drop both

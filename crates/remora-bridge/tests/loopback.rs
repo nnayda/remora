@@ -41,9 +41,9 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
 use remora_bridge::{
-    prologue, run_pairing, serve_bridge, wake_channel, BridgeConfig, BridgeEvent, BridgeIdentity,
-    Handshake, HandshakeKind, PairingCommand, PairingError, PairingFile, PairingOutcome,
-    PairingProgress, RemoteSource, Roster, RosterEntry, Transport, NOISE_PATTERN,
+    prologue, run_pairing, serve_bridge, wake_channel, BridgeConfig, BridgeEvent, BridgeHealth,
+    BridgeIdentity, Handshake, HandshakeKind, PairingCommand, PairingError, PairingFile,
+    PairingOutcome, PairingProgress, RemoteSource, Roster, RosterEntry, Transport, NOISE_PATTERN,
 };
 use remora_core::{
     ExclusiveSource, FakeSessionSource, SessionChannel, SessionLocks, SessionSource,
@@ -276,6 +276,7 @@ impl Harness {
             // A never-written path: these tests never mutate the roster (Task 14
             // drives the pairing/revocation ceremony that persists it).
             roster_path: dir.path().join("bridge_roster.toml"),
+            health: tokio::sync::watch::channel(BridgeHealth::Starting).0,
         };
         // The bridge serves through the same per-session-locked seam the desktop
         // uses (ADR-0021 D7): wrap the source in an ExclusiveSource.
@@ -1150,6 +1151,7 @@ impl PairingHarness {
             identity,
             roster: roster.clone(),
             roster_path: dir.path().join("bridge_roster.toml"),
+            health: tokio::sync::watch::channel(BridgeHealth::Starting).0,
         };
         let bridge_source: Arc<dyn SessionSource> = Arc::new(ExclusiveSource::new(
             source,

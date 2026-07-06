@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bridge health watch** (#234, spec D8): `serve_bridge` now publishes coarse
+  relay-connection health over a `watch` channel (`BridgeHealth`), so an
+  operator surface can distinguish healthy, relay-unreachable, and
+  relay-refused states. A config-level rejection — the relay naming an
+  `AssertDevices` error (wrong `registration_token` or a missing/mismatched
+  `BridgeEntry`) — surfaces as a distinct `Rejected` state instead of
+  collapsing into the same reconnect path as a transient outage. (A
+  hello-stage bad token is closed silently by the untrusted relay and still
+  reads as reconnecting; assert-stage rejection is the diagnosable one.)
 - **UnifiedPush wake delivery** (#233, ADR-0023): when a paired device is
   disconnected and its session needs attention, the relay can POST a generic
   wake ("a session needs your attention" — never session content) to a
