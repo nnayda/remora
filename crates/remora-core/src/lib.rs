@@ -8,6 +8,7 @@ pub mod activity;
 pub mod config;
 pub mod discovery;
 pub mod naming;
+pub mod resolve;
 pub mod spawn_plan;
 pub mod transport;
 

@@ -3421,6 +3421,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "futures-util",
  "nix 0.31.3",
  "portable-pty",
  "remora-protocol",
