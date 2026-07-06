@@ -27,10 +27,10 @@ use remora_bridge::{
     BridgeWakeHandle, PairingCommand, Roster,
 };
 use remora_core::config::{Config, ConfigError};
+use remora_core::resolve::ResolvingSource;
 use remora_core::SessionSource;
 
 use crate::bridge::Bridge;
-use crate::remote_host::ResolvingSource;
 
 /// Channel depth for pairing commands/events between the UI and the bridge.
 /// Pairing is a low-rate, human-driven ceremony; a small buffer is ample.

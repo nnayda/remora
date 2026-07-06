@@ -465,7 +465,7 @@ impl Bridge {
     /// spawn/attach/respawn so the load-then-resolve step lives in one place.
     fn resolve_for(&self, project_id: &ProjectId) -> Result<Arc<dyn SessionSource>, BridgeError> {
         let config = Arc::new(self.load_config()?);
-        self.resolver.for_project(&config, project_id)
+        Ok(self.resolver.for_project(&config, project_id)?)
     }
 
     /// The source `attach` drives (ADR-0021 spec D11 hybrid). When a loopback
@@ -815,7 +815,7 @@ mod tests {
     use remora_core::{FakeSessionSource, SessionSource, SourceError};
     use remora_protocol::{SessionMeta, SessionState};
 
-    use super::resolve::SourceResolver;
+    use super::resolve::{ResolveError, SourceResolver};
     use error::{SessionListDto, SessionStateDto};
 
     /// Flatten a host-grouped list result to the sessions across all hosts,
@@ -833,7 +833,7 @@ mod tests {
             &self,
             _config: &Arc<Config>,
             _project_id: &ProjectId,
-        ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+        ) -> Result<Arc<dyn SessionSource>, ResolveError> {
             Ok(Arc::clone(&self.0))
         }
         fn all(&self, _config: &Arc<Config>) -> Vec<(HostId, Arc<dyn SessionSource>)> {
@@ -1562,7 +1562,7 @@ mod tests {
             &self,
             _c: &Arc<Config>,
             project_id: &ProjectId,
-        ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+        ) -> Result<Arc<dyn SessionSource>, ResolveError> {
             self.seen
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -1772,7 +1772,7 @@ mod tests {
             &self,
             _c: &Arc<Config>,
             _p: &ProjectId,
-        ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+        ) -> Result<Arc<dyn SessionSource>, ResolveError> {
             unreachable!()
         }
         fn all(&self, _c: &Arc<Config>) -> Vec<(HostId, Arc<dyn SessionSource>)> {
@@ -1826,7 +1826,7 @@ mod tests {
             &self,
             _c: &Arc<Config>,
             _p: &ProjectId,
-        ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+        ) -> Result<Arc<dyn SessionSource>, ResolveError> {
             unreachable!()
         }
         fn all(&self, _c: &Arc<Config>) -> Vec<(HostId, Arc<dyn SessionSource>)> {
@@ -1871,7 +1871,7 @@ mod tests {
             &self,
             _c: &Arc<Config>,
             _p: &ProjectId,
-        ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+        ) -> Result<Arc<dyn SessionSource>, ResolveError> {
             unreachable!()
         }
         fn all(&self, _c: &Arc<Config>) -> Vec<(HostId, Arc<dyn SessionSource>)> {
@@ -1981,7 +1981,7 @@ mod tests {
             &self,
             _c: &Arc<Config>,
             _p: &ProjectId,
-        ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+        ) -> Result<Arc<dyn SessionSource>, ResolveError> {
             unreachable!()
         }
         fn all(&self, _c: &Arc<Config>) -> Vec<(HostId, Arc<dyn SessionSource>)> {
@@ -2031,7 +2031,7 @@ mod tests {
             &self,
             _c: &Arc<Config>,
             _p: &ProjectId,
-        ) -> Result<Arc<dyn SessionSource>, BridgeError> {
+        ) -> Result<Arc<dyn SessionSource>, ResolveError> {
             unreachable!()
         }
         fn all(&self, _c: &Arc<Config>) -> Vec<(HostId, Arc<dyn SessionSource>)> {

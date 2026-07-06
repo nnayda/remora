@@ -29,10 +29,8 @@
 //! [`run_pairing`] driver over the in-process relay, and auto-confirms the (self)
 //! device — see [`drive_loopback_pairing`] for why the auto-confirm is dev-only.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use rand::Rng as _;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -41,12 +39,11 @@ use remora_bridge::{
     run_pairing, serve_bridge, wake_channel, BridgeConfig, BridgeEvent, BridgeIdentity,
     BridgeWakeHandle, PairingCommand, PairingFile, PairingProgress, RemoteSource, Roster,
 };
-use remora_core::config::{Config, ConfigError};
-use remora_core::{SessionChannel, SessionSource, SourceError};
-use remora_protocol::{AgentId, ProjectId, SessionId, SessionMeta, SpawnSpec};
+use remora_core::config::Config;
+use remora_core::resolve::ResolvingSource;
+use remora_core::SessionSource;
 use remora_relay::{serve, AuditSink, BridgeEntry, PushConfig, RelayConfig};
 
-use crate::bridge::resolve::SourceResolver;
 use crate::bridge::Bridge;
 
 /// Lifetime of the dev-loopback pairing window. The self-device auto-confirms
@@ -319,143 +316,6 @@ fn random_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// The [`SessionSource`] the loopback bridge serves: it resolves each request's
-/// project through the desktop's own resolver against freshly-loaded config,
-/// exactly like the Bridge's direct path — so the bridge and the direct path go
-/// through the same per-session exclusion registry.
-pub(crate) struct ResolvingSource {
-    resolver: Arc<dyn SourceResolver>,
-    config_path: PathBuf,
-}
-
-impl ResolvingSource {
-    /// Build a source that resolves each request through `resolver` against the
-    /// config at `config_path`. Shared by the loopback and the real relay bridge
-    /// so both serve through the desktop's one per-session exclusion registry.
-    pub(crate) fn new(resolver: Arc<dyn SourceResolver>, config_path: PathBuf) -> Self {
-        Self {
-            resolver,
-            config_path,
-        }
-    }
-
-    /// Load config fresh (a missing file is an empty config — a fresh device is
-    /// valid, ADR-0004). Config problems surface as `Transport` across the seam.
-    fn load_config(&self) -> Result<Arc<Config>, SourceError> {
-        match Config::load(&self.config_path) {
-            Ok(config) => Ok(Arc::new(config)),
-            Err(ConfigError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                Ok(Arc::new(Config::default()))
-            }
-            Err(e) => Err(SourceError::Transport(format!("config load failed: {e}"))),
-        }
-    }
-
-    /// Resolve `project_id`'s (already exclusion-wrapped) source from fresh
-    /// config.
-    fn for_project(&self, project_id: &ProjectId) -> Result<Arc<dyn SessionSource>, SourceError> {
-        let config = self.load_config()?;
-        // `BridgeError` is a frontend serde DTO (no `Display`); render its Debug
-        // for the transport detail. `Display` on `SourceError::Transport` still
-        // escapes/bounds it before it ever reaches a log or the wire.
-        self.resolver
-            .for_project(&config, project_id)
-            .map_err(|e| SourceError::Transport(format!("resolve failed: {e:?}")))
-    }
-}
-
-#[async_trait]
-impl SessionSource for ResolvingSource {
-    async fn spawn(&self, spec: SpawnSpec) -> Result<SessionChannel, SourceError> {
-        let source = self.for_project(&spec.project_id)?;
-        source.spawn(spec).await
-    }
-
-    async fn attach(
-        &self,
-        project_id: &ProjectId,
-        session_id: &SessionId,
-    ) -> Result<SessionChannel, SourceError> {
-        self.for_project(project_id)?
-            .attach(project_id, session_id)
-            .await
-    }
-
-    async fn external_attach_command(
-        &self,
-        project_id: &ProjectId,
-        session_id: &SessionId,
-    ) -> Result<Vec<String>, SourceError> {
-        self.for_project(project_id)?
-            .external_attach_command(project_id, session_id)
-            .await
-    }
-
-    async fn remote_workspace(
-        &self,
-        project_id: &ProjectId,
-        session_id: &SessionId,
-        workspace_path: &str,
-    ) -> Result<remora_core::RemoteWorkspace, SourceError> {
-        self.for_project(project_id)?
-            .remote_workspace(project_id, session_id, workspace_path)
-            .await
-    }
-
-    async fn respawn(
-        &self,
-        project_id: &ProjectId,
-        session_id: &SessionId,
-        agent: Option<AgentId>,
-    ) -> Result<SessionChannel, SourceError> {
-        self.for_project(project_id)?
-            .respawn(project_id, session_id, agent)
-            .await
-    }
-
-    async fn stop(
-        &self,
-        project_id: &ProjectId,
-        session_id: &SessionId,
-    ) -> Result<(), SourceError> {
-        self.for_project(project_id)?
-            .stop(project_id, session_id)
-            .await
-    }
-
-    async fn remove(
-        &self,
-        project_id: &ProjectId,
-        session_id: &SessionId,
-        force: bool,
-    ) -> Result<(), SourceError> {
-        self.for_project(project_id)?
-            .remove(project_id, session_id, force)
-            .await
-    }
-
-    /// Every configured host's sessions, flattened. Not routed through by the
-    /// desktop today (hybrid keeps `list` direct), but implemented so the served
-    /// source is complete and any future both-route switch is a one-liner.
-    async fn list(&self) -> Result<Vec<SessionMeta>, SourceError> {
-        let config = self.load_config()?;
-        let sources = self.resolver.all(&config);
-        let results = futures_util::future::join_all(
-            sources
-                .into_iter()
-                .map(|(_id, src)| async move { src.list().await }),
-        )
-        .await;
-        let mut all = Vec::new();
-        for result in results {
-            all.extend(result?);
-        }
-        Ok(all)
-    }
 }
 
 #[cfg(test)]

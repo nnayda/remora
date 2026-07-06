@@ -634,6 +634,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Config→`SessionSource` resolution moved from the desktop shell into
+  `remora-core::resolve`, shared with the upcoming headless bridge (#234).
 - **Tabs reflow live while dragging to reorder** (#185): dragging a tab now
   shuffles the other tabs out of the way in real time and slides the dragged
   tab (dimmed) into its prospective slot, instead of showing a static drop
