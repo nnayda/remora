@@ -4,6 +4,7 @@
 
 mod args;
 mod ctl_client;
+mod ctl_server;
 mod daemon;
 
 use std::path::{Path, PathBuf};
