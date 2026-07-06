@@ -47,7 +47,7 @@ pub struct Cli {
 /// caller exits 0 for --help/--version, 2 otherwise (it can tell them apart
 /// by checking the original args).
 pub fn parse(args: &[String]) -> Result<Cli, String> {
-    let mut it = args.iter().peekable();
+    let mut it = args.iter();
     let sub = it.next().ok_or_else(|| USAGE.to_string())?;
     match sub.as_str() {
         "--help" | "-h" => return Err(USAGE.to_string()),
@@ -55,22 +55,31 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         _ => {}
     }
 
+    // A value-taking flag must never swallow a following flag as its value.
+    let flag_value =
+        |it: &mut std::slice::Iter<'_, String>, flag: &str| -> Result<String, String> {
+            match it.next() {
+                Some(v) if !v.starts_with('-') => Ok(v.clone()),
+                _ => Err(format!("{flag} requires a value\n\n{USAGE}")),
+            }
+        };
+
     let mut state_dir: Option<PathBuf> = None;
-    let mut ttl_secs: u64 = DEFAULT_PAIR_TTL_SECS;
+    let mut ttl: Option<u64> = None;
     let mut require_relay = false;
     let mut positionals: Vec<String> = Vec::new();
 
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--state-dir" => {
-                let v = it.next().ok_or("--state-dir requires a value")?;
-                state_dir = Some(PathBuf::from(v));
+                state_dir = Some(PathBuf::from(flag_value(&mut it, "--state-dir")?));
             }
             "--ttl" => {
-                let v = it.next().ok_or("--ttl requires a value")?;
-                ttl_secs = v
-                    .parse()
-                    .map_err(|_| format!("--ttl expects seconds, got `{v}`"))?;
+                let v = flag_value(&mut it, "--ttl")?;
+                ttl = Some(
+                    v.parse()
+                        .map_err(|_| format!("--ttl expects seconds, got `{v}`\n\n{USAGE}"))?,
+                );
             }
             "--require-relay" => require_relay = true,
             other if other.starts_with('-') => {
@@ -87,43 +96,68 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         Ok(())
     };
 
+    // Symmetric per-subcommand flag validation: `--ttl` belongs to `pair`
+    // alone, `--require-relay` to `status` alone (`--state-dir` is global).
+    // Tracking `ttl` as set-vs-unset (not compared against the default)
+    // means `serve --ttl 120` is rejected like any other misplaced flag.
+    let reject_misplaced_flags =
+        |ttl_allowed: bool, require_relay_allowed: bool| -> Result<(), String> {
+            if ttl.is_some() && !ttl_allowed {
+                return Err(format!("--ttl is not valid for `{sub}`\n\n{USAGE}"));
+            }
+            if require_relay && !require_relay_allowed {
+                return Err(format!(
+                    "--require-relay is not valid for `{sub}`\n\n{USAGE}"
+                ));
+            }
+            Ok(())
+        };
+
     let command = match sub.as_str() {
         "serve" => {
+            reject_misplaced_flags(false, false)?;
             if positionals.len() > 1 {
                 return Err(format!("serve takes at most one config path\n\n{USAGE}"));
-            }
-            if require_relay || ttl_secs != DEFAULT_PAIR_TTL_SECS {
-                return Err(format!("flag not valid for `serve`\n\n{USAGE}"));
             }
             Command::Serve {
                 config: positionals.pop().map(PathBuf::from),
             }
         }
         "init" => {
+            reject_misplaced_flags(false, false)?;
             expect_positionals(0)?;
             Command::Init
         }
         "pair" => {
+            reject_misplaced_flags(true, false)?;
             expect_positionals(0)?;
-            Command::Pair { ttl_secs }
+            Command::Pair {
+                ttl_secs: ttl.unwrap_or(DEFAULT_PAIR_TTL_SECS),
+            }
         }
         "devices" => {
+            reject_misplaced_flags(false, false)?;
             expect_positionals(0)?;
             Command::Devices
         }
         "revoke" => {
+            reject_misplaced_flags(false, false)?;
             if positionals.len() != 1 {
                 return Err(format!("revoke takes exactly one <device-id>\n\n{USAGE}"));
             }
-            Command::Revoke {
-                device_id: positionals.pop().unwrap_or_default(),
+            let device_id = positionals.pop().unwrap_or_default();
+            if device_id.is_empty() {
+                return Err(format!("revoke <device-id> must not be empty\n\n{USAGE}"));
             }
+            Command::Revoke { device_id }
         }
         "status" => {
+            reject_misplaced_flags(false, true)?;
             expect_positionals(0)?;
             Command::Status { require_relay }
         }
         "fingerprint" => {
+            reject_misplaced_flags(false, false)?;
             expect_positionals(0)?;
             Command::Fingerprint
         }
@@ -208,6 +242,63 @@ mod tests {
             Command::Status {
                 require_relay: true
             }
+        ));
+    }
+
+    // Important 1: a value-taking flag must never consume a following flag
+    // as its value; a missing or flag-shaped value is an error.
+    #[test]
+    fn value_flag_never_consumes_a_following_flag() {
+        assert!(matches!(
+            parse(&["pair".into(), "--state-dir".into(), "--require-relay".into()]),
+            Err(msg) if msg.contains("--state-dir requires a value") && msg.contains("Usage")
+        ));
+        assert!(matches!(
+            parse(&["pair".into(), "--ttl".into()]),
+            Err(msg) if msg.contains("--ttl requires a value") && msg.contains("Usage")
+        ));
+        assert!(matches!(
+            parse(&["pair".into(), "--ttl".into(), "--state-dir".into(), "/x".into()]),
+            Err(msg) if msg.contains("--ttl requires a value")
+        ));
+        assert!(matches!(
+            parse(&["serve".into(), "--state-dir".into()]),
+            Err(msg) if msg.contains("--state-dir requires a value")
+        ));
+    }
+
+    // Important 2: per-subcommand flag validation — `--ttl` only on `pair`,
+    // `--require-relay` only on `status`; `--state-dir` is valid everywhere.
+    #[test]
+    fn flags_are_rejected_on_wrong_subcommands() {
+        for args in [
+            vec!["pair", "--require-relay"],
+            vec!["status", "--ttl", "5"],
+            vec!["init", "--ttl", "5"],
+            vec!["serve", "--ttl", "120"], // equal to the default is still misplaced
+            vec!["devices", "--require-relay"],
+            vec!["fingerprint", "--ttl", "5"],
+            vec!["revoke", "some-id", "--require-relay"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let result = parse(&owned);
+            assert!(result.is_err(), "expected error for {args:?}");
+            let msg = result.expect_err("checked above");
+            assert!(
+                msg.contains("Usage"),
+                "error for {args:?} lacks usage: {msg}"
+            );
+        }
+        // --state-dir stays valid on every subcommand.
+        assert!(parse(&["init".into(), "--state-dir".into(), "/x".into()]).is_ok());
+        assert!(parse(&["fingerprint".into(), "--state-dir".into(), "/x".into()]).is_ok());
+    }
+
+    #[test]
+    fn revoke_rejects_empty_device_id() {
+        assert!(matches!(
+            parse(&["revoke".into(), "".into()]),
+            Err(msg) if msg.contains("device-id") && msg.contains("Usage")
         ));
     }
 
