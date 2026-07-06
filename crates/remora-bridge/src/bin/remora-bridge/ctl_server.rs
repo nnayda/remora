@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use remora_bridge::{fingerprint, BridgeEvent, BridgeHealth, PairingCommand, PairingOutcome};
 use remora_protocol::DeviceId;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -45,6 +45,23 @@ pub async fn serve_ctl(listener: UnixListener, state: DaemonState, shutdown: Can
             }
         }
     }
+}
+
+/// D1/G6: reads one request line with the byte cap enforced at the reader
+/// itself. `take(MAX_REQUEST_LINE + 1)` stops the kernel-level reads at the
+/// cap, so a no-newline flood can never grow the buffer past it — `read_line`
+/// sees EOF at the limit and returns. The caller detects the breach as
+/// `line.len() > MAX_REQUEST_LINE`; a shorter newline-less line is a genuine
+/// client close. The per-call `take` on `&mut reader` resets the budget each
+/// line and keeps the BufReader (and any pipelined bytes) intact.
+async fn bounded_read_line<R>(reader: &mut R, line: &mut String) -> std::io::Result<usize>
+where
+    R: AsyncBufRead + Unpin,
+{
+    (&mut *reader)
+        .take(MAX_REQUEST_LINE as u64 + 1)
+        .read_line(line)
+        .await
 }
 
 /// Writes one response as a single JSON line and flushes (the client blocks on
@@ -101,8 +118,14 @@ async fn handle_conn(
     let mut line = String::new();
 
     // First request line: bounded by both a timeout and a size cap (G6). A
-    // breach of either gets one Error line then close.
-    let read = tokio::time::timeout(FIRST_LINE_TIMEOUT, reader.read_line(&mut line)).await;
+    // breach of either gets one Error line then close. The cap is enforced
+    // inside the read itself (see `bounded_read_line`), not merely checked
+    // after — a no-newline flood stops at the cap, not at the timeout.
+    let read = tokio::time::timeout(
+        FIRST_LINE_TIMEOUT,
+        bounded_read_line(&mut reader, &mut line),
+    )
+    .await;
     let n = match read {
         Err(_elapsed) => {
             let _ = send(
@@ -413,14 +436,15 @@ async fn handle_pair(
     }
 
     // Read further request lines in a dedicated task (no read timeout in this
-    // human-paced phase — bounded by the client-side window deadline, D13a).
+    // human-paced phase — bounded by the client-side window deadline, D13a;
+    // each line is still byte-capped via `bounded_read_line`).
     let (line_tx, mut line_rx) = mpsc::channel::<PairRead>(4);
-    tokio::spawn(async move {
+    let reader_task = tokio::spawn(async move {
         let mut reader = reader;
         let mut line = String::new();
         loop {
             line.clear();
-            match reader.read_line(&mut line).await {
+            match bounded_read_line(&mut reader, &mut line).await {
                 Ok(0) => {
                     let _ = line_tx.send(PairRead::Closed).await;
                     return;
@@ -529,6 +553,11 @@ async fn handle_pair(
             },
         }
     }
+
+    // The session is over: kill the reader task outright (dropping `wr` below
+    // closes only the write half — a stalled client that never closes its end
+    // would otherwise keep the task parked in read_line forever).
+    reader_task.abort();
 
     // Fail-safe: any abnormal exit (connection close, explicit cancel, lag,
     // shutdown) closes the relay window so it never dangles.

@@ -203,6 +203,57 @@ fn status_semantics_during_relay_outage() {
     child.wait().expect("wait");
 }
 
+// G6/D1: a no-newline flood must be stopped by the byte cap itself, not the
+// 10s first-line timeout — the "too large" error (or a close) arrives
+// promptly, memory never grows past the cap, and the daemon survives.
+#[test]
+fn no_newline_flood_is_bounded_by_the_cap_not_the_timeout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = write_config(dir.path(), "ws://127.0.0.1:1");
+    let mut child = spawn_serve(&config, dir.path());
+    let sock = dir.path().join("ctl.sock");
+    wait_for("ctl.sock", || sock.exists());
+
+    {
+        use std::io::{Read, Write};
+        let mut conn = std::os::unix::net::UnixStream::connect(&sock).expect("connect");
+        // Deadline shorter than the server's 10s first-line timeout: if the
+        // response only arrives via that timeout (or never), this read errs
+        // and the assertion below fails.
+        conn.set_read_timeout(Some(Duration::from_secs(8)))
+            .expect("set timeout");
+        // Stream 128 KiB with NO trailing newline. A mid-write broken pipe
+        // IS the bound working (the server closed at the cap).
+        let chunk = vec![b'a'; 8 * 1024];
+        for _ in 0..16 {
+            if conn.write_all(&chunk).is_err() {
+                break;
+            }
+        }
+        let mut out = Vec::new();
+        let read = conn.read_to_end(&mut out);
+        assert!(
+            read.is_ok(),
+            "expected a prompt error line or close, got {read:?}"
+        );
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.is_empty() || text.contains("too large"),
+            "expected the cap (not the timeout) to answer, got: {text}"
+        );
+    }
+
+    let after = Command::new(BIN)
+        .args(["status", "--state-dir"])
+        .arg(dir.path())
+        .output()
+        .expect("status after flood");
+    assert!(after.status.success(), "daemon must survive the flood");
+
+    kill_term(child.id());
+    child.wait().expect("wait");
+}
+
 // Client against no daemon: named error, nonzero exit.
 #[test]
 fn ctl_against_dead_daemon_is_a_clear_error() {
