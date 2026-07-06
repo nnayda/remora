@@ -131,6 +131,91 @@ fn stale_socket_is_recovered_on_next_start() {
     second.wait().expect("wait");
 }
 
+// status against a daemon whose relay never answers: daemon-alive semantics
+// (exit 0) vs --require-relay (exit 1). G10.
+#[test]
+fn status_semantics_during_relay_outage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = write_config(dir.path(), "ws://127.0.0.1:1");
+    let mut child = spawn_serve(&config, dir.path());
+    let sock = dir.path().join("ctl.sock");
+    wait_for("ctl.sock", || sock.exists());
+
+    let plain = Command::new(BIN)
+        .args(["status", "--state-dir"])
+        .arg(dir.path())
+        .output()
+        .expect("status");
+    assert!(plain.status.success(), "plain status must be liveness-true");
+    assert!(String::from_utf8_lossy(&plain.stdout).contains("reconnecting"));
+
+    let strict = Command::new(BIN)
+        .args(["status", "--require-relay", "--state-dir"])
+        .arg(dir.path())
+        .output()
+        .expect("status strict");
+    assert!(
+        !strict.status.success(),
+        "--require-relay must fail while disconnected"
+    );
+
+    // G7: revoke of anything is health-gated while disconnected — fast, clear.
+    let revoke = Command::new(BIN)
+        .args(["revoke", "feedbeef", "--state-dir"])
+        .arg(dir.path())
+        .output()
+        .expect("revoke");
+    assert!(!revoke.status.success());
+    assert!(String::from_utf8_lossy(&revoke.stderr).contains("not connected"));
+
+    // devices works offline (roster is local).
+    let devices = Command::new(BIN)
+        .args(["devices", "--state-dir"])
+        .arg(dir.path())
+        .output()
+        .expect("devices");
+    assert!(devices.status.success());
+    assert!(String::from_utf8_lossy(&devices.stdout).contains("no paired devices"));
+
+    // G6: an oversize first line gets an error, and the daemon survives.
+    {
+        use std::io::{Read, Write};
+        let mut conn = std::os::unix::net::UnixStream::connect(&sock).expect("connect");
+        let big = vec![b'a'; 100 * 1024];
+        // The server may close mid-write once the cap trips; a broken pipe
+        // here IS the bound working.
+        let _ = conn.write_all(&big);
+        let _ = conn.write_all(b"\n");
+        let mut out = String::new();
+        let _ = conn.read_to_string(&mut out);
+    }
+    let after = Command::new(BIN)
+        .args(["status", "--state-dir"])
+        .arg(dir.path())
+        .output()
+        .expect("status after oversize");
+    assert!(
+        after.status.success(),
+        "daemon must survive an oversize request"
+    );
+
+    kill_term(child.id());
+    child.wait().expect("wait");
+}
+
+// Client against no daemon: named error, nonzero exit.
+#[test]
+fn ctl_against_dead_daemon_is_a_clear_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(BIN)
+        .args(["status", "--state-dir"])
+        .arg(dir.path())
+        .output()
+        .expect("status");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("daemon not running"));
+}
+
 /// Send SIGTERM without unsafe: /bin/kill is universally present.
 fn kill_term(pid: u32) {
     let ok = Command::new("kill")

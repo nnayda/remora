@@ -26,20 +26,14 @@ const IDENTITY_FILE: &str = "bridge_identity.toml";
 const ROSTER_FILE: &str = "bridge_roster.toml";
 /// D1: bound on one ctl request line; a wedged/hostile client cannot grow
 /// an unbounded buffer.
-#[allow(dead_code, reason = "consumed by the ctl server, plan Task 9")]
 pub(crate) const MAX_REQUEST_LINE: usize = 64 * 1024;
 /// D1: a connection must present its first request promptly; interactive
 /// pauses only happen later, inside a pair ceremony (bounded by the window).
-#[allow(dead_code, reason = "consumed by the ctl server, plan Task 9")]
 pub(crate) const FIRST_LINE_TIMEOUT: Duration = Duration::from_secs(10);
 const PAIRING_CHANNEL_DEPTH: usize = 8;
 const EVENT_FANOUT_DEPTH: usize = 64;
 
 /// Shared handles the ctl server serves requests from (Task 9).
-#[allow(
-    dead_code,
-    reason = "fields consumed by the ctl server, plan Task 9; the stub ignores them"
-)]
 #[derive(Clone)]
 pub(crate) struct DaemonState {
     pub commands: mpsc::Sender<PairingCommand>,

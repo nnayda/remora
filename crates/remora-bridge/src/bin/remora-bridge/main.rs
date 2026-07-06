@@ -6,6 +6,7 @@ mod args;
 mod ctl_client;
 mod ctl_server;
 mod daemon;
+mod proto;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
