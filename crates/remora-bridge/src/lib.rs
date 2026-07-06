@@ -26,7 +26,9 @@ pub use bridge::{
     is_ws_url, serve_bridge, wake_channel, BridgeConfig, BridgeError, BridgeEvent, BridgeHealth,
     BridgeServeError, BridgeWakeHandle, PairingCommand, PairingOutcome, WakeReceiver,
 };
-pub use identity::{fingerprint, BridgeIdentity, IdentityError, PairingFile, Roster, RosterEntry};
+pub use identity::{
+    fingerprint, BridgeIdentity, IdentityError, IdentityLock, PairingFile, Roster, RosterEntry,
+};
 pub use noise::{
     chunk_bytes, prologue, Handshake, HandshakeKind, NoiseError, Transport, MAX_NOISE_PLAINTEXT,
     NOISE_PATTERN, PTY_CHUNK_BYTES,

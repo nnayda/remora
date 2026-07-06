@@ -31,6 +31,7 @@ remora-bridge = { path = "crates/remora-bridge" }
 remora-core = { path = "crates/remora-core" }
 remora-protocol = { path = "crates/remora-protocol" }
 remora-relay = { path = "crates/remora-relay" }
+rustix = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shlex = "2.0"

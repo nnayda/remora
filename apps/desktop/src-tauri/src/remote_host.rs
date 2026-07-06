@@ -120,8 +120,16 @@ pub async fn start_loopback(
     // The identity/roster paths come from `bridge_state` so the loopback and the
     // real relay bridge share one load-bearing layout (ADR-0021).
     let config_path = bridge.config_path();
-    let identity =
-        BridgeIdentity::load_or_create(&crate::bridge_state::identity_path(&config_path))?;
+    // Claim exclusive use of this identity for the process lifetime before
+    // touching it (spec D2, #234): the desktop's in-process bridge and a
+    // future headless `remora-bridge serve` pointed at the same state dir
+    // would otherwise silently share one identity file. Loopback and the real
+    // relay bridge are mutually exclusive at runtime (see `lib.rs`), so this
+    // only ever contends with a *different* process, never the relay bridge
+    // in the same one.
+    let identity_path = crate::bridge_state::identity_path(&config_path);
+    let identity_lock = remora_bridge::IdentityLock::acquire(&identity_path)?;
+    let identity = BridgeIdentity::load_or_create(&identity_path)?;
     // Start from an EMPTY roster: the device this run pairs is enrolled by the
     // real ceremony below, not seeded inline. The confirm path does persist the
     // enrolled entry to `bridge_roster.toml`, but it is overwritten each run and
@@ -199,6 +207,9 @@ pub async fn start_loopback(
     let (wake, wake_rx) = wake_channel();
     let shutdown_c = shutdown.clone();
     let bridge_task = tokio::spawn(async move {
+        // Held for exactly the bridge's lifetime: dropped when this task ends,
+        // releasing the identity for a future claimant.
+        let _identity_lock = identity_lock;
         if let Err(e) = serve_bridge(
             bridge_cfg,
             source,

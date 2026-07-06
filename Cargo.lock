@@ -3404,6 +3404,7 @@ dependencies = [
  "remora-core",
  "remora-protocol",
  "remora-relay",
+ "rustix",
  "serde",
  "serde_json",
  "snow",
