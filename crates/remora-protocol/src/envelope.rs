@@ -269,13 +269,14 @@ impl std::error::Error for EnvelopeError {}
 /// session exists, so — unlike the rest of an envelope's payload — its
 /// fields are plaintext the relay legitimately reads to route and
 /// authenticate the connection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct RelayHello {
     /// Whether the connecting peer is a bridge or a device.
     pub role: HelloRole,
     /// The relay-issued credential (rendezvous token or bridge registration
-    /// token) proving admission to routing.
+    /// token) proving admission to routing. A bearer credential — redacted
+    /// from the manual [`Debug`] impl (#278).
     pub token: String,
     /// Pairing identity: the long-lived key this peer authenticates as.
     pub device_id: DeviceId,
@@ -285,6 +286,20 @@ pub struct RelayHello {
     /// For a device: the bridge it wants routed to. For a bridge: its own
     /// id (mirrors `routing_id`).
     pub bridge_id: DeviceId,
+}
+
+impl std::fmt::Debug for RelayHello {
+    /// Redacts `token` — the bearer credential — keeping the routing ids
+    /// visible for diagnostics (#278).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayHello")
+            .field("role", &self.role)
+            .field("token", &"[redacted]")
+            .field("device_id", &self.device_id)
+            .field("routing_id", &self.routing_id)
+            .field("bridge_id", &self.bridge_id)
+            .finish()
+    }
 }
 
 /// Which side of a relay connection a [`RelayHello`] describes.
@@ -299,7 +314,7 @@ pub enum HelloRole {
 /// carried in a [`FrameType::Control`] envelope whose `dst` is
 /// [`DeviceId::ZERO`] (relay-terminated). `id` correlates the relay's
 /// [`RelayControlAck`]/[`RelayControlError`] reply.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum RelayControl {
@@ -322,10 +337,35 @@ pub enum RelayControl {
     },
 }
 
+impl std::fmt::Debug for RelayControl {
+    /// Redacts `RegisterPairing`'s rendezvous token; `AssertDevices` delegates
+    /// to [`AssertedDevice`]'s own redacting impl (#278).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RelayControl::RegisterPairing { id, ttl_secs, .. } => f
+                .debug_struct("RegisterPairing")
+                .field("id", id)
+                .field("token", &"[redacted]")
+                .field("ttl_secs", ttl_secs)
+                .finish(),
+            RelayControl::CancelPairing { id } => {
+                f.debug_struct("CancelPairing").field("id", id).finish()
+            }
+            RelayControl::AssertDevices { id, devices } => f
+                .debug_struct("AssertDevices")
+                .field("id", id)
+                .field("devices", devices)
+                .finish(),
+        }
+    }
+}
+
 /// One asserted device credential inside [`RelayControl::AssertDevices`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssertedDevice {
     pub device_id: DeviceId,
+    /// The per-device relay routing credential — a bearer token, redacted
+    /// from the manual [`Debug`] impl (#278).
     pub token: String,
     /// The device's registered push-wake channel (ADR-0023), if any.
     /// `#[serde(default)]` so pre-v4 asserts encoded without this field
@@ -333,6 +373,17 @@ pub struct AssertedDevice {
     /// registration.
     #[serde(default)]
     pub push: Option<PushRegistration>,
+}
+
+impl std::fmt::Debug for AssertedDevice {
+    /// Redacts `token` — the per-device bearer credential (#278).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssertedDevice")
+            .field("device_id", &self.device_id)
+            .field("token", &"[redacted]")
+            .field("push", &self.push)
+            .finish()
+    }
 }
 
 /// Relay→bridge acknowledgement of a [`RelayControl`] with matching `id`.
@@ -579,5 +630,44 @@ mod tests {
             .expect("deserialize"),
             err
         );
+    }
+
+    #[test]
+    fn relay_credential_debug_impls_redact_tokens() {
+        // RelayHello: the admission bearer token must not reach a log.
+        let hello = RelayHello {
+            role: HelloRole::Device,
+            token: "hello-SECRET-token".to_string(),
+            device_id: nonzero_device_id(0x11),
+            routing_id: nonzero_device_id(0x22),
+            bridge_id: nonzero_device_id(0x33),
+        };
+        let dbg = format!("{hello:?}");
+        assert!(!dbg.contains("hello-SECRET-token"), "leaked: {dbg}");
+        assert!(dbg.contains("[redacted]"), "no redaction marker: {dbg}");
+        assert!(dbg.contains("Device"), "role should stay visible: {dbg}");
+
+        // AssertedDevice + the AssertDevices control that carries it.
+        let control = RelayControl::AssertDevices {
+            id: 7,
+            devices: vec![AssertedDevice {
+                device_id: nonzero_device_id(0x44),
+                token: "asserted-SECRET-token".to_string(),
+                push: None,
+            }],
+        };
+        let dbg = format!("{control:?}");
+        assert!(!dbg.contains("asserted-SECRET-token"), "leaked: {dbg}");
+        assert!(dbg.contains("id: 7"), "id should stay visible: {dbg}");
+
+        // RegisterPairing: the rendezvous token admits a device to routing.
+        let register = RelayControl::RegisterPairing {
+            id: 9,
+            token: "rvz-SECRET-token".to_string(),
+            ttl_secs: 300,
+        };
+        let dbg = format!("{register:?}");
+        assert!(!dbg.contains("rvz-SECRET-token"), "leaked: {dbg}");
+        assert!(dbg.contains("ttl_secs: 300"), "ttl should stay: {dbg}");
     }
 }

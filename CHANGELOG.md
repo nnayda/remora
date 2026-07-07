@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Pairing/relay secrets are zeroized on drop and redacted from `Debug`**
+  (#278): the in-memory secrets the pairing and relay work introduced — the
+  pairing window secret and `PairingCode.psk`, per-pair session PSKs and relay
+  tokens (roster entries, pairing files), the bridge's static private key, and
+  per-dial decoded key material — are now wiped when their owners drop
+  (`zeroize`), and every secret-bearing type that had a derived `Debug`
+  (`PairingCode`, `PairingFile`, `RosterEntry`, `PairingBridgeMsg::Grant`,
+  `RelayHello`/`AssertedDevice`/`RegisterPairing` tokens, the relay's
+  `BridgeEntry`, the desktop's `PairingCodeDto`, the ctl `WindowOpened`) now
+  redacts its secret fields, so an incidental `{:?}` log line can never carry
+  a PSK, private key, or bearer token. Noise transport plaintext buffers are
+  also scrubbed after seal/open. Pairing codes are still rendered wherever the
+  operator is meant to see them.
+
 ### Fixed
 
 - **Pairing events are tagged with their window generation, so a stale event

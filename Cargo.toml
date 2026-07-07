@@ -47,6 +47,9 @@ toml = { version = "1", default-features = false, features = ["parse", "serde"] 
 toml_edit = "0.25.12"
 unicode-general-category = "1"
 unicode-segmentation = "1"
+# Secret hygiene (#278): wipe pairing PSKs, window secrets, and device tokens
+# from memory on drop. Already in-tree transitively (snow/rustls); MIT/Apache-2.0.
+zeroize = { version = "1.8", features = ["derive"] }
 # `no_std` is what makes vte's OSC buffer a bounded ArrayVec<1024> (the DoS
 # bound ADR-0013 relies on); it is vte's default today, but pin it explicitly
 # so a future `default-features = false` can't silently turn osc_raw into an

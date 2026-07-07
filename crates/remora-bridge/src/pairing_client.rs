@@ -40,6 +40,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use zeroize::{Zeroize as _, Zeroizing};
 
 use remora_protocol::{
     DeviceId, Envelope, FrameType, HelloRole, PairingBridgeMsg, PairingClientMsg, PairingCode,
@@ -146,11 +147,31 @@ fn random_device_id() -> Result<DeviceId, PairingError> {
     Ok(DeviceId(raw))
 }
 
+/// A freshly minted device keypair whose private half is zeroized on drop
+/// (#278). `snow::Keypair` itself has no drop hygiene, and the ceremony has
+/// many early-return paths — the wrapper covers them all. Derefs to the inner
+/// keypair so callers read `.private`/`.public` unchanged.
+struct MintedKeypair(snow::Keypair);
+
+impl std::ops::Deref for MintedKeypair {
+    type Target = snow::Keypair;
+
+    fn deref(&self) -> &snow::Keypair {
+        &self.0
+    }
+}
+
+impl Drop for MintedKeypair {
+    fn drop(&mut self) {
+        self.0.private.zeroize();
+    }
+}
+
 /// Mints this device's durable identity: a fresh X25519 static keypair (the same
 /// way the identity layer does) plus a random [`DeviceId`]. Both are secret to
 /// the device — the private key never leaves, and the id is bound into the Noise
 /// prologue and preamble so it cannot be swapped by the relay.
-fn mint_device_identity() -> Result<(snow::Keypair, DeviceId), PairingError> {
+fn mint_device_identity() -> Result<(MintedKeypair, DeviceId), PairingError> {
     let params: snow::params::NoiseParams = NOISE_PATTERN
         .parse()
         .map_err(|e: snow::Error| PairingError::Transport(format!("noise params: {e}")))?;
@@ -158,7 +179,7 @@ fn mint_device_identity() -> Result<(snow::Keypair, DeviceId), PairingError> {
         .generate_keypair()
         .map_err(|e| PairingError::Transport(format!("keypair generation failed: {e}")))?;
     let device_id = random_device_id()?;
-    Ok((keypair, device_id))
+    Ok((MintedKeypair(keypair), device_id))
 }
 
 /// Runs the whole device-side pairing ceremony against the bridge responder
@@ -297,7 +318,7 @@ pub async fn run_pairing(
             device_token,
             psk,
             bridge_name: _,
-        } => (device_token, psk),
+        } => (device_token, Zeroizing::new(psk)),
         PairingBridgeMsg::Rejected { reason } => return Err(map_rejection(reason)),
         _ => {
             return Err(PairingError::Transport(
@@ -345,7 +366,8 @@ pub async fn run_pairing(
 /// bridge id and static key), the bridge grant (`device_token`, session `psk`),
 /// and this device's minted identity. The granted PSK is validated to be 32
 /// bytes and re-encoded canonically so a malformed grant is a typed error, not a
-/// pairing file that fails at first dial.
+/// pairing file that fails at first dial. The decoded PSK bytes are zeroized
+/// once re-encoded (#278).
 fn build_pairing_file(
     code: &PairingCode,
     relay_url: &str,
@@ -354,19 +376,21 @@ fn build_pairing_file(
     device_keypair: &snow::Keypair,
     device_id: DeviceId,
 ) -> Result<PairingFile, PairingError> {
-    let psk_bytes = B64
-        .decode(session_psk_b64)
-        .map_err(|_| PairingError::Transport("granted psk is not valid base64".to_string()))?;
-    let psk: [u8; 32] = psk_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| PairingError::Transport("granted psk is not 32 bytes".to_string()))?;
+    let psk_bytes = Zeroizing::new(
+        B64.decode(session_psk_b64)
+            .map_err(|_| PairingError::Transport("granted psk is not valid base64".to_string()))?,
+    );
+    if psk_bytes.len() != 32 {
+        return Err(PairingError::Transport(
+            "granted psk is not 32 bytes".to_string(),
+        ));
+    }
     Ok(PairingFile {
         relay_url: relay_url.to_string(),
         device_token,
         bridge_id: code.bridge_id,
         bridge_static_pubkey: B64.encode(code.bridge_key),
-        psk: B64.encode(psk),
+        psk: B64.encode(psk_bytes.as_slice()),
         device_id,
         device_private_key: B64.encode(&device_keypair.private),
         device_public_key: B64.encode(&device_keypair.public),

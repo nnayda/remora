@@ -19,6 +19,7 @@ use base64::Engine as _;
 use blake2::{Blake2s256, Digest as _};
 use rand::TryRng as _;
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use remora_protocol::{DeviceId, PushRegistration};
 
@@ -232,12 +233,21 @@ pub fn fingerprint(pubkey: &[u8]) -> String {
 /// keypair it presents in every Noise session.
 ///
 /// Persisted as TOML with the id in hex and both key halves in base64. Not
-/// `Clone`/`Debug` on purpose — it holds a private key.
+/// `Clone`/`Debug` on purpose — it holds a private key — and the private key
+/// bytes are zeroized on drop (#278).
 pub struct BridgeIdentity {
     /// This bridge's stable device id (the `bridge_id` clients route to).
     pub device_id: DeviceId,
     /// The bridge's long-term X25519 static keypair.
     pub static_keypair: snow::Keypair,
+}
+
+impl Drop for BridgeIdentity {
+    fn drop(&mut self) {
+        // `snow::Keypair` is a plain struct with no drop hygiene of its own;
+        // the private half is ours to scrub. The public half is public.
+        self.static_keypair.private.zeroize();
+    }
 }
 
 /// On-disk shape of [`BridgeIdentity`].
@@ -303,9 +313,13 @@ impl BridgeIdentity {
 
 /// One paired device: its device id, its pinned static public key, and the PSK
 /// shared with this bridge for that pairing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Secret-bearing (#278): `psk` and `relay_token` are zeroized when an entry
+/// (or any clone) drops, and both are redacted from the manual [`Debug`] impl.
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct RosterEntry {
     /// The device's stable device id.
+    #[zeroize(skip)]
     pub device_id: DeviceId,
     /// The device's pinned X25519 static public key.
     pub static_pubkey: Vec<u8>,
@@ -324,7 +338,26 @@ pub struct RosterEntry {
     /// The device's registered push-wake channel (ADR-0023), if any. Set via
     /// `RemoteOp::RegisterPushEndpoint` (Task 4); a freshly enrolled device
     /// starts with `None`.
+    #[zeroize(skip)]
     pub push: Option<PushRegistration>,
+}
+
+impl std::fmt::Debug for RosterEntry {
+    /// Redacts `psk` (the per-pair session PSK) and `relay_token` (the
+    /// per-device relay bearer credential); the rest is display metadata and
+    /// the device's *public* pinned key (#278).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RosterEntry")
+            .field("device_id", &self.device_id)
+            .field("static_pubkey", &self.static_pubkey)
+            .field("psk", &"[redacted]")
+            .field("relay_token", &"[redacted]")
+            .field("name", &self.name)
+            .field("enrolled_at", &self.enrolled_at)
+            .field("last_connected_at", &self.last_connected_at)
+            .field("push", &self.push)
+            .finish()
+    }
 }
 
 /// The set of devices paired with this bridge.
@@ -455,24 +488,48 @@ impl Roster {
 /// the relay and complete the Noise handshake: the relay endpoint + device
 /// token, the bridge's id and static public key (to pin), the shared PSK, and
 /// the device's own minted id + keypair.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Secret-bearing (#278): `device_token`, `psk`, and `device_private_key` are
+/// zeroized when a file value (or any clone) drops, and all three are redacted
+/// from the manual [`Debug`] impl.
+#[derive(Clone, PartialEq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct PairingFile {
     /// The relay endpoint (`wss://…`) to dial.
     pub relay_url: String,
     /// The device's routing credential, asserted by the bridge.
     pub device_token: String,
     /// The bridge's device id.
+    #[zeroize(skip)]
     pub bridge_id: DeviceId,
     /// The bridge's static public key (base64) — the device pins this.
     pub bridge_static_pubkey: String,
     /// The shared `psk2` for this pairing (base64).
     pub psk: String,
     /// The device's minted device id.
+    #[zeroize(skip)]
     pub device_id: DeviceId,
     /// The device's static private key (base64).
     pub device_private_key: String,
     /// The device's static public key (base64).
     pub device_public_key: String,
+}
+
+impl std::fmt::Debug for PairingFile {
+    /// Redacts `device_token` (relay bearer credential), `psk` (session PSK),
+    /// and `device_private_key`; endpoints, ids, and public keys stay visible
+    /// for diagnostics (#278).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairingFile")
+            .field("relay_url", &self.relay_url)
+            .field("device_token", &"[redacted]")
+            .field("bridge_id", &self.bridge_id)
+            .field("bridge_static_pubkey", &self.bridge_static_pubkey)
+            .field("psk", &"[redacted]")
+            .field("device_id", &self.device_id)
+            .field("device_private_key", &"[redacted]")
+            .field("device_public_key", &self.device_public_key)
+            .finish()
+    }
 }
 
 impl PairingFile {
@@ -792,6 +849,107 @@ mod tests {
         assert!(matches!(second, Err(IdentityError::Locked { .. })));
         drop(first);
         IdentityLock::acquire(&path).expect("lock re-acquirable after release");
+    }
+
+    #[test]
+    fn roster_entry_debug_redacts_psk_and_relay_token() {
+        let entry = RosterEntry {
+            device_id: DeviceId([0x11; 32]),
+            static_pubkey: vec![0xaa; 32],
+            // 0xED = 237: a decimal rendering distinct from other fields.
+            psk: [0xED; 32],
+            relay_token: "relay-SECRET-token".to_string(),
+            name: "phone".to_string(),
+            enrolled_at: Some(1_765_000_000),
+            last_connected_at: None,
+            push: None,
+        };
+        let dbg = format!("{entry:?}");
+        assert!(!dbg.contains("237"), "psk bytes leaked: {dbg}");
+        assert!(!dbg.contains("relay-SECRET-token"), "token leaked: {dbg}");
+        assert!(dbg.contains("[redacted]"), "no redaction marker: {dbg}");
+        assert!(dbg.contains("phone"), "name should stay visible: {dbg}");
+
+        // A whole roster delegates to the entry's redacting impl.
+        let roster = Roster {
+            entries: vec![entry],
+        };
+        let dbg = format!("{roster:?}");
+        assert!(!dbg.contains("relay-SECRET-token"), "leaked: {dbg}");
+    }
+
+    #[test]
+    fn pairing_file_debug_redacts_secrets() {
+        let pf = PairingFile {
+            relay_url: "wss://r/ws".to_string(),
+            device_token: "tok-SECRET".to_string(),
+            bridge_id: DeviceId([3; 32]),
+            bridge_static_pubkey: B64.encode([0x22; 32]),
+            psk: B64.encode([0xED; 32]),
+            device_id: DeviceId([4; 32]),
+            device_private_key: B64.encode([0xEE; 32]),
+            device_public_key: B64.encode([0x44; 32]),
+        };
+        let dbg = format!("{pf:?}");
+        assert!(!dbg.contains("tok-SECRET"), "device token leaked: {dbg}");
+        assert!(
+            !dbg.contains(&B64.encode([0xED; 32])),
+            "psk b64 leaked: {dbg}"
+        );
+        assert!(
+            !dbg.contains(&B64.encode([0xEE; 32])),
+            "private key b64 leaked: {dbg}"
+        );
+        assert!(dbg.contains("[redacted]"), "no redaction marker: {dbg}");
+        assert!(dbg.contains("wss://r/ws"), "relay_url should stay: {dbg}");
+        assert!(
+            dbg.contains(&B64.encode([0x44; 32])),
+            "public key should stay visible: {dbg}"
+        );
+    }
+
+    #[test]
+    fn zeroize_clears_secret_fields_and_keeps_skipped_ids() {
+        // Calling `zeroize()` directly exercises the exact same derive the
+        // drop path uses, without reading freed memory: the secret fields must
+        // clear, the `#[zeroize(skip)]` ids must survive.
+        let mut entry = RosterEntry {
+            device_id: DeviceId([0x11; 32]),
+            static_pubkey: vec![0xaa; 32],
+            psk: [0xbb; 32],
+            relay_token: "relay-tok".to_string(),
+            name: "phone".to_string(),
+            enrolled_at: Some(1),
+            last_connected_at: None,
+            push: None,
+        };
+        entry.zeroize();
+        assert_eq!(entry.psk, [0u8; 32], "psk must be wiped");
+        assert!(entry.relay_token.is_empty(), "relay_token must be wiped");
+        assert_eq!(
+            entry.device_id,
+            DeviceId([0x11; 32]),
+            "skipped device_id must survive"
+        );
+
+        let mut pf = PairingFile {
+            relay_url: "wss://r/ws".to_string(),
+            device_token: "tok".to_string(),
+            bridge_id: DeviceId([3; 32]),
+            bridge_static_pubkey: B64.encode([0u8; 32]),
+            psk: B64.encode([0x5a; 32]),
+            device_id: DeviceId([4; 32]),
+            device_private_key: B64.encode([0x5b; 32]),
+            device_public_key: B64.encode([0u8; 32]),
+        };
+        pf.zeroize();
+        assert!(pf.psk.is_empty(), "psk must be wiped");
+        assert!(pf.device_token.is_empty(), "device_token must be wiped");
+        assert!(
+            pf.device_private_key.is_empty(),
+            "device_private_key must be wiped"
+        );
+        assert_eq!(pf.bridge_id, DeviceId([3; 32]), "skipped id must survive");
     }
 
     #[test]

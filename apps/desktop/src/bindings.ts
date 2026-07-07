@@ -463,7 +463,8 @@ export type KubectlFieldDto = { command: boolean; value: string }
 /**
  * A freshly minted pairing code for the UI: the encoded string to render as a
  * QR (and offer as a copyable fallback), plus the window deadline for a
- * countdown. `code` embeds the PSK by design (ADR-0021 D1); never log it.
+ * countdown. `code` embeds the PSK by design (ADR-0021 D1); never log it —
+ * and the manual [`Debug`] impl redacts it so a `{:?}` cannot either (#278).
  */
 export type PairingCodeDto = { 
 /**

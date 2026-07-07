@@ -21,6 +21,7 @@
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use zeroize::Zeroizing;
 
 use remora_protocol::{DeviceId, ENVELOPE_VERSION, PROTOCOL_VERSION};
 
@@ -228,8 +229,12 @@ impl Transport {
     /// Serializes `msg` (JSON), enforces [`MAX_NOISE_PLAINTEXT`] on the
     /// *encoded* bytes (a [`NoiseError::Oversized`] error, never truncation),
     /// then encrypts it into one envelope payload.
+    ///
+    /// The serialized plaintext buffer is zeroized after sealing (#278): some
+    /// sealed messages carry secrets (a pairing `Grant` carries the session
+    /// PSK and device token), and wiping every message costs one memset.
     pub fn seal<T: Serialize>(&mut self, msg: &T) -> Result<Vec<u8>, NoiseError> {
-        let plaintext = serde_json::to_vec(msg).map_err(NoiseError::Serialize)?;
+        let plaintext = Zeroizing::new(serde_json::to_vec(msg).map_err(NoiseError::Serialize)?);
         if plaintext.len() > MAX_NOISE_PLAINTEXT {
             return Err(NoiseError::Oversized {
                 size: plaintext.len(),
@@ -247,16 +252,18 @@ impl Transport {
 
     /// Decrypts one envelope payload and deserializes it as `T`. Fails on a
     /// tampered ciphertext or an out-of-order message (nonce mismatch).
+    ///
+    /// The decrypted plaintext buffer is zeroized after deserializing (#278),
+    /// mirroring [`seal`](Transport::seal).
     pub fn open<T: DeserializeOwned>(&mut self, ciphertext: &[u8]) -> Result<T, NoiseError> {
         // The plaintext is always shorter than the ciphertext (which carries
         // the AEAD tag), so `ciphertext.len()` is a safe output-buffer size.
-        let mut buf = vec![0u8; ciphertext.len()];
+        let mut buf = Zeroizing::new(vec![0u8; ciphertext.len()]);
         let n = self
             .state
             .read_message(ciphertext, &mut buf)
             .map_err(snow_err)?;
-        buf.truncate(n);
-        serde_json::from_slice(&buf).map_err(NoiseError::Deserialize)
+        serde_json::from_slice(&buf[..n]).map_err(NoiseError::Deserialize)
     }
 }
 
