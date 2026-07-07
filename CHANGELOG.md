@@ -30,6 +30,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Live `[relay]` reconfig via the config watcher** (#277): the desktop's
+  hosted relay bridge no longer reads `[relay]` only at launch. Editing the
+  config now starts the bridge when the section is added, cleanly restarts it
+  when `relay_url`/`registration_token` change, and cleanly stops it when the
+  section is removed — no app relaunch. A clean stop actually reaps the
+  bridge: the serve and event-forwarder tasks are joined (releasing the
+  bridge identity lock, previously held until process exit), the push-wake
+  tee is rewired to the current bridge, and Settings→Devices commands fail
+  with "relay not configured" instead of talking to a dead bridge's channels.
+  Unrelated config edits (including `push_wake_url`, which the hosted bridge
+  never reads) never churn live relay connections.
 - **Headless `remora-bridge` binary** (#234, ADR-0021): `serve` daemon with a
   hardened Unix ctl socket, `init`/`pair`/`devices`/`revoke`/`status`/
   `fingerprint` CLI (copy-paste pairing code, confirm-gated enrollment that
