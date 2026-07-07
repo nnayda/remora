@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Bridge event delivery no longer rides the serve hot path** (#283):
+  `serve_bridge` now hands `BridgeEvent`s to a dedicated forwarder task over
+  an internal non-blocking queue, so a consumer that stalls on the event
+  channel can never head-of-line-block inbound frame dispatch for all peers.
+  Nothing is dropped and per-pairing event order is preserved. Also reaps the
+  fire-and-forget `RegisterPairing` control waiter after the ack timeout, so
+  a relay that never answers no longer parks the entry until connection
+  teardown.
 - **`remora-bridge pair` no longer reports "expired" for an enrollment that
   committed** (#300): a Confirm/Reject answered near the window deadline could
   race the daemon's authoritative pairing result — the client-side deadline
