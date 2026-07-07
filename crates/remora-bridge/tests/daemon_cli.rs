@@ -232,15 +232,24 @@ fn no_newline_flood_is_bounded_by_the_cap_not_the_timeout() {
         }
         let mut out = Vec::new();
         let read = conn.read_to_end(&mut out);
-        assert!(
-            read.is_ok(),
-            "expected a prompt error line or close, got {read:?}"
-        );
-        let text = String::from_utf8_lossy(&out);
-        assert!(
-            text.is_empty() || text.contains("too large"),
-            "expected the cap (not the timeout) to answer, got: {text}"
-        );
+        // Three acceptable prompt outcomes, all meaning the cap answered:
+        // the "too large" error line, a clean close (FIN → Ok with no
+        // data), or a reset (RST → ECONNRESET): a server that closes while
+        // our unread flood bytes are still queued resets rather than
+        // FIN-closing, which is timing/kernel-dependent (seen on CI).
+        // Only a *timeout* here would mean the 10s deadline answered
+        // instead of the cap.
+        match read {
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&out);
+                assert!(
+                    text.is_empty() || text.contains("too large"),
+                    "expected the cap (not the timeout) to answer, got: {text}"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(e) => panic!("expected an error line, close, or reset, got {e:?}"),
+        }
     }
 
     let after = Command::new(BIN)
