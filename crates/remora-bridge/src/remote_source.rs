@@ -45,6 +45,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use zeroize::Zeroizing;
 
 use remora_core::{SessionChannel, SessionSource, SourceError};
 use remora_protocol::{
@@ -71,8 +72,11 @@ const B64: base64::engine::general_purpose::GeneralPurpose =
 const RELAY_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Decoded Noise key material for one dial: device static private key, the
-/// bridge's pinned static public key, and the per-pair PSK.
-type KeyMaterial = (Vec<u8>, Vec<u8>, [u8; 32]);
+/// bridge's pinned static public key, and the per-pair PSK. The private key
+/// and PSK are wrapped in [`Zeroizing`] so each dial's decoded copies are
+/// wiped when the dial completes or fails (#278); the bridge public key is
+/// pinning material, not a secret.
+type KeyMaterial = (Zeroizing<Vec<u8>>, Vec<u8>, Zeroizing<[u8; 32]>);
 
 /// The client [`SessionSource`] for relay mode (ADR-0021).
 ///
@@ -117,18 +121,22 @@ impl RemoteSource {
     /// device's static private key, the bridge's pinned static public key, and
     /// the per-pair PSK.
     fn key_material(&self) -> Result<KeyMaterial, SourceError> {
-        let device_priv = B64
-            .decode(&self.pairing.device_private_key)
-            .map_err(|e| SourceError::Transport(format!("bad device private key: {e}")))?;
+        let device_priv = Zeroizing::new(
+            B64.decode(&self.pairing.device_private_key)
+                .map_err(|e| SourceError::Transport(format!("bad device private key: {e}")))?,
+        );
         let bridge_pub = B64
             .decode(&self.pairing.bridge_static_pubkey)
             .map_err(|e| SourceError::Transport(format!("bad bridge public key: {e}")))?;
-        let psk_bytes = B64
-            .decode(&self.pairing.psk)
-            .map_err(|e| SourceError::Transport(format!("bad psk: {e}")))?;
-        let psk: [u8; 32] = psk_bytes
-            .try_into()
-            .map_err(|_| SourceError::Transport("psk is not 32 bytes".to_string()))?;
+        let psk_bytes = Zeroizing::new(
+            B64.decode(&self.pairing.psk)
+                .map_err(|e| SourceError::Transport(format!("bad psk: {e}")))?,
+        );
+        if psk_bytes.len() != 32 {
+            return Err(SourceError::Transport("psk is not 32 bytes".to_string()));
+        }
+        let mut psk = Zeroizing::new([0u8; 32]);
+        psk.copy_from_slice(&psk_bytes);
         Ok((device_priv, bridge_pub, psk))
     }
 

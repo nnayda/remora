@@ -9,6 +9,7 @@
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::DeviceId;
 
@@ -22,16 +23,44 @@ const URL_B64: base64::engine::general_purpose::GeneralPurpose =
 
 /// Everything a device needs to reach and authenticate to one bridge. Decoded
 /// from (or encoded to) the `remora-pair:1:…` string.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Secret-bearing (#278): `psk` is the pairing secret and `rendezvous_token`
+/// is the relay routing credential. Both are zeroized when a code (or any
+/// clone of it) drops, and both are redacted from the manual [`Debug`] impl so
+/// an incidental `{:?}` log line never carries them. The full secret string is
+/// only ever produced deliberately, via [`PairingCode::encode`].
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct PairingCode {
     pub relay_url: Option<String>,
     pub rendezvous_token: Option<String>,
     pub mesh_addr: Option<String>,
     pub psk: [u8; 32],
+    #[zeroize(skip)]
     pub bridge_id: DeviceId,
     pub bridge_key: [u8; 32],
     pub bridge_name: Option<String>,
     pub min_protocol: u32,
+}
+
+impl std::fmt::Debug for PairingCode {
+    /// Redacts `psk` (the pairing secret) and `rendezvous_token` (the relay
+    /// routing credential); everything else is public routing/pinning material
+    /// and stays visible for diagnostics.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairingCode")
+            .field("relay_url", &self.relay_url)
+            .field(
+                "rendezvous_token",
+                &self.rendezvous_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("mesh_addr", &self.mesh_addr)
+            .field("psk", &"[redacted]")
+            .field("bridge_id", &self.bridge_id)
+            .field("bridge_key", &self.bridge_key)
+            .field("bridge_name", &self.bridge_name)
+            .field("min_protocol", &self.min_protocol)
+            .finish()
+    }
 }
 
 /// On-the-wire JSON shape (keys as base64, secrets as standard base64).
@@ -176,7 +205,14 @@ pub enum PairingClientMsg {
 }
 
 /// Bridge → device, inside the pairing Noise session (ADR-0021 D3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not zeroize-on-drop: this is a serde wire DTO whose `Grant` fields are
+/// moved out by the receiving ceremony (a `Drop` impl would forbid that);
+/// the durable owners of the granted material ([`crate::PairingCode`] is the
+/// analogous protocol-side owner; the bridge's roster entry and the device's
+/// pairing file are the crate-external ones) zeroize instead. Its [`Debug`]
+/// is manual so a logged `Grant` never carries the credentials (#278).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum PairingBridgeMsg {
@@ -195,6 +231,26 @@ pub enum PairingBridgeMsg {
     /// The pairing was refused; `reason` distinguishes user-reject from a
     /// protocol condition.
     Rejected { reason: PairingRejectReason },
+}
+
+impl std::fmt::Debug for PairingBridgeMsg {
+    /// Redacts `Grant`'s `device_token` and `psk` — the durable credentials —
+    /// so a mis-sequenced or error-logged grant never reaches a log (#278).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PairingBridgeMsg::Pending => write!(f, "Pending"),
+            PairingBridgeMsg::Grant { bridge_name, .. } => f
+                .debug_struct("Grant")
+                .field("device_token", &"[redacted]")
+                .field("psk", &"[redacted]")
+                .field("bridge_name", bridge_name)
+                .finish(),
+            PairingBridgeMsg::Confirmed => write!(f, "Confirmed"),
+            PairingBridgeMsg::Rejected { reason } => {
+                f.debug_struct("Rejected").field("reason", reason).finish()
+            }
+        }
+    }
 }
 
 /// Why a [`PairingBridgeMsg::Rejected`] was sent.
@@ -339,6 +395,54 @@ mod tests {
                 msg
             );
         }
+    }
+
+    #[test]
+    fn pairing_code_debug_redacts_psk_and_rendezvous_token() {
+        // 0xED = 237: a byte value whose decimal rendering would be visible in
+        // a derived array Debug, distinct from every non-secret field here.
+        let code = PairingCode {
+            relay_url: Some("wss://relay.example/ws".to_string()),
+            rendezvous_token: Some("rvz-SECRET-token".to_string()),
+            mesh_addr: None,
+            psk: [0xED; 32],
+            bridge_id: DeviceId([0x11; 32]),
+            bridge_key: [0x22; 32],
+            bridge_name: Some("desktop".to_string()),
+            min_protocol: 3,
+        };
+        let dbg = format!("{code:?}");
+        assert!(!dbg.contains("237"), "psk bytes leaked: {dbg}");
+        assert!(
+            !dbg.contains("rvz-SECRET-token"),
+            "rendezvous token leaked: {dbg}"
+        );
+        assert!(dbg.contains("[redacted]"), "no redaction marker: {dbg}");
+        // Non-secret fields stay visible for diagnostics.
+        assert!(dbg.contains("wss://relay.example/ws"), "got: {dbg}");
+        assert!(dbg.contains("min_protocol: 3"), "got: {dbg}");
+    }
+
+    #[test]
+    fn pairing_grant_debug_redacts_credentials() {
+        let msg = PairingBridgeMsg::Grant {
+            device_token: "tok-SECRET".to_string(),
+            psk: "cHNrLVNFQ1JFVA==".to_string(),
+            bridge_name: Some("desktop".to_string()),
+        };
+        let dbg = format!("{msg:?}");
+        assert!(!dbg.contains("tok-SECRET"), "device token leaked: {dbg}");
+        assert!(!dbg.contains("cHNrLVNFQ1JFVA"), "psk b64 leaked: {dbg}");
+        assert!(dbg.contains("[redacted]"), "no redaction marker: {dbg}");
+        assert!(dbg.contains("desktop"), "bridge_name should stay: {dbg}");
+
+        // The non-secret variants keep a legible Debug.
+        assert_eq!(format!("{:?}", PairingBridgeMsg::Pending), "Pending");
+        assert_eq!(format!("{:?}", PairingBridgeMsg::Confirmed), "Confirmed");
+        let rejected = PairingBridgeMsg::Rejected {
+            reason: PairingRejectReason::UserRejected,
+        };
+        assert!(format!("{rejected:?}").contains("UserRejected"));
     }
 
     #[test]

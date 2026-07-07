@@ -84,8 +84,9 @@ fn parse_device_id(device_id: &str) -> Result<DeviceId, BridgeError> {
 
 /// A freshly minted pairing code for the UI: the encoded string to render as a
 /// QR (and offer as a copyable fallback), plus the window deadline for a
-/// countdown. `code` embeds the PSK by design (ADR-0021 D1); never log it.
-#[derive(Clone, Debug, serde::Serialize, specta::Type)]
+/// countdown. `code` embeds the PSK by design (ADR-0021 D1); never log it —
+/// and the manual [`Debug`] impl redacts it so a `{:?}` cannot either (#278).
+#[derive(Clone, serde::Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingCodeDto {
     /// The `remora-pair:1:…` string (QR payload + copyable fallback).
@@ -94,6 +95,16 @@ pub struct PairingCodeDto {
     pub expires_at: u64,
     /// The window lifetime, in seconds, it was opened for.
     pub ttl_secs: u64,
+}
+
+impl std::fmt::Debug for PairingCodeDto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairingCodeDto")
+            .field("code", &"[redacted]")
+            .field("expires_at", &self.expires_at)
+            .field("ttl_secs", &self.ttl_secs)
+            .finish()
+    }
 }
 
 /// One paired device, for the roster view. `device_id` is the 64-hex string;
@@ -487,6 +498,21 @@ mod tests {
         let json = serde_json::to_string(&dto).expect("serialize");
         assert!(json.contains(r#""expiresAt":100"#), "{json}");
         assert!(json.contains(r#""ttlSecs":120"#), "{json}");
+    }
+
+    #[test]
+    fn pairing_code_dto_debug_redacts_the_code() {
+        // The DTO's `code` is the full remora-pair secret string; serializing
+        // it to the frontend is the point, but Debug must not carry it (#278).
+        let dto = PairingCodeDto {
+            code: "remora-pair:1:SECRET-payload".to_string(),
+            expires_at: 100,
+            ttl_secs: 120,
+        };
+        let dbg = format!("{dto:?}");
+        assert!(!dbg.contains("SECRET-payload"), "code leaked: {dbg}");
+        assert!(dbg.contains("[redacted]"), "no redaction marker: {dbg}");
+        assert!(dbg.contains("100"), "expires_at should stay visible: {dbg}");
     }
 
     #[test]

@@ -62,6 +62,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroize as _;
 
 use remora_core::{sanitize, SessionSource};
 use remora_protocol::{
@@ -463,6 +464,13 @@ struct PeerDeps {
     episodes: Arc<Mutex<WakeEpisodes>>,
 }
 
+impl Drop for PeerDeps {
+    fn drop(&mut self) {
+        // The bridge's static private key copy dies with the serve run (#278).
+        self.bridge_static_priv.zeroize();
+    }
+}
+
 /// Deregisters a peer's [`LivePeers`] slot when the peer task returns, for any
 /// reason. Mirrors [`DoneGuard`]/[`CancelGuard`]: registration is RAII so a
 /// revocation kick never targets a session that has already ended.
@@ -675,6 +683,14 @@ struct PairingWindow {
     /// The running responder task, once a device has arrived. `None` while the
     /// window is open but no device has connected yet.
     task: Option<PairingTaskHandle>,
+}
+
+impl Drop for PairingWindow {
+    fn drop(&mut self) {
+        // The window secret is the QR's pairing PSK; wipe it when the window
+        // closes, expires, or is replaced (#278).
+        self.secret.zeroize();
+    }
 }
 
 /// A handle to the running pairing responder task, held by [`PairingWindow`].
@@ -1368,6 +1384,13 @@ struct PairingParams {
     generation: u64,
 }
 
+impl Drop for PairingParams {
+    fn drop(&mut self) {
+        // The task's copy of the window secret dies with the task (#278).
+        self.secret.zeroize();
+    }
+}
+
 /// Emits a terminal [`BridgeEvent::PairingResult`] tagged with the window
 /// generation the attempt ran on, so consumers can drop a stale result from a
 /// replaced window (#299).
@@ -1846,7 +1869,9 @@ fn client_version_ok(client_version: u32) -> bool {
 fn next_device_token() -> Result<String, BridgeError> {
     let mut raw = [0u8; 32];
     fill_random(&mut raw)?;
-    Ok(raw.iter().map(|b| format!("{b:02x}")).collect())
+    let token = raw.iter().map(|b| format!("{b:02x}")).collect();
+    raw.zeroize();
+    Ok(token)
 }
 
 /// Mints a fresh per-pair session PSK: 32 OS-CSPRNG bytes.
@@ -2830,6 +2855,10 @@ fn mint_pairing_code(deps: &Arc<PeerDeps>) -> Result<(PairingCode, String), Brid
         bridge_name: None,
         min_protocol: PROTOCOL_VERSION,
     };
+    // The locals were copied into the code (which zeroizes on drop, #278);
+    // scrub the stack copies here.
+    psk.zeroize();
+    token_raw.zeroize();
     Ok((code, rendezvous_token))
 }
 
@@ -4616,6 +4645,35 @@ mod tests {
         for expected in sequence {
             assert_eq!(events_rx.recv().await, Some(expected));
         }
+    }
+
+    #[test]
+    fn bridge_event_debug_redacts_pairing_code_secrets() {
+        // BridgeEvent keeps a derived Debug; the secrecy comes from
+        // PairingCode's manual impl, which this pins in the event context
+        // (#278). 0xED = 237: distinct from every non-secret byte used here.
+        let event = BridgeEvent::PairingWindowOpened {
+            code: PairingCode {
+                relay_url: Some("ws://test".to_string()),
+                rendezvous_token: Some("rvz-SECRET-token".to_string()),
+                mesh_addr: None,
+                psk: [0xED; 32],
+                bridge_id: DeviceId([9u8; 32]),
+                bridge_key: [8u8; 32],
+                bridge_name: None,
+                min_protocol: PROTOCOL_VERSION,
+            },
+            expires_at: 12345,
+            generation: 1,
+        };
+        let dbg = format!("{event:?}");
+        assert!(!dbg.contains("237"), "psk bytes leaked: {dbg}");
+        assert!(!dbg.contains("rvz-SECRET-token"), "token leaked: {dbg}");
+        assert!(dbg.contains("[redacted]"), "no redaction marker: {dbg}");
+        assert!(
+            dbg.contains("PairingWindowOpened"),
+            "variant name should stay visible: {dbg}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

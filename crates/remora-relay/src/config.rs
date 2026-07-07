@@ -68,10 +68,21 @@ fn default_max_connections() -> usize {
 /// One registered bridge: the token it presents in its `RelayHello` and the
 /// [`DeviceId`] that token is scoped to. A token admits exactly this
 /// identity — nothing else (spec D5).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 pub struct BridgeEntry {
+    /// The registration bearer token — redacted from the manual [`Debug`]
+    /// impl so a `{:?}` of the (reload-logged) config never carries it (#278).
     pub token: String,
     pub device_id: DeviceId,
+}
+
+impl std::fmt::Debug for BridgeEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BridgeEntry")
+            .field("token", &"[redacted]")
+            .field("device_id", &self.device_id)
+            .finish()
+    }
 }
 
 /// Opt-in audit log config (ADR-0021's "observability... catchable"
@@ -464,5 +475,20 @@ mod tests {
         assert!(!token_matches("", "non-empty"));
         assert!(!token_matches("non-empty", ""));
         assert!(token_matches("", ""));
+    }
+
+    #[test]
+    fn bridge_entry_debug_redacts_the_token() {
+        let entry = BridgeEntry {
+            token: "bridge-SECRET-token".to_string(),
+            device_id: DeviceId([0x11; 32]),
+        };
+        let dbg = format!("{entry:?}");
+        assert!(!dbg.contains("bridge-SECRET-token"), "leaked: {dbg}");
+        assert!(dbg.contains("[redacted]"), "no redaction marker: {dbg}");
+        assert!(
+            dbg.contains("device_id"),
+            "device_id should stay visible: {dbg}"
+        );
     }
 }
