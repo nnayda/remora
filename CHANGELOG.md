@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   health reporting that distinguishes rejection from outage, and a lifetime
   identity lock preventing two bridge processes from silently sharing one
   bridge identity.
+- **`remora-bridge` container image and operator docs** (#234): a debian-slim
+  + openssh-client, non-root container image with a reproducible binary
+  (verify script + weekly CI) and `crates/remora-bridge/README.md` covering
+  first deploy, no-camera pairing, desktop→headless migration, and
+  coexistence.
 - **Bridge health watch** (#234, spec D8): `serve_bridge` now publishes coarse
   relay-connection health over a `watch` channel (`BridgeHealth`), so an
   operator surface can distinguish healthy, relay-unreachable, and

@@ -39,9 +39,10 @@ touched `crates/`, iterate with `cargo test -p remora-core -p remora-protocol`.
   relay envelope (ADR-0021)
 - `crates/remora-relay` — blind envelope-frame relay binary (ADR-0021); routes
   opaque frames between paired devices, never sees plaintext
-- `crates/remora-bridge` — user-side bridge library (ADR-0021): a
-  `RemoteSource` driving `remora-core` end-to-end over Noise, hosted
-  in-process by the desktop today; standalone headless binary is future (#234)
+- `crates/remora-bridge` — user-side bridge (ADR-0021): a `RemoteSource`
+  driving `remora-core` end-to-end over Noise. Library + standalone headless
+  binary (`remora-bridge serve`, see crates/remora-bridge/README.md); hosted
+  in-process by the desktop today, or run as its own daemon/container
 - `docs/` — VISION.md (direction), ARCHITECTURE.md (system map),
   ROADMAP.md (MVP build order + stage status), adr/ (decisions)
 
