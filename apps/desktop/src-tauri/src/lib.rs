@@ -76,42 +76,56 @@ pub fn run() {
             };
 
             // Real relay bridge (ADR-0021 D7): when `[relay]` is configured, host
-            // this device's bridge so paired devices can reach it. Precedence: the
-            // dev loopback WINS — when it is active this device is already its own
-            // in-process bridge, so we do not also stand up the real relay bridge
-            // (they would contend for the one identity/roster). When loopback is
-            // off, startup still parses config.toml (`load_relay_section`) to
-            // check for the section; if it's absent, no bridge is spawned.
-            let pairing_handles = if loopback_active {
+            // this device's bridge so paired devices can reach it — supervised
+            // (#277), so a live config edit starts/restarts/stops it without an
+            // app relaunch. Precedence: the dev loopback WINS — when it is active
+            // this device is already its own in-process bridge, so no supervisor
+            // is managed at all (they would contend for the one identity/roster)
+            // and live `[relay]` edits are deliberately inert.
+            let supervisor = if loopback_active {
                 None
             } else {
-                relay::start_relay_bridge(&app_bridge)
+                // The Bridge's wake slot is set once, before it moves into
+                // managed state — so it gets the *swappable* tee (#233/#277):
+                // the supervisor points it at the current bridge's wake handle
+                // on every start and clears it on stop.
+                let wake = Arc::new(relay::SwappableWaker::default());
+                app_bridge.set_wake_handle(wake.clone());
+                Some(relay::RelaySupervisor::new(
+                    app_bridge.resolver(),
+                    config_path.clone(),
+                    wake,
+                ))
             };
 
-            // When a relay bridge is running, tee the output pump's session
-            // status transitions into its wake path (#233) so a hosted session
-            // going `Awaiting` push-wakes a paired device. Cheap, cloneable
-            // handle; set before the Bridge is handed to managed state.
-            if let Some(handles) = &pairing_handles {
-                app_bridge.set_wake_handle(Arc::new(handles.wake.clone()));
-            }
-
             app.manage(app_bridge);
-            // Expose the pairing channels for the pairing UI's commands (Task 16,
-            // #232). Managed only when a relay bridge is actually running. Before
-            // managing, start the forwarder that turns the bridge's `BridgeEvent`
-            // stream into frontend events (it takes the receiver out of `handles`).
-            if let Some(handles) = pairing_handles {
-                bridge::pairing::spawn_event_forwarder(app.handle().clone(), &handles);
-                app.manage(handles);
+            if let Some(supervisor) = supervisor {
+                // Launch-time start goes through the same transition path as a
+                // live edit: nothing running + `[relay]` present → Start (and
+                // absent → nothing). Applied before managing so the pairing
+                // commands never observe a half-started supervisor.
+                let handle = app.handle().clone();
+                tauri::async_runtime::block_on(supervisor.reconfigure(&handle));
+                app.manage(supervisor);
             }
 
-            // Live-reload the sidebar when the config file changes on disk.
-            // Non-fatal: on failure the app still runs with manual refresh.
+            // Live-reload the sidebar when the config file changes on disk,
+            // and re-diff the `[relay]` section against the hosted bridge
+            // (#277). Non-fatal: on failure the app still runs with manual
+            // refresh (and launch-time relay state).
             let handle = app.handle().clone();
             if let Err(e) =
                 config_watch::watch_config(&config_path, CONFIG_WATCH_DEBOUNCE, move || {
                     let _ = ConfigChanged.emit(&handle);
+                    // Off the watcher thread; the supervisor serializes bursts
+                    // (each queued run re-reads the config, so the last write
+                    // wins). No supervisor managed (loopback mode) → no-op.
+                    let handle = handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(supervisor) = handle.try_state::<relay::RelaySupervisor>() {
+                            supervisor.reconfigure(&handle).await;
+                        }
+                    });
                 })
             {
                 eprintln!("config watcher failed to start: {e}");

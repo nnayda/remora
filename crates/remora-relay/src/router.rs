@@ -82,6 +82,64 @@ struct RouterState {
     /// it — an already-admitted connection is never re-checked, so a token
     /// rotation never drops live connections.
     bridge_entries: Vec<BridgeEntry>,
+    /// Monotonic pairing-window serial, stamped into each [`PairingWindow`] so
+    /// a window-admitted connection can be tied to the *specific* window that
+    /// admitted it (#280): when that window closes, is replaced, or expires,
+    /// the connection's basis is gone and it is swept.
+    next_window_serial: u64,
+}
+
+impl RouterState {
+    /// Kicks every device connection in `bridge_id`'s group whose admission
+    /// basis is no longer backed by the bridge's current soft state at `now`
+    /// (#280): a window-admitted connection whose window was closed, replaced,
+    /// or has expired, and a credential-admitted connection whose device is no
+    /// longer asserted. Removes their registrations (so they can no longer
+    /// route) and returns their routing ids for the server to kick (4001).
+    ///
+    /// Called from every control path that mutates the bridge's soft state —
+    /// `RegisterPairing` (window replaced), `CancelPairing` (window closed),
+    /// and `AssertDevices` (credential set replaced; also the bridge's
+    /// reconnect assert, which is why the sweep reads the *live* registrations
+    /// rather than diffing the previous asserted set — a device revoked while
+    /// its bridge was offline has no entry in the fresh soft state's old set).
+    /// Deliberately **not** called on bridge hello or disconnect: device
+    /// registrations survive a bridge restart by design, and the reconnecting
+    /// bridge's connect-time assert runs this sweep moments later. A window
+    /// that expires with no further control traffic is swept by the next
+    /// control; until then it is availability-shaped residue, bounded by byte
+    /// budgets — the roster remains the security boundary either way.
+    fn sweep_group(&mut self, bridge_id: DeviceId, now: u64) -> Vec<DeviceId> {
+        let Some(bs) = self.bridges.get(&bridge_id) else {
+            return Vec::new();
+        };
+        let live_window = bs
+            .window
+            .as_ref()
+            .filter(|w| w.expires_at > now)
+            .map(|w| w.serial);
+        let kicked: Vec<DeviceId> = self
+            .conns
+            .iter()
+            .filter(|(_, reg)| {
+                reg.role == HelloRole::Device
+                    && reg.bridge_id == bridge_id
+                    && match reg.basis {
+                        AdmissionBasis::AssertedCredential => {
+                            !bs.asserted.contains_key(&reg.device_id)
+                        }
+                        AdmissionBasis::PairingWindow { window_serial } => {
+                            live_window != Some(window_serial)
+                        }
+                    }
+            })
+            .map(|(routing_id, _)| *routing_id)
+            .collect();
+        for routing_id in &kicked {
+            self.conns.remove(routing_id);
+        }
+        kicked
+    }
 }
 
 /// Per-bridge soft state (ADR-0021 D4): the bridge's asserted device
@@ -105,9 +163,30 @@ struct BridgeState {
 
 /// A bridge's single active pairing window: a rendezvous token that admits the
 /// pairing device to routing until `expires_at` (absolute unix seconds).
+/// `serial` uniquely identifies this window instance
+/// ([`RouterState::next_window_serial`]), so connections it admitted can be
+/// swept once it is closed, replaced, or expired (#280).
 struct PairingWindow {
     token: String,
     expires_at: u64,
+    serial: u64,
+}
+
+/// What admitted a device connection at hello time (#280). Recorded on its
+/// [`Registration`] so that when the admission's backing soft state disappears
+/// — the pairing window closes, or the credential is no longer asserted — the
+/// connection can be kicked rather than lingering as routable residue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionBasis {
+    /// Admitted by matching a bridge-asserted `(device_id, token)` credential —
+    /// or upgraded to this when the bridge later asserted the device's id (the
+    /// post-pairing `AssertDevices`, ADR-0021 D3's assert-before-grant). Also
+    /// stamped, vacuously, on bridge registrations (bridges authenticate
+    /// against the bridge table and are never swept).
+    AssertedCredential,
+    /// Admitted by presenting the rendezvous token of the pairing window with
+    /// this serial. Valid only while that exact window is open and unexpired.
+    PairingWindow { window_serial: u64 },
 }
 
 /// One live connection's registration.
@@ -122,6 +201,9 @@ struct Registration {
     device_id: DeviceId,
     /// The connection serial that owns this registration.
     serial: u64,
+    /// What admitted this connection (#280); consulted (and possibly upgraded)
+    /// by [`RouterState::sweep_group`] when the bridge's soft state changes.
+    basis: AdmissionBasis,
     outbound: OutboundHandle,
 }
 
@@ -166,8 +248,12 @@ pub enum HelloOutcome {
 /// [`RelayControl`] message (ADR-0021 D4).
 #[derive(Debug)]
 pub enum ControlOutcome {
-    /// The control message was applied; the server replies `RelayControlAck`.
-    Ack,
+    /// The control message was applied; the server replies `RelayControlAck`
+    /// and kicks each **routing id** in `kicked` via its kill channel (4001):
+    /// connections whose admission basis the control just revoked — a device
+    /// admitted through a pairing window that this `CancelPairing` closed or
+    /// this `RegisterPairing` replaced, and never since asserted (#280).
+    Ack { kicked: Vec<DeviceId> },
     /// The control message was rejected (e.g. it arrived on a stale bridge
     /// connection); the server replies `RelayControlError`.
     Error(String),
@@ -243,6 +329,7 @@ impl Router {
                 bridges: HashMap::new(),
                 push_state: PushState::default(),
                 bridge_entries: config.bridges.clone(),
+                next_window_serial: 0,
             }),
             push_permits,
         })
@@ -295,7 +382,7 @@ impl Router {
         now: u64,
     ) -> (HelloOutcome, Option<OutboundHandle>) {
         let mut state = self.lock();
-        let Some((routing_id, bridge_id)) = self.authenticate_at(&state, hello, now) else {
+        let Some((routing_id, bridge_id, basis)) = self.authenticate_at(&state, hello, now) else {
             return (HelloOutcome::Rejected, None);
         };
 
@@ -320,6 +407,7 @@ impl Router {
                 bridge_id,
                 device_id: hello.device_id,
                 serial,
+                basis,
                 outbound,
             },
         );
@@ -346,14 +434,15 @@ impl Router {
     /// an unexpired pairing window whose rendezvous token matches. `now` is
     /// wall-clock seconds, threaded in so window expiry is testable.
     ///
-    /// Returns the `(routing_id, bridge_id)` the connection registers under, or
-    /// `None` if the hello must be rejected.
+    /// Returns the `(routing_id, bridge_id, basis)` the connection registers
+    /// under — `basis` records *what* admitted it (#280) — or `None` if the
+    /// hello must be rejected.
     fn authenticate_at(
         &self,
         state: &RouterState,
         hello: &RelayHello,
         now: u64,
-    ) -> Option<(DeviceId, DeviceId)> {
+    ) -> Option<(DeviceId, DeviceId, AdmissionBasis)> {
         match hello.role {
             HelloRole::Bridge => {
                 // A bridge routes under its own device id; token must match the
@@ -369,7 +458,11 @@ impl Router {
                 if !token_matches(&hello.token, &entry.token) {
                     return None;
                 }
-                Some((hello.device_id, hello.device_id))
+                Some((
+                    hello.device_id,
+                    hello.device_id,
+                    AdmissionBasis::AssertedCredential,
+                ))
             }
             HelloRole::Device => {
                 // A device joins its bridge's group under a fresh routing id
@@ -387,21 +480,30 @@ impl Router {
                 // Bridge-asserted soft state (ADR-0021 D4): admit iff the
                 // claimed bridge is connected and either asserts this device's
                 // credential or has an unexpired pairing window matching the
-                // presented token.
+                // presented token. The asserted credential is checked first so
+                // a token matching both admits under the stronger basis.
                 let bridge = state.bridges.get(&hello.bridge_id)?;
                 let asserted_ok = bridge
                     .asserted
                     .get(&hello.device_id)
                     .is_some_and(|expected| token_matches(&hello.token, expected));
-                let window_ok = bridge
+                if asserted_ok {
+                    return Some((
+                        hello.routing_id,
+                        hello.bridge_id,
+                        AdmissionBasis::AssertedCredential,
+                    ));
+                }
+                let window_serial = bridge
                     .window
                     .as_ref()
-                    .is_some_and(|w| w.expires_at > now && token_matches(&hello.token, &w.token));
-                if asserted_ok || window_ok {
-                    Some((hello.routing_id, hello.bridge_id))
-                } else {
-                    None
-                }
+                    .filter(|w| w.expires_at > now && token_matches(&hello.token, &w.token))
+                    .map(|w| w.serial)?;
+                Some((
+                    hello.routing_id,
+                    hello.bridge_id,
+                    AdmissionBasis::PairingWindow { window_serial },
+                ))
             }
         }
     }
@@ -439,19 +541,33 @@ impl Router {
             RelayControl::RegisterPairing {
                 token, ttl_secs, ..
             } => {
+                let serial = state.next_window_serial;
+                state.next_window_serial += 1;
                 if let Some(bs) = state.bridges.get_mut(&bridge_id) {
                     bs.window = Some(PairingWindow {
                         token,
                         expires_at: now.saturating_add(ttl_secs),
+                        serial,
                     });
                 }
-                ControlOutcome::Ack
+                // Replacing the window revokes the old one: connections it
+                // admitted (and that were never upgraded by an assert) lose
+                // their basis and are kicked (#280).
+                let kicked = state.sweep_group(bridge_id, now);
+                ControlOutcome::Ack { kicked }
             }
             RelayControl::CancelPairing { .. } => {
                 if let Some(bs) = state.bridges.get_mut(&bridge_id) {
                     bs.window = None;
                 }
-                ControlOutcome::Ack
+                // Closing the window revokes it: a token-only prober admitted
+                // during the window loses its live, routable connection here
+                // rather than keeping it indefinitely (#280). A legitimately
+                // paired device is safe: the ceremony's assert-before-grant
+                // (ADR-0021 D3) upgraded its basis to `AssertedCredential`
+                // before the bridge sends this cancel.
+                let kicked = state.sweep_group(bridge_id, now);
+                ControlOutcome::Ack { kicked }
             }
             RelayControl::AssertDevices { devices, .. } => {
                 // Build the replacement routing-credential and push-registration
@@ -473,42 +589,37 @@ impl Router {
                     }
                     new_asserted.insert(d.device_id, d.token);
                 }
-                // Devices in the old set but not the new one are de-asserted.
-                let removed: std::collections::HashSet<DeviceId> = {
-                    let bs = match state.bridges.get_mut(&bridge_id) {
-                        Some(bs) => bs,
-                        // Unreachable: presence + serial checked above under the
-                        // same lock, but stay total rather than panic.
-                        None => return ControlOutcome::Error("stale connection".to_string()),
-                    };
-                    let removed = bs
-                        .asserted
-                        .keys()
-                        .filter(|id| !new_asserted.contains_key(id))
-                        .copied()
-                        .collect();
-                    bs.asserted = new_asserted;
-                    bs.push = new_push;
-                    removed
+                let s = &mut *state;
+                let bs = match s.bridges.get_mut(&bridge_id) {
+                    Some(bs) => bs,
+                    // Unreachable: presence + serial checked above under the
+                    // same lock, but stay total rather than panic.
+                    None => return ControlOutcome::Error("stale connection".to_string()),
                 };
-                // Map each de-asserted device_id back to its live routing id(s)
-                // in this bridge's group, drop those registrations so they can
-                // no longer route, and hand the routing ids to the server to
-                // kick (4001). Note `push_state` (cooldowns/budgets) is *not*
-                // touched here — it survives re-asserts by design.
-                let kicked: Vec<DeviceId> = state
-                    .conns
-                    .iter()
-                    .filter(|(_, reg)| {
-                        reg.role == HelloRole::Device
-                            && reg.bridge_id == bridge_id
-                            && removed.contains(&reg.device_id)
-                    })
-                    .map(|(routing_id, _)| *routing_id)
-                    .collect();
-                for routing_id in &kicked {
-                    state.conns.remove(routing_id);
+                bs.asserted = new_asserted;
+                bs.push = new_push;
+                // Upgrade: a window-admitted connection whose device id the
+                // bridge now asserts is legitimized — the ceremony's
+                // assert-before-grant covers the pending device (ADR-0021 D3),
+                // so upgrading here is what lets the freshly paired device
+                // survive the `CancelPairing` that closes the window (#280).
+                let asserted = &bs.asserted;
+                for reg in s.conns.values_mut() {
+                    if reg.role == HelloRole::Device
+                        && reg.bridge_id == bridge_id
+                        && matches!(reg.basis, AdmissionBasis::PairingWindow { .. })
+                        && asserted.contains_key(&reg.device_id)
+                    {
+                        reg.basis = AdmissionBasis::AssertedCredential;
+                    }
                 }
+                // Sweep against the *live* registrations, not a diff of the
+                // previous asserted set: after a bridge reconnect the fresh
+                // soft state's old set is empty, so a diff would never kick a
+                // device revoked while the bridge was offline (#280). Note
+                // `push_state` (cooldowns/budgets) is *not* touched here — it
+                // survives re-asserts by design.
+                let kicked = state.sweep_group(bridge_id, now);
                 ControlOutcome::Asserted {
                     kicked,
                     invalid_push,
@@ -1012,7 +1123,7 @@ mod tests {
             },
             1000,
         );
-        assert!(matches!(out, ControlOutcome::Ack));
+        assert!(matches!(out, ControlOutcome::Ack { .. }));
         // A device presenting the rendezvous token for this bridge is admitted.
         let mut h = device_hello(0x60);
         h.token = "rvz".to_string();
@@ -1058,6 +1169,261 @@ mod tests {
             router.hello_at(&h, outbound_channel(1024).0, 1121).0,
             HelloOutcome::Rejected
         ));
+    }
+
+    // ---- Admission-basis kicks (#280) ----
+
+    /// Device hello presenting the pairing window's rendezvous token, claiming
+    /// identity `device` and routing id `routing`.
+    fn window_hello(device: u8, routing: u8, token: &str) -> RelayHello {
+        RelayHello {
+            role: HelloRole::Device,
+            token: token.to_string(),
+            device_id: did(device),
+            routing_id: did(routing),
+            bridge_id: did(BRIDGE),
+        }
+    }
+
+    /// Opens `BRIDGE`'s pairing window (token `rvz`, ttl 120s at `now`).
+    fn open_window(router: &Router, bridge: &ConnPermit, now: u64) {
+        let out = router.handle_control_at(
+            bridge,
+            RelayControl::RegisterPairing {
+                id: 1,
+                token: "rvz".to_string(),
+                ttl_secs: 120,
+            },
+            now,
+        );
+        assert!(matches!(out, ControlOutcome::Ack { .. }));
+    }
+
+    #[tokio::test]
+    async fn cancel_pairing_kicks_window_admitted_connection() {
+        // Gap 1 of #280: a token-only prober admitted during the window must
+        // not keep a live, routable connection after the window closes.
+        let router = Router::new(config());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        open_window(&router, &bridge, 1000);
+        let (ph, _prx) = outbound_channel(1024);
+        let _prober = accept(
+            router
+                .hello_at(&window_hello(0x70, 0x71, "rvz"), ph, 1000)
+                .0,
+        );
+
+        let out = router.handle_control_at(&bridge, RelayControl::CancelPairing { id: 2 }, 1001);
+        match out {
+            ControlOutcome::Ack { kicked } => assert_eq!(kicked, vec![did(0x71)]),
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        // Its registration is gone: the bridge can no longer route to it.
+        let (outcome, _) = router.route(&bridge, did(BRIDGE), did(0x71), vec![1]);
+        assert!(matches!(outcome, RouteOutcome::PeerUnavailable));
+    }
+
+    #[tokio::test]
+    async fn register_pairing_replacement_kicks_old_window_connection() {
+        // A RegisterPairing that replaces the window revokes the old one, and
+        // with it every connection the old window admitted.
+        let router = Router::new(config());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        open_window(&router, &bridge, 1000);
+        let (ph, _prx) = outbound_channel(1024);
+        let _prober = accept(
+            router
+                .hello_at(&window_hello(0x70, 0x71, "rvz"), ph, 1000)
+                .0,
+        );
+
+        let out = router.handle_control_at(
+            &bridge,
+            RelayControl::RegisterPairing {
+                id: 2,
+                token: "rvz2".to_string(),
+                ttl_secs: 120,
+            },
+            1001,
+        );
+        match out {
+            ControlOutcome::Ack { kicked } => assert_eq!(kicked, vec![did(0x71)]),
+            other => panic!("expected Ack, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn paired_device_upgraded_by_assert_survives_window_close() {
+        // The legitimate ceremony (ADR-0021 D3): the device connects via the
+        // window, the bridge's assert-before-grant covers it (roster ∪
+        // pending), and only then does the bridge cancel the window. The
+        // assert upgrades the connection's basis, so the cancel must NOT kick
+        // it — the final `Confirmed` pairing frame still needs the connection.
+        let router = Router::new(config());
+        let (bh, _brx) = outbound_channel(1024);
+        let bridge = accept(router.hello(&bridge_hello(), bh).0);
+        open_window(&router, &bridge, 1000);
+        let (dh, _drx) = outbound_channel(1024);
+        let _device = accept(
+            router
+                .hello_at(&window_hello(DEVICE, 0x55, "rvz"), dh, 1000)
+                .0,
+        );
+
+        // Assert-before-grant: the pending device's id enters the asserted set
+        // while its window-admitted connection is live. Nothing is kicked.
+        let out = router.handle_control_at(
+            &bridge,
+            RelayControl::AssertDevices {
+                id: 2,
+                devices: vec![AssertedDevice {
+                    device_id: did(DEVICE),
+                    token: "device-tok".to_string(),
+                    push: None,
+                }],
+            },
+            1001,
+        );
+        match out {
+            ControlOutcome::Asserted { kicked, .. } => assert!(kicked.is_empty()),
+            other => panic!("expected Asserted, got {other:?}"),
+        }
+
+        // The ceremony's closing CancelPairing does not kick the upgraded
+        // connection...
+        let out = router.handle_control_at(&bridge, RelayControl::CancelPairing { id: 3 }, 1002);
+        match out {
+            ControlOutcome::Ack { kicked } => assert!(kicked.is_empty()),
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        // ...and the bridge can still reach it (the final Confirmed frame).
+        let (outcome, _) = router.route(&bridge, did(BRIDGE), did(0x55), vec![1]);
+        assert!(matches!(outcome, RouteOutcome::Delivered));
+    }
+
+    #[tokio::test]
+    async fn window_connection_survives_roster_reassert_mid_ceremony() {
+        // Before assert-before-grant covers the arriving device, the bridge may
+        // legitimately re-assert its roster (e.g. a push-registration change).
+        // The window is still open and unexpired, so the mid-ceremony
+        // connection's basis is intact — it must not be kicked.
+        let router = Router::new(config());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        open_window(&router, &bridge, 1000);
+        let (dh, _drx) = outbound_channel(1024);
+        let _device = accept(
+            router
+                .hello_at(&window_hello(DEVICE, 0x55, "rvz"), dh, 1000)
+                .0,
+        );
+
+        // Roster-only assert that does NOT cover the pairing device.
+        let out = assert_devices(&router, &bridge, 1001, vec![]);
+        match out {
+            ControlOutcome::Asserted { kicked, .. } => {
+                assert!(kicked.is_empty(), "mid-ceremony connection survives")
+            }
+            other => panic!("expected Asserted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_window_connection_kicked_on_next_assert() {
+        // A window that expired by TTL (no CancelPairing ever arrived — e.g.
+        // the reject path) no longer backs its admissions: the next assert
+        // sweeps them.
+        let router = Router::new(config());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        open_window(&router, &bridge, 1000);
+        let (ph, _prx) = outbound_channel(1024);
+        let _prober = accept(
+            router
+                .hello_at(&window_hello(0x70, 0x71, "rvz"), ph, 1000)
+                .0,
+        );
+
+        // now = 1000 + 121 > the window deadline: the basis is gone.
+        let out = assert_devices(&router, &bridge, 1121, vec![]);
+        match out {
+            ControlOutcome::Asserted { kicked, .. } => assert_eq!(kicked, vec![did(0x71)]),
+            other => panic!("expected Asserted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_assert_kicks_device_revoked_while_bridge_offline() {
+        // Gap 2 of #280: a device revoked while its bridge was offline. The
+        // bridge's reconnect starts fresh soft state, so a diff against the
+        // (empty) previous asserted set would kick nothing; the sweep runs
+        // against the live registrations instead.
+        let router = Router::new(config());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+                push: None,
+            }],
+        );
+        let (dh, _drx) = outbound_channel(1024);
+        let _device = accept(router.hello(&device_hello(0x55), dh).0);
+
+        // Bridge drops (its soft state goes with it; the device's registration
+        // deliberately survives), then reconnects and asserts WITHOUT the
+        // device — it was revoked while the bridge was offline.
+        router.disconnect(&bridge);
+        let bridge2 = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        let out = assert_devices(&router, &bridge2, 0, vec![]);
+        match out {
+            ControlOutcome::Asserted { kicked, .. } => assert_eq!(kicked, vec![did(0x55)]),
+            other => panic!("expected Asserted, got {other:?}"),
+        }
+        // Its registration is gone.
+        let (outcome, _) = router.route(&bridge2, did(BRIDGE), did(0x55), vec![1]);
+        assert!(matches!(outcome, RouteOutcome::PeerUnavailable));
+    }
+
+    #[tokio::test]
+    async fn reconnect_assert_keeps_still_asserted_device() {
+        // The reconnect grace: a device that survives its bridge's restart and
+        // IS in the reconnect assert keeps its registration (no kick, no forced
+        // reconnect churn).
+        let router = Router::new(config());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+                push: None,
+            }],
+        );
+        let (dh, _drx) = outbound_channel(1024);
+        let _device = accept(router.hello(&device_hello(0x55), dh).0);
+
+        router.disconnect(&bridge);
+        let bridge2 = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        let out = assert_devices(
+            &router,
+            &bridge2,
+            0,
+            vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+                push: None,
+            }],
+        );
+        match out {
+            ControlOutcome::Asserted { kicked, .. } => assert!(kicked.is_empty()),
+            other => panic!("expected Asserted, got {other:?}"),
+        }
+        let (outcome, _) = router.route(&bridge2, did(BRIDGE), did(0x55), vec![1]);
+        assert!(matches!(outcome, RouteOutcome::Delivered));
     }
 
     #[tokio::test]

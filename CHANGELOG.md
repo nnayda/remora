@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to the generation from its own `PairingWindowOpened` (matched by code) and
   silently ignores pairing events from any other generation, still bounded by
   its window deadline.
+- **Relay kicks connections whose admission basis is gone** (#280): the relay
+  now records what admitted each device connection — a bridge-asserted
+  credential or an open pairing window. Closing or replacing the window
+  (`CancelPairing`/`RegisterPairing`) kicks a token-only prober it admitted,
+  and a bridge's reconnect `AssertDevices` sweeps the *live* registrations
+  rather than diffing the previous asserted set, so a device revoked while its
+  bridge was offline is kicked too. A legitimately pairing device is safe: the
+  ceremony's assert-before-grant upgrades its connection to the asserted
+  credential before the window closes. Kicked victims also now reliably see
+  their 4001 close code — the writer no longer races the reader's close frame
+  with a bare socket close when the router deregisters a connection.
 - **Bridge event delivery no longer rides the serve hot path** (#283):
   `serve_bridge` now hands `BridgeEvent`s to a dedicated forwarder task over
   an internal non-blocking queue, so a consumer that stalls on the event
@@ -67,6 +78,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Live `[relay]` reconfig via the config watcher** (#277): the desktop's
+  hosted relay bridge no longer reads `[relay]` only at launch. Editing the
+  config now starts the bridge when the section is added, cleanly restarts it
+  when `relay_url`/`registration_token` change, and cleanly stops it when the
+  section is removed — no app relaunch. A clean stop actually reaps the
+  bridge: the serve and event-forwarder tasks are joined (releasing the
+  bridge identity lock, previously held until process exit), the push-wake
+  tee is rewired to the current bridge, and Settings→Devices commands fail
+  with "relay not configured" instead of talking to a dead bridge's channels.
+  Unrelated config edits (including `push_wake_url`, which the hosted bridge
+  never reads) never churn live relay connections.
 - **Relay SIGHUP config reload** (#276): `remora-relay` now re-reads its TOML
   config on `SIGHUP` and hot-swaps the `[[bridges]]` table without dropping
   live connections, so operators can rotate bridge registration tokens in
