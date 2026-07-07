@@ -110,7 +110,7 @@ impl Relay {
                 .expect("relay runtime");
             rt.block_on(async move {
                 let audit = AuditSink::new(&config).expect("audit sink");
-                let (addr, _accept) = serve(config, audit).await.expect("relay serve");
+                let (addr, _router, _accept) = serve(config, audit).await.expect("relay serve");
                 addr_tx.send(addr).expect("publish relay addr");
                 // Park until killed; the detached accept + connection tasks run
                 // on this runtime's workers meanwhile.

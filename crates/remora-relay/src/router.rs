@@ -36,14 +36,18 @@ use std::sync::{Arc, Mutex};
 use remora_protocol::{DeviceId, HelloRole, RelayControl, RelayHello};
 use tokio::sync::{mpsc, Semaphore};
 
-use crate::config::{token_matches, RelayConfig};
+use crate::config::{token_matches, BridgeEntry, RelayConfig};
 use crate::push::{decide_wake, DropReason, PushConfig, PushState, StoredRegistration};
 
 /// Sans-IO connection registry and routing authority. Cheap to clone-share via
 /// the returned [`Arc`]; all mutable state lives behind a single [`Mutex`] that
 /// is never held across an `.await` (every method here is synchronous).
 pub struct Router {
-    config: Arc<RelayConfig>,
+    /// Push-wake policy (ADR-0023), fixed at startup: `[push]` is not
+    /// hot-reloadable (#276). The only config the router consults live is the
+    /// bridges table, which lives in [`RouterState::bridge_entries`] so
+    /// [`Router::reload_bridges`] can swap it.
+    push_config: PushConfig,
     state: Mutex<RouterState>,
     /// Global cap on simultaneously in-flight push deliveries (ADR-0023). Shared
     /// across every connection so a burst of wakes from many bridges cannot
@@ -72,6 +76,12 @@ struct RouterState {
     /// `asserted`/`push` maps) never resets a device's cooldown — a bridge
     /// cannot clear a phone's rate limit by re-asserting.
     push_state: PushState,
+    /// The live bridge-registration table (`[[bridges]]` in the relay config),
+    /// seeded from config at startup and hot-swapped wholesale by a SIGHUP
+    /// reload ([`Router::reload_bridges`], #276). Only *future* hellos consult
+    /// it — an already-admitted connection is never re-checked, so a token
+    /// rotation never drops live connections.
+    bridge_entries: Vec<BridgeEntry>,
 }
 
 /// Per-bridge soft state (ADR-0021 D4): the bridge's asserted device
@@ -226,21 +236,33 @@ impl Router {
     pub fn new(config: Arc<RelayConfig>) -> Arc<Router> {
         let push_permits = Arc::new(Semaphore::new(config.push.max_in_flight));
         Arc::new(Router {
-            config,
+            push_config: config.push.clone(),
             state: Mutex::new(RouterState {
                 next_serial: 0,
                 conns: HashMap::new(),
                 bridges: HashMap::new(),
                 push_state: PushState::default(),
+                bridge_entries: config.bridges.clone(),
             }),
             push_permits,
         })
     }
 
+    /// Replaces the bridge-registration table with `bridges` (SIGHUP config
+    /// reload, #276). Affects only *future* hellos: a connection already
+    /// admitted under an old (rotated or removed) token keeps routing until it
+    /// disconnects on its own — the operator's stated goal is rotating bridge
+    /// registration tokens *without* dropping live connections. Nothing else
+    /// about the running relay changes.
+    pub fn reload_bridges(&self, bridges: Vec<BridgeEntry>) {
+        let mut state = self.lock();
+        state.bridge_entries = bridges;
+    }
+
     /// The push-wake network policy this relay was configured with (ADR-0023),
     /// handed to a spawned [`crate::push::deliver_wake`] on a cleared decision.
     pub fn push_config(&self) -> PushConfig {
-        self.config.push.clone()
+        self.push_config.clone()
     }
 
     /// A handle to the shared global in-flight semaphore for push deliveries.
@@ -315,7 +337,9 @@ impl Router {
 
     /// Validates a hello's token and routing-id scoping per spec D5/D16.
     ///
-    /// A **bridge** is authenticated against the static config token bound to
+    /// A **bridge** is authenticated against the live bridge-registration
+    /// table ([`RouterState::bridge_entries`] — seeded from config, hot-swapped
+    /// by a SIGHUP reload, #276) token bound to
     /// its device id. A **device** is authenticated against its bridge's live
     /// soft state (ADR-0021 D4): the claimed `bridge_id` must have an active
     /// connection whose asserted set holds a matching `(device_id, token)`, or
@@ -333,13 +357,13 @@ impl Router {
         match hello.role {
             HelloRole::Bridge => {
                 // A bridge routes under its own device id; token must match the
-                // bridge entry bound to that device id.
+                // bridge entry bound to that device id (the *live* table — a
+                // SIGHUP reload may have rotated it since startup, #276).
                 if hello.routing_id != hello.device_id || hello.bridge_id != hello.device_id {
                     return None;
                 }
-                let entry = self
-                    .config
-                    .bridges
+                let entry = state
+                    .bridge_entries
                     .iter()
                     .find(|b| b.device_id == hello.device_id)?;
                 if !token_matches(&hello.token, &entry.token) {
@@ -353,9 +377,8 @@ impl Router {
                 if hello.routing_id.is_zero() {
                     return None;
                 }
-                if self
-                    .config
-                    .bridges
+                if state
+                    .bridge_entries
                     .iter()
                     .any(|b| b.device_id == hello.routing_id)
                 {
@@ -549,7 +572,7 @@ impl Router {
         });
 
         match decide_wake(
-            &self.config.push,
+            &self.push_config,
             &mut state.push_state,
             bridge_id,
             dst,
@@ -1402,6 +1425,117 @@ mod tests {
         let (outcome, kill) = router.route(&device, did(0x77), did(BRIDGE), vec![1]);
         assert!(matches!(outcome, RouteOutcome::NotAllowed));
         assert!(kill.is_none());
+    }
+
+    // ---- SIGHUP bridge-table reload (#276) ----
+
+    #[tokio::test]
+    async fn reload_bridges_admits_the_rotated_token_and_rejects_the_old() {
+        let router = Router::new(config());
+        // Rotate BRIDGE's token (and drop OTHER_BRIDGE entirely).
+        router.reload_bridges(vec![BridgeEntry {
+            token: "rotated-tok".to_string(),
+            device_id: did(BRIDGE),
+        }]);
+
+        // The old token no longer authenticates...
+        let (outcome, _) = router.hello(&bridge_hello(), outbound_channel(1024).0);
+        assert!(matches!(outcome, HelloOutcome::Rejected));
+
+        // ...the rotated one does.
+        let mut rotated = bridge_hello();
+        rotated.token = "rotated-tok".to_string();
+        let (outcome, _) = router.hello(&rotated, outbound_channel(1024).0);
+        assert!(matches!(outcome, HelloOutcome::Accepted(_)));
+    }
+
+    #[tokio::test]
+    async fn reload_bridges_never_drops_a_live_connection() {
+        // The operator's rotation goal (#276): swap the token, keep sessions.
+        let router = Router::new(config());
+        let (bh, mut brx) = outbound_channel(1024);
+        let bridge = accept(router.hello(&bridge_hello(), bh).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+                push: None,
+            }],
+        );
+        let (dh, _drx) = outbound_channel(1024);
+        let device = accept(router.hello(&device_hello(0x55), dh).0);
+
+        // Rotate the bridge's token out from under its live connection.
+        router.reload_bridges(vec![BridgeEntry {
+            token: "rotated-tok".to_string(),
+            device_id: did(BRIDGE),
+        }]);
+
+        // The live device→bridge path still routes: the admitted connection is
+        // never re-checked against the swapped table.
+        let (outcome, kill) = router.route(&device, did(0x55), did(BRIDGE), vec![1, 2, 3]);
+        assert!(matches!(outcome, RouteOutcome::Delivered));
+        assert!(kill.is_none());
+        let frame = brx.recv().await.expect("frame delivered to bridge");
+        assert_eq!(frame.bytes(), &[1, 2, 3]);
+
+        // The bridge's soft state also survives: a new device hello against
+        // its asserted roster is still admitted.
+        let (dh2, _drx2) = outbound_channel(1024);
+        assert!(matches!(
+            router.hello_at(&device_hello(0x56), dh2, 0).0,
+            HelloOutcome::Accepted(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reload_bridges_blocks_device_routing_ids_shadowing_new_bridges() {
+        // The no-shadowing rule reads the live table too: after a reload adds
+        // a bridge id, a device may no longer claim it as a routing id.
+        let router = Router::new(config());
+        let bridge = accept(router.hello(&bridge_hello(), outbound_channel(1024).0).0);
+        assert_devices(
+            &router,
+            &bridge,
+            0,
+            vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+                push: None,
+            }],
+        );
+        const NEW_BRIDGE: u8 = 0x77;
+        router.reload_bridges(vec![
+            BridgeEntry {
+                token: "bridge-tok".to_string(),
+                device_id: did(BRIDGE),
+            },
+            BridgeEntry {
+                token: "new-bridge-tok".to_string(),
+                device_id: did(NEW_BRIDGE),
+            },
+        ]);
+        assert!(matches!(
+            router
+                .hello_at(&device_hello(NEW_BRIDGE), outbound_channel(1024).0, 0)
+                .0,
+            HelloOutcome::Rejected
+        ));
+        // And the freshly added bridge can register.
+        let new_bridge_hello = RelayHello {
+            role: HelloRole::Bridge,
+            token: "new-bridge-tok".to_string(),
+            device_id: did(NEW_BRIDGE),
+            routing_id: did(NEW_BRIDGE),
+            bridge_id: did(NEW_BRIDGE),
+        };
+        assert!(matches!(
+            router.hello(&new_bridge_hello, outbound_channel(1024).0).0,
+            HelloOutcome::Accepted(_)
+        ));
     }
 
     // ---- Push-wake decision (ADR-0023, spec Task 6) ----
