@@ -281,6 +281,120 @@ async fn unjoined_window_expires_with_nonzero_exit() {
     kill_term(&mut daemon);
 }
 
+// #300: a Confirm answered near the deadline must NOT report "expired" when
+// the enrollment committed — after the decision is sent the client waits a
+// bounded grace for the daemon's authoritative PairResult. A scripted fake
+// ctl server controls the timing exactly: it withholds the result until the
+// client-side window deadline (expires_at + 5s skew grace) has fired, then
+// delivers "paired" inside the post-decision grace.
+#[tokio::test(flavor = "multi_thread")]
+async fn confirm_near_deadline_reports_the_authoritative_result() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sock = dir.path().join("ctl.sock");
+    let listener = tokio::net::UnixListener::bind(&sock).expect("bind fake ctl.sock");
+
+    let server = tokio::spawn(async move {
+        let (stream, _addr) = listener.accept().await.expect("accept");
+        let (rd, mut wr) = stream.into_split();
+        let mut lines = TokioBufReader::new(rd).lines();
+
+        let open = lines
+            .next_line()
+            .await
+            .expect("read pair_open")
+            .expect("pair_open line");
+        assert!(open.contains("pair_open"), "first request: {open}");
+
+        // A window that is nearly over: the client's local deadline lands
+        // ~6s out (expires_at + its 5s clock-skew grace).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let opened = format!(
+            "{{\"event\":\"window_opened\",\"code\":\"remora-pair:fake\",\"expires_at\":{}}}\n",
+            now + 1
+        );
+        wr.write_all(opened.as_bytes()).await.expect("write opened");
+        wr.write_all(
+            b"{\"event\":\"device_arrived\",\"device_id\":\"feedbeef\",\
+              \"name\":\"race phone\",\"fingerprint\":\"aa:bb\"}\n",
+        )
+        .await
+        .expect("write arrived");
+
+        let decision = lines
+            .next_line()
+            .await
+            .expect("read decision")
+            .expect("decision line");
+        assert!(decision.contains("pair_confirm"), "decision: {decision}");
+
+        // Withhold the result until well past the client's window deadline
+        // (~6s) but well inside its post-decision grace (deadline + 5s).
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        wr.write_all(
+            b"{\"event\":\"pair_result\",\"outcome\":\"paired\",\
+              \"device_id\":\"feedbeef\",\"name\":\"race phone\"}\n",
+        )
+        .await
+        .expect("write result");
+        // Hold the connection open briefly so the close never races the
+        // client's read of the result line.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+
+    let mut pair = Command::new(BIN)
+        .args(["pair", "--ttl", "1", "--state-dir"])
+        .arg(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn pair");
+    let mut pair_out = BufReader::new(pair.stdout.take().expect("stdout"));
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert!(
+            pair_out.read_line(&mut line).expect("read pair stdout") > 0,
+            "pair exited before prompting"
+        );
+        if line.contains("Confirm enrollment?") {
+            pair.stdin
+                .as_mut()
+                .expect("stdin")
+                .write_all(b"y\n")
+                .expect("write y");
+            break;
+        }
+    }
+
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut pair_out, &mut rest).expect("drain stdout");
+    let status = pair.wait().expect("pair wait");
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(pair.stderr.as_mut().expect("stderr"), &mut stderr)
+        .expect("drain stderr");
+
+    assert!(
+        status.success(),
+        "pair must exit 0 on the late authoritative result; stderr: {stderr}"
+    );
+    assert!(
+        rest.contains("Device enrolled."),
+        "expected the authoritative outcome, got stdout: {rest} stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("expired"),
+        "must not report expired for a committed enrollment: {stderr}"
+    );
+
+    server.await.expect("fake server");
+}
+
 fn kill_term(child: &mut Child) {
     let _ = Command::new("kill")
         .args(["-TERM", &child.id().to_string()])
