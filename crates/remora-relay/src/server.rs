@@ -683,7 +683,9 @@ fn route_frame(
 /// Dispatches a bridge's relay-terminated [`RelayControl`] (ADR-0021 D4): decode
 /// the JSON, apply it via [`Router::handle_control`], reply an
 /// `RelayControlAck`/`RelayControlError` on the bridge's *own* outbound, and kick
-/// any de-asserted devices via their kill channels (4001).
+/// any connections whose admission basis the control revoked — de-asserted
+/// devices, and window-admitted connections whose window closed (#280) — via
+/// their kill channels (4001).
 ///
 /// A `Control` frame from a device (not a bridge) is a protocol violation → 4002.
 /// The relay decodes only this frame's JSON; `Data`/`Pairing` payloads stay
@@ -707,7 +709,11 @@ fn dispatch_control(
     // variant, so the fallback is unreachable.
     let id = control_request_id(&control);
     match router.handle_control(permit, control) {
-        ControlOutcome::Ack => {
+        ControlOutcome::Ack { kicked } => {
+            // A closed/replaced pairing window revokes the admission basis of
+            // any connection it admitted that was never upgraded by an assert
+            // (#280): kick those by routing id, then ack the control.
+            kick_conns(registrar, &kicked);
             reply_control(router, permit, control_ack_bytes(id));
             DataStep::Continue
         }
@@ -737,19 +743,30 @@ fn dispatch_control(
                     reason.clone(),
                 ));
             }
-            // De-asserted devices with live connections are kicked by routing id
-            // via the registrar kill channel (4001), then the assert is still
-            // acked so the bridge learns its roster change was applied.
-            {
-                let reg = registrar.lock().unwrap_or_else(|p| p.into_inner());
-                for routing_id in &kicked {
-                    if let Some(conn) = reg.conns.get(routing_id) {
-                        let _ = conn.kill.send(CloseReason::AuthFailure);
-                    }
-                }
-            }
+            // Devices whose admission basis this assert revoked — de-asserted
+            // credentials, and window admissions whose window is gone (#280) —
+            // are kicked by routing id, then the assert is still acked so the
+            // bridge learns its roster change was applied.
+            kick_conns(registrar, &kicked);
             reply_control(router, permit, control_ack_bytes(id));
             DataStep::Continue
+        }
+    }
+}
+
+/// Kicks each routing id in `kicked` via its registrar kill channel (4001):
+/// these are connections the router already deregistered because their
+/// admission basis is gone — a de-asserted credential, or a pairing window
+/// that closed, was replaced, or expired (#280). A routing id with no live
+/// registrar entry (already tearing down) is a silent no-op.
+fn kick_conns(registrar: &Mutex<Registrar>, kicked: &[DeviceId]) {
+    if kicked.is_empty() {
+        return;
+    }
+    let reg = registrar.lock().unwrap_or_else(|p| p.into_inner());
+    for routing_id in kicked {
+        if let Some(conn) = reg.conns.get(routing_id) {
+            let _ = conn.kill.send(CloseReason::AuthFailure);
         }
     }
 }
@@ -832,8 +849,21 @@ async fn writer_task(
                         // `frame` drops here, releasing its byte reservation
                         // only after the write completed.
                     }
-                    // Every outbound handle dropped and the queue drained.
-                    None => break,
+                    // Every outbound handle dropped and the queue drained: the
+                    // router deregistered this connection out from under us (a
+                    // kick — de-assert, a closed pairing window (#280), or a
+                    // 4009 displacement). Do NOT slam the socket here: the
+                    // reader is about to receive the kill and signal the real
+                    // close reason, and closing first would race it into a
+                    // bare close with no code. Wait for the reader's final
+                    // frame instead; a dropped sender (reader gone without a
+                    // signal) falls through to the plain close below.
+                    None => {
+                        if let Ok(frame) = (&mut final_rx).await {
+                            let _ = sink.send(Message::Close(Some(frame))).await;
+                        }
+                        break;
+                    }
                 }
             }
         }

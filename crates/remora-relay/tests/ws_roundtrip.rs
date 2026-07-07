@@ -219,6 +219,29 @@ async fn bridge_with_asserted_device(url: &str) -> Ws {
     bridge
 }
 
+/// Sends `control` on the bridge connection and awaits the matching
+/// `RelayControlAck` for `id`.
+async fn send_control_expect_ack(bridge: &mut Ws, id: u32, control: &RelayControl) {
+    send_bin(bridge, control_frame(BRIDGE, control)).await;
+    let bytes = recv_bin(bridge).await;
+    let envelope = Envelope::decode(&bytes).expect("decode control reply");
+    assert_eq!(envelope.frame_type, FrameType::Control, "reply is Control");
+    let ack: RelayControlAck = serde_json::from_slice(&envelope.payload).expect("decode ack");
+    assert_eq!(ack.id, id, "ack correlates the request id");
+}
+
+/// Device hello presenting a pairing window's rendezvous token, claiming
+/// identity `device_id` and routing id `routing_id`.
+fn window_hello(device_id: u8, routing_id: u8, token: &str) -> RelayHello {
+    RelayHello {
+        role: HelloRole::Device,
+        token: token.to_string(),
+        device_id: did(device_id),
+        routing_id: did(routing_id),
+        bridge_id: did(BRIDGE),
+    }
+}
+
 #[tokio::test]
 async fn round_trip_device_bridge_data() {
     let url = start(base_config(None)).await;
@@ -610,4 +633,135 @@ async fn connections_beyond_max_are_rejected() {
 
     drop(bridge);
     drop(device);
+}
+
+/// #280 gap 1: a token-only prober admitted through the pairing window keeps a
+/// live, routable relay connection only while the window is open — closing the
+/// window (CancelPairing) kicks it with 4001.
+#[tokio::test]
+async fn window_prober_kicked_when_pairing_window_closes() {
+    let url = start(base_config(None)).await;
+    let mut bridge = connect(&url).await;
+    send_bin(&mut bridge, hello_frame(&bridge_hello())).await;
+    send_control_expect_ack(
+        &mut bridge,
+        1,
+        &RelayControl::RegisterPairing {
+            id: 1,
+            token: "rvz".to_string(),
+            ttl_secs: 120,
+        },
+    )
+    .await;
+
+    // The prober connects with only the rendezvous token and proves it is
+    // routable: its Pairing frame reaches the bridge.
+    let mut prober = connect(&url).await;
+    send_bin(&mut prober, hello_frame(&window_hello(0x70, 0x71, "rvz"))).await;
+    let probe = frame(FrameType::Pairing, 0x71, BRIDGE);
+    send_bin(&mut prober, probe.clone()).await;
+    assert_eq!(
+        recv_bin(&mut bridge).await,
+        probe,
+        "prober routable while the window is open"
+    );
+
+    // Window closes without any assert covering the prober: it is kicked.
+    send_control_expect_ack(&mut bridge, 2, &RelayControl::CancelPairing { id: 2 }).await;
+    expect_close(&mut prober, 4001).await;
+}
+
+/// #280: the legitimate pairing ceremony survives the window close. The
+/// bridge's assert-before-grant (ADR-0021 D3) covers the pending device while
+/// its window-admitted connection is live, upgrading its basis — so the
+/// ceremony-closing CancelPairing must NOT kick it, and the bridge can still
+/// reach it afterwards (the final `Confirmed` pairing frame).
+#[tokio::test]
+async fn paired_device_survives_window_close_after_assert() {
+    let url = start(base_config(None)).await;
+    let mut bridge = connect(&url).await;
+    send_bin(&mut bridge, hello_frame(&bridge_hello())).await;
+    send_control_expect_ack(
+        &mut bridge,
+        1,
+        &RelayControl::RegisterPairing {
+            id: 1,
+            token: "rvz".to_string(),
+            ttl_secs: 120,
+        },
+    )
+    .await;
+
+    // The pairing device connects through the window under its real identity
+    // and proves it is registered before the assert.
+    let mut device = connect(&url).await;
+    send_bin(
+        &mut device,
+        hello_frame(&window_hello(DEVICE, DEV_ROUTING, "rvz")),
+    )
+    .await;
+    let warmup = frame(FrameType::Pairing, DEV_ROUTING, BRIDGE);
+    send_bin(&mut device, warmup.clone()).await;
+    assert_eq!(recv_bin(&mut bridge).await, warmup, "ceremony frame routed");
+
+    // Assert-before-grant covers the pending device, then the window closes.
+    send_control_expect_ack(
+        &mut bridge,
+        2,
+        &RelayControl::AssertDevices {
+            id: 2,
+            devices: vec![AssertedDevice {
+                device_id: did(DEVICE),
+                token: "device-tok".to_string(),
+                push: None,
+            }],
+        },
+    )
+    .await;
+    send_control_expect_ack(&mut bridge, 3, &RelayControl::CancelPairing { id: 3 }).await;
+
+    // The upgraded connection survived: the bridge's final ceremony frame
+    // still reaches it.
+    let confirmed = frame(FrameType::Pairing, BRIDGE, DEV_ROUTING);
+    send_bin(&mut bridge, confirmed.clone()).await;
+    assert_eq!(
+        recv_bin(&mut device).await,
+        confirmed,
+        "paired device still reachable after the window closed"
+    );
+}
+
+/// #280 gap 2: a device revoked while its bridge was offline is kicked when
+/// the bridge reconnects and asserts a set without it — the sweep runs against
+/// the live registrations, not a diff of the fresh (empty) previous set.
+#[tokio::test]
+async fn reconnect_assert_kicks_device_revoked_while_bridge_offline() {
+    let url = start(base_config(None)).await;
+    let mut bridge = bridge_with_asserted_device(&url).await;
+
+    // The device connects and proves it is registered.
+    let mut device = connect(&url).await;
+    send_bin(&mut device, hello_frame(&device_hello())).await;
+    let warmup = data_frame(DEV_ROUTING, BRIDGE, b"warmup");
+    send_bin(&mut device, warmup.clone()).await;
+    assert_eq!(recv_bin(&mut bridge).await, warmup, "device registered");
+
+    // The bridge goes offline; the device's registration survives. While
+    // offline, the device is revoked (its roster entry removed), so the
+    // reconnecting bridge asserts WITHOUT it.
+    drop(bridge);
+    let mut bridge2 = connect(&url).await;
+    send_bin(&mut bridge2, hello_frame(&bridge_hello())).await;
+    send_control_expect_ack(
+        &mut bridge2,
+        2,
+        &RelayControl::AssertDevices {
+            id: 2,
+            devices: vec![],
+        },
+    )
+    .await;
+
+    // The revoked device's live connection is kicked (4001).
+    expect_close(&mut device, 4001).await;
 }
