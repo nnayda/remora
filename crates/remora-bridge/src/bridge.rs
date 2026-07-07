@@ -29,6 +29,12 @@
 //! holds a lock across an `.await`; the only per-peer unboundedness is the
 //! bounded mpsc queues.
 //!
+//! [`BridgeEvent`] delivery to the caller rides off the hot path (#283): the
+//! serve loop and pairing tasks enqueue events synchronously onto an internal
+//! queue drained by one dedicated forwarder task, so a consumer that stalls on
+//! the caller's bounded channel can never head-of-line-block inbound frame
+//! dispatch (see [`spawn_event_forwarder`]).
+//!
 //! # Bounding the peer map (#231)
 //!
 //! Under ADR-0021 the relay is untrusted for routing: it can inject Data frames
@@ -745,6 +751,12 @@ pub async fn serve_bridge(
         return Err(BridgeServeError::InvalidRelayUrl(config.relay_url));
     }
 
+    // Event delivery is decoupled from the serve loop (#283): everything below
+    // sends on this internal queue (a sync, non-blocking send) and a dedicated
+    // forwarder task drains it into the caller's bounded channel, so a slow
+    // event consumer can never head-of-line-block inbound frame dispatch.
+    let events = spawn_event_forwarder(events);
+
     let deps = Arc::new(PeerDeps {
         bridge_id: config.identity.device_id,
         bridge_static_priv: config.identity.static_keypair.private.clone(),
@@ -841,6 +853,37 @@ pub async fn serve_bridge(
     }
 }
 
+/// Spawns the dedicated event-forwarder task (#283) and returns the internal
+/// queue the serve loop and pairing tasks send [`BridgeEvent`]s on.
+///
+/// Sending on the returned queue is synchronous and never blocks, so event
+/// emission can sit inside the serve-loop select without a slow consumer
+/// head-of-line-blocking inbound dispatch for all peers. The forwarder drains
+/// the queue FIFO into the caller's bounded `events` channel, so nothing is
+/// dropped and per-pairing event order (`PairingWindowOpened` →
+/// `PairingDeviceArrived` → `PairingResult`) is preserved — the ctl pair flow
+/// depends on that order. The buffer is unbounded, which is safe here because
+/// events are human-paced (a handful per pairing ceremony / roster change), so
+/// a stalled consumer grows it by trickles, not floods.
+///
+/// The task exits when every sender clone drops (`serve_bridge` returned and
+/// all pairing tasks ended) or when the caller drops its receiver — after
+/// which queue sends fail silently, matching the previous fire-and-forget
+/// `let _ = events.send(..)` semantics.
+fn spawn_event_forwarder(events: mpsc::Sender<BridgeEvent>) -> mpsc::UnboundedSender<BridgeEvent> {
+    let (queue_tx, mut queue_rx) = mpsc::unbounded_channel::<BridgeEvent>();
+    tokio::spawn(async move {
+        while let Some(event) = queue_rx.recv().await {
+            if events.send(event).await.is_err() {
+                // The consumer dropped its receiver: no one is listening, so
+                // stop forwarding (and let queued events drop with the queue).
+                break;
+            }
+        }
+    });
+    queue_tx
+}
+
 /// Runs one relay connection to completion: dial, hello, assert the roster, then
 /// read/route until the connection drops or `shutdown` fires.
 async fn run_connection(
@@ -848,7 +891,7 @@ async fn run_connection(
     deps: &Arc<PeerDeps>,
     control_seq: &Arc<AtomicU32>,
     commands: &mut mpsc::Receiver<PairingCommand>,
-    events: &mpsc::Sender<BridgeEvent>,
+    events: &mpsc::UnboundedSender<BridgeEvent>,
     wake: &mut mpsc::Receiver<WakeNote>,
     shutdown: &CancellationToken,
 ) -> ConnOutcome {
@@ -1140,7 +1183,7 @@ fn dispatch_inbound(
     deps: &Arc<PeerDeps>,
     outbound_tx: &mpsc::Sender<Message>,
     control_seq: &Arc<AtomicU32>,
-    events: &mpsc::Sender<BridgeEvent>,
+    events: &mpsc::UnboundedSender<BridgeEvent>,
     done_tx: &mpsc::UnboundedSender<(DeviceId, u64)>,
     pairing_done_tx: &mpsc::UnboundedSender<(u64, PairingExit)>,
     conn_token: &CancellationToken,
@@ -1237,7 +1280,7 @@ fn dispatch_pairing_frame(
     outbound_tx: &mpsc::Sender<Message>,
     control_seq: &Arc<AtomicU32>,
     control_waiters: &ControlWaiters,
-    events: &mpsc::Sender<BridgeEvent>,
+    events: &mpsc::UnboundedSender<BridgeEvent>,
     pairing_done_tx: &mpsc::UnboundedSender<(u64, PairingExit)>,
     conn_token: &CancellationToken,
 ) {
@@ -1327,7 +1370,7 @@ async fn run_pairing(
     outbound_tx: mpsc::Sender<Message>,
     control_seq: Arc<AtomicU32>,
     control_waiters: ControlWaiters,
-    events: mpsc::Sender<BridgeEvent>,
+    events: mpsc::UnboundedSender<BridgeEvent>,
     pairing_done_tx: mpsc::UnboundedSender<(u64, PairingExit)>,
     conn_token: CancellationToken,
 ) {
@@ -1409,13 +1452,11 @@ async fn run_pairing(
     }
     let name = sanitize(&raw_name, MAX_DEVICE_NAME_CHARS).into_string();
     let device_fingerprint = fingerprint(&remote_static);
-    let _ = events
-        .send(BridgeEvent::PairingDeviceArrived {
-            device_id,
-            name: name.clone(),
-            fingerprint: device_fingerprint,
-        })
-        .await;
+    let _ = events.send(BridgeEvent::PairingDeviceArrived {
+        device_id,
+        name: name.clone(),
+        fingerprint: device_fingerprint,
+    });
     if send_pairing_msg(
         &mut transport,
         &outbound_tx,
@@ -1449,11 +1490,9 @@ async fn run_pairing(
                 },
             )
             .await;
-            let _ = events
-                .send(BridgeEvent::PairingResult(PairingOutcome::Rejected {
-                    device_id,
-                }))
-                .await;
+            let _ = events.send(BridgeEvent::PairingResult(PairingOutcome::Rejected {
+                device_id,
+            }));
             return;
         }
         PairingDecision::Closed => {
@@ -1468,9 +1507,7 @@ async fn run_pairing(
                 },
             )
             .await;
-            let _ = events
-                .send(BridgeEvent::PairingResult(PairingOutcome::Expired))
-                .await;
+            let _ = events.send(BridgeEvent::PairingResult(PairingOutcome::Expired));
             return;
         }
     }
@@ -1487,11 +1524,9 @@ async fn run_pairing(
             },
         )
         .await;
-        let _ = events
-            .send(BridgeEvent::PairingResult(PairingOutcome::Rejected {
-                device_id,
-            }))
-            .await;
+        let _ = events.send(BridgeEvent::PairingResult(PairingOutcome::Rejected {
+            device_id,
+        }));
         return;
     }
 
@@ -1548,9 +1583,7 @@ async fn run_pairing(
         // pending credential may or may not be live; re-assert roster-only to be
         // sure it is dropped, then abandon the attempt.
         reassert_roster_only(&deps, &outbound_tx, &control_seq).await;
-        let _ = events
-            .send(BridgeEvent::PairingResult(PairingOutcome::Expired))
-            .await;
+        let _ = events.send(BridgeEvent::PairingResult(PairingOutcome::Expired));
         return;
     }
 
@@ -1587,9 +1620,7 @@ async fn run_pairing(
     };
     if !confirmed {
         reassert_roster_only(&deps, &outbound_tx, &control_seq).await;
-        let _ = events
-            .send(BridgeEvent::PairingResult(PairingOutcome::Expired))
-            .await;
+        let _ = events.send(BridgeEvent::PairingResult(PairingOutcome::Expired));
         return;
     }
 
@@ -1606,9 +1637,7 @@ async fn run_pairing(
             roster.entries.pop();
             drop(roster);
             reassert_roster_only(&deps, &outbound_tx, &control_seq).await;
-            let _ = events
-                .send(BridgeEvent::PairingResult(PairingOutcome::Expired))
-                .await;
+            let _ = events.send(BridgeEvent::PairingResult(PairingOutcome::Expired));
             return;
         }
     }
@@ -1629,13 +1658,11 @@ async fn run_pairing(
         },
     )
     .await;
-    let _ = events
-        .send(BridgeEvent::PairingResult(PairingOutcome::Paired {
-            device_id,
-            name,
-        }))
-        .await;
-    let _ = events.send(BridgeEvent::RosterChanged).await;
+    let _ = events.send(BridgeEvent::PairingResult(PairingOutcome::Paired {
+        device_id,
+        name,
+    }));
+    let _ = events.send(BridgeEvent::RosterChanged);
 }
 
 /// The resolved outcome of the confirm/reject await.
@@ -2601,6 +2628,27 @@ fn route_control_reply(payload: &[u8], control_waiters: &ControlWaiters) {
     }
 }
 
+/// Reaps `id`'s pending control waiter once [`CONTROL_ACK_TIMEOUT`] elapses
+/// without a reply (#283), so a fire-and-forget request the relay never
+/// answers does not park its `control_waiters` entry until connection
+/// teardown.
+///
+/// Safe to run unconditionally: correlation ids are minted from a monotonic
+/// sequence and never reused within a process, so the reap can only ever
+/// remove *this* request's entry — and when the relay's ack/error already
+/// completed (and removed) the waiter, the reap is a no-op. The spawned task
+/// holds only a clone of the map's `Arc`, so at worst it outlives a torn-down
+/// connection by the timeout, removing nothing.
+fn reap_waiter_after_timeout(control_waiters: &ControlWaiters, id: u32) {
+    let waiters = Arc::clone(control_waiters);
+    tokio::spawn(async move {
+        tokio::time::sleep(CONTROL_ACK_TIMEOUT).await;
+        if let Ok(mut map) = waiters.lock() {
+            map.remove(&id);
+        }
+    });
+}
+
 /// Handles one [`PairingCommand`] from the desktop: opens/replaces or cancels the
 /// pairing window, routes the user's confirm/reject decision into the running
 /// pairing task, and applies revocation.
@@ -2609,7 +2657,7 @@ async fn handle_command(
     cmd: PairingCommand,
     deps: &Arc<PeerDeps>,
     outbound_tx: &mpsc::Sender<Message>,
-    events: &mpsc::Sender<BridgeEvent>,
+    events: &mpsc::UnboundedSender<BridgeEvent>,
     control_seq: &Arc<AtomicU32>,
     control_waiters: &ControlWaiters,
     pairing: &mut Option<PairingWindow>,
@@ -2650,6 +2698,11 @@ async fn handle_command(
                 let _ = reply.send(Err(BridgeError::Disconnected));
                 return;
             }
+            // Fire-and-forget means nothing awaits (and so nothing removes)
+            // this waiter if the relay never answers — reap it on the same
+            // deadline the awaited control path uses, so an un-acked request
+            // does not park its entry until connection teardown (#283).
+            reap_waiter_after_timeout(control_waiters, id);
             let expires_at = now_secs().saturating_add(ttl_secs);
             // Record the local window (secret + deadline). Replacing an existing
             // one drops its channels, so any in-flight task exits; a fresh
@@ -2661,12 +2714,10 @@ async fn handle_command(
                 generation: *pairing_generation,
                 task: None,
             });
-            let _ = events
-                .send(BridgeEvent::PairingWindowOpened {
-                    code: code.clone(),
-                    expires_at,
-                })
-                .await;
+            let _ = events.send(BridgeEvent::PairingWindowOpened {
+                code: code.clone(),
+                expires_at,
+            });
             let _ = reply.send(Ok(code));
         }
         PairingCommand::CancelWindow => {
@@ -2690,7 +2741,7 @@ async fn handle_command(
         PairingCommand::Revoke { device_id, reply } => {
             let result = revoke_device(&device_id, deps, outbound_tx, control_seq.as_ref()).await;
             if result.is_ok() {
-                let _ = events.send(BridgeEvent::RosterChanged).await;
+                let _ = events.send(BridgeEvent::RosterChanged);
             }
             let _ = reply.send(result);
         }
@@ -4052,7 +4103,7 @@ mod tests {
     /// The channel bundle a spawned [`run_pairing`] is driven through in tests.
     struct PairingHarness {
         outbound_rx: mpsc::Receiver<Message>,
-        events_rx: mpsc::Receiver<BridgeEvent>,
+        events_rx: mpsc::UnboundedReceiver<BridgeEvent>,
         frame_tx: mpsc::Sender<Vec<u8>>,
         ctl_tx: mpsc::Sender<PairingCtl>,
         done_rx: mpsc::UnboundedReceiver<(u64, PairingExit)>,
@@ -4067,7 +4118,7 @@ mod tests {
         secret: [u8; 32],
     ) -> PairingHarness {
         let (outbound_tx, outbound_rx) = mpsc::channel::<Message>(16);
-        let (events_tx, events_rx) = mpsc::channel::<BridgeEvent>(16);
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<BridgeEvent>();
         let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(16);
         let (ctl_tx, ctl_rx) = mpsc::channel::<PairingCtl>(4);
         let (done_tx, done_rx) = mpsc::unbounded_channel::<(u64, PairingExit)>();
@@ -4198,7 +4249,7 @@ mod tests {
 
         // A fresh device's first frame is admitted: dispatch spawns a new task.
         let (outbound_tx, _outbound_rx) = mpsc::channel::<Message>(16);
-        let (events_tx, _events_rx) = mpsc::channel::<BridgeEvent>(16);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel::<BridgeEvent>();
         let (done_tx, _done_rx) = mpsc::unbounded_channel::<(u64, PairingExit)>();
         let src_b = DeviceId([0xb0; 32]);
         dispatch_pairing_frame(
@@ -4459,5 +4510,117 @@ mod tests {
         let remaining = deadline_from_now(future);
         assert!(remaining > Duration::ZERO);
         assert!(remaining <= Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn event_forwarder_preserves_order_and_never_blocks_producers() {
+        // #283: a stalled consumer (capacity-1 channel, deliberately not
+        // drained) must not block event producers — sends onto the forwarder
+        // queue are sync and complete immediately, so the serve loop can never
+        // head-of-line-block on event delivery. Once the consumer drains,
+        // every event arrives in emission order (WindowOpened → DeviceArrived
+        // → PairingResult → RosterChanged) — the order the ctl pair flow
+        // depends on — with none dropped.
+        let (events_tx, mut events_rx) = mpsc::channel::<BridgeEvent>(1);
+        let queue = spawn_event_forwarder(events_tx);
+
+        let code = PairingCode {
+            relay_url: Some("ws://test".to_string()),
+            rendezvous_token: Some("tok".to_string()),
+            mesh_addr: None,
+            psk: [7u8; 32],
+            bridge_id: DeviceId([9u8; 32]),
+            bridge_key: [8u8; 32],
+            bridge_name: None,
+            min_protocol: PROTOCOL_VERSION,
+        };
+        let device_id = DeviceId([0xd1; 32]);
+        let sequence = vec![
+            BridgeEvent::PairingWindowOpened {
+                code,
+                expires_at: now_secs() + 60,
+            },
+            BridgeEvent::PairingDeviceArrived {
+                device_id,
+                name: "phone".to_string(),
+                fingerprint: "fp".to_string(),
+            },
+            BridgeEvent::PairingResult(PairingOutcome::Paired {
+                device_id,
+                name: "phone".to_string(),
+            }),
+            BridgeEvent::RosterChanged,
+        ];
+        // Every send completes synchronously even though the consumer has
+        // read nothing and its channel holds at most one event.
+        for event in &sequence {
+            queue
+                .send(event.clone())
+                .expect("the queue accepts while the consumer stalls");
+        }
+        // Drain: all events arrive, in order.
+        for expected in sequence {
+            assert_eq!(events_rx.recv().await, Some(expected));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unacked_open_window_waiter_is_reaped_after_timeout() {
+        // #283: the OpenWindow RegisterPairing waiter is fire-and-forget, so
+        // if the relay never answers, nothing else would remove its entry
+        // until connection teardown. The reap clears it once
+        // CONTROL_ACK_TIMEOUT elapses — without touching a later, unrelated
+        // waiter still inside its own deadline.
+        let waiters: ControlWaiters = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = oneshot::channel();
+        waiters.lock().expect("lock").insert(1, tx);
+        reap_waiter_after_timeout(&waiters, 1);
+
+        let (later_tx, _later_rx) = oneshot::channel();
+        waiters.lock().expect("lock").insert(2, later_tx);
+
+        tokio::time::sleep(CONTROL_ACK_TIMEOUT + Duration::from_millis(10)).await;
+        // Let the woken reaper task run to completion on this runtime.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let map = waiters.lock().expect("lock");
+        assert!(
+            !map.contains_key(&1),
+            "the un-acked waiter must be reaped on timeout"
+        );
+        assert!(
+            map.contains_key(&2),
+            "an unrelated pending waiter must survive the reap"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiter_reap_after_reply_is_a_noop() {
+        // The relay answered inside the deadline: `route_control_reply`
+        // removed and completed the waiter, so the scheduled reap must find
+        // nothing — ids are never reused, so the late reap cannot disturb any
+        // other request's entry.
+        let waiters: ControlWaiters = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = oneshot::channel();
+        waiters.lock().expect("lock").insert(7, tx);
+        reap_waiter_after_timeout(&waiters, 7);
+
+        let ack = serde_json::to_vec(&RelayControlAck { id: 7 }).expect("encode ack");
+        route_control_reply(&ack, &waiters);
+        assert!(
+            matches!(rx.await, Ok(Ok(()))),
+            "the ack completes the waiter"
+        );
+
+        tokio::time::sleep(CONTROL_ACK_TIMEOUT + Duration::from_millis(10)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            waiters.lock().expect("lock").is_empty(),
+            "the late reap is a harmless no-op"
+        );
     }
 }

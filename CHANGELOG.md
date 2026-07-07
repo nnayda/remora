@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Bridge event delivery no longer rides the serve hot path** (#283):
+  `serve_bridge` now hands `BridgeEvent`s to a dedicated forwarder task over
+  an internal non-blocking queue, so a consumer that stalls on the event
+  channel can never head-of-line-block inbound frame dispatch for all peers.
+  Nothing is dropped and per-pairing event order is preserved. Also reaps the
+  fire-and-forget `RegisterPairing` control waiter after the ack timeout, so
+  a relay that never answers no longer parks the entry until connection
+  teardown.
 - **macOS line-editing chords in the terminal**: Cmd+Delete (kill line
   backward), Cmd+Left / Cmd+Right (jump to line start/end), and
   Option+Delete (delete word) now work in the embedded terminal. xterm.js
