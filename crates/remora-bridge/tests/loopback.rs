@@ -1387,6 +1387,7 @@ impl PairingHarness {
                     device_id,
                     name,
                     fingerprint,
+                    ..
                 } => return (device_id, name, fingerprint),
                 BridgeEvent::PairingWindowOpened { .. } => continue,
                 other => panic!("expected PairingDeviceArrived, got {other:?}"),
@@ -1398,7 +1399,7 @@ impl PairingHarness {
     async fn await_result(&mut self) -> PairingOutcome {
         loop {
             match self.next_event().await {
-                BridgeEvent::PairingResult(outcome) => return outcome,
+                BridgeEvent::PairingResult { outcome, .. } => return outcome,
                 BridgeEvent::PairingWindowOpened { .. }
                 | BridgeEvent::PairingDeviceArrived { .. }
                 | BridgeEvent::RosterChanged => continue,
@@ -1674,6 +1675,7 @@ async fn pairing_end_to_end_then_attach() {
         BridgeEvent::PairingWindowOpened {
             code: opened,
             expires_at,
+            ..
         } => {
             assert_eq!(opened.bridge_id, code.bridge_id);
             assert!(expires_at >= 1, "expiry is a real unix timestamp");

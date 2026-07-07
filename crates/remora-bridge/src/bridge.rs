@@ -347,20 +347,39 @@ pub enum PairingCommand {
 
 /// An event the bridge emits to the desktop over the [`serve_bridge`] event
 /// channel, mirroring pairing progress and roster changes.
+///
+/// Every pairing event carries the `generation` of the window it belongs to —
+/// the monotonic counter the connection loop stamps into each
+/// [`PairingWindow`]. A replaced window's responder task reports its terminal
+/// [`PairingResult`](BridgeEvent::PairingResult) *asynchronously*, so a
+/// consumer driving a fresh window can receive a stale `Expired` (or a stale
+/// arrival) after its own `PairingWindowOpened`. Consumers must record the
+/// generation from their window's `PairingWindowOpened` and ignore pairing
+/// events tagged with any other generation (#299).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BridgeEvent {
     /// A pairing window opened; the desktop shows `code` until `expires_at`
-    /// (Unix seconds).
-    PairingWindowOpened { code: PairingCode, expires_at: u64 },
+    /// (Unix seconds). `generation` tags every later event for this window.
+    PairingWindowOpened {
+        code: PairingCode,
+        expires_at: u64,
+        generation: u64,
+    },
     /// A device reached the open pairing window and awaits confirmation.
     PairingDeviceArrived {
+        generation: u64,
         device_id: DeviceId,
         name: String,
         fingerprint: String,
     },
-    /// A pairing attempt reached a terminal state.
-    PairingResult(PairingOutcome),
+    /// A pairing attempt reached a terminal state. `generation` names the
+    /// window the attempt ran on — a replaced window's `Expired` arrives
+    /// tagged with the OLD window's generation, never the current one.
+    PairingResult {
+        generation: u64,
+        outcome: PairingOutcome,
+    },
     /// The roster changed (a device was enrolled or revoked); the desktop may
     /// refresh its paired-devices view.
     RosterChanged,
@@ -1349,6 +1368,20 @@ struct PairingParams {
     generation: u64,
 }
 
+/// Emits a terminal [`BridgeEvent::PairingResult`] tagged with the window
+/// generation the attempt ran on, so consumers can drop a stale result from a
+/// replaced window (#299).
+fn emit_pairing_result(
+    events: &mpsc::UnboundedSender<BridgeEvent>,
+    generation: u64,
+    outcome: PairingOutcome,
+) {
+    let _ = events.send(BridgeEvent::PairingResult {
+        generation,
+        outcome,
+    });
+}
+
 /// The whole confirm-gated pairing ceremony for one arrived device (ADR-0021
 /// D3), run as a dedicated task off the connection loop.
 ///
@@ -1453,6 +1486,7 @@ async fn run_pairing(
     let name = sanitize(&raw_name, MAX_DEVICE_NAME_CHARS).into_string();
     let device_fingerprint = fingerprint(&remote_static);
     let _ = events.send(BridgeEvent::PairingDeviceArrived {
+        generation: params.generation,
         device_id,
         name: name.clone(),
         fingerprint: device_fingerprint,
@@ -1490,9 +1524,11 @@ async fn run_pairing(
                 },
             )
             .await;
-            let _ = events.send(BridgeEvent::PairingResult(PairingOutcome::Rejected {
-                device_id,
-            }));
+            emit_pairing_result(
+                &events,
+                params.generation,
+                PairingOutcome::Rejected { device_id },
+            );
             return;
         }
         PairingDecision::Closed => {
@@ -1507,7 +1543,7 @@ async fn run_pairing(
                 },
             )
             .await;
-            let _ = events.send(BridgeEvent::PairingResult(PairingOutcome::Expired));
+            emit_pairing_result(&events, params.generation, PairingOutcome::Expired);
             return;
         }
     }
@@ -1524,9 +1560,11 @@ async fn run_pairing(
             },
         )
         .await;
-        let _ = events.send(BridgeEvent::PairingResult(PairingOutcome::Rejected {
-            device_id,
-        }));
+        emit_pairing_result(
+            &events,
+            params.generation,
+            PairingOutcome::Rejected { device_id },
+        );
         return;
     }
 
@@ -1583,7 +1621,7 @@ async fn run_pairing(
         // pending credential may or may not be live; re-assert roster-only to be
         // sure it is dropped, then abandon the attempt.
         reassert_roster_only(&deps, &outbound_tx, &control_seq).await;
-        let _ = events.send(BridgeEvent::PairingResult(PairingOutcome::Expired));
+        emit_pairing_result(&events, params.generation, PairingOutcome::Expired);
         return;
     }
 
@@ -1620,7 +1658,7 @@ async fn run_pairing(
     };
     if !confirmed {
         reassert_roster_only(&deps, &outbound_tx, &control_seq).await;
-        let _ = events.send(BridgeEvent::PairingResult(PairingOutcome::Expired));
+        emit_pairing_result(&events, params.generation, PairingOutcome::Expired);
         return;
     }
 
@@ -1637,7 +1675,7 @@ async fn run_pairing(
             roster.entries.pop();
             drop(roster);
             reassert_roster_only(&deps, &outbound_tx, &control_seq).await;
-            let _ = events.send(BridgeEvent::PairingResult(PairingOutcome::Expired));
+            emit_pairing_result(&events, params.generation, PairingOutcome::Expired);
             return;
         }
     }
@@ -1658,10 +1696,11 @@ async fn run_pairing(
         },
     )
     .await;
-    let _ = events.send(BridgeEvent::PairingResult(PairingOutcome::Paired {
-        device_id,
-        name,
-    }));
+    emit_pairing_result(
+        &events,
+        params.generation,
+        PairingOutcome::Paired { device_id, name },
+    );
     let _ = events.send(BridgeEvent::RosterChanged);
 }
 
@@ -2717,6 +2756,7 @@ async fn handle_command(
             let _ = events.send(BridgeEvent::PairingWindowOpened {
                 code: code.clone(),
                 expires_at,
+                generation: *pairing_generation,
             });
             let _ = reply.send(Ok(code));
         }
@@ -4362,12 +4402,14 @@ mod tests {
         // The arrival surfaces to the desktop, then Pending reaches the device.
         match harness.events_rx.recv().await {
             Some(BridgeEvent::PairingDeviceArrived {
+                generation,
                 device_id: id,
                 name,
                 ..
             }) => {
                 assert_eq!(id, device_id);
                 assert_eq!(name, "phone");
+                assert_eq!(generation, 7, "the arrival carries its window generation");
             }
             other => panic!("expected PairingDeviceArrived, got {other:?}"),
         }
@@ -4393,8 +4435,15 @@ mod tests {
             "got {rejected:?}"
         );
         match harness.events_rx.recv().await {
-            Some(BridgeEvent::PairingResult(PairingOutcome::Rejected { device_id: id })) => {
+            Some(BridgeEvent::PairingResult {
+                generation,
+                outcome: PairingOutcome::Rejected { device_id: id },
+            }) => {
                 assert_eq!(id, device_id);
+                assert_eq!(
+                    generation, 7,
+                    "the terminal result carries its window generation (#299)"
+                );
             }
             other => panic!("expected PairingResult(Rejected), got {other:?}"),
         }
@@ -4539,16 +4588,21 @@ mod tests {
             BridgeEvent::PairingWindowOpened {
                 code,
                 expires_at: now_secs() + 60,
+                generation: 1,
             },
             BridgeEvent::PairingDeviceArrived {
+                generation: 1,
                 device_id,
                 name: "phone".to_string(),
                 fingerprint: "fp".to_string(),
             },
-            BridgeEvent::PairingResult(PairingOutcome::Paired {
-                device_id,
-                name: "phone".to_string(),
-            }),
+            BridgeEvent::PairingResult {
+                generation: 1,
+                outcome: PairingOutcome::Paired {
+                    device_id,
+                    name: "phone".to_string(),
+                },
+            },
             BridgeEvent::RosterChanged,
         ];
         // Every send completes synchronously even though the consumer has
