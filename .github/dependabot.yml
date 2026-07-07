@@ -38,3 +38,15 @@ updates:
       interval: weekly
     commit-message:
       prefix: chore
+
+  # Keeps the bridge image's pinned base-image digests
+  # (crates/remora-bridge/Dockerfile: rust:1-bookworm, debian:bookworm-slim)
+  # current as upstream patches them — the digest-refresh cadence for #234's
+  # reproducible build. Bumps the sha256 pin while holding the tag; the weekly
+  # bridge-reproducible.yml run re-verifies reproducibility after each bump.
+  - package-ecosystem: docker
+    directory: /crates/remora-bridge
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore

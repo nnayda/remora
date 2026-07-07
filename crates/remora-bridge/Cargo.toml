@@ -15,11 +15,12 @@ futures-util = { workspace = true }
 rand = { workspace = true }
 remora-core = { workspace = true }
 remora-protocol = { workspace = true }
+rustix = { workspace = true, features = ["fs", "process"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 snow = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "macros", "time", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "macros", "time", "io-util", "io-std", "signal"] }
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 tokio-util = { workspace = true }
 toml = { workspace = true, features = ["display"] }

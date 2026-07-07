@@ -27,10 +27,10 @@ use remora_bridge::{
     BridgeWakeHandle, PairingCommand, Roster,
 };
 use remora_core::config::{Config, ConfigError};
+use remora_core::resolve::ResolvingSource;
 use remora_core::SessionSource;
 
 use crate::bridge::Bridge;
-use crate::remote_host::ResolvingSource;
 
 /// Channel depth for pairing commands/events between the UI and the bridge.
 /// Pairing is a low-rate, human-driven ceremony; a small buffer is ample.
@@ -118,16 +118,30 @@ pub(crate) fn start_relay_bridge(bridge: &Bridge) -> Option<PairingHandles> {
         return None;
     }
 
+    // Claim exclusive use of this identity for the process lifetime before
+    // touching it (spec D2, #234): the desktop's in-process bridge and a
+    // future headless `remora-bridge serve` pointed at the same state dir
+    // would otherwise silently share one identity file. Non-fatal by the same
+    // contract as the checks above: another bridge already holding it just
+    // means this device doesn't also start one.
+    let identity_path = crate::bridge_state::identity_path(&config_path);
+    let identity_lock = match remora_bridge::IdentityLock::acquire(&identity_path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("relay bridge not started: {e}");
+            return None;
+        }
+    };
+
     // Durable identity (stable across runs) + the paired-device roster (persists
     // real pairings), both from the shared bridge-state layout.
-    let identity =
-        match BridgeIdentity::load_or_create(&crate::bridge_state::identity_path(&config_path)) {
-            Ok(identity) => identity,
-            Err(e) => {
-                eprintln!("relay bridge not started: bridge identity unavailable: {e}");
-                return None;
-            }
-        };
+    let identity = match BridgeIdentity::load_or_create(&identity_path) {
+        Ok(identity) => identity,
+        Err(e) => {
+            eprintln!("relay bridge not started: bridge identity unavailable: {e}");
+            return None;
+        }
+    };
     let roster_path = crate::bridge_state::roster_path(&config_path);
     let roster = match Roster::load(&roster_path) {
         Ok(roster) => roster,
@@ -159,6 +173,8 @@ pub(crate) fn start_relay_bridge(bridge: &Bridge) -> Option<PairingHandles> {
         identity,
         roster: roster.clone(),
         roster_path,
+        // The desktop drops the receiver for now; #282 will consume it.
+        health: tokio::sync::watch::channel(remora_bridge::BridgeHealth::Starting).0,
     };
 
     let (commands_tx, commands_rx) = mpsc::channel::<PairingCommand>(PAIRING_CHANNEL_DEPTH);
@@ -166,6 +182,9 @@ pub(crate) fn start_relay_bridge(bridge: &Bridge) -> Option<PairingHandles> {
     let (wake, wake_rx) = wake_channel();
     let shutdown_task = shutdown.clone();
     let task = tauri::async_runtime::spawn(async move {
+        // Held for exactly the bridge's lifetime: dropped when this task ends,
+        // releasing the identity for a future claimant.
+        let _identity_lock = identity_lock;
         // `serve_bridge` only returns `Err` on an unusable configuration (e.g. a
         // non-`ws` relay URL); transient relay/network failures are retried
         // internally. Log a fatal stop rather than panic.

@@ -20,6 +20,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Headless `remora-bridge` binary** (#234, ADR-0021): `serve` daemon with a
+  hardened Unix ctl socket, `init`/`pair`/`devices`/`revoke`/`status`/
+  `fingerprint` CLI (copy-paste pairing code, confirm-gated enrollment that
+  fails closed on a dropped session, client-side window deadline), relay
+  health reporting that distinguishes rejection from outage, and a lifetime
+  identity lock preventing two bridge processes from silently sharing one
+  bridge identity.
+- **`remora-bridge` container image and operator docs** (#234): a debian-slim
+  + openssh-client, non-root container image with a reproducible binary
+  (verify script + weekly CI) and `crates/remora-bridge/README.md` covering
+  first deploy, no-camera pairing, desktop→headless migration, and
+  coexistence.
+- **Bridge health watch** (#234, spec D8): `serve_bridge` now publishes coarse
+  relay-connection health over a `watch` channel (`BridgeHealth`), so an
+  operator surface can distinguish healthy, relay-unreachable, and
+  relay-refused states. A config-level rejection — the relay naming an
+  `AssertDevices` error (wrong `registration_token` or a missing/mismatched
+  `BridgeEntry`) — surfaces as a distinct `Rejected` state instead of
+  collapsing into the same reconnect path as a transient outage. (A
+  hello-stage bad token is closed silently by the untrusted relay and still
+  reads as reconnecting; assert-stage rejection is the diagnosable one.)
 - **UnifiedPush wake delivery** (#233, ADR-0023): when a paired device is
   disconnected and its session needs attention, the relay can POST a generic
   wake ("a session needs your attention" — never session content) to a
@@ -634,6 +655,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Config→`SessionSource` resolution moved from the desktop shell into
+  `remora-core::resolve`, shared with the headless bridge (#234).
 - **Tabs reflow live while dragging to reorder** (#185): dragging a tab now
   shuffles the other tabs out of the way in real time and slides the dragged
   tab (dimmed) into its prospective slot, instead of showing a static drop

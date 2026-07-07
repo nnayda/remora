@@ -13,7 +13,7 @@
 
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use blake2::{Blake2s256, Digest as _};
@@ -62,6 +62,12 @@ pub enum IdentityError {
     /// The OS CSPRNG could not be read.
     #[error("could not read random bytes: {0}")]
     Random(String),
+    /// Another live process holds this identity (spec D2, #234).
+    #[error("bridge identity {path} is in use by another bridge process (desktop app or another remora-bridge serve)")]
+    Locked {
+        /// The identity file another process is holding.
+        path: PathBuf,
+    },
 }
 
 impl IdentityError {
@@ -166,6 +172,44 @@ fn ensure_secret_mode(path: &Path) -> std::io::Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+/// Held for the lifetime of a bridge host process to guarantee a single
+/// process serves a given identity (spec D2, #234): the desktop's in-process
+/// bridge and a headless `remora-bridge serve` pointed at the same state dir
+/// would otherwise silently share one bridge identity — one relay
+/// registration, two uncoordinated claimants.
+///
+/// Advisory `flock(LOCK_EX | LOCK_NB)` on `<identity>.lock` (a sibling file,
+/// not the identity itself, so locking never races the atomic
+/// temp-file-rename writes in [`write_secret_file`]). Dropping releases.
+pub struct IdentityLock {
+    // Held only for its flock; the fd releases the lock on drop.
+    _file: std::fs::File,
+}
+
+impl IdentityLock {
+    /// Acquire the exclusive lock for `identity_path`, failing fast (never
+    /// blocking) when another process holds it.
+    pub fn acquire(identity_path: &Path) -> Result<IdentityLock, IdentityError> {
+        let mut lock_path = identity_path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock_path = PathBuf::from(lock_path);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(|e| IdentityError::io(&lock_path, e))?;
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(IdentityLock { _file: file }),
+            Err(rustix::io::Errno::WOULDBLOCK) => Err(IdentityError::Locked {
+                path: identity_path.to_path_buf(),
+            }),
+            Err(e) => Err(IdentityError::io(&lock_path, std::io::Error::from(e))),
+        }
+    }
 }
 
 /// A short, human-comparable fingerprint of an X25519 static public key
@@ -735,6 +779,19 @@ mod tests {
             !roster.remove_by_device(&DeviceId([0x11; 32])),
             "second remove is a no-op"
         );
+    }
+
+    #[test]
+    fn identity_lock_excludes_second_claimant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bridge_identity.toml");
+        let first = IdentityLock::acquire(&path).expect("first lock");
+        // flock is per open-file-description: a second open in the SAME
+        // process conflicts too, so this asserts the real exclusion.
+        let second = IdentityLock::acquire(&path);
+        assert!(matches!(second, Err(IdentityError::Locked { .. })));
+        drop(first);
+        IdentityLock::acquire(&path).expect("lock re-acquirable after release");
     }
 
     #[test]

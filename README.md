@@ -62,7 +62,7 @@ Your sandbox only needs `tmux`, `git`, and your agent's CLI.
 | `crates/remora-core` | Session model and the `SessionSource` transport seam |
 | `crates/remora-protocol` | Wire protocol types shared by clients, the bridge, and the relay envelope (ADR-0021); specified in [docs/PROTOCOL.md](docs/PROTOCOL.md) |
 | `crates/remora-relay` | Blind envelope-frame relay binary (ADR-0021) |
-| `crates/remora-bridge` | User-side bridge library (ADR-0021): a `RemoteSource` driving `remora-core` end-to-end over Noise; hosted by the desktop today, standalone headless binary is future (#234) |
+| `crates/remora-bridge` | User-side bridge (ADR-0021): a `RemoteSource` driving `remora-core` end-to-end over Noise. Library + standalone headless binary (`remora-bridge serve`, see [crates/remora-bridge/README.md](crates/remora-bridge/README.md)); hosted in-process by the desktop today, or run as its own daemon/container |
 | `docs/` | Vision, architecture notes, the [wire protocol spec](docs/PROTOCOL.md), ADRs |
 
 ## Developing
