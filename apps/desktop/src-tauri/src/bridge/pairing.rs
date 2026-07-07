@@ -8,14 +8,17 @@
 //! bridge's fingerprint). A spawned forwarder task turns each [`BridgeEvent`]
 //! into a frontend event so the pairing panel updates without polling.
 //!
-//! When no relay bridge is hosted (no `[relay]` section, so no
-//! [`PairingHandles`] in managed state) every command fails cleanly with
+//! When no relay bridge is hosted (no `[relay]` section — or it was removed by
+//! a live config edit, #277 — so the managed [`RelaySupervisor`] holds no
+//! [`PairingHandles`]) every command fails cleanly with
 //! [`BridgeError::RelayNotConfigured`] and the UI shows a "relay not configured"
 //! state rather than a pairing panel.
 //!
 //! **Secret handling:** the [`PairingCodeDto::code`] string embeds the pairing
 //! PSK by design (ADR-0021 D1 — it is what the phone scans as a QR / pastes).
 //! It crosses to the frontend for rendering, but is **never** logged here.
+
+use std::sync::Arc;
 
 use tauri::{AppHandle, Manager};
 use tauri_specta::Event;
@@ -25,7 +28,7 @@ use remora_bridge::{fingerprint, BridgeEvent, PairingCommand, PairingOutcome};
 use remora_protocol::{DeviceId, PairingCode};
 
 use crate::bridge::error::BridgeError;
-use crate::relay::PairingHandles;
+use crate::relay::{PairingHandles, RelaySupervisor};
 
 /// The default pairing-window lifetime if the caller does not specify one.
 /// A pairing ceremony is a brief, attended flow; two minutes is ample.
@@ -53,10 +56,15 @@ fn bridge_gone() -> BridgeError {
     }
 }
 
-/// Looks up the running bridge's [`PairingHandles`], or the "relay not
-/// configured" error when none is hosted.
-fn handles(app: &AppHandle) -> Result<tauri::State<'_, PairingHandles>, BridgeError> {
-    app.try_state::<PairingHandles>()
+/// Looks up the running bridge's [`PairingHandles`] through the managed
+/// [`RelaySupervisor`], or the "relay not configured" error when no bridge is
+/// hosted — either because no supervisor exists (loopback mode) or because the
+/// supervisor currently runs no bridge (`[relay]` absent or removed, #277).
+/// Cloning the `Arc` out (rather than holding managed state) means a bridge
+/// stopped mid-command fails on its closed channels, never on freed handles.
+fn handles(app: &AppHandle) -> Result<Arc<PairingHandles>, BridgeError> {
+    app.try_state::<RelaySupervisor>()
+        .and_then(|supervisor| supervisor.handles())
         .ok_or_else(relay_not_configured)
 }
 
@@ -225,18 +233,22 @@ fn emit_event(app: &AppHandle, emit: PairingEmit) {
 
 /// Spawns the forwarder task that drains the bridge's [`BridgeEvent`] receiver
 /// (taken out of `handles` once) and emits the matching frontend event for each.
-/// A no-op if the receiver was already taken. Called once at app setup.
+/// A no-op if the receiver was already taken. Called once per bridge start
+/// (launch or live reconfig, #277); the task's handle is stored back into
+/// `handles` so a clean stop can join it (it ends on its own when the serve
+/// task drops the event sender).
 pub fn spawn_event_forwarder(app: AppHandle, handles: &PairingHandles) {
     let Some(mut rx) = handles.take_events() else {
         return;
     };
-    tauri::async_runtime::spawn(async move {
+    let task = tauri::async_runtime::spawn(async move {
         while let Some(event) = rx.recv().await {
             if let Some(emit) = map_bridge_event(event) {
                 emit_event(&app, emit);
             }
         }
     });
+    handles.set_forwarder(task);
 }
 
 // ---------------------------------------------------------------------------
