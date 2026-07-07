@@ -8,8 +8,10 @@
 //! budget deterministically testable without a real clock. The *delivery*
 //! half ([`deliver_wake`]) consumes the endpoint a successful decision
 //! returns: resolve, filter every address through the network policy
-//! ([`filter_addrs`]), pin the checked address (DNS-rebinding defense), and
-//! POST the fixed generic body behind the global in-flight semaphore.
+//! ([`filter_addrs`]), pin a checked address (DNS-rebinding defense; on a
+//! connect failure it fails over across the *other* checked addresses,
+//! bounded — never an unpinned fallback), and POST the fixed generic body
+//! behind the global in-flight semaphore.
 //!
 //! State that must outlive a single frame — the per-device last-wake instant
 //! (cooldown) and the per-bridge token bucket (budget) — lives in [`PushState`],
@@ -711,8 +713,70 @@ enum Attempt {
     Permanent,
 }
 
-/// One resolve → filter → pinned-POST attempt. Never logs the endpoint URL —
-/// only outcomes by category (metadata policy).
+/// How many of one resolution's policy-passing addresses a single delivery
+/// attempt will try before giving up (#290). Multi-homed distributors (ntfy.sh
+/// publishes several A/AAAA records) shouldn't lose a wake because the one
+/// address we happened to pin was down; but the fail-over must stay small —
+/// each attempt can burn up to [`WAKE_TIMEOUT`] while holding the global
+/// in-flight permit, so the cap bounds one delivery attempt at
+/// `MAX_ADDR_ATTEMPTS × WAKE_TIMEOUT`. Every candidate has already passed
+/// [`filter_addrs`]; there is never a fall-back to unpinned resolution.
+const MAX_ADDR_ATTEMPTS: usize = 3;
+
+/// Runs the pinned POST against each vetted address in order, failing over on
+/// *transport* errors only (connect refused/reset/timeout), bounded by
+/// [`MAX_ADDR_ATTEMPTS`]. Any HTTP response is the endpoint answering, so it
+/// is final for this delivery attempt — the other addresses front the same
+/// service, and a 5xx already gets the outer once-retry.
+///
+/// SSRF invariant (#290): the caller passes only addresses that survived
+/// [`filter_addrs`]; every attempt is pinned to exactly one of them via
+/// [`post_wake_pinned`], and this function never resolves anything itself.
+/// Split out (like [`post_wake_pinned`]) so the fail-over order is
+/// unit-testable without DNS.
+async fn post_wake_failover(endpoint: &str, host: &str, port: u16, allowed: &[IpAddr]) -> Attempt {
+    for &checked_ip in allowed.iter().take(MAX_ADDR_ATTEMPTS) {
+        let checked = SocketAddr::new(checked_ip, port);
+        match post_wake_pinned(endpoint, host, checked).await {
+            Ok(status) if status.is_success() => {
+                eprintln!(
+                    "remora-relay: push wake delivered (status {})",
+                    status.as_u16()
+                );
+                return Attempt::Delivered;
+            }
+            // 5xx is a server-side blip — retry once (outer backoff). 4xx (and
+            // any other non-2xx) is the endpoint refusing this request;
+            // retrying will not change it.
+            Ok(status) if status.is_server_error() => {
+                eprintln!(
+                    "remora-relay: push wake delivery failed (status {})",
+                    status.as_u16()
+                );
+                return Attempt::Transient;
+            }
+            Ok(status) => {
+                eprintln!(
+                    "remora-relay: push wake dropped (status {})",
+                    status.as_u16()
+                );
+                return Attempt::Permanent;
+            }
+            // Transport failure (connect/timeout) — try the next vetted
+            // address, if any. The endpoint URL is never logged.
+            Err(_) => {
+                eprintln!("remora-relay: push wake delivery failed (transport)");
+            }
+        }
+    }
+    // Every attempted address failed at the transport layer — transient, so
+    // the outer backoff gets one full re-resolve + re-filter retry.
+    Attempt::Transient
+}
+
+/// One resolve → filter → pinned-POST attempt (with bounded per-address
+/// fail-over, see [`post_wake_failover`]). Never logs the endpoint URL — only
+/// outcomes by category (metadata policy).
 async fn attempt_delivery(endpoint: &str, cfg: &PushConfig) -> Attempt {
     let target = match parse_target(endpoint) {
         Ok(target) => target,
@@ -730,57 +794,29 @@ async fn attempt_delivery(endpoint: &str, cfg: &PushConfig) -> Attempt {
             return Attempt::Transient;
         }
     };
-    let checked_ip = match filter_addrs(&addrs, target.scheme_is_http, cfg) {
-        // First surviving address; pinning it closes the rebinding window.
-        Ok(mut allowed) => allowed.remove(0),
+    let allowed = match filter_addrs(&addrs, target.scheme_is_http, cfg) {
+        // The surviving addresses, in resolution order; each attempt below
+        // pins exactly one of them, which closes the rebinding window.
+        Ok(allowed) => allowed,
         Err(reason) => {
             eprintln!("remora-relay: push wake dropped ({})", reason.as_str());
             return Attempt::Permanent;
         }
     };
-
-    let checked = SocketAddr::new(checked_ip, target.port);
-    match post_wake_pinned(endpoint, &target.host, checked).await {
-        Ok(status) if status.is_success() => {
-            eprintln!(
-                "remora-relay: push wake delivered (status {})",
-                status.as_u16()
-            );
-            Attempt::Delivered
-        }
-        // 5xx is a server-side blip — retry once. 4xx (and any other non-2xx)
-        // is the endpoint refusing this request; retrying will not change it.
-        Ok(status) if status.is_server_error() => {
-            eprintln!(
-                "remora-relay: push wake delivery failed (status {})",
-                status.as_u16()
-            );
-            Attempt::Transient
-        }
-        Ok(status) => {
-            eprintln!(
-                "remora-relay: push wake dropped (status {})",
-                status.as_u16()
-            );
-            Attempt::Permanent
-        }
-        // Transport failure (connect/timeout) — transient, retry once. The
-        // endpoint URL is never logged.
-        Err(_) => {
-            eprintln!("remora-relay: push wake delivery failed (transport)");
-            Attempt::Transient
-        }
-    }
+    post_wake_failover(endpoint, &target.host, target.port, &allowed).await
 }
 
 /// Delivers one wake to a device-supplied endpoint under the full ADR-0023
 /// network policy: hold a global in-flight permit (drop, never queue, if none
 /// is immediately free), resolve the host ourselves, filter every resolved
-/// address against the SSRF policy, then POST to the *checked* address with the
-/// connection pinned to it. On a transient failure (DNS, connect/timeout, 5xx)
-/// it retries **once** after [`WAKE_RETRY_DELAY`]; the permit is released during
-/// that backoff and a fresh one is acquired for the retry (#233 C4).
-/// Non-transient failures (SSRF reject, 4xx) do not retry.
+/// address against the SSRF policy, then POST to a *checked* address with the
+/// connection pinned to it. Within one attempt, a transport failure fails over
+/// across up to [`MAX_ADDR_ATTEMPTS`] policy-passing addresses, each pinned
+/// (#290) — never an unpinned re-resolution. On a transient failure (DNS,
+/// connect/timeout on every tried address, 5xx) it retries **once** after
+/// [`WAKE_RETRY_DELAY`]; the permit is released during that backoff and a
+/// fresh one is acquired for the retry (#233 C4). Non-transient failures
+/// (SSRF reject, 4xx) do not retry.
 ///
 /// Returns whether the wake was ultimately delivered (a 2xx). `false` — a final
 /// failure or an unavailable permit (on the first attempt *or* the retry) — is
@@ -1669,6 +1705,110 @@ mod tests {
         let (method, body) = rx.recv().await.expect("request received");
         assert_eq!(method, "POST");
         assert_eq!(body, WAKE_BODY);
+    }
+
+    /// Connect failure on the first pinned address fails over to the next
+    /// *vetted* address (#290): the first candidate has nothing listening
+    /// (immediate refusal on loopback), the second is the real listener — the
+    /// wake lands there, still pinned, with the fixed body.
+    #[tokio::test]
+    async fn failover_tries_next_vetted_addr_on_connect_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let (method, body) =
+                serve_one(&mut sock, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+            let _ = tx.send((method, body));
+        });
+
+        // 127.0.0.2:port has no listener → immediate connect refusal; the
+        // fail-over must then pin and reach 127.0.0.1 (the real listener).
+        let allowed = [v4("127.0.0.2"), v4("127.0.0.1")];
+        let endpoint = format!("http://multihome.example:{}/", addr.port());
+        let outcome =
+            post_wake_failover(&endpoint, "multihome.example", addr.port(), &allowed).await;
+        assert_eq!(outcome, Attempt::Delivered, "second vetted address served");
+        let (method, body) = rx.recv().await.expect("request received");
+        assert_eq!(method, "POST");
+        assert_eq!(body, WAKE_BODY);
+    }
+
+    /// The fail-over is bounded by [`MAX_ADDR_ATTEMPTS`] (#290): with the only
+    /// live listener sitting *past* the cap, delivery gives up (transient) and
+    /// the listener is never contacted.
+    #[tokio::test]
+    async fn failover_is_bounded_to_max_addr_attempts() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_srv = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.expect("accept");
+                count_srv.fetch_add(1, SeqCst);
+                tokio::spawn(async move {
+                    let _ =
+                        serve_one(&mut sock, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+                });
+            }
+        });
+
+        // MAX_ADDR_ATTEMPTS dead candidates first; the live listener is one
+        // past the cap and must never be reached.
+        let allowed = [
+            v4("127.0.0.2"),
+            v4("127.0.0.3"),
+            v4("127.0.0.4"),
+            v4("127.0.0.1"),
+        ];
+        assert_eq!(allowed.len(), MAX_ADDR_ATTEMPTS + 1, "listener past cap");
+        let endpoint = format!("http://multihome.example:{}/", addr.port());
+        let outcome =
+            post_wake_failover(&endpoint, "multihome.example", addr.port(), &allowed).await;
+        assert_eq!(outcome, Attempt::Transient, "all capped attempts refused");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(count.load(SeqCst), 0, "listener past the cap never tried");
+    }
+
+    /// An HTTP response — even a failure status — stops the fail-over (#290):
+    /// the endpoint answered, so the other addresses (same service) are not
+    /// tried. A 404 from the first address stays Permanent; if the loop
+    /// wrongly continued, the dead second address would flip it to Transient.
+    #[tokio::test]
+    async fn failover_stops_on_http_response() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_srv = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.expect("accept");
+                count_srv.fetch_add(1, SeqCst);
+                tokio::spawn(async move {
+                    let _ = serve_one(
+                        &mut sock,
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await;
+                });
+            }
+        });
+
+        let allowed = [v4("127.0.0.1"), v4("127.0.0.2")];
+        let endpoint = format!("http://multihome.example:{}/", addr.port());
+        let outcome =
+            post_wake_failover(&endpoint, "multihome.example", addr.port(), &allowed).await;
+        assert_eq!(outcome, Attempt::Permanent, "the 404 answer is final");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(count.load(SeqCst), 1, "no fail-over after an HTTP answer");
     }
 
     /// A literal-IP endpoint is parsed and skips DNS; a bad scheme is refused.

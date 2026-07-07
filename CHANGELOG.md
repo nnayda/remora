@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Push-endpoint validation and wake-delivery fail-over** (#290): the push
+  endpoint validator now rejects degenerate hosts a naive check let through —
+  an explicitly empty bracketed IPv6 host (`https://[]:8080/x`), an
+  unterminated bracket, and junk between the bracket and the port. Relay wake
+  delivery no longer gives up when TCP connect to the first policy-passing
+  address fails: it fails over across the other SSRF-vetted addresses (each
+  attempt still pinned to exactly one checked address, capped at 3) before
+  falling back to the existing single delayed retry.
 - **Dev loopback no longer leaks its bridge task — or the bridge identity —
   when pairing fails** (#297): `start_loopback` spawned the in-process bridge
   before driving the pairing ceremony, and a pairing failure dropped the
