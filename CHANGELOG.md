@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Pairing events are tagged with their window generation, so a stale event
+  can no longer terminalize a fresh `remora-bridge pair` session** (#299): a
+  replaced pairing window's responder task reports its terminal
+  `PairingResult(Expired)` asynchronously, so a back-to-back second pair
+  session could receive the old window's `Expired` (or a stale arrival) after
+  its own `PairingWindowOpened` — printing "expired" immediately and leaving
+  its own window open with no operator attached. `BridgeEvent`'s pairing
+  variants now carry the window generation the engine already tracks, every
+  emission site tags the window it belongs to, and the ctl pair session binds
+  to the generation from its own `PairingWindowOpened` (matched by code) and
+  silently ignores pairing events from any other generation, still bounded by
+  its window deadline.
 - **Relay kicks connections whose admission basis is gone** (#280): the relay
   now records what admitted each device connection — a bridge-asserted
   credential or an open pairing window. Closing or replacing the window

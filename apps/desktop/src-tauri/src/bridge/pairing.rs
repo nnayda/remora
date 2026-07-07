@@ -195,24 +195,30 @@ fn map_outcome(outcome: PairingOutcome) -> PairingOutcomeDto {
 
 /// Maps one [`BridgeEvent`] to the frontend event to emit, or `None` for a
 /// future (`#[non_exhaustive]`) variant with no frontend surface yet.
+///
+/// The window `generation` the bridge tags pairing events with (#299) is not
+/// forwarded yet: surfacing it to the PairingDialog needs new DTO plumbing and
+/// dialog-side filtering, which rides with the planned generation work in
+/// #281. Until then the dialog keeps the pre-#299 behavior.
 fn map_bridge_event(event: BridgeEvent) -> Option<PairingEmit> {
     match event {
-        BridgeEvent::PairingWindowOpened { code, expires_at } => {
-            Some(PairingEmit::WindowOpened(PairingWindowOpened {
-                code: code.encode(),
-                expires_at,
-            }))
-        }
+        BridgeEvent::PairingWindowOpened {
+            code, expires_at, ..
+        } => Some(PairingEmit::WindowOpened(PairingWindowOpened {
+            code: code.encode(),
+            expires_at,
+        })),
         BridgeEvent::PairingDeviceArrived {
             device_id,
             name,
             fingerprint,
+            ..
         } => Some(PairingEmit::DeviceArrived(PairingDeviceArrived {
             device_id: device_id.to_string(),
             name,
             fingerprint,
         })),
-        BridgeEvent::PairingResult(outcome) => Some(PairingEmit::Result(PairingResult {
+        BridgeEvent::PairingResult { outcome, .. } => Some(PairingEmit::Result(PairingResult {
             outcome: map_outcome(outcome),
         })),
         BridgeEvent::RosterChanged => Some(PairingEmit::RosterChanged(RosterChanged)),
@@ -390,6 +396,7 @@ mod tests {
         let opened = map_bridge_event(BridgeEvent::PairingWindowOpened {
             code: sample_code(),
             expires_at: 42,
+            generation: 1,
         });
         match opened {
             Some(PairingEmit::WindowOpened(e)) => {
@@ -400,6 +407,7 @@ mod tests {
         }
 
         let arrived = map_bridge_event(BridgeEvent::PairingDeviceArrived {
+            generation: 1,
             device_id: DeviceId([0xab; 32]),
             name: "phone".to_string(),
             fingerprint: "ABCD-1234-5678".to_string(),
@@ -413,10 +421,13 @@ mod tests {
             _ => panic!("PairingDeviceArrived must map to DeviceArrived"),
         }
 
-        let paired = map_bridge_event(BridgeEvent::PairingResult(PairingOutcome::Paired {
-            device_id: DeviceId([0x11; 32]),
-            name: "laptop".to_string(),
-        }));
+        let paired = map_bridge_event(BridgeEvent::PairingResult {
+            generation: 1,
+            outcome: PairingOutcome::Paired {
+                device_id: DeviceId([0x11; 32]),
+                name: "laptop".to_string(),
+            },
+        });
         match paired {
             Some(PairingEmit::Result(PairingResult {
                 outcome: PairingOutcomeDto::Paired { device_id, name },
@@ -427,9 +438,12 @@ mod tests {
             _ => panic!("PairingResult(Paired) must map to Result(Paired)"),
         }
 
-        let rejected = map_bridge_event(BridgeEvent::PairingResult(PairingOutcome::Rejected {
-            device_id: DeviceId([0x22; 32]),
-        }));
+        let rejected = map_bridge_event(BridgeEvent::PairingResult {
+            generation: 1,
+            outcome: PairingOutcome::Rejected {
+                device_id: DeviceId([0x22; 32]),
+            },
+        });
         assert!(matches!(
             rejected,
             Some(PairingEmit::Result(PairingResult {
@@ -437,7 +451,10 @@ mod tests {
             }))
         ));
 
-        let expired = map_bridge_event(BridgeEvent::PairingResult(PairingOutcome::Expired));
+        let expired = map_bridge_event(BridgeEvent::PairingResult {
+            generation: 1,
+            outcome: PairingOutcome::Expired,
+        });
         assert!(matches!(
             expired,
             Some(PairingEmit::Result(PairingResult {

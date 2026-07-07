@@ -396,11 +396,19 @@ async fn handle_pair(
         }
     };
 
-    // The authoritative `expires_at` rides on the PairingWindowOpened event,
-    // emitted before any arrival on the same in-order channel.
-    let expires_at = loop {
+    // The authoritative `expires_at` and window generation ride on the
+    // PairingWindowOpened event, emitted before any arrival on the same
+    // in-order channel. Match OUR window by its code (each mint is a fresh
+    // random secret): a stale WindowOpened still in flight from an earlier
+    // session must not be adopted, or this session would record the wrong
+    // generation and expiry (#299).
+    let (expires_at, generation) = loop {
         match events.recv().await {
-            Ok(BridgeEvent::PairingWindowOpened { expires_at, .. }) => break expires_at,
+            Ok(BridgeEvent::PairingWindowOpened {
+                code: opened,
+                expires_at,
+                generation,
+            }) if opened == code => break (expires_at, generation),
             Ok(_) => continue,
             Err(broadcast::error::RecvError::Lagged(_)) => {
                 let _ = send(
@@ -478,29 +486,32 @@ async fn handle_pair(
         tokio::select! {
             _ = shutdown.cancelled() => break,
             event = events.recv() => match event {
-                Ok(BridgeEvent::PairingDeviceArrived { device_id, name, fingerprint }) => {
-                    if send(
-                        &mut wr,
-                        &CtlResponse::DeviceArrived {
-                            device_id: device_id.to_string(),
-                            name,
-                            fingerprint,
-                        },
-                    )
-                    .await
-                    .is_err()
-                    {
+                Ok(event) => match classify_pair_event(event, generation) {
+                    PairEvent::Arrived { device_id, name, fingerprint } => {
+                        if send(
+                            &mut wr,
+                            &CtlResponse::DeviceArrived {
+                                device_id: device_id.to_string(),
+                                name,
+                                fingerprint,
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    PairEvent::Result(outcome) => {
+                        let _ = send(&mut wr, &pair_result_dto(&outcome)).await;
+                        got_result = true;
                         break;
                     }
-                }
-                Ok(BridgeEvent::PairingResult(outcome)) => {
-                    let _ = send(&mut wr, &pair_result_dto(&outcome)).await;
-                    got_result = true;
-                    break;
-                }
-                // PairingWindowOpened (a replacement) / RosterChanged: not part
-                // of this session's stream — ignore.
-                Ok(_) => {}
+                    // Stale-generation pairing events (a replaced window's
+                    // async Expired, #299), window replacements, roster pings:
+                    // not this session's stream — keep waiting.
+                    PairEvent::Ignore => {}
+                },
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     let _ = send(
                         &mut wr,
@@ -595,6 +606,50 @@ async fn route_decision<W: AsyncWriteExt + Unpin>(
     let _ = state.commands.send(cmd).await;
 }
 
+/// What one [`BridgeEvent`] means for a pair session bound to a window
+/// generation (#299).
+#[derive(Debug, PartialEq)]
+enum PairEvent {
+    /// An arrival on THIS session's window: prompt the operator.
+    Arrived {
+        device_id: DeviceId,
+        name: String,
+        fingerprint: String,
+    },
+    /// THIS session's window reached a terminal state: report and end.
+    Result(PairingOutcome),
+    /// Anything else — pairing events tagged with another window's generation
+    /// (a replaced window's responder task reports asynchronously, so its
+    /// `Expired` or a late arrival can land after this session's own
+    /// WindowOpened), window replacements, roster pings, future variants.
+    Ignore,
+}
+
+/// Classifies one bridge event against the session's window generation
+/// (learned from its own `PairingWindowOpened`). A stale event from another
+/// generation must never terminalize — or prompt inside — a fresh session; the
+/// caller keeps waiting on `Ignore`, still bounded by the client-side window
+/// deadline (D13a).
+fn classify_pair_event(event: BridgeEvent, session_generation: u64) -> PairEvent {
+    match event {
+        BridgeEvent::PairingDeviceArrived {
+            generation,
+            device_id,
+            name,
+            fingerprint,
+        } if generation == session_generation => PairEvent::Arrived {
+            device_id,
+            name,
+            fingerprint,
+        },
+        BridgeEvent::PairingResult {
+            generation,
+            outcome,
+        } if generation == session_generation => PairEvent::Result(outcome),
+        _ => PairEvent::Ignore,
+    }
+}
+
 fn pair_result_dto(outcome: &PairingOutcome) -> CtlResponse {
     match outcome {
         PairingOutcome::Paired { device_id, name } => CtlResponse::PairResult {
@@ -619,5 +674,329 @@ fn pair_result_dto(outcome: &PairingOutcome) -> CtlResponse {
             device_id: None,
             name: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use remora_bridge::Roster;
+    use remora_protocol::{PairingCode, PROTOCOL_VERSION};
+    use tokio::io::AsyncBufReadExt;
+    use tokio::sync::{watch, RwLock};
+
+    use super::*;
+
+    fn device(seed: u8) -> DeviceId {
+        DeviceId([seed; 32])
+    }
+
+    fn arrived(generation: u64, seed: u8) -> BridgeEvent {
+        BridgeEvent::PairingDeviceArrived {
+            generation,
+            device_id: device(seed),
+            name: "phone".to_string(),
+            fingerprint: "aa:bb".to_string(),
+        }
+    }
+
+    fn result(generation: u64, outcome: PairingOutcome) -> BridgeEvent {
+        BridgeEvent::PairingResult {
+            generation,
+            outcome,
+        }
+    }
+
+    // ---- classify_pair_event: the #299 filter decision, in isolation. ----
+
+    #[test]
+    fn stale_generation_result_is_ignored() {
+        // The issue's exact hazard: the replaced window's async Expired must
+        // not terminalize a session bound to a newer generation.
+        assert_eq!(
+            classify_pair_event(result(1, PairingOutcome::Expired), 2),
+            PairEvent::Ignore
+        );
+    }
+
+    #[test]
+    fn own_generation_result_terminates() {
+        assert_eq!(
+            classify_pair_event(result(2, PairingOutcome::Expired), 2),
+            PairEvent::Result(PairingOutcome::Expired)
+        );
+    }
+
+    #[test]
+    fn stale_generation_arrival_is_ignored() {
+        assert_eq!(classify_pair_event(arrived(1, 0xEE), 2), PairEvent::Ignore);
+    }
+
+    #[test]
+    fn own_generation_arrival_prompts() {
+        match classify_pair_event(arrived(2, 0xAB), 2) {
+            PairEvent::Arrived { device_id, .. } => assert_eq!(device_id, device(0xAB)),
+            other => panic!("expected Arrived, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_pairing_events_are_ignored() {
+        assert_eq!(
+            classify_pair_event(BridgeEvent::RosterChanged, 2),
+            PairEvent::Ignore
+        );
+        // A window replacement mid-session (any generation) is not part of
+        // this session's stream either.
+        assert_eq!(
+            classify_pair_event(
+                BridgeEvent::PairingWindowOpened {
+                    code: test_code(9),
+                    expires_at: far_future(),
+                    generation: 3,
+                },
+                2
+            ),
+            PairEvent::Ignore
+        );
+    }
+
+    // ---- handle_pair end-to-end over a socketpair, with a scripted engine:
+    // the back-to-back scenario from #299, made deterministic. ----
+
+    fn test_code(seed: u8) -> PairingCode {
+        PairingCode {
+            relay_url: Some("ws://127.0.0.1:1".to_string()),
+            rendezvous_token: Some(format!("tok-{seed}")),
+            mesh_addr: None,
+            psk: [seed; 32],
+            bridge_id: device(9),
+            bridge_key: [8u8; 32],
+            bridge_name: None,
+            min_protocol: PROTOCOL_VERSION,
+        }
+    }
+
+    fn far_future() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            + 3600
+    }
+
+    /// A DaemonState backed by a scripted fake engine: the test drives
+    /// `commands_rx` (replies to OpenWindow) and `events_tx` (the broadcast
+    /// stream) by hand.
+    fn test_state() -> (
+        DaemonState,
+        mpsc::Receiver<PairingCommand>,
+        broadcast::Sender<BridgeEvent>,
+    ) {
+        let (commands_tx, commands_rx) = mpsc::channel::<PairingCommand>(8);
+        let (events_tx, _) = broadcast::channel::<BridgeEvent>(64);
+        // The sender may drop: a watch receiver keeps serving the last value.
+        let (_health_tx, health_rx) = watch::channel(BridgeHealth::Connected { since: 0 });
+        let state = DaemonState {
+            commands: commands_tx,
+            events: events_tx.clone(),
+            health: health_rx,
+            roster: Arc::new(RwLock::new(Roster::default())),
+            device_id: "bridge-id".to_string(),
+            fingerprint: "br:fp".to_string(),
+        };
+        (state, commands_rx, events_tx)
+    }
+
+    /// Spawns `handle_pair` over a fresh socketpair, returning the client end
+    /// (as a line reader) and the session task handle.
+    fn spawn_session(
+        state: DaemonState,
+        ttl_secs: u64,
+    ) -> (
+        tokio::io::Lines<tokio::io::BufReader<tokio::net::UnixStream>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (client, server) = tokio::net::UnixStream::pair().expect("socketpair");
+        let (srd, swr) = server.into_split();
+        let session = tokio::spawn(handle_pair(
+            BufReader::new(srd),
+            swr,
+            state,
+            Arc::new(Mutex::new(())),
+            ttl_secs,
+            CancellationToken::new(),
+        ));
+        let lines = tokio::io::BufReader::new(client).lines();
+        (lines, session)
+    }
+
+    /// Reads and decodes the next ctl response line, bounded so a regression
+    /// hangs the assertion, not CI.
+    async fn next_resp(
+        lines: &mut tokio::io::Lines<tokio::io::BufReader<tokio::net::UnixStream>>,
+    ) -> CtlResponse {
+        let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .expect("response within deadline")
+            .expect("read response line")
+            .expect("connection stayed open");
+        serde_json::from_str(&line).expect("decode ctl response")
+    }
+
+    /// Receives the session's OpenWindow command and replies with `code`,
+    /// completing the scripted engine's open phase. Events may only be
+    /// broadcast after this returns: the session subscribes before sending
+    /// OpenWindow, so ordering is deterministic.
+    async fn answer_open_window(
+        commands_rx: &mut mpsc::Receiver<PairingCommand>,
+        code: &PairingCode,
+    ) {
+        let cmd = tokio::time::timeout(Duration::from_secs(10), commands_rx.recv())
+            .await
+            .expect("OpenWindow within deadline")
+            .expect("command channel open");
+        match cmd {
+            PairingCommand::OpenWindow { reply, .. } => {
+                reply.send(Ok(code.clone())).expect("reply accepted");
+            }
+            other => panic!("expected OpenWindow, got {other:?}"),
+        }
+    }
+
+    // #299: session 2 opens its window, then the OLD window's asynchronous
+    // Expired (and a stale arrival) land after its own WindowOpened. The
+    // session must NOT report "expired" — it keeps waiting and reaches its
+    // real outcome.
+    #[tokio::test]
+    async fn stale_expired_from_a_replaced_window_does_not_terminalize_a_fresh_session() {
+        let (state, mut commands_rx, events_tx) = test_state();
+        let (mut lines, session) = spawn_session(state, 30);
+
+        let code = test_code(2);
+        answer_open_window(&mut commands_rx, &code).await;
+
+        // This session's window: generation 2.
+        events_tx
+            .send(BridgeEvent::PairingWindowOpened {
+                code: code.clone(),
+                expires_at: far_future(),
+                generation: 2,
+            })
+            .expect("send opened");
+        // The replaced window's responder task reports asynchronously — the
+        // millisecond race from #299, scripted deterministically: its Expired
+        // (and a stale arrival) arrive AFTER the fresh WindowOpened.
+        events_tx
+            .send(result(1, PairingOutcome::Expired))
+            .expect("send stale expired");
+        events_tx
+            .send(arrived(1, 0xEE))
+            .expect("send stale arrival");
+        // The fresh window's real ceremony.
+        events_tx.send(arrived(2, 0xAB)).expect("send arrival");
+        events_tx
+            .send(result(
+                2,
+                PairingOutcome::Paired {
+                    device_id: device(0xAB),
+                    name: "phone".to_string(),
+                },
+            ))
+            .expect("send paired");
+
+        match next_resp(&mut lines).await {
+            CtlResponse::WindowOpened { code: c, .. } => assert_eq!(c, code.encode()),
+            other => panic!("expected WindowOpened, got {other:?}"),
+        }
+        // The very next line must be THIS window's arrival — a stale Expired
+        // (or stale arrival) surfacing here is the #299 bug.
+        match next_resp(&mut lines).await {
+            CtlResponse::DeviceArrived { device_id, .. } => {
+                assert_eq!(device_id, device(0xAB).to_string());
+            }
+            other => panic!("stale event leaked into the fresh session: {other:?}"),
+        }
+        match next_resp(&mut lines).await {
+            CtlResponse::PairResult { outcome, .. } => assert_eq!(outcome, "paired"),
+            other => panic!("expected PairResult, got {other:?}"),
+        }
+
+        session.await.expect("session task");
+        // The session resolved for real, so the fail-safe must NOT have
+        // cancelled the (already consumed) window.
+        assert!(
+            commands_rx.try_recv().is_err(),
+            "no CancelWindow after a genuine result"
+        );
+    }
+
+    // A stale WindowOpened still in flight from an earlier session must not be
+    // adopted: the session waits for the event carrying ITS code, so it binds
+    // to the right generation and deadline.
+    #[tokio::test]
+    async fn stale_window_opened_is_not_adopted_by_a_fresh_session() {
+        let (state, mut commands_rx, events_tx) = test_state();
+        let (mut lines, session) = spawn_session(state, 30);
+
+        let code = test_code(2);
+        answer_open_window(&mut commands_rx, &code).await;
+
+        let ours = far_future();
+        // An earlier window's WindowOpened (different code, older generation)
+        // delivered late — before our own.
+        events_tx
+            .send(BridgeEvent::PairingWindowOpened {
+                code: test_code(1),
+                expires_at: 111,
+                generation: 1,
+            })
+            .expect("send stale opened");
+        events_tx
+            .send(BridgeEvent::PairingWindowOpened {
+                code: code.clone(),
+                expires_at: ours,
+                generation: 2,
+            })
+            .expect("send opened");
+        // Prove the session bound generation 2, not 1: a gen-1 Expired is
+        // ignored, a gen-2 result terminates.
+        events_tx
+            .send(result(1, PairingOutcome::Expired))
+            .expect("send stale expired");
+        events_tx
+            .send(result(
+                2,
+                PairingOutcome::Rejected {
+                    device_id: device(0xAB),
+                },
+            ))
+            .expect("send rejected");
+
+        match next_resp(&mut lines).await {
+            CtlResponse::WindowOpened {
+                code: c,
+                expires_at,
+            } => {
+                assert_eq!(c, code.encode(), "the session announces ITS window");
+                assert_eq!(
+                    expires_at, ours,
+                    "the deadline is ITS window's, not the stale one"
+                );
+            }
+            other => panic!("expected WindowOpened, got {other:?}"),
+        }
+        match next_resp(&mut lines).await {
+            CtlResponse::PairResult { outcome, .. } => {
+                assert_eq!(
+                    outcome, "rejected",
+                    "gen-2 result, not the stale gen-1 expired"
+                );
+            }
+            other => panic!("expected PairResult, got {other:?}"),
+        }
+
+        session.await.expect("session task");
     }
 }
