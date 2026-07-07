@@ -20,6 +20,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   credential before the window closes. Kicked victims also now reliably see
   their 4001 close code — the writer no longer races the reader's close frame
   with a bare socket close when the router deregisters a connection.
+- **Bridge event delivery no longer rides the serve hot path** (#283):
+  `serve_bridge` now hands `BridgeEvent`s to a dedicated forwarder task over
+  an internal non-blocking queue, so a consumer that stalls on the event
+  channel can never head-of-line-block inbound frame dispatch for all peers.
+  Nothing is dropped and per-pairing event order is preserved. Also reaps the
+  fire-and-forget `RegisterPairing` control waiter after the ack timeout, so
+  a relay that never answers no longer parks the entry until connection
+  teardown.
+- **`remora-bridge pair` no longer reports "expired" for an enrollment that
+  committed** (#300): a Confirm/Reject answered near the window deadline could
+  race the daemon's authoritative pairing result — the client-side deadline
+  fired first and printed "expired" even though the roster had gained the
+  device. Once a decision has been sent, the pair client now waits a bounded
+  grace (5s) for the authoritative result and reports it; if none arrives it
+  reports an honest indeterminate outcome pointing at `remora-bridge devices`
+  instead of a flat "expired". A deadline before any decision still reports
+  expired, and the daemon-side window lifetime is untouched (fail-closed).
+- **Push-endpoint validation and wake-delivery fail-over** (#290): the push
   endpoint validator now rejects degenerate hosts a naive check let through —
   an explicitly empty bracketed IPv6 host (`https://[]:8080/x`), an
   unterminated bracket, and junk between the bracket and the port. Relay wake
@@ -48,6 +66,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Live `[relay]` reconfig via the config watcher** (#277): the desktop's
+  hosted relay bridge no longer reads `[relay]` only at launch. Editing the
+  config now starts the bridge when the section is added, cleanly restarts it
+  when `relay_url`/`registration_token` change, and cleanly stops it when the
+  section is removed — no app relaunch. A clean stop actually reaps the
+  bridge: the serve and event-forwarder tasks are joined (releasing the
+  bridge identity lock, previously held until process exit), the push-wake
+  tee is rewired to the current bridge, and Settings→Devices commands fail
+  with "relay not configured" instead of talking to a dead bridge's channels.
+  Unrelated config edits (including `push_wake_url`, which the hosted bridge
+  never reads) never churn live relay connections.
 - **Relay SIGHUP config reload** (#276): `remora-relay` now re-reads its TOML
   config on `SIGHUP` and hot-swaps the `[[bridges]]` table without dropping
   live connections, so operators can rotate bridge registration tokens in

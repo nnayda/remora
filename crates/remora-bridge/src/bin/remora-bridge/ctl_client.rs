@@ -221,9 +221,21 @@ async fn pair(state_dir: &Path, ttl_secs: u64) -> Result<ExitCode, String> {
     let deadline = window_deadline(expires_at);
 
     let mut stdin = BufReader::new(tokio::io::stdin());
+    // Set once a Confirm/Reject has gone out. From then on the daemon owns
+    // the outcome, so the local deadline stops meaning "expired" (#300): a
+    // decision answered near the deadline may have committed the enrollment
+    // daemon-side even though the authoritative PairResult is still in flight.
+    let mut decision_sent = false;
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => {
+                if decision_sent {
+                    // Prefer the event channel for a bounded moment so the
+                    // authoritative result can arrive and be reported truthfully.
+                    let wait =
+                        await_result_after_decision(&mut rx, DECISION_RESULT_GRACE).await;
+                    return report_decision_wait(wait);
+                }
                 let _ = write_req(&mut wr, &CtlRequest::PairCancel).await;
                 return expired();
             }
@@ -240,6 +252,18 @@ async fn pair(state_dir: &Path, ttl_secs: u64) -> Result<ExitCode, String> {
                     let mut answer = String::new();
                     let confirm = tokio::select! {
                         _ = tokio::time::sleep_until(deadline) => {
+                            if decision_sent {
+                                // A prior decision is already with the daemon
+                                // (this prompt was for a later arrival); its
+                                // outcome may have committed — same grace as
+                                // the outer deadline branch (#300).
+                                let wait = await_result_after_decision(
+                                    &mut rx,
+                                    DECISION_RESULT_GRACE,
+                                )
+                                .await;
+                                return report_decision_wait(wait);
+                            }
                             let _ = write_req(&mut wr, &CtlRequest::PairCancel).await;
                             return expired();
                         }
@@ -259,33 +283,120 @@ async fn pair(state_dir: &Path, ttl_secs: u64) -> Result<ExitCode, String> {
                         CtlRequest::PairReject { device_id }
                     };
                     write_req(&mut wr, &decision).await?;
+                    decision_sent = true;
                     // Loop back to await the daemon's authoritative PairResult.
                 }
                 Some(Ok(CtlResponse::PairResult { outcome, .. })) => {
-                    return match outcome.as_str() {
-                        "paired" => {
-                            println!("Device enrolled.");
-                            Ok(ExitCode::SUCCESS)
-                        }
-                        // The operator's reject is a completed ceremony, not a failure.
-                        "rejected" => {
-                            println!("Enrollment rejected.");
-                            Ok(ExitCode::SUCCESS)
-                        }
-                        "expired" => expired(),
-                        other => Err(format!("unexpected pairing outcome: {other}")),
-                    };
+                    return report_outcome(&outcome);
                 }
                 Some(Ok(CtlResponse::Error { message })) => return Err(message),
                 Some(Ok(other)) => {
                     return Err(format!("unexpected response during pairing: {other:?}"))
                 }
                 Some(Err(e)) => return Err(e),
-                // Daemon dropped the connection with no result — treat as expiry.
-                None => return expired(),
+                // Daemon dropped the connection with no result: before any
+                // decision that reads as expiry; after one it is indeterminate
+                // (the enrollment may have committed before the drop).
+                None => {
+                    return if decision_sent {
+                        no_result_after_decision()
+                    } else {
+                        expired()
+                    };
+                }
             }
         }
     }
+}
+
+/// How long the client keeps listening for the daemon's authoritative
+/// `PairResult` after a Confirm/Reject decision has been sent but the local
+/// window deadline has fired (#300). Distinct from the clock-skew grace in
+/// [`window_deadline`]: this one only covers the last hop — the result
+/// normally arrives within milliseconds (local socket plus one engine round
+/// trip), so a few seconds absorbs a loaded host without letting a wedged
+/// daemon hang the CLI. Purely a client-side wait: the daemon-side window
+/// lifetime is untouched and stays fail-closed.
+const DECISION_RESULT_GRACE: Duration = Duration::from_secs(5);
+
+/// Terminal reading of the post-decision grace wait (#300).
+#[derive(Debug, PartialEq)]
+enum DecisionWait {
+    /// The authoritative `PairResult` outcome arrived within the grace.
+    Outcome(String),
+    /// The daemon reported an error (or the stream broke) during the wait.
+    Failed(String),
+    /// No result before the grace elapsed (or the daemon dropped the
+    /// connection): the enrollment may or may not have committed.
+    NoResult,
+}
+
+/// Drains the event channel for a bounded grace, looking for the
+/// authoritative `PairResult`. Factored off the socket loop so the
+/// decision-then-deadline race is unit-testable with a plain channel.
+async fn await_result_after_decision(
+    rx: &mut tokio::sync::mpsc::Receiver<Result<CtlResponse, String>>,
+    grace: Duration,
+) -> DecisionWait {
+    let grace_deadline = tokio::time::Instant::now() + grace;
+    loop {
+        let msg = tokio::select! {
+            _ = tokio::time::sleep_until(grace_deadline) => return DecisionWait::NoResult,
+            msg = rx.recv() => msg,
+        };
+        match msg {
+            Some(Ok(CtlResponse::PairResult { outcome, .. })) => {
+                return DecisionWait::Outcome(outcome);
+            }
+            Some(Ok(CtlResponse::Error { message })) => return DecisionWait::Failed(message),
+            // Anything else on a window already past its deadline is stale
+            // chatter (e.g. a late second arrival we can no longer prompt
+            // for); only the result or an error terminates the wait.
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return DecisionWait::Failed(e),
+            None => return DecisionWait::NoResult,
+        }
+    }
+}
+
+/// Maps the grace-wait reading to the process outcome.
+fn report_decision_wait(wait: DecisionWait) -> Result<ExitCode, String> {
+    match wait {
+        DecisionWait::Outcome(outcome) => report_outcome(&outcome),
+        DecisionWait::Failed(message) => Err(message),
+        DecisionWait::NoResult => no_result_after_decision(),
+    }
+}
+
+/// Renders the daemon's authoritative pairing outcome (shared by the normal
+/// event-stream path and the post-decision grace path).
+fn report_outcome(outcome: &str) -> Result<ExitCode, String> {
+    match outcome {
+        "paired" => {
+            println!("Device enrolled.");
+            Ok(ExitCode::SUCCESS)
+        }
+        // The operator's reject is a completed ceremony, not a failure.
+        "rejected" => {
+            println!("Enrollment rejected.");
+            Ok(ExitCode::SUCCESS)
+        }
+        "expired" => expired(),
+        other => Err(format!("unexpected pairing outcome: {other}")),
+    }
+}
+
+/// A decision went out but no authoritative result came back before the
+/// window deadline plus grace: the enrollment may have committed daemon-side,
+/// so calling it "expired" would lie (#300). Report indeterminate, point at
+/// the roster, and exit nonzero like `expired` (a user-facing outcome, not an
+/// internal error — no `remora-bridge:` prefix).
+fn no_result_after_decision() -> Result<ExitCode, String> {
+    eprintln!(
+        "no pairing result before the window deadline — the decision was sent; \
+         run `remora-bridge devices` to see whether the device enrolled"
+    );
+    Ok(ExitCode::FAILURE)
 }
 
 /// The client-side expiry outcome (D13a): a user-facing next step on stderr and
@@ -373,5 +484,92 @@ fn print_device_table(devices: &[DeviceDto]) {
     print_row(&headers.map(str::to_string));
     for row in &rows {
         print_row(row);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    fn result_line(outcome: &str) -> Result<CtlResponse, String> {
+        Ok(CtlResponse::PairResult {
+            outcome: outcome.to_string(),
+            device_id: None,
+            name: None,
+        })
+    }
+
+    // #300: the authoritative result beats the grace deadline and is reported,
+    // not swallowed by a flat "expired".
+    #[tokio::test(start_paused = true)]
+    async fn grace_reports_a_late_pair_result() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(result_line("paired")).await.expect("send");
+        let wait = await_result_after_decision(&mut rx, Duration::from_secs(5)).await;
+        assert_eq!(wait, DecisionWait::Outcome("paired".to_string()));
+    }
+
+    // A daemon-asserted "expired" arriving during the grace is still honored —
+    // the grace defers to the authoritative outcome, whatever it is.
+    #[tokio::test(start_paused = true)]
+    async fn grace_defers_to_an_authoritative_expired() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(result_line("expired")).await.expect("send");
+        let wait = await_result_after_decision(&mut rx, Duration::from_secs(5)).await;
+        assert_eq!(wait, DecisionWait::Outcome("expired".to_string()));
+    }
+
+    // Stale chatter (e.g. a late second arrival) must not terminate the wait;
+    // only the result does.
+    #[tokio::test(start_paused = true)]
+    async fn grace_skips_stale_chatter_before_the_result() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(Ok(CtlResponse::DeviceArrived {
+            device_id: "feedbeef".to_string(),
+            name: "late phone".to_string(),
+            fingerprint: "aa:bb".to_string(),
+        }))
+        .await
+        .expect("send");
+        tx.send(result_line("paired")).await.expect("send");
+        let wait = await_result_after_decision(&mut rx, Duration::from_secs(5)).await;
+        assert_eq!(wait, DecisionWait::Outcome("paired".to_string()));
+    }
+
+    // The grace is bounded: with no result it ends as the indeterminate
+    // NoResult, never hanging the CLI on a wedged daemon.
+    #[tokio::test(start_paused = true)]
+    async fn grace_elapsing_without_a_result_is_indeterminate() {
+        // tx stays alive so the channel never closes; the paused clock
+        // auto-advances to the grace deadline once recv() is the only waiter.
+        let (tx, mut rx) = mpsc::channel::<Result<CtlResponse, String>>(8);
+        let wait = await_result_after_decision(&mut rx, Duration::from_secs(5)).await;
+        assert_eq!(wait, DecisionWait::NoResult);
+        drop(tx);
+    }
+
+    // A daemon that drops the connection after the decision is indeterminate
+    // (the enrollment may have committed before the drop), not "expired".
+    #[tokio::test(start_paused = true)]
+    async fn daemon_drop_during_grace_is_indeterminate() {
+        let (tx, mut rx) = mpsc::channel::<Result<CtlResponse, String>>(8);
+        drop(tx);
+        let wait = await_result_after_decision(&mut rx, Duration::from_secs(5)).await;
+        assert_eq!(wait, DecisionWait::NoResult);
+    }
+
+    // An explicit daemon error (or stream decode failure) still surfaces as an
+    // error, not as the indeterminate outcome.
+    #[tokio::test(start_paused = true)]
+    async fn daemon_error_during_grace_fails() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(Ok(CtlResponse::Error {
+            message: "boom".to_string(),
+        }))
+        .await
+        .expect("send");
+        let wait = await_result_after_decision(&mut rx, Duration::from_secs(5)).await;
+        assert_eq!(wait, DecisionWait::Failed("boom".to_string()));
     }
 }

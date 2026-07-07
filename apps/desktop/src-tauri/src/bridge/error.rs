@@ -75,8 +75,9 @@ pub enum BridgeError {
         reason: DirtyReasonDto,
     },
     /// A relay/pairing command was invoked but this device hosts no relay bridge
-    /// (no `[relay]` section, so no `PairingHandles` in managed state). The UI
-    /// shows a "relay not configured" state instead of a pairing panel.
+    /// (no `[relay]` section — or it was removed by a live config edit, #277 —
+    /// so the supervisor holds no `PairingHandles`). The UI shows a "relay not
+    /// configured" state instead of a pairing panel.
     RelayNotConfigured {
         message: String,
     },
