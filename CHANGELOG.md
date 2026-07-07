@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Relay SIGHUP config reload** (#276): `remora-relay` now re-reads its TOML
+  config on `SIGHUP` and hot-swaps the `[[bridges]]` table without dropping
+  live connections, so operators can rotate bridge registration tokens in
+  place (`kill -HUP`, or `docker kill --signal=HUP` for the container). A
+  reload that fails to parse keeps the running config; non-hot fields — most
+  notably `listen` — are detected and logged as requiring a restart, never
+  half-applied.
 - **Headless `remora-bridge` binary** (#234, ADR-0021): `serve` daemon with a
   hardened Unix ctl socket, `init`/`pair`/`devices`/`revoke`/`status`/
   `fingerprint` CLI (copy-paste pairing code, confirm-gated enrollment that

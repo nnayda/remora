@@ -22,7 +22,7 @@ mod router;
 mod server;
 
 pub use audit::{AuditRecord, AuditSink, CloseReason, PushEndpointWarning};
-pub use config::{AuditConfig, BridgeEntry, RelayConfig, RelayConfigError};
+pub use config::{AuditConfig, BridgeEntry, RelayConfig, RelayConfigError, ReloadOutcome};
 pub use push::{decide_wake, DropReason, PushConfig, PushState, StoredRegistration};
 pub use router::{
     outbound_channel, ConnPermit, ControlOutcome, HelloOutcome, OutboundFrame, OutboundHandle,

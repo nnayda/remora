@@ -14,7 +14,7 @@ use remora_protocol::{
     AssertedDevice, DeviceId, Envelope, FrameType, HelloRole, RelayControl, RelayControlAck,
     RelayHello,
 };
-use remora_relay::{serve, AuditConfig, AuditSink, BridgeEntry, PushConfig, RelayConfig};
+use remora_relay::{serve, AuditConfig, AuditSink, BridgeEntry, PushConfig, RelayConfig, Router};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
@@ -129,9 +129,15 @@ fn control_frame(src: u8, control: &RelayControl) -> Vec<u8> {
 }
 
 async fn start(config: Arc<RelayConfig>) -> String {
+    start_with_router(config).await.0
+}
+
+/// [`start`] that also hands back the server's [`Router`], for the reload test
+/// (#276) that hot-swaps the bridges table under a live relay.
+async fn start_with_router(config: Arc<RelayConfig>) -> (String, Arc<Router>) {
     let audit = AuditSink::new(&config).expect("audit sink");
-    let (addr, _handle) = serve(config, audit).await.expect("serve binds");
-    format!("ws://{addr}")
+    let (addr, router, _handle) = serve(config, audit).await.expect("serve binds");
+    (format!("ws://{addr}"), router)
 }
 
 async fn connect(url: &str) -> Ws {
@@ -291,6 +297,46 @@ async fn bridge_control_assert_then_device_pairs_and_routes() {
     send_bin(&mut device, pairing.clone()).await;
     let got = recv_bin(&mut bridge).await;
     assert_eq!(got, pairing, "bridge received the identical Pairing frame");
+}
+
+#[tokio::test]
+async fn bridge_table_reload_rotates_tokens_without_dropping_live_connections() {
+    // #276: hot-swap the bridges table under a live relay — the same
+    // `Router::reload_bridges` call the binary's SIGHUP handler makes — and
+    // verify the rotation semantics end to end over the wire.
+    let (url, router) = start_with_router(base_config(None)).await;
+
+    // A bridge admitted under the old token, with its device asserted.
+    let mut bridge = bridge_with_asserted_device(&url).await;
+
+    // Rotate the bridge's registration token.
+    router.reload_bridges(vec![BridgeEntry {
+        token: "rotated-tok".to_string(),
+        device_id: did(BRIDGE),
+    }]);
+
+    // A NEW connection presenting the old token is rejected (4001)...
+    let mut stale = connect(&url).await;
+    send_bin(&mut stale, hello_frame(&bridge_hello())).await;
+    expect_close(&mut stale, 4001).await;
+
+    // ...while the live bridge — admitted before the rotation — keeps routing:
+    // its asserted device connects and a Pairing frame flows to it verbatim.
+    let mut device = connect(&url).await;
+    send_bin(&mut device, hello_frame(&device_hello())).await;
+    let pairing = frame(FrameType::Pairing, DEV_ROUTING, BRIDGE);
+    send_bin(&mut device, pairing.clone()).await;
+    let got = recv_bin(&mut bridge).await;
+    assert_eq!(got, pairing, "live bridge still routes after the rotation");
+
+    // The rotated token is admitted: its hello displaces the live bridge
+    // (newest-wins), observable as the old connection's 4009 close — proof the
+    // new credential authenticated.
+    let mut rotated_hello = bridge_hello();
+    rotated_hello.token = "rotated-tok".to_string();
+    let mut rotated = connect(&url).await;
+    send_bin(&mut rotated, hello_frame(&rotated_hello)).await;
+    expect_close(&mut bridge, 4009).await;
 }
 
 #[tokio::test]

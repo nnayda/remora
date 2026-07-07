@@ -27,9 +27,14 @@ against is asserted by each bridge, never configured here).
 remora-relay /etc/remora/relay.toml
 ```
 
-The config path is the one and only argument. There is no hot-reload:
-changing the file has no effect until the process restarts (see
-[Token rotation](#token-rotation-and-revocation) below).
+The config path is the one and only argument. On Unix, sending the process
+`SIGHUP` re-reads that file and hot-swaps the `[[bridges]]` table without
+dropping live connections (see
+[Token rotation](#token-rotation-and-revocation) below). Every other field —
+most notably `listen` — still requires a restart: a changed value is detected
+and logged as needing one, never half-applied. A reload that fails to read or
+parse keeps the running config and logs the error. In the container, send the
+signal with `docker kill --signal=HUP <container>`.
 
 ### Container image
 
@@ -234,12 +239,17 @@ reachable once that flag is on.
 
 ## Token rotation and revocation
 
-There is no admin API and no hot-reload for **bridge** tokens: to rotate or
-revoke one, edit `relay.toml` (remove or replace the `[[bridges]]` entry) and
-restart the process. A bridge connection already routing under a removed
-token stays up until it next disconnects or is killed by the operator (e.g.
-`docker restart`); there is no live-kick of an already-admitted connection
-today.
+To rotate or revoke a **bridge** token, edit `relay.toml` (remove or replace
+the `[[bridges]]` entry) and send the relay `SIGHUP` (`kill -HUP <pid>`, or
+`docker kill --signal=HUP <container>`): the `[[bridges]]` table is re-read
+and swapped in place, with no restart and no dropped connections (#276).
+There is still no admin API. The swap governs only *future* registrations —
+a bridge connection already routing under a removed or rotated token stays up
+until it next disconnects or is killed by the operator (e.g. `docker
+restart`); there is no live-kick of an already-admitted connection today. A
+reload that fails to parse keeps the old table and logs the error; a changed
+field other than `[[bridges]]` (e.g. `listen`) is logged as requiring a
+restart and left unapplied.
 
 **Device** tokens are never in `relay.toml` at all (ADR-0021 D4) — pairing and
 revocation are bridge-side operations (the desktop's Devices panel, or a

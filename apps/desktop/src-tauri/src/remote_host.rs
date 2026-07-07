@@ -175,7 +175,7 @@ pub async fn start_loopback(
         push: loopback_push_config(push_endpoint.as_deref()),
     });
     let audit = AuditSink::new(&relay_cfg)?;
-    let (addr, relay_accept) = serve(relay_cfg, audit).await?;
+    let (addr, _relay_router, relay_accept) = serve(relay_cfg, audit).await?;
     let relay_url = format!("ws://{addr}");
 
     // The bridge serves through the *same* wrapping resolver the direct path

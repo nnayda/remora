@@ -44,7 +44,7 @@ async fn relay_and_config(dir: &Path) -> (std::path::PathBuf, tokio::task::JoinH
         push: remora_relay::PushConfig::default(),
     });
     let audit = remora_relay::AuditSink::new(&relay_cfg).expect("audit");
-    let (addr, accept) = remora_relay::serve(relay_cfg, audit).await.expect("relay");
+    let (addr, _router, accept) = remora_relay::serve(relay_cfg, audit).await.expect("relay");
 
     let config = dir.join("config.toml");
     std::fs::write(
