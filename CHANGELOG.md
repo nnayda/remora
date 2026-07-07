@@ -17,6 +17,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fire-and-forget `RegisterPairing` control waiter after the ack timeout, so
   a relay that never answers no longer parks the entry until connection
   teardown.
+- **`remora-bridge pair` no longer reports "expired" for an enrollment that
+  committed** (#300): a Confirm/Reject answered near the window deadline could
+  race the daemon's authoritative pairing result — the client-side deadline
+  fired first and printed "expired" even though the roster had gained the
+  device. Once a decision has been sent, the pair client now waits a bounded
+  grace (5s) for the authoritative result and reports it; if none arrives it
+  reports an honest indeterminate outcome pointing at `remora-bridge devices`
+  instead of a flat "expired". A deadline before any decision still reports
+  expired, and the daemon-side window lifetime is untouched (fail-closed).
+- **Push-endpoint validation and wake-delivery fail-over** (#290): the push
+  endpoint validator now rejects degenerate hosts a naive check let through —
+  an explicitly empty bracketed IPv6 host (`https://[]:8080/x`), an
+  unterminated bracket, and junk between the bracket and the port. Relay wake
+  delivery no longer gives up when TCP connect to the first policy-passing
+  address fails: it fails over across the other SSRF-vetted addresses (each
+  attempt still pinned to exactly one checked address, capped at 3) before
+  falling back to the existing single delayed retry.
+- **Dev loopback no longer leaks its bridge task — or the bridge identity —
+  when pairing fails** (#297): `start_loopback` spawned the in-process bridge
+  before driving the pairing ceremony, and a pairing failure dropped the
+  task's `JoinHandle` without aborting it. The leaked task kept running for
+  the process life and, since #234's identity lock, kept holding the identity
+  flock — so the relay-bridge fallback (`REMORA_REMOTE_LOOPBACK=1` with
+  `[relay]` configured) failed with a misleading "in use by another bridge
+  process". The loopback's relay and bridge tasks now live in a drop-guard:
+  every early return aborts them, and the pairing-failure path awaits the
+  aborted tasks so the identity is claimable again before the fallback runs.
 - **macOS line-editing chords in the terminal**: Cmd+Delete (kill line
   backward), Cmd+Left / Cmd+Right (jump to line start/end), and
   Option+Delete (delete word) now work in the embedded terminal. xterm.js
@@ -28,6 +55,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Relay SIGHUP config reload** (#276): `remora-relay` now re-reads its TOML
+  config on `SIGHUP` and hot-swaps the `[[bridges]]` table without dropping
+  live connections, so operators can rotate bridge registration tokens in
+  place (`kill -HUP`, or `docker kill --signal=HUP` for the container). A
+  reload that fails to parse keeps the running config; non-hot fields — most
+  notably `listen` — are detected and logged as requiring a restart, never
+  half-applied.
 - **Headless `remora-bridge` binary** (#234, ADR-0021): `serve` daemon with a
   hardened Unix ctl socket, `init`/`pair`/`devices`/`revoke`/`status`/
   `fingerprint` CLI (copy-paste pairing code, confirm-gated enrollment that

@@ -75,19 +75,9 @@ pub struct RemoteHost {
     /// wake channel stays open for the loopback's life; `lib.rs` clones it into
     /// the Bridge via `set_wake_handle`.
     pub wake: BridgeWakeHandle,
-    shutdown: CancellationToken,
-    bridge_task: JoinHandle<()>,
-    relay_accept: JoinHandle<()>,
-}
-
-impl Drop for RemoteHost {
-    fn drop(&mut self) {
-        // Signal the bridge's reconnect loop to stop, then abort both tasks so a
-        // shutting-down app leaves no relay/bridge task spinning.
-        self.shutdown.cancel();
-        self.bridge_task.abort();
-        self.relay_accept.abort();
-    }
+    /// Keeps the relay + bridge tasks alive for the loopback's life; dropping
+    /// the host tears them down (see [`LoopbackTasks`]).
+    _tasks: LoopbackTasks,
 }
 
 impl RemoteHost {
@@ -99,10 +89,57 @@ impl RemoteHost {
         RemoteHost {
             remote,
             wake,
-            shutdown: CancellationToken::new(),
-            bridge_task: tokio::spawn(async {}),
-            relay_accept: tokio::spawn(async {}),
+            _tasks: LoopbackTasks {
+                shutdown: CancellationToken::new(),
+                bridge_task: tokio::spawn(async {}),
+                relay_accept: tokio::spawn(async {}),
+            },
         }
+    }
+}
+
+/// The loopback's spawned tasks plus their shutdown token, grouped so a single
+/// owner both keeps them alive and tears them down. On success the group moves
+/// into [`RemoteHost`]; until then it is a drop-guard inside [`start_loopback`],
+/// so *every* early return after the spawns aborts the tasks instead of leaking
+/// them for the process life (#297). The leak was load-bearing: the bridge task
+/// owns the [`remora_bridge::IdentityLock`], so a leaked task kept the identity
+/// flock and made the relay-bridge fallback in `lib.rs` fail with a misleading
+/// "in use by another bridge process".
+struct LoopbackTasks {
+    shutdown: CancellationToken,
+    bridge_task: JoinHandle<()>,
+    relay_accept: JoinHandle<()>,
+}
+
+impl Drop for LoopbackTasks {
+    fn drop(&mut self) {
+        // Signal the bridge's reconnect loop to stop, then abort both tasks so
+        // dropping the last owner (the RemoteHost of a shutting-down app, or the
+        // guard on an early return out of `start_loopback`) leaves no
+        // relay/bridge task spinning.
+        self.shutdown.cancel();
+        self.bridge_task.abort();
+        self.relay_accept.abort();
+    }
+}
+
+impl LoopbackTasks {
+    /// Aborts both tasks and waits for them to actually finish. `abort()` alone
+    /// only *signals*: the aborted future is dropped later, on a runtime worker.
+    /// The bridge task holds the identity flock, which is released only when its
+    /// future is dropped — so the pairing-failure path awaits here, guaranteeing
+    /// the identity is claimable again the moment `start_loopback` returns `Err`
+    /// and `lib.rs` falls back to the real relay bridge (#297).
+    async fn abort_and_wait(mut self) {
+        self.shutdown.cancel();
+        self.bridge_task.abort();
+        self.relay_accept.abort();
+        // `JoinHandle` is `Unpin`, so await through `&mut`, leaving `self` for
+        // its Drop (a no-op re-abort of finished tasks). A cancelled task
+        // resolves `Err(Cancelled)`; either way its future is gone on return.
+        let _ = (&mut self.bridge_task).await;
+        let _ = (&mut self.relay_accept).await;
     }
 }
 
@@ -175,7 +212,7 @@ pub async fn start_loopback(
         push: loopback_push_config(push_endpoint.as_deref()),
     });
     let audit = AuditSink::new(&relay_cfg)?;
-    let (addr, relay_accept) = serve(relay_cfg, audit).await?;
+    let (addr, _relay_router, relay_accept) = serve(relay_cfg, audit).await?;
     let relay_url = format!("ws://{addr}");
 
     // The bridge serves through the *same* wrapping resolver the direct path
@@ -224,16 +261,33 @@ pub async fn start_loopback(
         }
     });
 
+    // From here on the spawned tasks live inside the guard: any return path that
+    // does not hand them to a `RemoteHost` aborts them instead of leaking them
+    // (and, with the bridge task, the identity flock) for the process life (#297).
+    let tasks = LoopbackTasks {
+        shutdown,
+        bridge_task,
+        relay_accept,
+    };
+
     // Run the real pairing ceremony against our own bridge (dev-only auto-confirm)
     // and take the resulting durable `PairingFile` for the client transport.
-    let pairing = drive_loopback_pairing(commands_tx, events_rx).await?;
+    let pairing = match drive_loopback_pairing(commands_tx, events_rx).await {
+        Ok(pairing) => pairing,
+        Err(e) => {
+            // Tear the just-started relay + bridge down *to completion* before
+            // surfacing the failure: the caller falls back to the real relay
+            // bridge, which must be able to re-acquire the identity flock the
+            // bridge task is still holding (#297).
+            tasks.abort_and_wait().await;
+            return Err(e);
+        }
+    };
 
     Ok(RemoteHost {
         remote: Arc::new(RemoteSource::new(pairing).with_push_endpoint(push_endpoint)),
         wake,
-        shutdown,
-        bridge_task,
-        relay_accept,
+        _tasks: tasks,
     })
 }
 
@@ -358,6 +412,55 @@ mod tests {
             },
             PushConfig::default(),
         );
+    }
+
+    /// The crux of #297: `abort_and_wait` must not just *signal* the aborts but
+    /// wait for the tasks' futures to be dropped. The bridge task owns the
+    /// [`remora_bridge::IdentityLock`], and flock is per open-file-description,
+    /// so a leaked (or merely signalled) task blocks a same-process re-acquire —
+    /// exactly what the relay-bridge fallback in `lib.rs` does after a pairing
+    /// failure.
+    #[tokio::test]
+    async fn abort_and_wait_releases_the_identity_flock() {
+        // Unique pid-tagged dir so concurrent `cargo test` runs don't collide
+        // (matches the temp-path convention elsewhere in the crate).
+        let dir = std::env::temp_dir().join(format!("remora-loopback-297-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let identity_path = dir.join("bridge_identity.toml");
+        let lock = remora_bridge::IdentityLock::acquire(&identity_path).expect("first acquire");
+
+        // Mirror `start_loopback`: the lock lives inside the spawned bridge task
+        // and is released only when that task's future is dropped. The task parks
+        // on a channel nobody writes, like a reconnect loop that never exits.
+        let (_park_tx, park_rx) = tokio::sync::oneshot::channel::<()>();
+        let bridge_task = tokio::spawn(async move {
+            let _identity_lock = lock;
+            let _ = park_rx.await;
+        });
+
+        // Pre-fix symptom: while the bridge task lives, the identity is not
+        // claimable — this is the misleading "in use by another bridge process".
+        assert!(
+            remora_bridge::IdentityLock::acquire(&identity_path).is_err(),
+            "identity flock should be held while the bridge task lives"
+        );
+
+        let shutdown = CancellationToken::new();
+        let tasks = LoopbackTasks {
+            shutdown: shutdown.clone(),
+            bridge_task,
+            relay_accept: tokio::spawn(async {}),
+        };
+        tasks.abort_and_wait().await;
+
+        // The aborts were *awaited*, so the flock must already be free here — no
+        // polling or sleeping — and the cooperative shutdown was signalled too.
+        assert!(shutdown.is_cancelled(), "shutdown token must be cancelled");
+        drop(
+            remora_bridge::IdentityLock::acquire(&identity_path)
+                .expect("identity re-acquirable after teardown (#297)"),
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

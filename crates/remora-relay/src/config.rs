@@ -98,6 +98,74 @@ impl RelayConfig {
     pub fn from_toml_str(s: &str) -> Result<RelayConfig, RelayConfigError> {
         Ok(toml::from_str(s)?)
     }
+
+    /// Parses `contents` and merges it into this (running) config for a
+    /// SIGHUP reload (#276): [`RelayConfig::from_toml_str`] then
+    /// [`RelayConfig::merge_reload`]. A parse failure returns the error and
+    /// touches nothing — the caller keeps the running config unchanged.
+    pub fn reload_from_str(&self, contents: &str) -> Result<ReloadOutcome, RelayConfigError> {
+        Ok(self.merge_reload(RelayConfig::from_toml_str(contents)?))
+    }
+
+    /// Merges a freshly parsed config into this (running) one for a SIGHUP
+    /// reload (#276). Only the `bridges` table is hot-appliable; every other
+    /// field keeps its running value in [`ReloadOutcome::effective`] and, if
+    /// it changed in the file, is named in
+    /// [`ReloadOutcome::restart_required`] so the operator learns a restart
+    /// is needed rather than believing the change took effect.
+    ///
+    /// Because `effective` keeps the *running* values for non-hot fields, a
+    /// still-pending change (e.g. a new `listen` address) is re-flagged on
+    /// every subsequent reload until the process restarts.
+    pub fn merge_reload(&self, new: RelayConfig) -> ReloadOutcome {
+        let mut restart_required = Vec::new();
+        if new.listen != self.listen {
+            restart_required.push("listen");
+        }
+        if new.buffer_bytes != self.buffer_bytes {
+            restart_required.push("buffer_bytes");
+        }
+        if new.handshake_timeout_secs != self.handshake_timeout_secs {
+            restart_required.push("handshake_timeout_secs");
+        }
+        if new.max_connections != self.max_connections {
+            restart_required.push("max_connections");
+        }
+        if new.audit != self.audit {
+            restart_required.push("audit");
+        }
+        if new.push != self.push {
+            restart_required.push("push");
+        }
+        let bridges_changed = new.bridges != self.bridges;
+        let effective = RelayConfig {
+            bridges: new.bridges,
+            ..self.clone()
+        };
+        ReloadOutcome {
+            effective,
+            bridges_changed,
+            restart_required,
+        }
+    }
+}
+
+/// Result of merging a reloaded config into the running one
+/// ([`RelayConfig::merge_reload`], SIGHUP reload #276).
+#[derive(Debug, PartialEq)]
+pub struct ReloadOutcome {
+    /// The new effective config: the running config with the hot-appliable
+    /// `bridges` table taken from the reloaded file. Every non-hot field
+    /// keeps its running value, so this is what the caller should treat as
+    /// "running" from now on.
+    pub effective: RelayConfig,
+    /// Whether the `bridges` table actually changed (the caller only needs to
+    /// swap the router's live table when it did).
+    pub bridges_changed: bool,
+    /// Names of fields that changed in the file but are not hot-reloadable —
+    /// most notably `listen`: a listen-address change requires a restart, the
+    /// old listener stays bound. The caller logs one warning per entry.
+    pub restart_required: Vec<&'static str>,
 }
 
 /// Constant-time token comparison (`subtle::ConstantTimeEq` over bytes),
@@ -254,6 +322,138 @@ mod tests {
                 || err.to_string().to_lowercase().contains("hex")
                 || err.to_string().to_lowercase().contains("invalid"),
             "error should mention the parse failure, got: {err}"
+        );
+    }
+
+    /// A minimal running config with one bridge entry, for the reload tests.
+    fn running_config() -> RelayConfig {
+        let bridge_id = "11".repeat(32);
+        RelayConfig::from_toml_str(&format!(
+            r#"
+            listen = "127.0.0.1:9440"
+
+            [[bridges]]
+            token = "old-token"
+            device_id = "{bridge_id}"
+            "#
+        ))
+        .expect("valid running config")
+    }
+
+    #[test]
+    fn reload_swaps_bridges_table() {
+        let running = running_config();
+        let bridge_id = "11".repeat(32);
+        let outcome = running
+            .reload_from_str(&format!(
+                r#"
+                listen = "127.0.0.1:9440"
+
+                [[bridges]]
+                token = "rotated-token"
+                device_id = "{bridge_id}"
+                "#
+            ))
+            .expect("valid reload parses");
+
+        assert!(outcome.bridges_changed);
+        assert!(
+            outcome.restart_required.is_empty(),
+            "a pure token rotation needs no restart"
+        );
+        assert_eq!(outcome.effective.bridges.len(), 1);
+        assert_eq!(outcome.effective.bridges[0].token, "rotated-token");
+        // Everything else keeps its running value.
+        assert_eq!(outcome.effective.listen, running.listen);
+        assert_eq!(outcome.effective.buffer_bytes, running.buffer_bytes);
+    }
+
+    #[test]
+    fn reload_with_unchanged_bridges_reports_no_change() {
+        let running = running_config();
+        let bridge_id = "11".repeat(32);
+        let outcome = running
+            .reload_from_str(&format!(
+                r#"
+                listen = "127.0.0.1:9440"
+
+                [[bridges]]
+                token = "old-token"
+                device_id = "{bridge_id}"
+                "#
+            ))
+            .expect("valid reload parses");
+        assert!(!outcome.bridges_changed);
+        assert!(outcome.restart_required.is_empty());
+        assert_eq!(outcome.effective, running);
+    }
+
+    #[test]
+    fn reload_rejects_invalid_toml_without_touching_running_config() {
+        let running = running_config();
+        let err = running
+            .reload_from_str("listen = not-even-toml {{{")
+            .expect_err("malformed reload rejected");
+        assert!(err.to_string().contains("invalid relay config"));
+        // The running config is untouched by construction (`reload_from_str`
+        // borrows immutably); assert it still parses hellos as before.
+        assert_eq!(running.bridges[0].token, "old-token");
+    }
+
+    #[test]
+    fn reload_flags_listen_change_and_keeps_old_listener_address() {
+        let running = running_config();
+        let outcome = running
+            .reload_from_str(r#"listen = "0.0.0.0:9999""#)
+            .expect("valid reload parses");
+        assert!(outcome.restart_required.contains(&"listen"));
+        assert_eq!(
+            outcome.effective.listen, "127.0.0.1:9440",
+            "the effective config keeps the address actually bound"
+        );
+        // The bridges table in the file (empty) still applies.
+        assert!(outcome.bridges_changed);
+        assert!(outcome.effective.bridges.is_empty());
+    }
+
+    #[test]
+    fn reload_flags_every_non_hot_field() {
+        let running = running_config();
+        let outcome = running
+            .reload_from_str(
+                r#"
+                listen = "0.0.0.0:9999"
+                buffer_bytes = 42
+                handshake_timeout_secs = 99
+                max_connections = 7
+
+                [audit]
+                path = "/tmp/audit.log"
+
+                [push]
+                enabled = true
+                "#,
+            )
+            .expect("valid reload parses");
+        assert_eq!(
+            outcome.restart_required,
+            vec![
+                "listen",
+                "buffer_bytes",
+                "handshake_timeout_secs",
+                "max_connections",
+                "audit",
+                "push",
+            ]
+        );
+        // None of them are half-applied: the effective config keeps every
+        // running value except the (hot) bridges table.
+        assert_eq!(
+            outcome.effective,
+            RelayConfig {
+                bridges: Vec::new(),
+                ..running
+            }
         );
     }
 

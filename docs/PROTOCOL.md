@@ -42,8 +42,9 @@ Relay mode:    client ── WS/TLS ── relay (blind) ── WS/TLS ── br
 In relay mode the session protocol rides **unchanged** inside the Noise
 session; the envelope and the `remote` wrapper are the only surface relay mode
 adds. The bridge is the hosted `SessionSource` — it runs only on user hardware
-(in the desktop app today), so relay mode never puts session content or
-sandbox credentials on the relay.
+(in-process in the desktop app, or standalone as the headless
+`remora-bridge serve` daemon, #234), so relay mode never puts session content
+or sandbox credentials on the relay.
 
 ## Versioning
 
@@ -94,9 +95,10 @@ recoverable message.
   should not depend on JSON specifically for the payload, only on the shapes.
 - **Envelope: hand-rolled fixed-offset binary.** The relay is on the hot path
   for every keystroke, so its header is a fixed byte layout, not JSON (see
-  [The relay envelope](#the-relay-envelope)). The one exception is the
-  relay-visible `RelayHello` payload, which is serde JSON because the relay
-  must read it to authenticate the connection.
+  [The relay envelope](#the-relay-envelope)). The exceptions are the
+  relay-visible payloads — the `RelayHello` frame and the bridge → relay
+  `Control` plane — which are serde JSON because the relay must read them to
+  authenticate and administer the connection.
 - **Bytes are JSON number arrays.** `ChannelInput::Bytes` / `ChannelOutput::Bytes`
   encode raw PTY bytes as `[104, 105, ...]`. Bytes are **opaque** — never valid
   UTF-8 in general (split multibyte runs, ANSI control bytes) and never to be
@@ -254,14 +256,43 @@ analogue in direct mode). These are the plaintext the Noise layer seals.
 - **`Request { id, op }`** — `id` is a client-chosen correlation token the
   bridge echoes on the matching `Response`. Requests may interleave with each
   other and with the unsolicited `Input`/`Output` stream on the same session.
-  `RemoteOp` is `"list"` (discover sessions across the bridge's hosts) or
-  `{"attach":{project_id, session_id}}`.
-- **`RemoteResult`** in a `Response` is `{"sessions":[SessionMeta,…]}` (answers
-  `list`), `"attached"` (a successful `attach`; the channel stream follows on
-  the same session), or `{"error": WireError}`.
 - **`Input(ChannelInput)`** is meaningless before a successful
   `attach`; **`Output(ChannelOutput)`** and `channel_closed` are unsolicited
   stream events, not `Response`s.
+
+**`RemoteOp` / `RemoteResult`** — every operation a bridge supports, and the
+result that answers it on success. Any op may instead answer
+`{"error": WireError}`.
+
+| `RemoteOp` | `RemoteResult` | Meaning |
+| --- | --- | --- |
+| `"list"` | `{"sessions":[SessionMeta,…]}` | Discover sessions across the bridge's configured hosts. |
+| `{"attach":{project_id, session_id}}` | `"attached"` | Attach to one session; the channel stream follows on the same session. |
+| `"list_devices"` | `{"devices":[DeviceInfo,…]}` | List the bridge's paired devices (ADR-0021 D6 remote revocation, #232). |
+| `{"revoke_device":{"device_id":"<64 hex>"}}` | `"revoked"` | Revoke a device from the bridge's roster by id; a device revoking its own id is how unpairing works (#232). |
+| `{"register_push_endpoint":{"registration":…}}` | `"push_endpoint_set"` | Register — or, with `"registration":null`, clear — this device's push-wake endpoint ([ADR-0023](adr/0023-unifiedpush-first-wake-delivery.md), #233). |
+
+`DeviceInfo` (one paired device, in a `devices` result) is **display-safe**:
+the bridge sends `name` and `fingerprint` already sanitized.
+
+```json
+{"device_id":"<64 hex>","name":"iPhone","fingerprint":"ABCD-1234-EF56",
+ "enrolled_at":1765500000,"last_connected_at":null,"is_self":true}
+```
+
+`fingerprint` is the `XXXX-XXXX-XXXX` rendering of the device's static key
+(ADR-0021 D5); `enrolled_at`/`last_connected_at` are optional Unix epoch
+seconds; `is_self` is true on the entry that is the requesting device itself —
+revoking it unpairs the requester.
+
+`register_push_endpoint`'s `registration` is a `PushRegistration`
+([`push`](../crates/remora-protocol/src/push.rs)); v1's only variant is a
+UnifiedPush distributor endpoint,
+`{"unified_push":{"endpoint":"https://ntfy.sh/topic"}}`. The registration is
+**bridge-asserted**: the device tells its own bridge, which persists it in the
+device's roster entry and forwards it to the relay in every subsequent
+device-credential assertion — a device never registers push with the relay
+directly.
 
 `WireError` is the stable protocol projection of core's `SourceError` — it
 evolves append-only under `PROTOCOL_VERSION`, not 1:1 with core:
@@ -285,12 +316,13 @@ responsible for producing a value already safe to render (the same discipline
 
 Relay mode wraps every frame in a fixed-offset binary header the relay parses
 to route, around an opaque payload it never inspects (Noise ciphertext in
-practice; plain JSON only for the pre-Noise `RelayHello`).
+practice; plain JSON only for the pre-Noise `RelayHello` and the bridge-only
+`Control` plane).
 [`Envelope`](../crates/remora-protocol/src/envelope.rs):
 
 ```text
 offset 0    u8        ENVELOPE_VERSION            (decode rejects != 1)
-offset 1    u8        frame type                  (decode rejects > 3)
+offset 1    u8        frame type                  (decode rejects > 4)
 offset 2    [u8; 32]  src routing id (DeviceId)
 offset 34   [u8; 32]  dst routing id (DeviceId)
 offset 66   payload   0..=65535 bytes             (decode rejects longer)
@@ -309,16 +341,18 @@ touching the payload):
 | 1 | `Data` | Opaque session payload (Noise ciphertext). |
 | 2 | `Pairing` | Device pairing frame (ADR-0021, #232): carries the split-secret enrollment ceremony between a joining device and its bridge. |
 | 3 | `PushTrigger` | Bridge → relay wake request (ADR-0023, #233): an empty-payload frame asking the relay to decide whether a registered device needs a UnifiedPush wake. A device sending one is a protocol violation. |
+| 4 | `Control` | Bridge → relay control plane (ADR-0021 D4, #232): pairing-window lifecycle and device-credential assertion (`RelayControl`). Relay-terminated (`dst` all-zero) and relay-visible JSON, like `RelayHello`; the relay replies with a JSON ack/error correlated by `id`. Only a bridge may send one. |
 
 **`DeviceId`** is an opaque 32-byte routing identity. `DeviceId::ZERO`
-(all-zero) is reserved and valid **only** as the `dst` of a `Hello` frame,
-before the peer has learned a real routing id; any other use is a protocol
-violation the relay/bridge reject.
+(all-zero) is reserved and valid **only** as the `dst` of a `Hello` frame
+(before the peer has learned a real routing id) or of a relay-terminated
+`Control` frame; any other use is a protocol violation the relay/bridge
+reject.
 
-**`RelayHello`** (the `Hello` frame's payload, serde JSON) is the only
-relay-visible payload. It is how a peer introduces itself *to the relay* before
-any Noise session exists, so its fields are plaintext the relay legitimately
-reads to route and authenticate the connection — and nothing more.
+**`RelayHello`** (the `Hello` frame's payload, serde JSON) is how a peer
+introduces itself *to the relay* before any Noise session exists, so its
+fields are plaintext the relay legitimately reads to route and authenticate
+the connection — and nothing more.
 
 ```json
 {"role":"device","token":"<relay credential>",
@@ -391,7 +425,8 @@ The relay is a **blind forwarder**
 ([ADR-0021](adr/0021-blind-relay-bridge-trust-model.md)). By construction it
 legitimately observes: opaque `DeviceId`s and pairing-group association
 (routing); connection liveness, frame sizes, and timestamps; connection
-credentials (`RelayHello.token`); and push tokens. The protocol **never**
+credentials (`RelayHello.token`, the bridge's asserted device credentials);
+and push tokens. The protocol **never**
 requires it to see: session content, session names/previews, host config,
 sandbox addresses or credentials, agent identity, or repo/branch names — and an
 implementation must not leak these through routing headers, logs, or crash
@@ -405,17 +440,20 @@ consideration, not a v1 guarantee.
 ## Status and scope
 
 The types above are what [relay slice 1](adr/0021-blind-relay-bridge-trust-model.md)
-(#231) shipped: the envelope protocol, the Noise session, and one end-to-end
-PTY stream (attach, list). Since then, QR split-secret pairing and the
-`Pairing` frame (#232) and opt-in UnifiedPush wake delivery over the
-`PushTrigger` frame ([ADR-0023](adr/0023-unifiedpush-first-wake-delivery.md),
-#233) have both landed, each with its own `PROTOCOL_VERSION` bump (this page's
-`RemoteOp`/`RemoteResult` listing above predates both and does not yet enumerate
-`ListDevices`/`RevokeDevice`/`RegisterPushEndpoint`/`PushEndpointSet` — see the
-crate doc comments for the current, normative set). Deliberately **not** yet
-specified here, and owned by follow-ups: the headless bridge binary (#234) and
-the durable ciphertext-mailbox session record (#71). When those land, any new
-frame types or session messages version alongside `PROTOCOL_VERSION`.
+(#231) shipped — the envelope protocol, the Noise session, and one end-to-end
+PTY stream (attach, list) — plus what has landed on top of it, each with its
+own `PROTOCOL_VERSION` bump: QR split-secret pairing (#232), which added the
+`Pairing` and `Control` frames and the `list_devices`/`revoke_device` ops, and
+opt-in UnifiedPush wake delivery
+([ADR-0023](adr/0023-unifiedpush-first-wake-delivery.md), #233), which added
+the `PushTrigger` frame and the `register_push_endpoint` op. The headless
+bridge binary (#234) hosts this same protocol unchanged — it added no wire
+surface. Not yet specified on this page: the pairing ceremony's own message
+shapes (the `Pairing` frame's payload —
+[`pairing`](../crates/remora-protocol/src/pairing.rs) is the normative
+source), and the durable ciphertext-mailbox session record, owned by
+follow-up #71. When new frame types or session messages land, they version
+alongside `PROTOCOL_VERSION`.
 
 ## See also
 
