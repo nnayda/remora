@@ -55,10 +55,11 @@ nothing else:
 | `ctl.sock` | The Unix control socket the one-shot subcommands (`pair`, `devices`, `revoke`, `status`, `fingerprint`) dial to talk to a running `serve`. |
 
 Editing `[hosts]`/`[projects]`/`[agents]` takes effect on the next call that
-resolves them — no restart. `[relay]` is different: `relay_url`,
-`registration_token`, and `push_wake_url` are read once at `serve` startup, so
-changing any of them needs a restart to take effect — the same no-hot-reload
-convention the relay's own config follows.
+resolves them — no restart. `[relay]` is different: `relay_url` and
+`registration_token` are read once at `serve` startup, so changing either needs
+a restart to take effect — the same no-hot-reload convention the relay's own
+config follows. (`push_wake_url` is a device-side registration value the
+headless daemon does not yet act on — see the [Known gap](#health--ops) below.)
 
 ## First deploy (greenfield)
 
@@ -140,9 +141,9 @@ Once paired, manage the roster with:
   **Requires the live relay connection**: `revoke` checks bridge health first
   and refuses with a named error ("bridge is not connected to the relay
   (...); revoke needs the live connection to kick the device") if the bridge
-  is currently `reconnecting` or `rejected`, rather than writing a
-  half-applied revocation to disk that the relay hasn't actually heard about
-  yet.
+  is not currently connected (still `starting`, `reconnecting`, or `rejected`),
+  rather than writing a half-applied revocation to disk that the relay hasn't
+  actually heard about yet.
 
 ## Migration from the desktop bridge
 
@@ -293,7 +294,9 @@ other client reconnect is.
 end-to-end for the desktop app, whose session-output pump feeds the wake
 trigger, but the headless daemon has no equivalent pump yet — a disconnected
 phone paired only to a headless bridge will not currently get a push wake
-when a session needs attention. Tracked as a follow-up issue at ship.
+when a session needs attention, and `[relay] push_wake_url` is consequently
+inert in the headless config (carried through migration for when the pump
+lands, but read by nothing today). Tracked as a follow-up issue at ship.
 
 ## Reproducible builds
 

@@ -175,14 +175,41 @@ pub async fn run_serve(config_path: PathBuf, state_dir: PathBuf) -> Result<(), S
     let ctl_shutdown = shutdown.clone();
     let ctl_task = tokio::spawn(crate::ctl_server::serve_ctl(listener, state, ctl_shutdown));
 
-    // ---- Signals → cancel → cleanup (G3). ----
-    wait_for_shutdown_signal().await;
-    eprintln!("remora-bridge: shutting down");
-    shutdown.cancel();
-    let _ = bridge_task.await;
+    let mut bridge_task = bridge_task;
+
+    // ---- Signals → cancel → cleanup (G3), OR bridge-engine death → nonzero
+    // exit (G3b). If `serve_bridge` returns or panics while we are still meant
+    // to be serving, the ctl server would keep answering with a frozen health
+    // value while both flocks (held *inside* the task) have already been
+    // released on task exit — a second daemon could then bind over this
+    // zombie's socket. Treat an unrequested engine exit as fatal: tear down
+    // and return Err so an orchestrator restarts the container. ----
+    let outcome = tokio::select! {
+        _ = wait_for_shutdown_signal() => {
+            eprintln!("remora-bridge: shutting down");
+            shutdown.cancel();
+            // The handle was only polled by ref in select above, so it still
+            // yields the task's result here.
+            let _ = (&mut bridge_task).await;
+            Ok(())
+        }
+        joined = &mut bridge_task => {
+            let cause = match &joined {
+                Ok(()) => "bridge task returned".to_string(),
+                Err(e) => format!("bridge task panicked: {e}"),
+            };
+            eprintln!(
+                "remora-bridge: bridge engine exited unexpectedly ({cause}); \
+                 shutting the daemon down for restart"
+            );
+            shutdown.cancel();
+            Err("bridge engine exited unexpectedly".to_string())
+        }
+    };
+
     ctl_task.abort();
     let _ = std::fs::remove_file(&socket_path);
-    Ok(())
+    outcome
 }
 
 async fn drain_events(

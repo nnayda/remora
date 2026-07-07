@@ -35,13 +35,16 @@ RUN apt-get update \
 # this directory — never a read-only mount over the whole dir (spec D5).
 RUN useradd --uid 65532 --user-group --create-home --home-dir /home/remora remora \
  && mkdir -p /home/remora/.ssh /var/lib/remora-bridge \
- && chmod 700 /home/remora/.ssh \
+ && chmod 700 /home/remora/.ssh /var/lib/remora-bridge \
  && chown remora:remora /home/remora/.ssh /var/lib/remora-bridge
 
-COPY --from=build /src/target/release/remora-bridge /remora-bridge
+# Land the binary on the default PATH: `docker exec <ctr> remora-bridge …` and
+# the k8s exec probes invoke it by bare name (spec D7), and debian-slim's PATH
+# does not include `/`, so a `/remora-bridge` copy would be "not found".
+COPY --from=build /src/target/release/remora-bridge /usr/local/bin/remora-bridge
 USER remora
 # Spec D7: bare `docker exec <ctr> remora-bridge status` (and the k8s exec
 # liveness probe) must find ctl.sock without flags — the env var carries the
 # state dir to every subcommand.
 ENV REMORA_BRIDGE_STATE_DIR=/var/lib/remora-bridge
-ENTRYPOINT ["/remora-bridge", "serve", "/etc/remora/config.toml"]
+ENTRYPOINT ["remora-bridge", "serve", "/etc/remora/config.toml"]
