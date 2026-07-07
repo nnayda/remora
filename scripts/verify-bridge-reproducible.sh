@@ -30,10 +30,10 @@ cleanup() {
 trap cleanup EXIT
 
 extract() {
-  # $1 = image tag, $2 = output path — copy /remora-bridge out of the image.
+  # $1 = image tag, $2 = output path — copy the binary out of the image.
   local cid
   cid="$(docker create "$1")"
-  docker cp "$cid:/remora-bridge" "$2"
+  docker cp "$cid:/usr/local/bin/remora-bridge" "$2"
   docker rm "$cid" >/dev/null
 }
 

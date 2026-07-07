@@ -124,7 +124,7 @@ pub async fn run_serve(config_path: PathBuf, state_dir: PathBuf) -> Result<(), S
     // the headless daemon has no such pump, so nothing ever sends on
     // `_wake_handle` (it stays alive to the end of run_serve, unused) and
     // the bridge's wake arm simply never fires — disconnected phones get no
-    // PushTrigger from a headless bridge yet. Tracked as a #234 follow-up
+    // PushTrigger from a headless bridge yet. Tracked as the #298 follow-up
     // issue.
     let (_wake_handle, wake_rx) = wake_channel();
     let shutdown = CancellationToken::new();

@@ -43,6 +43,16 @@ path is Linux-first and documented as such: `$XDG_CONFIG_HOME` (or
    /etc/remora/config.toml` with neither of the above keeps its state next to
    the config it read).
 
+One consequence worth spelling out: the client subcommands (`status`, `pair`,
+`devices`, `revoke`, `fingerprint`) never read a config path, so rule 3
+resolves against the *default* config location for them. If you start `serve`
+with a custom config path and rely on rule 3, pass the same `--state-dir` (or
+set `$REMORA_BRIDGE_STATE_DIR`) on every client invocation too, or they will
+probe a `ctl.sock` that isn't there and report the daemon as not running. The
+container sidesteps this entirely — the image bakes
+`REMORA_BRIDGE_STATE_DIR=/var/lib/remora-bridge` into the environment, so bare
+`docker exec` commands always find the socket.
+
 The state dir holds everything this bridge needs to survive a restart and
 nothing else:
 
@@ -71,7 +81,7 @@ four steps:
    identity file under the state dir and prints the two values everyone else
    needs:
 
-   ```
+   ```text
    device_id   <64 hex chars>
    fingerprint <XXXX-XXXX-XXXX>
    ```
@@ -88,9 +98,14 @@ four steps:
    the config, claims the identity and single-instance locks, binds
    `ctl.sock`, and starts dialing the relay.
 
-A wrong `registration_token` or a `device_id` the relay doesn't recognize does
-**not** show up as a network error: `remora-bridge status` reports it plainly
-as `rejected` (see [Health & ops](#health--ops)), never as an outage.
+The two credential failure modes read differently, and only one of them is
+self-diagnosing: a `device_id` the relay doesn't recognize (or a refused
+device assertion) surfaces as `rejected` in `remora-bridge status` — a named
+config problem, never an outage. A wrong `registration_token`, though, is
+closed **silently** by the relay at the hello stage (an untrusted relay
+explains nothing) and reads as endless `reconnecting`; if `status` shows that
+against a relay you know is up, check the token first. Details in
+[Health & ops](#health--ops).
 
 ## Pairing (no camera — the whole story)
 
@@ -107,7 +122,7 @@ docker exec -it <ctr> remora-bridge pair
 override) and prints the window duration, then the code on its own indented
 line, then waits:
 
-```
+```text
 Pairing window open (2m0s). Scan or paste on your device:
 
   remora-pair:1:<...>
@@ -119,7 +134,7 @@ Paste that `remora-pair:1:…` string into the device's pairing UI (or hand it
 to whatever client-side flow consumes it). When a device shows up, `pair`
 prints its claimed name and fingerprint and asks:
 
-```
+```text
 Confirm enrollment? [y/N]
 ```
 
@@ -296,7 +311,7 @@ trigger, but the headless daemon has no equivalent pump yet — a disconnected
 phone paired only to a headless bridge will not currently get a push wake
 when a session needs attention, and `[relay] push_wake_url` is consequently
 inert in the headless config (carried through migration for when the pump
-lands, but read by nothing today). Tracked as a follow-up issue at ship.
+lands, but read by nothing today). Tracked as [#298](https://github.com/nnayda/remora/issues/298).
 
 ## Reproducible builds
 

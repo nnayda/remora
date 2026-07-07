@@ -82,9 +82,10 @@ relay** (`remora-relay`, a standalone binary) routes end-to-end-encrypted
 `remora-protocol` frames between paired devices without being able to read
 them, and the **bridge** (`remora-bridge`, a library) hosts a `RemoteSource`
 that drives `remora-core` end-to-end over Noise — same seam, no UI changes.
-The bridge is only ever hosted on user hardware: it runs in-process inside
-the desktop app (dev-only loopback dogfood behind
-`REMORA_REMOTE_LOOPBACK=1`), or as a standalone headless `remora-bridge`
+The bridge is only ever hosted on user hardware: in-process inside the
+desktop app whenever `[relay]` is configured — the normal relay flow (a
+dev-only loopback dogfood additionally exists behind
+`REMORA_REMOTE_LOOPBACK=1`) — or as a standalone headless `remora-bridge`
 binary/container for laptop-asleep access (#234) — see
 [crates/remora-bridge/README.md](../crates/remora-bridge/README.md) for
 running the headless binary as an operator. Relay **slice 1** (envelope
