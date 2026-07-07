@@ -93,9 +93,12 @@ impl std::error::Error for PushEndpointError {}
 /// Checks (in order): total length ≤ [`MAX_PUSH_ENDPOINT_LEN`] bytes; no
 /// whitespace or control characters; a parseable `scheme://authority...`
 /// shape; scheme is `http` or `https`; authority carries no userinfo
-/// (`user@`); no fragment (`#...`); host component is non-empty. Does not
-/// resolve the host or otherwise touch the network — that is the relay's
-/// delivery-time SSRF policy (ADR-0023), not this crate's concern.
+/// (`user@`); no fragment (`#...`); host component is non-empty — including
+/// the *inside* of a bracketed IPv6 literal, so `https://[]:8080/x` is
+/// rejected, as are an unterminated `[` and junk between `]` and the port
+/// (#290). Does not resolve the host or otherwise touch the network — that
+/// is the relay's delivery-time SSRF policy (ADR-0023), not this crate's
+/// concern.
 pub fn validate_push_endpoint(url: &str) -> Result<(), PushEndpointError> {
     if url.len() > MAX_PUSH_ENDPOINT_LEN {
         return Err(PushEndpointError::TooLong(url.len()));
@@ -117,7 +120,23 @@ pub fn validate_push_endpoint(url: &str) -> Result<(), PushEndpointError> {
     if authority.contains('@') {
         return Err(PushEndpointError::UserInfo);
     }
-    let host = authority.split(':').next().unwrap_or("");
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        // Bracketed IPv6 literal: the host is what sits inside the brackets,
+        // and it must not be empty — a naive split-on-':' saw `[` and let the
+        // degenerate `https://[]:8080/x` through (#290).
+        let Some(end) = bracketed.find(']') else {
+            // Unterminated `[...` is not a valid authority at all.
+            return Err(PushEndpointError::InvalidUrl);
+        };
+        // After `]` only nothing or a `:port` may follow.
+        let after = &bracketed[end + 1..];
+        if !(after.is_empty() || after.starts_with(':')) {
+            return Err(PushEndpointError::InvalidUrl);
+        }
+        &bracketed[..end]
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
     if host.is_empty() {
         return Err(PushEndpointError::EmptyHost);
     }
@@ -144,7 +163,12 @@ mod tests {
 
     #[test]
     fn validate_push_endpoint_edge_table() {
-        let ok = ["https://ntfy.sh/topic", "http://192.168.1.10:8080/t"];
+        let ok = [
+            "https://ntfy.sh/topic",
+            "http://192.168.1.10:8080/t",
+            "https://[::1]:8080/t",    // bracketed IPv6 literal with port
+            "https://[fd00::1]/topic", // bracketed IPv6 literal, default port
+        ];
         for u in ok {
             assert!(validate_push_endpoint(u).is_ok(), "{u}");
         }
@@ -163,5 +187,43 @@ mod tests {
         }
         let long = format!("https://h/{}", "a".repeat(2100));
         assert!(validate_push_endpoint(&long).is_err());
+    }
+
+    /// Degenerate host shapes (#290): an explicitly empty bracketed IPv6 host
+    /// used to slip past the naive split-on-':' host check; it and its
+    /// neighbours (unterminated bracket, junk after the bracket, port-only
+    /// authority) are all rejected now.
+    #[test]
+    fn validate_push_endpoint_rejects_degenerate_hosts() {
+        assert_eq!(
+            validate_push_endpoint("https://[]:8080/x"),
+            Err(PushEndpointError::EmptyHost),
+            "empty bracketed IPv6 host with port"
+        );
+        assert_eq!(
+            validate_push_endpoint("https://[]/x"),
+            Err(PushEndpointError::EmptyHost),
+            "empty bracketed IPv6 host without port"
+        );
+        assert_eq!(
+            validate_push_endpoint("https://[]"),
+            Err(PushEndpointError::EmptyHost),
+            "empty bracketed IPv6 host, bare authority"
+        );
+        assert_eq!(
+            validate_push_endpoint("https://[::1/x"),
+            Err(PushEndpointError::InvalidUrl),
+            "unterminated bracket"
+        );
+        assert_eq!(
+            validate_push_endpoint("https://[::1]junk:8080/x"),
+            Err(PushEndpointError::InvalidUrl),
+            "junk between the closing bracket and the port"
+        );
+        assert_eq!(
+            validate_push_endpoint("https://:8080/x"),
+            Err(PushEndpointError::EmptyHost),
+            "port-only authority"
+        );
     }
 }
