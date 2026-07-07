@@ -9,7 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Push-endpoint validation and wake-delivery fail-over** (#290): the push
+- **Relay kicks connections whose admission basis is gone** (#280): the relay
+  now records what admitted each device connection — a bridge-asserted
+  credential or an open pairing window. Closing or replacing the window
+  (`CancelPairing`/`RegisterPairing`) kicks a token-only prober it admitted,
+  and a bridge's reconnect `AssertDevices` sweeps the *live* registrations
+  rather than diffing the previous asserted set, so a device revoked while its
+  bridge was offline is kicked too. A legitimately pairing device is safe: the
+  ceremony's assert-before-grant upgrades its connection to the asserted
+  credential before the window closes. Kicked victims also now reliably see
+  their 4001 close code — the writer no longer races the reader's close frame
+  with a bare socket close when the router deregisters a connection.
   endpoint validator now rejects degenerate hosts a naive check let through —
   an explicitly empty bracketed IPv6 host (`https://[]:8080/x`), an
   unterminated bracket, and junk between the bracket and the port. Relay wake
