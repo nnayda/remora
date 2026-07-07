@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`remora-bridge pair` no longer reports "expired" for an enrollment that
+  committed** (#300): a Confirm/Reject answered near the window deadline could
+  race the daemon's authoritative pairing result — the client-side deadline
+  fired first and printed "expired" even though the roster had gained the
+  device. Once a decision has been sent, the pair client now waits a bounded
+  grace (5s) for the authoritative result and reports it; if none arrives it
+  reports an honest indeterminate outcome pointing at `remora-bridge devices`
+  instead of a flat "expired". A deadline before any decision still reports
+  expired, and the daemon-side window lifetime is untouched (fail-closed).
 - **macOS line-editing chords in the terminal**: Cmd+Delete (kill line
   backward), Cmd+Left / Cmd+Right (jump to line start/end), and
   Option+Delete (delete word) now work in the embedded terminal. xterm.js
