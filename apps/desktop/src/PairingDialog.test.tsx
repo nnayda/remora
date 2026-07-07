@@ -5,6 +5,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PairingDeviceArrived, PairingOutcomeDto } from "./bindings";
@@ -125,11 +126,16 @@ describe("PairingDialog — window open", () => {
     // The copyable pairing string is shown verbatim.
     expect(screen.getByText(CODE)).not.toBeNull();
     // The QR is generated locally from that exact string (no network fetch).
-    expect(qr.toDataURL).toHaveBeenCalledWith(CODE, expect.anything());
+    // The draw lives in a passive effect scheduled *after* the commit that
+    // findByText observed, so poll instead of asserting synchronously — under
+    // CI load the assertion could fire before the effect ran (#302).
+    await waitFor(() =>
+      expect(qr.toDataURL).toHaveBeenCalledWith(CODE, expect.anything()),
+    );
 
     // Copy button hands the exact code to the clipboard seam.
     fireEvent.click(screen.getByRole("button", { name: /copy pairing code/i }));
-    expect(clip.writeClipboard).toHaveBeenCalledWith(CODE);
+    await waitFor(() => expect(clip.writeClipboard).toHaveBeenCalledWith(CODE));
   });
 });
 
