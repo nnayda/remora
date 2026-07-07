@@ -168,11 +168,13 @@ impl ConnPushState {
 
 /// Binds `config.listen` and serves relay connections until the returned
 /// [`JoinHandle`] is dropped or the task ends. Returns the actual bound address
-/// (so a `127.0.0.1:0` listen resolves to a concrete ephemeral port for tests).
+/// (so a `127.0.0.1:0` listen resolves to a concrete ephemeral port for tests)
+/// plus the server's [`Router`], so the binary can hot-swap the bridges table
+/// on a SIGHUP config reload ([`Router::reload_bridges`], #276).
 pub async fn serve(
     config: Arc<RelayConfig>,
     audit: Arc<AuditSink>,
-) -> std::io::Result<(SocketAddr, JoinHandle<()>)> {
+) -> std::io::Result<(SocketAddr, Arc<Router>, JoinHandle<()>)> {
     let listener = TcpListener::bind(&config.listen).await?;
     let addr = listener.local_addr()?;
 
@@ -184,7 +186,9 @@ pub async fn serve(
     let conn_limit = Arc::new(Semaphore::new(config.max_connections));
     let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
 
+    let accept_router = router.clone();
     let handle = tokio::spawn(async move {
+        let router = accept_router;
         loop {
             let stream = match listener.accept().await {
                 Ok((stream, _peer)) => stream,
@@ -229,7 +233,7 @@ pub async fn serve(
         }
     });
 
-    Ok((addr, handle))
+    Ok((addr, router, handle))
 }
 
 /// WebSocket config that caps message and frame size to a single max envelope.
