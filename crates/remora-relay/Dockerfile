@@ -17,7 +17,7 @@
 # repo's floating `rust-toolchain.toml` (`channel = "stable"`). Dependabot
 # refreshes this digest weekly so the build image doesn't silently drift behind
 # a new stable release.
-FROM rust:1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS build
+FROM rust:1-bookworm@sha256:7d0723df719e7f213b69dc7c8c595985c3f4b060cfbee4f7bc0e347a86fe3b6a AS build
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked -p remora-relay
