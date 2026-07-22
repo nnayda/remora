@@ -41,7 +41,7 @@ subtle = "2"
 tempfile = "3.27.0"
 thiserror = "2"
 tokio = { version = "1", default-features = false }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 tokio-util = "0.7"
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 toml_edit = "0.25.12"
