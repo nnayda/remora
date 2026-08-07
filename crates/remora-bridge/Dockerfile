@@ -24,7 +24,7 @@ RUN cargo build --release --locked -p remora-bridge --bins
 # Pinned by digest (docker.io/library/debian:bookworm-slim, resolved via
 # `docker buildx imagetools inspect debian:bookworm-slim` on 2026-07-06).
 # Dependabot keeps this fresh afterwards.
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 RUN apt-get update \
  && apt-get install -y --no-install-recommends openssh-client \
  && rm -rf /var/lib/apt/lists/*
