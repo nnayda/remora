@@ -26,7 +26,7 @@ RUN cargo build --release --locked -p remora-relay
 # `docker buildx imagetools inspect gcr.io/distroless/cc-debian12` on
 # 2026-07-02). Distroless images ship both a root and a preconfigured
 # `nonroot` user (uid 65532) regardless of tag suffix; USER below selects it.
-FROM gcr.io/distroless/cc-debian12@sha256:7ee09f36862efbdbf70422db263e411c2618409ca46faa555bd5b636155307df
+FROM gcr.io/distroless/cc-debian12@sha256:6e1871c34683dc9ee996d13084497783fd98ac0200213d0826625f4e9d4be1d0
 COPY --from=build /src/target/release/remora-relay /remora-relay
 USER nonroot
 # Config path is fixed; mount your relay.toml at this path (see README).
