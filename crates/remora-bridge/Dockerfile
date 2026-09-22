@@ -16,7 +16,7 @@
 # kubectl matching your cluster. See crates/remora-bridge/README.md.
 
 # Same digest-pinned builder as the relay (Dependabot refreshes weekly).
-FROM rust:1-bookworm@sha256:7d0723df719e7f213b69dc7c8c595985c3f4b060cfbee4f7bc0e347a86fe3b6a AS build
+FROM rust:1-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS build
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked -p remora-bridge --bins
